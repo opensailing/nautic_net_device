@@ -1,0 +1,21 @@
+# Nerves artifacts (MUST be a case-sensitive volume)
+export NERVES_DL_DIR='/Volumes/Nerves/dl'
+export NERVES_ARTIFACTS_DIR='/Volumes/Nerves/artifacts'
+
+# Wi-Fi settings
+export VINGATE_NET_WIFI_SSID='FBI Van'
+export VINTAGE_NET_WIFI_PSK='shhhh'
+
+# Nerves system
+export MIX_TARGET='nautic_net_rpi2'
+# Or, if PiCAN-M support is not needed: export MIX_TARGET='rpi2'
+
+# CAN device driver
+export CAN_DRIVER='pican-m'
+# export CAN_DRIVER='canusb'
+
+# Public keys separated by ";"
+export EXTRA_SSH_KEYS=''
+
+# Domain where nautic_net_ingest is hosted
+export NAUTIC_NET_INGEST_BASE_URL='http://localhost:4000'
