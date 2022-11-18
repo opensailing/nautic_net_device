@@ -30,7 +30,6 @@ defmodule NauticNet.Device.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:nautic_net_nmea2000, path: "../nautic_net_nmea2000"},
       # Dependencies for all targets
       {:nerves, "~> 1.7.15", runtime: false},
       {:shoehorn, "~> 0.8.0"},
@@ -57,6 +56,10 @@ defmodule NauticNet.Device.MixProject do
       # {:nautic_net_system_rpi2,
       #  path: "../../../nautic_net_system_rpi2", runtime: false, targets: :nautic_net_rpi2},
 
+      # NauticNet libraries
+      {:nautic_net_nmea2000, path: "../nautic_net_nmea2000"},
+      {:nautic_net_proto, path: "../nautic_net_proto"},
+
       # CANUSB serial communication
       {:circuits_uart, "~> 1.3"},
 
@@ -66,9 +69,6 @@ defmodule NauticNet.Device.MixProject do
       # Telemetry
       {:telemetry, "~> 1.0"},
       {:telemetry_metrics, "~> 0.6.1"},
-
-      # Transport
-      {:nautic_net_proto, path: "../nautic_net_proto"},
 
       # Cellular
       {:vintage_net_qmi, "~> 0.3.2", targets: @all_device_targets},
