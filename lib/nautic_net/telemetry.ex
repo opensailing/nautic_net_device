@@ -6,7 +6,7 @@ defmodule NauticNet.Telemetry do
   """
 
   alias NauticNet.DataSetRecorder
-  alias NauticNet.Proto
+  alias NauticNet.Protobuf
 
   def child_spec(_opts) do
     %{
@@ -49,7 +49,7 @@ defmodule NauticNet.Telemetry do
   defp to_proto_data_points([:nautic_net, :gps, :position], device_id, value) do
     [
       proto_data_point(device_id,
-        sample: {:position, Proto.PositionSample.new(latitude: value.lat, longitude: value.lon)}
+        sample: {:position, Protobuf.PositionSample.new(latitude: value.lat, longitude: value.lon)}
       )
     ]
   end
@@ -59,8 +59,8 @@ defmodule NauticNet.Telemetry do
       proto_data_point(device_id,
         sample:
           {:wind_velocity,
-           Proto.WindVelocitySample.new(
-             reference: Proto.WindReference.value(:WIND_REFERENCE_APPARENT),
+           Protobuf.WindVelocitySample.new(
+             reference: Protobuf.WindReference.value(:WIND_REFERENCE_APPARENT),
              speed_kt: value.magnitude,
              angle_deg: rad2deg(value.angle)
            )}
@@ -72,11 +72,11 @@ defmodule NauticNet.Telemetry do
 
   defp proto_data_point({_, unique_number}, fields) do
     [
-      timestamp: Proto.to_proto_timestamp(DateTime.utc_now()),
+      timestamp: Protobuf.to_proto_timestamp(DateTime.utc_now()),
       hw_unique_number: unique_number
     ]
     |> Keyword.merge(fields)
-    |> Proto.DataSet.DataPoint.new()
+    |> Protobuf.DataSet.DataPoint.new()
   end
 
   defp rad2deg(rad), do: 180 * rad / :math.pi()

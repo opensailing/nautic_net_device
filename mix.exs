@@ -58,7 +58,7 @@ defmodule NauticNet.Device.MixProject do
 
       # NauticNet libraries
       {:nautic_net_nmea2000, path: "../nautic_net_nmea2000"},
-      {:nautic_net_proto, path: "../nautic_net_proto"},
+      {:nautic_net_protobuf, path: "../nautic_net_protobuf"},
 
       # CANUSB serial communication
       {:circuits_uart, "~> 1.3"},

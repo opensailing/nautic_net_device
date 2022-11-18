@@ -4,8 +4,8 @@ defmodule NauticNet.DataSetRecorder do
   require Logger
 
   alias NauticNet.DataSetUploader
-  alias NauticNet.Proto
-  alias NauticNet.Proto.DataSet
+  alias NauticNet.Protobuf
+  alias NauticNet.Protobuf.DataSet
 
   @data_points_per_file 500
 
@@ -36,7 +36,7 @@ defmodule NauticNet.DataSetRecorder do
   end
 
   defp save_data_points(state) do
-    data_set = Proto.new_data_set(state.data_points)
+    data_set = Protobuf.new_data_set(state.data_points)
 
     path = Path.join(state.temp_dir, data_set.ref)
     File.write!(path, DataSet.encode(data_set))
