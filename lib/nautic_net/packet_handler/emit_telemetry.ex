@@ -1,12 +1,10 @@
-defmodule NauticNet.PacketHandler.Telemetry do
+defmodule NauticNet.PacketHandler.EmitTelemetry do
   @behaviour NauticNet.PacketHandler
 
   alias NauticNet.DeviceInfo
   alias NauticNet.Discovery
   alias NauticNet.NMEA2000.Packet
-  alias NauticNet.NMEA2000.J1939.GNSSPositionDataParams
-  alias NauticNet.NMEA2000.J1939.TemperatureParams
-  alias NauticNet.NMEA2000.J1939.WindDataParams
+  alias NauticNet.NMEA2000.J1939
 
   @impl NauticNet.PacketHandler
   def init(_opts) do
@@ -14,7 +12,7 @@ defmodule NauticNet.PacketHandler.Telemetry do
   end
 
   @impl NauticNet.PacketHandler
-  def handle_packet(%Packet{parameters: %WindDataParams{} = params} = packet, _config) do
+  def handle_packet(%Packet{parameters: %J1939.WindDataParams{} = params} = packet, _config) do
     execute([:nautic_net, :wind, params.wind_reference], packet, %{
       vector: %{
         timestamp: packet.timestamp,
@@ -24,7 +22,7 @@ defmodule NauticNet.PacketHandler.Telemetry do
     })
   end
 
-  def handle_packet(%Packet{parameters: %GNSSPositionDataParams{} = params} = packet, _config) do
+  def handle_packet(%Packet{parameters: %J1939.GNSSPositionDataParams{} = params} = packet, _config) do
     execute([:nautic_net, :gps], packet, %{
       position: %{
         timestamp: packet.timestamp,
@@ -34,7 +32,7 @@ defmodule NauticNet.PacketHandler.Telemetry do
     })
   end
 
-  def handle_packet(%Packet{parameters: %TemperatureParams{} = params} = packet, _config) do
+  def handle_packet(%Packet{parameters: %J1939.TemperatureParams{} = params} = packet, _config) do
     execute([:nautic_net, :temperature], packet, %{kelvin: params.temperature_k, timestamp: packet.timestamp})
   end
 

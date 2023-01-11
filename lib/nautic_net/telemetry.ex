@@ -2,7 +2,7 @@ defmodule NauticNet.Telemetry do
   @moduledoc """
   Defines metrics and starts the telemetry reporter.
 
-  See `NauticNet.PacketHandler.Telemetry` for where these metrics are emitted.
+  See `NauticNet.PacketHandler.EmitTelemetry` for where these metrics are emitted.
   """
 
   alias NauticNet.DataSetRecorder

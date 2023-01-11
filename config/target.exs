@@ -23,7 +23,7 @@ config :nautic_net_device, NauticNet.CAN, false
 #   handlers: [
 #     NauticNet.PacketHandler.DiscoverDevices,
 #     NauticNet.PacketHandler.Inspect,
-#     NauticNet.PacketHandler.Telemetry
+#     NauticNet.PacketHandler.EmitTelemetry
 #   ]
 
 config :logger, level: :debug
