@@ -22,8 +22,8 @@ defmodule NauticNet.Telemetry do
       # summary("nautic_net.temperature.kelvin", reporter_options: [every_ms: 1_000]),
       summary([:nautic_net, :wind, :apparent, :vector], reporter_options: [every_ms: 1_000]),
       last_value([:nautic_net, :gps, :position], reporter_options: [every_ms: 1_000]),
-      last_value([:nautic_net, :water_speed, :m_s], reporter_options: [every_ms: 1_000]),
-      last_value([:nautic_net, :water_depth, :m], reporter_options: [every_ms: 1_000]),
+      last_value([:nautic_net, :water_speed, :speed_m_s], reporter_options: [every_ms: 1_000]),
+      last_value([:nautic_net, :water_depth, :depth_m], reporter_options: [every_ms: 1_000]),
       last_value([:nautic_net, :heading, :rad], reporter_options: [every_ms: 1_000])
       ### TODO: velocity over ground
     ]
@@ -73,7 +73,7 @@ defmodule NauticNet.Telemetry do
         sample:
           {:wind_velocity,
            Protobuf.WindVelocitySample.new(
-             reference: Protobuf.WindReference.value(:WIND_REFERENCE_APPARENT),
+             wind_reference: Protobuf.WindReference.value(:WIND_REFERENCE_APPARENT),
              speed_m_s: mean.magnitude,
              angle_rad: mean.angle
            )}
@@ -83,20 +83,25 @@ defmodule NauticNet.Telemetry do
 
   ### SPEED, WATER REFERENCED
 
-  defp to_proto_data_points([:nautic_net, :water_speed, :m_s], device_id, %{
+  defp to_proto_data_points([:nautic_net, :water_speed, :speed_m_s], device_id, %{
          timestamp: timestamp,
          value: speed_m_s
        }) do
     [
       proto_data_point(device_id, timestamp,
-        sample: {:speed_water_referenced, Protobuf.SpeedSample.new(speed_m_s: speed_m_s)}
+        sample:
+          {:speed,
+           Protobuf.SpeedSample.new(
+             speed_reference: Protobuf.SpeedReference.value(:SPEED_REFERENCE_WATER),
+             speed_m_s: speed_m_s
+           )}
       )
     ]
   end
 
   ### WATER DEPTH
 
-  defp to_proto_data_points([:nautic_net, :water_depth, :m], device_id, %{
+  defp to_proto_data_points([:nautic_net, :water_depth, :depth_m], device_id, %{
          timestamp: timestamp,
          value: depth_m
        }) do
@@ -105,9 +110,19 @@ defmodule NauticNet.Telemetry do
 
   defp to_proto_data_points([:nautic_net, :heading, :rad], device_id, %{
          timestamp: timestamp,
-         value: heading_rad
+         value: angle_rad
        }) do
-    [proto_data_point(device_id, timestamp, sample: {:heading, Protobuf.HeadingSample.new(heading_rad: heading_rad)})]
+    [
+      proto_data_point(device_id, timestamp,
+        sample:
+          {:heading,
+           Protobuf.HeadingSample.new(
+             angle_rad: angle_rad,
+             # No idea if this is true or magnetic...
+             angle_reference: Protobuf.AngleReference.value(:ANGLE_REFERENCE_NONE)
+           )}
+      )
+    ]
   end
 
   ###  VELOCITY OVER GROUND
@@ -120,9 +135,11 @@ defmodule NauticNet.Telemetry do
     [
       proto_data_point(device_id, timestamp,
         sample:
-          {:velocity_over_ground,
+          {:velocity,
            Protobuf.VelocitySample.new(
-             reference: Protobuf.DirectionReference.new(:DIRECTION_REFERENCE_NONE),
+             # ANGLE_REFERENCE_REFERENCE_TRUE is an educated guess...
+             angle_reference: Protobuf.AngleReference.value(:ANGLE_REFERENCE_TRUE_NORTH),
+             speed_reference: Protobuf.SpeedReference.value(:SPEED_REFERENCE_GROUND),
              angle_rad: angle_rad,
              speed_m_s: speed_m_s
            )}
