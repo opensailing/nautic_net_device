@@ -40,7 +40,7 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
   end
 
   def handle_packet(%Packet{parameters: %J1939.SpeedParams{} = params} = packet, _config) do
-    execute([:nautic_net, :water_speed], packet, %{
+    execute([:nautic_net, :speed, :water], packet, %{
       speed_m_s: %{
         timestamp: packet.timestamp,
         value: params.water_speed
@@ -69,7 +69,7 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
   end
 
   def handle_packet(%Packet{parameters: %J1939.VelocityOverGroundParams{} = params} = packet, _config) do
-    execute([:nautic_net, :ground_velocity], packet, %{
+    execute([:nautic_net, :velocity, :ground], packet, %{
       vector: %{
         timestamp: packet.timestamp,
         angle: params.course_over_ground,

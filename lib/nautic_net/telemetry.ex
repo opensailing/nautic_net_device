@@ -22,10 +22,10 @@ defmodule NauticNet.Telemetry do
       # summary("nautic_net.temperature.kelvin", reporter_options: [every_ms: 1_000]),
       summary([:nautic_net, :wind, :apparent, :vector], reporter_options: [every_ms: 1_000]),
       last_value([:nautic_net, :gps, :position], reporter_options: [every_ms: 1_000]),
-      last_value([:nautic_net, :water_speed, :speed_m_s], reporter_options: [every_ms: 1_000]),
+      last_value([:nautic_net, :speed, :water, :speed_m_s], reporter_options: [every_ms: 1_000]),
       last_value([:nautic_net, :water_depth, :depth_m], reporter_options: [every_ms: 1_000]),
-      last_value([:nautic_net, :heading, :rad], reporter_options: [every_ms: 1_000])
-      ### TODO: velocity over ground
+      last_value([:nautic_net, :heading, :rad], reporter_options: [every_ms: 1_000]),
+      last_value([:nautic_net, :velocity, :ground, :vector], reporter_options: [every_ms: 1_000])
     ]
   end
 
@@ -83,7 +83,7 @@ defmodule NauticNet.Telemetry do
 
   ### SPEED, WATER REFERENCED
 
-  defp to_proto_data_points([:nautic_net, :water_speed, :speed_m_s], device_id, %{
+  defp to_proto_data_points([:nautic_net, :speed, :water, :speed_m_s], device_id, %{
          timestamp: timestamp,
          value: speed_m_s
        }) do
@@ -127,7 +127,7 @@ defmodule NauticNet.Telemetry do
 
   ###  VELOCITY OVER GROUND
 
-  defp to_proto_data_points([:nautic_net, :ground_velocity, :vector], device_id, %{
+  defp to_proto_data_points([:nautic_net, :velocity, :ground, :vector], device_id, %{
          timestamp: timestamp,
          angle: angle_rad,
          magnitude: speed_m_s
