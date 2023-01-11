@@ -11,9 +11,7 @@ defmodule NauticNet.Telemetry do
   def child_spec(_opts) do
     %{
       id: NauticNet.Telemetry,
-      start:
-        {NauticNet.Telemetry.Reporter, :start_link,
-         [[metrics: metrics(), callback: &report_metric/3]]}
+      start: {NauticNet.Telemetry.Reporter, :start_link, [[metrics: metrics(), callback: &report_metric/3]]}
     }
   end
 
@@ -24,6 +22,7 @@ defmodule NauticNet.Telemetry do
       # summary("nautic_net.temperature.kelvin", reporter_options: [every_ms: 1_000]),
       summary("nautic_net.wind.apparent.vector", reporter_options: [every_ms: 1_000]),
       last_value("nautic_net.gps.position", reporter_options: [every_ms: 1_000])
+      # TODO: Add other metrics
     ]
   end
 
@@ -46,33 +45,46 @@ defmodule NauticNet.Telemetry do
     |> DataSetRecorder.add_data_points()
   end
 
-  defp to_proto_data_points([:nautic_net, :gps, :position], device_id, value) do
+  ### GPS POSITION
+
+  defp to_proto_data_points([:nautic_net, :gps, :position], device_id, %{
+         timestamp: timestamp,
+         lat: lat,
+         lon: lon
+       }) do
     [
-      proto_data_point(device_id,
-        sample: {:position, Protobuf.PositionSample.new(latitude: value.lat, longitude: value.lon)}
+      proto_data_point(device_id, timestamp,
+        sample: {:position, Protobuf.PositionSample.new(latitude: lat, longitude: lon)}
       )
     ]
   end
 
-  defp to_proto_data_points([:nautic_net, :wind, :apparent, :vector], device_id, %{mean: value}) do
+  ### APPARENT WIND
+
+  defp to_proto_data_points([:nautic_net, :wind, :apparent, :vector], device_id, %{
+         timestamp: timestamp,
+         mean: mean
+       }) do
     [
-      proto_data_point(device_id,
+      proto_data_point(device_id, timestamp,
         sample:
           {:wind_velocity,
            Protobuf.WindVelocitySample.new(
              reference: Protobuf.WindReference.value(:WIND_REFERENCE_APPARENT),
-             speed_kt: value.magnitude,
-             angle_deg: rad2deg(value.angle)
+             speed_kt: mean.magnitude,
+             angle_deg: rad2deg(mean.angle)
            )}
       )
     ]
   end
 
+  # TODO: Add other measurement conversions
+
   defp to_proto_data_points(_metric_name, _device_id, _value), do: []
 
-  defp proto_data_point({_, unique_number}, fields) do
+  defp proto_data_point({_, unique_number}, timestamp, fields) do
     [
-      timestamp: Protobuf.to_proto_timestamp(DateTime.utc_now()),
+      timestamp: Protobuf.to_proto_timestamp(timestamp),
       hw_unique_number: unique_number
     ]
     |> Keyword.merge(fields)

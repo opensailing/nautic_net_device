@@ -5,10 +5,13 @@ defmodule NauticNet.CAN.Fake.Server do
 
   use GenServer
 
+  require Logger
+
   alias NauticNet.CAN.CANUSB.Protocol
   alias NauticNet.NMEA2000.Frame
 
   @name __MODULE__
+  @one_day_in_seconds 24 * 60 * 60
 
   defmodule State do
     defstruct close_device_fn: nil,
@@ -149,7 +152,7 @@ defmodule NauticNet.CAN.Fake.Server do
       timestamp =
         state.replay_started_at
         |> DateTime.add(timestamp_ms, :millisecond)
-        |> DateTime.add(-1, :day)
+        |> DateTime.add(-@one_day_in_seconds, :second)
 
       timestamp_monotonic_ms = state.replay_started_at_monotonic_ms + timestamp_ms
       frame = %{frame | timestamp: timestamp, timestamp_monotonic_ms: timestamp_monotonic_ms}
@@ -160,9 +163,12 @@ defmodule NauticNet.CAN.Fake.Server do
 
   defp open_log_device(filename, state) when is_binary(filename) do
     with {:ok, device} <- File.open(filename) do
+      Logger.info("Starting replay of #{filename}")
+
       {:ok, device,
        fn ->
          File.close(device)
+         Logger.info("Finished replay of #{filename}")
          send(state.parent_pid, :can_closed)
        end}
     end

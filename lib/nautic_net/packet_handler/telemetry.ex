@@ -17,6 +17,7 @@ defmodule NauticNet.PacketHandler.Telemetry do
   def handle_packet(%Packet{parameters: %WindDataParams{} = params} = packet, _config) do
     execute([:nautic_net, :wind, params.wind_reference], packet, %{
       vector: %{
+        timestamp: packet.timestamp,
         angle: params.wind_angle,
         magnitude: params.wind_speed
       }
@@ -26,6 +27,7 @@ defmodule NauticNet.PacketHandler.Telemetry do
   def handle_packet(%Packet{parameters: %GNSSPositionDataParams{} = params} = packet, _config) do
     execute([:nautic_net, :gps], packet, %{
       position: %{
+        timestamp: packet.timestamp,
         lat: params.latitude,
         lon: params.longitude
       }
@@ -33,7 +35,7 @@ defmodule NauticNet.PacketHandler.Telemetry do
   end
 
   def handle_packet(%Packet{parameters: %TemperatureParams{} = params} = packet, _config) do
-    execute([:nautic_net, :temperature], packet, %{kelvin: params.temperature_k})
+    execute([:nautic_net, :temperature], packet, %{kelvin: params.temperature_k, timestamp: packet.timestamp})
   end
 
   def handle_packet(_packet, _config), do: :ok

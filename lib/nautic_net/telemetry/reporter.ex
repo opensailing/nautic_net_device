@@ -211,6 +211,9 @@ defmodule NauticNet.Telemetry.Reporter do
          [%{angle: _, magnitude: _} | _] = measurements,
          callback
        ) do
+    # The summary periods will be very short, so this timestamp is close enough
+    timestamp = hd(measurements).timestamp
+
     count = length(measurements)
 
     # Pick the min and max vectors based purely on magnitude
@@ -240,6 +243,7 @@ defmodule NauticNet.Telemetry.Reporter do
     }
 
     callback.(metric.name, device_id, %{
+      timestamp: timestamp,
       min: min,
       max: max,
       mean: mean,
@@ -250,6 +254,9 @@ defmodule NauticNet.Telemetry.Reporter do
 
   defp report_on(%Summary{} = metric, device_id, [measurement | _] = measurements, callback)
        when is_number(measurement) do
+    # The summary periods will be very short, so this timestamp is close enough
+    timestamp = hd(measurements).timestamp
+
     # TODO: Make this more efficient
     count = length(measurements)
     {min, max} = Enum.min_max(measurements)
@@ -257,6 +264,7 @@ defmodule NauticNet.Telemetry.Reporter do
     sum = Enum.sum(measurements)
 
     callback.(metric.name, device_id, %{
+      timestamp: timestamp,
       min: min,
       max: max,
       mean: sum / count,

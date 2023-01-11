@@ -5,8 +5,8 @@ config :logger, level: :debug, backends: [:console]
 config :nautic_net_device, NauticNet.CAN,
   driver: NauticNet.CAN.Fake.Driver,
   handlers: [
-    # NauticNet.PacketHandler.DiscoverDevices,
-    # NauticNet.PacketHandler.Telemetry
+    NauticNet.PacketHandler.DiscoverDevices,
+    NauticNet.PacketHandler.Telemetry
     # {NauticNet.PacketHandler.CreateGPSLog, format: :gpx},
     # {NauticNet.PacketHandler.CreateGPSLog, format: :csv},
     # NauticNet.PacketHandler.SetTimeFromGPS,

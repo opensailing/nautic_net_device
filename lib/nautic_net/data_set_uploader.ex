@@ -10,7 +10,7 @@ defmodule NauticNet.DataSetUploader do
 
   require Logger
 
-  alias NauticNet.IngestClient
+  alias NauticNet.WebClient
 
   @retry_after :timer.seconds(1)
 
@@ -48,15 +48,15 @@ defmodule NauticNet.DataSetUploader do
     ref = Path.basename(path)
     binary = File.read!(path)
 
-    case IngestClient.post_data_set(this_device_id(), ref, binary) do
+    case WebClient.post_data_set(this_device_id(), ref, binary) do
       {:ok, _} ->
-        Logger.info("Uploaded #{path}")
+        Logger.info("Uploaded #{path}; #{length(rest)} file(s) remaining")
         File.rm!(path)
         send(self(), :upload_next)
         {:noreply, %{state | pending_files: rest, retrying?: false}}
 
       {:error, reason} ->
-        Logger.warn("Error uploading #{path}: #{inspect(reason)}")
+        Logger.warn("Error uploading #{path}: #{inspect(reason)}; #{length(state.pending_files)} file(s) remaining")
         Process.send_after(self(), :upload_next, @retry_after)
         {:noreply, %{state | pending_files: state.pending_files, retrying?: true}}
     end
