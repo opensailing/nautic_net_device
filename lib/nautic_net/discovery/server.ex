@@ -48,9 +48,17 @@ defmodule NauticNet.Discovery.Server do
     |> Map.new(&{&1.source_addr, &1})
   end
 
+  @doc """
+  Deletes all discovered devices.
+  """
+  def forget_all do
+    Logger.info("Forgetting all known hardware")
+    :ets.delete_all_objects(@table)
+  end
+
   @impl GenServer
   def init(_config) do
-    table = :ets.new(@table, [:set, :protected, :named_table, read_concurrency: true])
+    table = :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
     {:ok, %{table: table}}
   end
 

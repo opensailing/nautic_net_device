@@ -15,4 +15,5 @@ defmodule NauticNet.Discovery do
   defdelegate handle_packet(packet), to: Discovery.Server
   defdelegate fetch(source_address), to: Discovery.Server
   defdelegate all, to: Discovery.Server
+  defdelegate forget_all, to: Discovery.Server
 end
