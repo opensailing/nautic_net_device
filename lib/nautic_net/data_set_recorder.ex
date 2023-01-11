@@ -1,4 +1,12 @@
 defmodule NauticNet.DataSetRecorder do
+  @moduledoc """
+  Writes DataSets to disk so that we don't lose it, and then enqueues it for upload to the server.
+
+  The files are written to /tmp/datasets/{random base-64} in the raw Protobuf format, which can
+  be sent directly to server without any changes.
+
+  See also: NauticNet.DataSetUploader
+  """
   use GenServer
 
   require Logger

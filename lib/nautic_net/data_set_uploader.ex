@@ -1,9 +1,18 @@
 defmodule NauticNet.DataSetUploader do
+  @moduledoc """
+  Reads DataSets from disk and attempts to upload them to the server.
+
+  On upload success, the file is delete. On failure, it will retry after 1 second.
+
+  See also: NauticNet.DataSetRecorder
+  """
   use GenServer
 
   require Logger
 
   alias NauticNet.IngestClient
+
+  @retry_after :timer.seconds(1)
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -48,7 +57,7 @@ defmodule NauticNet.DataSetUploader do
 
       {:error, reason} ->
         Logger.warn("Error uploading #{path}: #{inspect(reason)}")
-        Process.send_after(self(), :upload_next, :timer.seconds(1))
+        Process.send_after(self(), :upload_next, @retry_after)
         {:noreply, %{state | pending_files: state.pending_files, retrying?: true}}
     end
   end

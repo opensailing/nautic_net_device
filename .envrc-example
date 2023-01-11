@@ -8,14 +8,15 @@ export VINTAGE_NET_WIFI_PSK='shhhh'
 
 # Nerves system
 export MIX_TARGET='nautic_net_rpi2'
-# Or, if PiCAN-M support is not needed: export MIX_TARGET='rpi2'
+# export MIX_TARGET='rpi2' # if PiCAN-M support is not needed
+# export MIX_TARGET='host' # for local development
 
 # CAN device driver
 export CAN_DRIVER='pican-m'
 # export CAN_DRIVER='canusb'
 
-# Public keys separated by ";"
+# Public keys separated by ";" that will be burned into the firmware to enable remote access
 export EXTRA_SSH_KEYS=''
 
-# Domain where nautic_net_ingest is hosted
-export NAUTIC_NET_INGEST_BASE_URL='http://localhost:4000'
+# Domain where nautic_net_web is hosted
+export NAUTIC_NET_WEB_BASE_URL='http://localhost:4000'

@@ -4,6 +4,24 @@ NMEA2000 device.
 
 ## Initial setup
 
+On macOS, make an APFS case-sensitive volume called "Nerves". This is important because case sensitivity matters, and APFS is case-insensitive by default.
+
+Go to https://github.com/DockYard/nautic_net_system_rpi2/releases/ and download the latest release .tar.gz package. Move it into `/Volumes/Nerves/dl`.
+
+```
+# Nerves dependencies (https://hexdocs.pm/nerves/installation.html)
+brew install fwup squashfs coreutils xz pkg-config
+
+# Install Elixir
+asdf install
+
+# Set up Nerves
+mix archive.install hex nerves_bootstrap
+
+# Get the stuff
+mix deps.get
+```
+
 Copy `.envrc-example` to `.envrc` and modify as needed. Then `direnv allow` to load the environment.
 
 ```sh

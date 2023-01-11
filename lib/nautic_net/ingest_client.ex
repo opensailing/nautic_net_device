@@ -1,7 +1,7 @@
 defmodule NauticNet.IngestClient do
   use Tesla
 
-  @base_url Application.compile_env!(:nautic_net_device, :ingest_base_url)
+  @base_url Application.compile_env!(:nautic_net_device, :base_url)
 
   plug Tesla.Middleware.BaseUrl, @base_url
   plug Tesla.Middleware.JSON
