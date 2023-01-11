@@ -83,7 +83,6 @@ defmodule NauticNet.Telemetry do
 
   ### SPEED, WATER REFERENCED
 
-  # This clause is never called... I can't figure out why :|
   defp to_proto_data_points([:nautic_net, :water_speed, :m_s], device_id, %{
          timestamp: timestamp,
          value: speed_m_s
@@ -111,7 +110,25 @@ defmodule NauticNet.Telemetry do
     [proto_data_point(device_id, timestamp, sample: {:heading, Protobuf.HeadingSample.new(heading_rad: heading_rad)})]
   end
 
-  ### TODO: VELOCITY OVER GROUND
+  ###  VELOCITY OVER GROUND
+
+  defp to_proto_data_points([:nautic_net, :ground_velocity, :vector], device_id, %{
+         timestamp: timestamp,
+         angle: angle_rad,
+         magnitude: speed_m_s
+       }) do
+    [
+      proto_data_point(device_id, timestamp,
+        sample:
+          {:velocity_over_ground,
+           Protobuf.VelocitySample.new(
+             reference: Protobuf.DirectionReference.new(:DIRECTION_REFERENCE_NONE),
+             angle_rad: angle_rad,
+             speed_m_s: speed_m_s
+           )}
+      )
+    ]
+  end
 
   defp to_proto_data_points(_metric_name, _device_id, _value), do: []
 
