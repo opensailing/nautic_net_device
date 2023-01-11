@@ -20,9 +20,12 @@ defmodule NauticNet.Telemetry do
 
     [
       # summary("nautic_net.temperature.kelvin", reporter_options: [every_ms: 1_000]),
-      summary("nautic_net.wind.apparent.vector", reporter_options: [every_ms: 1_000]),
-      last_value("nautic_net.gps.position", reporter_options: [every_ms: 1_000])
-      # TODO: Add other metrics
+      summary([:nautic_net, :wind, :apparent, :vector], reporter_options: [every_ms: 1_000]),
+      last_value([:nautic_net, :gps, :position], reporter_options: [every_ms: 1_000]),
+      last_value([:nautic_net, :water_speed, :m_s], reporter_options: [every_ms: 1_000]),
+      last_value([:nautic_net, :water_depth, :m], reporter_options: [every_ms: 1_000])
+      ### TODO: velocity over ground
+      ### TODO: heading
     ]
   end
 
@@ -78,7 +81,32 @@ defmodule NauticNet.Telemetry do
     ]
   end
 
-  # TODO: Add other measurement conversions
+  ### SPEED, WATER REFERENCED
+
+  # This clause is never called... I can't figure out why :|
+  defp to_proto_data_points([:nautic_net, :water_speed, :m_s], device_id, %{
+         timestamp: timestamp,
+         value: speed_m_s
+       }) do
+    [
+      proto_data_point(device_id, timestamp,
+        sample: {:speed_water_referenced, Protobuf.SpeedSample.new(speed_m_s: speed_m_s)}
+      )
+    ]
+  end
+
+  ### WATER DEPTH
+
+  defp to_proto_data_points([:nautic_net, :water_depth, :m], device_id, %{
+         timestamp: timestamp,
+         value: depth_m
+       }) do
+    [proto_data_point(device_id, timestamp, sample: {:water_depth, Protobuf.WaterDepthSample.new(depth_m: depth_m)})]
+  end
+
+  ### TODO: VELOCITY OVER GROUND
+
+  ### TODO: HEADING
 
   defp to_proto_data_points(_metric_name, _device_id, _value), do: []
 
