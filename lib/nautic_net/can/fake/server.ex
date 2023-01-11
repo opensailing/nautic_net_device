@@ -144,7 +144,13 @@ defmodule NauticNet.CAN.Fake.Server do
 
   defp emit_now(command, timestamp_ms, state) do
     with {:ok, %Frame{} = frame} <- Protocol.parse(command) do
-      timestamp = DateTime.add(state.replay_started_at, timestamp_ms, :millisecond)
+      # We are emitting frames faster than realtime, so fudge the frame timestamp. Put it ~1 day
+      # in the past so that we don't receive data from the "future".
+      timestamp =
+        state.replay_started_at
+        |> DateTime.add(timestamp_ms, :millisecond)
+        |> DateTime.add(-1, :day)
+
       timestamp_monotonic_ms = state.replay_started_at_monotonic_ms + timestamp_ms
       frame = %{frame | timestamp: timestamp, timestamp_monotonic_ms: timestamp_monotonic_ms}
 
