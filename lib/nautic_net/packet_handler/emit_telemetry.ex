@@ -60,6 +60,16 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
     })
   end
 
+  def handle_packet(%Packet{parameters: %J1939.VesselHeadingParams{heading: heading}} = packet, _config)
+      when is_number(heading) do
+    execute([:nautic_net, :heading], packet, %{
+      rad: %{
+        timestamp: packet.timestamp,
+        value: heading
+      }
+    })
+  end
+
   def handle_packet(_packet, _config), do: :ok
 
   @impl NauticNet.PacketHandler

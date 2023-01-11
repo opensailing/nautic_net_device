@@ -23,9 +23,9 @@ defmodule NauticNet.Telemetry do
       summary([:nautic_net, :wind, :apparent, :vector], reporter_options: [every_ms: 1_000]),
       last_value([:nautic_net, :gps, :position], reporter_options: [every_ms: 1_000]),
       last_value([:nautic_net, :water_speed, :m_s], reporter_options: [every_ms: 1_000]),
-      last_value([:nautic_net, :water_depth, :m], reporter_options: [every_ms: 1_000])
+      last_value([:nautic_net, :water_depth, :m], reporter_options: [every_ms: 1_000]),
+      last_value([:nautic_net, :heading, :rad], reporter_options: [every_ms: 1_000])
       ### TODO: velocity over ground
-      ### TODO: heading
     ]
   end
 
@@ -104,9 +104,14 @@ defmodule NauticNet.Telemetry do
     [proto_data_point(device_id, timestamp, sample: {:water_depth, Protobuf.WaterDepthSample.new(depth_m: depth_m)})]
   end
 
-  ### TODO: VELOCITY OVER GROUND
+  defp to_proto_data_points([:nautic_net, :heading, :rad], device_id, %{
+         timestamp: timestamp,
+         value: heading_rad
+       }) do
+    [proto_data_point(device_id, timestamp, sample: {:heading, Protobuf.HeadingSample.new(heading_rad: heading_rad)})]
+  end
 
-  ### TODO: HEADING
+  ### TODO: VELOCITY OVER GROUND
 
   defp to_proto_data_points(_metric_name, _device_id, _value), do: []
 
