@@ -71,8 +71,8 @@ defmodule NauticNet.Telemetry do
           {:wind_velocity,
            Protobuf.WindVelocitySample.new(
              reference: Protobuf.WindReference.value(:WIND_REFERENCE_APPARENT),
-             speed_kt: mean.magnitude,
-             angle_deg: rad2deg(mean.angle)
+             speed_m_s: mean.magnitude,
+             angle_rad: mean.angle
            )}
       )
     ]
@@ -90,6 +90,4 @@ defmodule NauticNet.Telemetry do
     |> Keyword.merge(fields)
     |> Protobuf.DataSet.DataPoint.new()
   end
-
-  defp rad2deg(rad), do: 180 * rad / :math.pi()
 end

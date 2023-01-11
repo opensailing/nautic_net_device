@@ -57,8 +57,11 @@ defmodule NauticNet.Device.MixProject do
       #  path: "../../../nautic_net_system_rpi2", runtime: false, targets: :nautic_net_rpi2},
 
       # NauticNet libraries
-      {:nautic_net_nmea2000, path: "../nautic_net_nmea2000"},
-      {:nautic_net_protobuf, path: "../nautic_net_protobuf"},
+      {:nautic_net_protobuf, github: "DockYard/nautic_net_protobuf"},
+      {:nautic_net_nmea2000, github: "DockYard/nautic_net_nmea2000"},
+      # Local dev:
+      # {:nautic_net_nmea2000, path: "../nautic_net_nmea2000"},
+      # {:nautic_net_protobuf, path: "../nautic_net_protobuf"},
 
       # CANUSB serial communication
       {:circuits_uart, "~> 1.3"},
