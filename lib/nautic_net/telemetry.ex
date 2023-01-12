@@ -21,7 +21,7 @@ defmodule NauticNet.Telemetry do
     [
       # summary("nautic_net.temperature.kelvin", reporter_options: [every_ms: 1_000]),
       summary([:nautic_net, :wind, :apparent, :vector], reporter_options: [every_ms: 1_000]),
-      last_value([:nautic_net, :gps, :position], reporter_options: [every_ms: 1_000]),
+      last_value([:nautic_net, :gps, :position], reporter_options: [asap?: true]),
       last_value([:nautic_net, :speed, :water, :speed_m_s], reporter_options: [every_ms: 1_000]),
       last_value([:nautic_net, :water_depth, :depth_m], reporter_options: [every_ms: 1_000]),
       last_value([:nautic_net, :heading, :rad], reporter_options: [every_ms: 1_000]),
