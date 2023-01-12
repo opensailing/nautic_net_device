@@ -18,7 +18,7 @@ defmodule NauticNet.CAN.Fake.Server do
               latest_replay_timestamp: 0,
               replay_device: nil,
               replay_opts: [],
-              replay_started_at: nil,
+              replay_start_time: nil,
               replay_started_at_monotonic_ms: nil,
               parent_pid: nil
   end
@@ -63,7 +63,7 @@ defmodule NauticNet.CAN.Fake.Server do
             state
             | latest_replay_timestamp: 0,
               replay_device: device,
-              replay_started_at: DateTime.utc_now(),
+              replay_start_time: replay_start_time(filename_or_list),
               replay_started_at_monotonic_ms: System.monotonic_time(:millisecond),
               replay_opts: opts,
               close_device_fn: close_device_fn
@@ -103,6 +103,23 @@ defmodule NauticNet.CAN.Fake.Server do
 
     {:noreply, read_next_log(state)}
   end
+
+  # Try to convert filename "2022-08-24T20_56_28Z.log" into a UTC %DateTime{}, falling back
+  # to "one day before now"
+  defp replay_start_time(filename) when is_binary(filename) do
+    filename
+    |> Path.basename(".log")
+    |> String.replace("_", ":")
+    |> DateTime.from_iso8601()
+    |> case do
+      {:ok, datetime, 0} -> datetime
+      _ -> default_replay_start_time()
+    end
+  end
+
+  defp replay_start_time(_), do: default_replay_start_time()
+
+  defp default_replay_start_time, do: DateTime.add(DateTime.utc_now(), -@one_day_in_seconds, :second)
 
   defp read_next_log(%State{replay_device: nil} = state), do: state
 
@@ -151,10 +168,7 @@ defmodule NauticNet.CAN.Fake.Server do
     with {:ok, %Frame{} = frame} <- Protocol.parse(command) do
       # We are emitting frames faster than realtime, so fudge the frame timestamp. Put it ~1 day
       # in the past so that we don't receive data from the "future".
-      timestamp =
-        state.replay_started_at
-        |> DateTime.add(timestamp_ms, :millisecond)
-        |> DateTime.add(-@one_day_in_seconds, :second)
+      timestamp = DateTime.add(state.replay_start_time, timestamp_ms, :millisecond)
 
       timestamp_monotonic_ms = state.replay_started_at_monotonic_ms + timestamp_ms
       frame = %{frame | timestamp: timestamp, timestamp_monotonic_ms: timestamp_monotonic_ms}
