@@ -19,13 +19,22 @@ defmodule NauticNet.DataSetUploader do
   end
 
   def add_file(path) do
-    GenServer.cast(__MODULE__, {:add_file, path})
+    send(__MODULE__, {:upload, path})
   end
 
   def init(opts) do
+    via = opts[:via] || :http
     temp_dir = opts[:temp_dir] || "/tmp/datasets"
-    send(self(), :upload_next)
-    {:ok, %{pending_files: list_pending_files(temp_dir), temp_dir: temp_dir, retrying?: false}}
+
+    for path <- list_pending_files(temp_dir) do
+      send(self(), {:upload, path})
+    end
+
+    {:ok,
+     %{
+       temp_dir: temp_dir,
+       via: via
+     }}
   end
 
   defp list_pending_files(temp_dir) do
@@ -34,30 +43,31 @@ defmodule NauticNet.DataSetUploader do
     |> Enum.map(fn filename -> Path.join(temp_dir, filename) end)
   end
 
-  def handle_cast({:add_file, path}, state) do
-    unless state.retrying? do
-      send(self(), :upload_next)
-    end
-
-    {:noreply, %{state | pending_files: [path | state.pending_files]}}
-  end
-
-  def handle_info(:upload_next, %{pending_files: []} = state), do: {:noreply, state}
-
-  def handle_info(:upload_next, %{pending_files: [path | rest]} = state) do
+  def handle_info({:upload, path}, state) do
     binary = File.read!(path)
 
-    case WebClient.post_data_set(binary) do
-      {:ok, _} ->
-        Logger.info("Uploaded #{path}; #{length(rest)} file(s) remaining")
+    case upload_data_set(binary, state.via) do
+      :ok ->
         File.rm!(path)
-        send(self(), :upload_next)
-        {:noreply, %{state | pending_files: rest, retrying?: false}}
+        Logger.info("Uploaded #{path}; #{length(File.ls!(state.temp_dir))} file(s) remain")
 
       {:error, reason} ->
-        Logger.warn("Error uploading #{path}: #{inspect(reason)}; #{length(state.pending_files)} file(s) remaining")
-        Process.send_after(self(), :upload_next, @retry_after)
-        {:noreply, %{state | pending_files: state.pending_files, retrying?: true}}
+        Logger.warn("Error uploading #{path}: #{inspect(reason)}")
+        Process.send_after(self(), {:upload, path}, @retry_after)
     end
+
+    {:noreply, state}
+  end
+
+  defp upload_data_set(binary, :http) do
+    case WebClient.post_data_set(binary) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp upload_data_set(_binary, :udp) do
+    # TODO
+    {:error, :not_implemented}
   end
 end
