@@ -45,10 +45,9 @@ defmodule NauticNet.DataSetUploader do
   def handle_info(:upload_next, %{pending_files: []} = state), do: {:noreply, state}
 
   def handle_info(:upload_next, %{pending_files: [path | rest]} = state) do
-    ref = Path.basename(path)
     binary = File.read!(path)
 
-    case WebClient.post_data_set(this_device_id(), ref, binary) do
+    case WebClient.post_data_set(binary) do
       {:ok, _} ->
         Logger.info("Uploaded #{path}; #{length(rest)} file(s) remaining")
         File.rm!(path)
@@ -59,14 +58,6 @@ defmodule NauticNet.DataSetUploader do
         Logger.warn("Error uploading #{path}: #{inspect(reason)}; #{length(state.pending_files)} file(s) remaining")
         Process.send_after(self(), :upload_next, @retry_after)
         {:noreply, %{state | pending_files: state.pending_files, retrying?: true}}
-    end
-  end
-
-  defp this_device_id do
-    if Kernel.function_exported?(Nerves.Runtime, :serial_number, 0) do
-      apply(Nerves.Runtime, :serial_number, [])
-    else
-      "host"
     end
   end
 end

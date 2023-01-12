@@ -44,7 +44,10 @@ defmodule NauticNet.DataSetRecorder do
   end
 
   defp save_data_points(state) do
-    data_set = Protobuf.new_data_set(state.data_points)
+    data_set =
+      Protobuf.new_data_set(state.data_points,
+        boat_identifier: NauticNet.boat_identifier()
+      )
 
     path = Path.join(state.temp_dir, data_set.ref)
     File.write!(path, DataSet.encode(data_set))
