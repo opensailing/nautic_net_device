@@ -61,7 +61,7 @@ defmodule NauticNet.Telemetry.Reporter do
 
     # Tables need to be public because handle_event/4 is invoked from a different process
     tables = %{
-      LastValue => :ets.new(__MODULE__.LastValue, [:public]),
+      LastValue => :ets.new(__MODULE__.LastValue, [:public, :duplicate_bag]),
       Summary => :ets.new(__MODULE__.Summary, [:public, :duplicate_bag])
     }
 
@@ -103,6 +103,7 @@ defmodule NauticNet.Telemetry.Reporter do
           # Nothing to report
           false
         else
+          # Determine if enough time has elapsed by comparing the earliest timestamp in ETS to now
           earliest_monotonic_ms =
             rows
             |> Enum.map(fn {_metric_name, _measurement, metadata} ->
@@ -198,8 +199,8 @@ defmodule NauticNet.Telemetry.Reporter do
   # Time to report it to the world
   defp report_on(%LastValue{} = _metric, _device_id, [], _callback), do: :noop
 
-  defp report_on(%LastValue{} = metric, device_id, [measurement], callback) do
-    callback.(metric.name, device_id, measurement)
+  defp report_on(%LastValue{} = metric, device_id, measurements, callback) do
+    callback.(metric.name, device_id, List.last(measurements))
   end
 
   defp report_on(%Summary{} = _metric, _device_id, [], _callback), do: :noop
