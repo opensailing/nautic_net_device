@@ -15,8 +15,6 @@ defmodule NauticNet.DataSetRecorder do
   alias NauticNet.Protobuf
   alias NauticNet.Protobuf.DataSet
 
-  @data_points_per_file 500
-
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
@@ -30,35 +28,53 @@ defmodule NauticNet.DataSetRecorder do
     temp_dir = opts[:temp_dir] || "/tmp/datasets"
     File.mkdir_p!(temp_dir)
 
-    {:ok, %{data_points: [], temp_dir: temp_dir}}
+    # Chunking can be specified as {x, :points} or {x, :bytes}
+    chunk_every = opts[:chunk_every] || {500, :points}
+
+    {:ok, %{data_points: [], temp_dir: temp_dir, chunk_every: chunk_every}}
   end
 
-  def handle_cast({:add_data_points, data_points}, state) do
-    state = %{state | data_points: data_points ++ state.data_points}
+  def handle_cast({:add_data_points, new_data_points}, state) do
+    all_data_points = new_data_points ++ state.data_points
+    {chunks_to_save, next_data_points} = chunkify(all_data_points, state.chunk_every)
 
-    if length(state.data_points) >= @data_points_per_file do
-      {:noreply, save_data_points(state)}
-    else
-      {:noreply, state}
+    for data_points <- chunks_to_save do
+      save_data_points(data_points, state)
     end
+
+    {:noreply, %{state | data_points: next_data_points}}
   end
 
-  defp save_data_points(state) do
+  # Returns a tuple of {chunks_of_data_points_to_save, remaining_data_points}
+  defp chunkify(data_points, {max_points, :points}) do
+    data_points
+    |> Enum.chunk_every(max_points)
+    |> Enum.split(-1)
+    |> then(fn {chunks, [rest]} -> {chunks, rest} end)
+  end
+
+  defp chunkify(data_points, {max_bytes, :bytes}) do
+    data_points
+    |> Protobuf.chunk_into_data_sets(max_bytes)
+    |> Enum.map(fn data_set -> data_set.data_points end)
+    |> Enum.split(-1)
+    |> then(fn {chunks, [rest]} -> {chunks, rest} end)
+  end
+
+  defp save_data_points(data_points, state) do
     data_set =
-      Protobuf.new_data_set(state.data_points,
+      Protobuf.new_data_set(data_points,
         boat_identifier: NauticNet.boat_identifier()
       )
 
     path = Path.join(state.temp_dir, data_set.ref)
     File.write!(path, DataSet.encode(data_set))
-    Logger.info("Saved #{length(state.data_points)} data points to #{path}")
+    Logger.info("Saved #{length(data_points)} data points to #{path}")
 
     DataSetUploader.add_file(path)
-
-    %{state | data_points: []}
   end
 
   def terminate(_reason, state) do
-    save_data_points(state)
+    save_data_points(state.data_points, state)
   end
 end

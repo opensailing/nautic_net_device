@@ -16,8 +16,8 @@ defmodule NauticNet.Application do
         NauticNet.Telemetry,
         {NauticNet.CAN, can_config()},
         {NauticNet.Discovery, discovery_config()},
-        NauticNet.DataSetRecorder,
         NauticNet.DataSetUploader,
+        {NauticNet.DataSetRecorder, chunk_every: {500, :bytes}},
         children(target())
       ])
 
