@@ -74,8 +74,8 @@ defmodule NauticNet.Telemetry do
           {:wind_velocity,
            Protobuf.WindVelocitySample.new(
              wind_reference: Protobuf.WindReference.value(:WIND_REFERENCE_APPARENT),
-             speed_m_s: mean.magnitude,
-             angle_rad: mean.angle
+             speed_cm_s: Protobuf.Convert.encode_unit(mean.magnitude, :m_s, :cm_s),
+             angle_mrad: Protobuf.Convert.encode_unit(mean.angle, :rad, :mrad)
            )}
       )
     ]
@@ -93,7 +93,7 @@ defmodule NauticNet.Telemetry do
           {:speed,
            Protobuf.SpeedSample.new(
              speed_reference: Protobuf.SpeedReference.value(:SPEED_REFERENCE_WATER),
-             speed_m_s: speed_m_s
+             speed_cm_s: Protobuf.Convert.encode_unit(speed_m_s, :m_s, :cm_s)
            )}
       )
     ]
@@ -105,7 +105,11 @@ defmodule NauticNet.Telemetry do
          timestamp: timestamp,
          value: depth_m
        }) do
-    [proto_data_point(device_id, timestamp, sample: {:water_depth, Protobuf.WaterDepthSample.new(depth_m: depth_m)})]
+    [
+      proto_data_point(device_id, timestamp,
+        sample: {:water_depth, Protobuf.WaterDepthSample.new(depth_cm: Protobuf.Convert.encode_unit(depth_m, :m, :cm))}
+      )
+    ]
   end
 
   defp to_proto_data_points([:nautic_net, :heading, :rad], device_id, %{
@@ -117,7 +121,7 @@ defmodule NauticNet.Telemetry do
         sample:
           {:heading,
            Protobuf.HeadingSample.new(
-             angle_rad: angle_rad,
+             angle_mrad: Protobuf.Convert.encode_unit(angle_rad, :rad, :mrad),
              # No idea if this is true or magnetic...
              angle_reference: Protobuf.AngleReference.value(:ANGLE_REFERENCE_NONE)
            )}
@@ -140,8 +144,8 @@ defmodule NauticNet.Telemetry do
              # ANGLE_REFERENCE_REFERENCE_TRUE is an educated guess...
              angle_reference: Protobuf.AngleReference.value(:ANGLE_REFERENCE_TRUE_NORTH),
              speed_reference: Protobuf.SpeedReference.value(:SPEED_REFERENCE_GROUND),
-             angle_rad: angle_rad,
-             speed_m_s: speed_m_s
+             angle_mrad: Protobuf.Convert.encode_unit(angle_rad, :rad, :mrad),
+             speed_cm_s: Protobuf.Convert.encode_unit(speed_m_s, :m_s, :cm_s)
            )}
       )
     ]

@@ -26,9 +26,13 @@ defmodule NauticNet.DataSetUploader do
     via = opts[:via] || :http
     temp_dir = opts[:temp_dir] || "/tmp/datasets"
 
-    for path <- list_pending_files(temp_dir) do
+    pending_files = list_pending_files(temp_dir)
+
+    for path <- pending_files do
       send(self(), {:upload, path})
     end
+
+    Logger.info("Found #{length(pending_files)} files in #{temp_dir} pending upload")
 
     {:ok,
      %{
