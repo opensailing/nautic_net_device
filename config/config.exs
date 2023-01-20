@@ -10,7 +10,8 @@ Application.start(:nerves_bootstrap)
 
 config :nautic_net_device,
   target: Mix.target(),
-  base_url: System.fetch_env!("NAUTIC_NET_WEB_BASE_URL")
+  base_url: System.fetch_env!("NAUTIC_NET_WEB_BASE_URL"),
+  udp_endpoint: System.fetch_env!("NAUTIC_NET_WEB_UDP_ENDPOINT")
 
 # Customize non-Elixir parts of the firmware. See
 # https://hexdocs.pm/nerves/advanced-configuration.html for details.

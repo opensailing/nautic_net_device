@@ -10,7 +10,8 @@ defmodule NauticNet.DataSetUploader do
 
   require Logger
 
-  alias NauticNet.WebClient
+  alias NauticNet.WebClients.HTTPClient
+  alias NauticNet.WebClients.UDPClient
 
   @retry_after :timer.seconds(1)
 
@@ -64,14 +65,14 @@ defmodule NauticNet.DataSetUploader do
   end
 
   defp upload_data_set(binary, :http) do
-    case WebClient.post_data_set(binary) do
+    case HTTPClient.post_data_set(binary) do
       {:ok, _} -> :ok
       {:error, reason} -> {:error, reason}
     end
   end
 
-  defp upload_data_set(_binary, :udp) do
-    # TODO
-    {:error, :not_implemented}
+  defp upload_data_set(binary, :udp) do
+    UDPClient.send_data_set(binary)
+    :ok
   end
 end

@@ -5,6 +5,8 @@ defmodule NauticNet.Application do
 
   use Application
 
+  @max_unfragmented_udp_payload_size {508, :bytes}
+
   @impl true
   def start(_type, _args) do
     # See https://hexdocs.pm/elixir/Supervisor.html
@@ -16,8 +18,10 @@ defmodule NauticNet.Application do
         NauticNet.Telemetry,
         {NauticNet.CAN, can_config()},
         {NauticNet.Discovery, discovery_config()},
-        {NauticNet.DataSetRecorder, chunk_every: {500, :bytes}},
-        {NauticNet.DataSetUploader, via: :http},
+        {NauticNet.WebClients.UDPClient.Server, udp_config()},
+        {NauticNet.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
+        {NauticNet.DataSetUploader, via: :udp},
+        # {NauticNet.DataSetUploader, via: :http},
         children(target())
       ])
 
@@ -44,5 +48,12 @@ defmodule NauticNet.Application do
 
   def discovery_config do
     Application.get_env(:nautic_net_device, NauticNet.Discovery, [])
+  end
+
+  def udp_config do
+    endpoint = Application.get_env(:nautic_net_device, :udp_endpoint, "localhost:4001")
+    [hostname, port] = String.split(endpoint, ":")
+
+    [hostname: hostname, port: String.to_integer(port)]
   end
 end

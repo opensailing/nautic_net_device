@@ -20,3 +20,4 @@ export EXTRA_SSH_KEYS=''
 
 # Domain where nautic_net_web is hosted
 export NAUTIC_NET_WEB_BASE_URL='http://localhost:4000'
+export NAUTIC_NET_WEB_UDP_ENDPOINT='localhost:4001'

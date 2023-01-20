@@ -1,4 +1,4 @@
-defmodule NauticNet.WebClient do
+defmodule NauticNet.WebClients.HTTPClient do
   use Tesla
 
   @base_url Application.compile_env!(:nautic_net_device, :base_url)
