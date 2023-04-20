@@ -18,9 +18,10 @@ defmodule NauticNet.Application do
         NauticNet.Telemetry,
         {NauticNet.CAN, can_config()},
         {NauticNet.Discovery, discovery_config()},
-        {NauticNet.WebClients.UDPClient.Server, udp_config()},
+        {NauticNet.WebClients.UDPClient, udp_config()},
         {NauticNet.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
         {NauticNet.DataSetUploader, via: :udp},
+        NauticNet.BaseStation,
         # {NauticNet.DataSetUploader, via: :http},
         children(target())
       ])
