@@ -240,7 +240,7 @@ defmodule NauticNet.Telemetry.Reporter do
     # Finally, convert back to polar coordinates
     mean = %{
       magnitude: :math.sqrt(x_mean * x_mean + y_mean * y_mean),
-      angle: :math.atan(y_mean / x_mean)
+      angle: if(x_mean == 0, do: 0, else: :math.atan(y_mean / x_mean))
     }
 
     callback.(metric.name, device_id, %{
