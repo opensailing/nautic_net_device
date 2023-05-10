@@ -86,7 +86,8 @@ defmodule NauticNet.BaseStation.Server do
 
     data_point =
       DataPoint.new(
-        timestamp: NauticNet.Protobuf.utc_now(),
+        # Zero-out the timestamp to indicate "ASAP", and the server will apply the timestamp after upload
+        timestamp: Google.Protobuf.Timestamp.new(),
         sample:
           {:tracker,
            TrackerSample.new(
