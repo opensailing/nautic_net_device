@@ -9,49 +9,69 @@ defmodule NauticNet.Application do
 
   @impl true
   def start(_type, _args) do
-    # See https://hexdocs.pm/elixir/Supervisor.html
-    # for other strategies and supported options
     opts = [strategy: :one_for_one, name: NauticNet.Supervisor]
 
-    children =
-      List.flatten([
-        NauticNet.Telemetry,
-        {NauticNet.CAN, can_config()},
-        {NauticNet.Discovery, discovery_config()},
-        {NauticNet.WebClients.UDPClient, udp_config()},
-        {NauticNet.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
-        {NauticNet.DataSetUploader, via: :udp},
-        NauticNet.BaseStation,
-        # {NauticNet.DataSetUploader, via: :http},
-        children(target())
-      ])
+    children = children(product(), target())
 
     Supervisor.start_link(children, opts)
   end
 
-  def children(:host) do
-    []
+  # Product: NMEA 2000 standalone, on-board device
+  defp children(:logger, target) do
+    http_server = if target == :host, do: [], else: [NauticNet.HttpDataListing]
+
+    [
+      NauticNet.Telemetry,
+      {NauticNet.CAN, can_config()},
+      {NauticNet.Discovery, discovery_config()},
+      {NauticNet.WebClients.UDPClient, udp_config()},
+      {NauticNet.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
+      {NauticNet.DataSetUploader, via: :udp}
+    ] ++ http_server
   end
 
-  def children(_device_target) do
+  # Product: Base station receiver node for nautic_net_tracker_mini
+  defp children(:uplink, _target) do
     [
-      NauticNet.HttpDataListing
+      {NauticNet.WebClients.UDPClient, udp_config()},
+      {NauticNet.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
+      {NauticNet.DataSetUploader, via: :udp},
+      NauticNet.BaseStation
     ]
   end
 
-  def target do
+  defp product do
+    case Application.get_env(:nautic_net_device, :product) do
+      "logger" ->
+        :logger
+
+      "uplink" ->
+        :uplink
+
+      unexpected ->
+        raise """
+        unexpected PRODUCT #{inspect(unexpected)}; must be one of:
+
+             - "logger" for NMEA2000 device
+             - "uplink" for mini tracker base station uplink node
+
+        """
+    end
+  end
+
+  defp target do
     Application.get_env(:nautic_net_device, :target)
   end
 
-  def can_config do
+  defp can_config do
     Application.get_env(:nautic_net_device, NauticNet.CAN, [])
   end
 
-  def discovery_config do
+  defp discovery_config do
     Application.get_env(:nautic_net_device, NauticNet.Discovery, [])
   end
 
-  def udp_config do
+  defp udp_config do
     endpoint = Application.get_env(:nautic_net_device, :udp_endpoint, "localhost:4001")
     [hostname, port] = String.split(endpoint, ":")
 

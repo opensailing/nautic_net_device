@@ -3,7 +3,7 @@ defmodule NauticNet.Device.MixProject do
 
   @app :nautic_net_device
   @version "0.1.0"
-  @all_device_targets [:rpi2, :nautic_net_rpi2, :nautic_net_rpi3]
+  @all_device_targets [:nautic_net_rpi2, :nautic_net_rpi3]
 
   def project do
     [

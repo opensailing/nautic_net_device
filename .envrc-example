@@ -1,26 +1,26 @@
-# Nerves artifacts (MUST be a case-sensitive volume)
+# Nerves artifacts (must be a case-sensitive volume - see README)
 export NERVES_DL_DIR='/Volumes/Nerves/dl'
 export NERVES_ARTIFACTS_DIR='/Volumes/Nerves/artifacts'
 
-# Uncomment for local development of dependencies (see mix.exs)
-#export NAUTIC_NET_DEPS_PATH='..'
+# Behavior of this device: logger | uplink
+export PRODUCT='logger'
 
-# Wi-Fi settings
-export VINGATE_NET_WIFI_SSID='FBI Van'
-export VINTAGE_NET_WIFI_PSK='shhhh'
+# Uncomment for local development of OpenSailing dependencies (see mix.exs)
+# export NAUTIC_NET_DEPS_PATH='..'
 
-# Nerves system
-export MIX_TARGET='nautic_net_rpi2'
-# export MIX_TARGET='rpi2' # if PiCAN-M support is not needed
-# export MIX_TARGET='host' # for local development
+# Device Wi-Fi
+export VINGATE_NET_WIFI_SSID='foo'
+export VINTAGE_NET_WIFI_PSK='bar'
 
-# CAN device driver
+# Nerves system: host | nautic_net_rpi2 | nautic_net_rpi3
+export MIX_TARGET='nautic_net_rpi3'
+
+# CAN device driver: disabled | pican-m | canusb
 export CAN_DRIVER='pican-m'
-# export CAN_DRIVER='canusb'
 
-# Public keys separated by ";" that will be burned into the firmware to enable remote access
+# Public SSH keys separated by ";"
 export EXTRA_SSH_KEYS=''
 
 # Domain where nautic_net_web is hosted
-export NAUTIC_NET_WEB_BASE_URL='http://localhost:4000'
-export NAUTIC_NET_WEB_UDP_ENDPOINT='localhost:4001'
+export BASE_URL='http://localhost:4000'
+export UDP_ENDPOINT='localhost:4001'

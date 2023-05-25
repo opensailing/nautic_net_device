@@ -7,8 +7,6 @@ defmodule NauticNet.WebClients.UDPClient.Server do
 
   require Logger
 
-  alias NauticNet.Ingest
-
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
