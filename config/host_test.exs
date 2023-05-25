@@ -1,3 +1,6 @@
+#
+# Configuration for testing the app in local development (not on-device).
+#
 import Config
 
 # Don't start these servers for testing; we will supervise them manually

@@ -1,30 +1,32 @@
+#
+# Configuration for running the app on the device.
+#
 import Config
 
-config :nautic_net_device, NauticNet.CAN, false
+handlers = [
+  NauticNet.PacketHandler.DiscoverDevices,
+  NauticNet.PacketHandler.Inspect,
+  NauticNet.PacketHandler.EmitTelemetry
+]
 
-#
-# TEMPORARILY disabled CANBUS to test cellular HAT!
-#
+can_config =
+  case System.get_env("CAN_DRIVER") do
+    "canusb" ->
+      config :nautic_net_device, NauticNet.CAN,
+        driver: {NauticNet.CAN.CANUSB.Driver, start_logging?: true},
+        handlers: handlers
 
-# driver_config =
-#   case System.get_env("CAN_DRIVER") do
-#     "canusb" ->
-#       {NauticNet.CAN.CANUSB.Driver, start_logging?: true}
+    "pican-m" ->
+      config :nautic_net_device, NauticNet.CAN,
+        driver: {NauticNet.CAN.PiCAN.Driver, []},
+        handlers: handlers
 
-#     "pican-m" ->
-#       {NauticNet.CAN.PiCAN.Driver, []}
+    "disabled" ->
+      config :nautic_net_device, NauticNet.CAN, false
 
-#     _else ->
-#       raise "the CAN_DRIVER environment variable must be one of: canusb, pican-m"
-#   end
-
-# config :nautic_net_device, NauticNet.CAN,
-#   driver: driver_config,
-#   handlers: [
-#     NauticNet.PacketHandler.DiscoverDevices,
-#     NauticNet.PacketHandler.Inspect,
-#     NauticNet.PacketHandler.EmitTelemetry
-#   ]
+    _else ->
+      raise "the CAN_DRIVER environment variable must be one of: canusb, pican-m, disabled"
+  end
 
 config :logger, level: :debug
 

@@ -1,3 +1,7 @@
+#
+# Configuration for running the app in local development (not on-device).
+#
+
 import Config
 
 config :logger, level: :debug, backends: [:console]
