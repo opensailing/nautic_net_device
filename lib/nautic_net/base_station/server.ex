@@ -81,8 +81,14 @@ defmodule NauticNet.BaseStation.Server do
     end
   end
 
-  defp upload_rover_data_now(%LoRaPacket{payload: {:roverData, %RoverData{} = rover_data}} = lora_packet, rssi) do
-    boat_id = Base.encode16(<<lora_packet.hardwareID::unsigned-integer-32>>)
+  defp upload_rover_data_now(%LoRaPacket{payload: {:rover_data, %RoverData{} = rover_data}} = lora_packet, rssi) do
+    # boat_id = Base.encode16(<<lora_packet.hardwareID::unsigned-integer-32>>)
+
+    boat_serial =
+      lora_packet.serial_number
+      |> to_string()
+      |> String.pad_leading(2, "0")
+      |> then(&"Boat-#{&1}")
 
     data_point =
       DataPoint.new(
@@ -96,7 +102,7 @@ defmodule NauticNet.BaseStation.Server do
            )}
       )
 
-    DataSet.new(boat_identifier: boat_id, data_points: [data_point])
+    DataSet.new(boat_identifier: boat_serial, data_points: [data_point])
     |> DataSet.encode()
     |> UDPClient.send_data_set()
 
