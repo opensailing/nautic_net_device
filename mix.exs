@@ -3,7 +3,7 @@ defmodule NauticNet.Device.MixProject do
 
   @app :nautic_net_device
   @version "0.1.0"
-  @all_device_targets [:rpi2, :nautic_net_rpi2]
+  @all_device_targets [:rpi2, :nautic_net_rpi2, :nautic_net_rpi3]
 
   def project do
     [
@@ -46,22 +46,23 @@ defmodule NauticNet.Device.MixProject do
       # bumps to Nerves systems. Since these include Linux kernel and Erlang
       # version updates, please review their release notes in case
       # changes to your application are needed.
-      {:nerves_system_rpi2, "1.20.1", runtime: false, targets: :rpi2},
+      # {:nerves_system_rpi2, "1.20.1", runtime: false, targets: :rpi2},
 
       # For a precompiled system artifact:
-      {:nautic_net_system_rpi2, "1.20.1",
-       github: "DockYard/nautic_net_system_rpi2", runtime: false, targets: :nautic_net_rpi2},
+      # {:nautic_net_system_rpi2, "1.20.1",
+      #  github: "DockYard/nautic_net_system_rpi2", runtime: false, targets: :nautic_net_rpi2},
 
       # For iterating on systems locally:
       # {:nautic_net_system_rpi2,
       #  path: "../../../nautic_net_system_rpi2", runtime: false, targets: :nautic_net_rpi2},
+      {:nautic_net_system_rpi3, path: "../nautic_net_system_rpi3", runtime: false, targets: :nautic_net_rpi3},
 
       # NauticNet libraries
-      {:nautic_net_protobuf, github: "DockYard/nautic_net_protobuf"},
+      # {:nautic_net_protobuf, github: "DockYard/nautic_net_protobuf"},
       {:nautic_net_nmea2000, github: "DockYard/nautic_net_nmea2000"},
       # Local dev:
       # {:nautic_net_nmea2000, path: "../nautic_net_nmea2000"},
-      # {:nautic_net_protobuf, path: "../nautic_net_protobuf"},
+      {:nautic_net_protobuf, path: "../nautic_net_protobuf"},
 
       # CANUSB serial communication
       {:circuits_uart, "~> 1.3"},
