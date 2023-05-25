@@ -2,7 +2,12 @@ defmodule NauticNet.DeviceInfo do
   @moduledoc """
   Represents information about a device on the NMEA network.
   """
-  defstruct [:source_addr, :manufacturer_code, :unique_number]
+  defstruct [
+    :manufacturer_code,
+    :manufacturer_name,
+    :source_addr,
+    :unique_number
+  ]
 
   @type id :: {manufacturer_code :: integer, unique_number :: integer}
   @type t :: %__MODULE__{}

@@ -50,11 +50,12 @@ defmodule NauticNet.DataSetUploader do
 
   def handle_info({:upload, path}, state) do
     binary = File.read!(path)
+    size = byte_size(binary)
 
     case upload_data_set(binary, state.via) do
       :ok ->
         File.rm!(path)
-        Logger.info("Uploaded #{path}; #{length(File.ls!(state.temp_dir))} file(s) remain")
+        Logger.info("Uploaded #{path} (#{size} bytes); #{length(File.ls!(state.temp_dir))} file(s) remain")
 
       {:error, reason} ->
         Logger.warn("Error uploading #{path}: #{inspect(reason)}")

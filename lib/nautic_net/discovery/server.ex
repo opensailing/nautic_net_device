@@ -4,6 +4,7 @@ defmodule NauticNet.Discovery.Server do
   require Logger
 
   alias NauticNet.DeviceInfo
+  alias NauticNet.NMEA2000.Manufacturers
   alias NauticNet.NMEA2000.J1939.ISOAddressClaimParams
   alias NauticNet.NMEA2000.Packet
 
@@ -74,7 +75,8 @@ defmodule NauticNet.Discovery.Server do
       Map.merge(existing_info, %{
         source_addr: packet.source_addr,
         manufacturer_code: packet.parameters.manufacturer_code,
-        unique_number: packet.parameters.unique_number
+        unique_number: packet.parameters.unique_number,
+        manufacturer_name: Manufacturers.get(packet.parameters.manufacturer_code) || "Unknown"
       })
 
     if new_info != existing_info do
