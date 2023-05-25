@@ -2,6 +2,9 @@
 export NERVES_DL_DIR='/Volumes/Nerves/dl'
 export NERVES_ARTIFACTS_DIR='/Volumes/Nerves/artifacts'
 
+# Uncomment for local development of dependencies (see mix.exs)
+#export NAUTIC_NET_DEPS_PATH='..'
+
 # Wi-Fi settings
 export VINGATE_NET_WIFI_SSID='FBI Van'
 export VINTAGE_NET_WIFI_PSK='shhhh'

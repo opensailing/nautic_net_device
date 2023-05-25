@@ -41,29 +41,6 @@ defmodule NauticNet.Device.MixProject do
       {:nerves_runtime, "~> 0.11.6", targets: @all_device_targets},
       {:nerves_pack, "~> 0.6.0", targets: @all_device_targets},
 
-      # Dependencies for specific targets
-      # NOTE: It's generally low risk and recommended to follow minor version
-      # bumps to Nerves systems. Since these include Linux kernel and Erlang
-      # version updates, please review their release notes in case
-      # changes to your application are needed.
-      # {:nerves_system_rpi2, "1.20.1", runtime: false, targets: :rpi2},
-
-      # For a precompiled system artifact:
-      # {:nautic_net_system_rpi2, "1.20.1",
-      #  github: "DockYard/nautic_net_system_rpi2", runtime: false, targets: :nautic_net_rpi2},
-
-      # For iterating on systems locally:
-      # {:nautic_net_system_rpi2,
-      #  path: "../../../nautic_net_system_rpi2", runtime: false, targets: :nautic_net_rpi2},
-      {:nautic_net_system_rpi3, path: "../nautic_net_system_rpi3", runtime: false, targets: :nautic_net_rpi3},
-
-      # NauticNet libraries
-      # {:nautic_net_protobuf, github: "DockYard/nautic_net_protobuf"},
-      {:nautic_net_nmea2000, github: "DockYard/nautic_net_nmea2000"},
-      # Local dev:
-      # {:nautic_net_nmea2000, path: "../nautic_net_nmea2000"},
-      {:nautic_net_protobuf, path: "../nautic_net_protobuf"},
-
       # CANUSB serial communication
       {:circuits_uart, "~> 1.3"},
 
@@ -81,7 +58,34 @@ defmodule NauticNet.Device.MixProject do
       {:tesla, "~> 1.4"},
       {:hackney, "~> 1.17"},
       {:jason, ">= 1.0.0"}
-    ]
+    ] ++ nautic_net_deps()
+  end
+
+  defp nautic_net_deps do
+    if deps_path = System.get_env("NAUTIC_NET_DEPS_PATH") do
+      # Local development
+      [
+        {:nautic_net_nmea2000, path: Path.join(deps_path, "nautic_net_nmea2000")},
+        {:nautic_net_protobuf, path: Path.join(deps_path, "nautic_net_protobuf")},
+        {:nautic_net_system_rpi3,
+         path: Path.join(deps_path, "nautic_net_system_rpi3"), runtime: false, targets: :nautic_net_rpi3}
+
+        # TODO: Cannot resolve dependencies... need to update to v1.22.2 to match rpi3
+        # {:nautic_net_system_rpi2, path: Path.join(deps_path, "nautic_net_system_rpi2"), runtime: false, targets: :nautic_net_rpi2},
+      ]
+    else
+      # Pull from GitHub
+      [
+        {:nautic_net_nmea2000, github: "opensailing/nautic_net_nmea2000"},
+        {:nautic_net_protobuf, github: "opensailing/nautic_net_protobuf"},
+        {:nautic_net_system_rpi3, "1.22.2",
+         github: "opensailing/nautic_net_system_rpi3", runtime: false, targets: :nautic_net_rpi3}
+
+        # TODO: Cannot resolve dependencies... need to update to v1.22.2 to match rpi3
+        # {:nautic_net_system_rpi2, "1.20.1",
+        #  github: "opensailing/nautic_net_system_rpi2", runtime: false, targets: :nautic_net_rpi2},
+      ]
+    end
   end
 
   def release do
