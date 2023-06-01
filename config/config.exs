@@ -10,7 +10,7 @@ Application.start(:nerves_bootstrap)
 
 config :nautic_net_device,
   target: Mix.target(),
-  base_url: System.fetch_env!("BASE_URL"),
+  api_endpoint: System.fetch_env!("API_ENDPOINT"),
   udp_endpoint: System.fetch_env!("UDP_ENDPOINT"),
   product: System.fetch_env!("PRODUCT")
 

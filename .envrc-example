@@ -22,5 +22,5 @@ export CAN_DRIVER='pican-m'
 export EXTRA_SSH_KEYS=''
 
 # Domain where nautic_net_web is hosted
-export BASE_URL='http://localhost:4000'
+export API_ENDPOINT='http://localhost:4000'
 export UDP_ENDPOINT='localhost:4001'

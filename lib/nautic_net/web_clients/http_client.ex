@@ -1,9 +1,9 @@
 defmodule NauticNet.WebClients.HTTPClient do
   use Tesla
 
-  @base_url Application.compile_env!(:nautic_net_device, :base_url)
+  @api_endpoint Application.compile_env!(:nautic_net_device, :api_endpoint)
 
-  plug Tesla.Middleware.BaseUrl, @base_url
+  plug Tesla.Middleware.BaseUrl, @api_endpoint
   plug Tesla.Middleware.JSON
 
   def post_data_set(proto_binary) do
