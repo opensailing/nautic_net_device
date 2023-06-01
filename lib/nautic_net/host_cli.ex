@@ -26,10 +26,5 @@ defmodule NauticNet.HostCLI do
     |> IO.puts()
   end
 
-  @doc """
-  Replay a CANUSB log file from the Fake driver.
-  """
-  def replay_log(log_filename, opts \\ []) do
-    NauticNet.CAN.Fake.Driver.replay_canusb_log(log_filename, opts)
-  end
+  defdelegate replay_log(log_filename, opts \\ []), to: NauticNet.DeviceCLI
 end
