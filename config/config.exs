@@ -12,7 +12,8 @@ config :nautic_net_device,
   target: Mix.target(),
   api_endpoint: System.fetch_env!("API_ENDPOINT"),
   udp_endpoint: System.fetch_env!("UDP_ENDPOINT"),
-  product: System.fetch_env!("PRODUCT")
+  product: System.fetch_env!("PRODUCT"),
+  replay_log: System.get_env("REPLAY_LOG")
 
 # Customize non-Elixir parts of the firmware. See
 # https://hexdocs.pm/nerves/advanced-configuration.html for details.

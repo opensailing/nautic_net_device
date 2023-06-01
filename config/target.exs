@@ -9,24 +9,28 @@ handlers = [
   NauticNet.PacketHandler.EmitTelemetry
 ]
 
-can_config =
-  case System.get_env("CAN_DRIVER") do
-    "canusb" ->
-      config :nautic_net_device, NauticNet.CAN,
-        driver: {NauticNet.CAN.CANUSB.Driver, start_logging?: true},
-        handlers: handlers
+case System.get_env("CAN_DRIVER") do
+  "canusb" ->
+    config :nautic_net_device, NauticNet.CAN,
+      driver: {NauticNet.CAN.CANUSB.Driver, start_logging?: true},
+      handlers: handlers
 
-    "pican-m" ->
-      config :nautic_net_device, NauticNet.CAN,
-        driver: {NauticNet.CAN.PiCAN.Driver, []},
-        handlers: handlers
+  "pican-m" ->
+    config :nautic_net_device, NauticNet.CAN,
+      driver: {NauticNet.CAN.PiCAN.Driver, []},
+      handlers: handlers
 
-    "disabled" ->
-      config :nautic_net_device, NauticNet.CAN, false
+  "fake" ->
+    config :nautic_net_device, NauticNet.CAN,
+      driver: NauticNet.CAN.Fake.Driver,
+      handlers: handlers
 
-    _else ->
-      raise "the CAN_DRIVER environment variable must be one of: canusb, pican-m, disabled"
-  end
+  "disabled" ->
+    config :nautic_net_device, NauticNet.CAN, false
+
+  _else ->
+    raise "the CAN_DRIVER environment variable must be one of: canusb, pican-m, disabled"
+end
 
 config :logger, level: :debug
 
@@ -100,8 +104,8 @@ config :vintage_net,
          networks: [
            %{
              key_mgmt: :wpa_psk,
-             ssid: System.fetch_env!("VINGATE_NET_WIFI_SSID"),
-             psk: System.fetch_env!("VINTAGE_NET_WIFI_PSK")
+             ssid: System.get_env("VINGATE_NET_WIFI_SSID"),
+             psk: System.get_env("VINTAGE_NET_WIFI_PSK")
            }
          ]
        },

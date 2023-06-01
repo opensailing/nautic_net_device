@@ -13,7 +13,10 @@ defmodule NauticNet.Application do
 
     children = children(product(), target())
 
-    Supervisor.start_link(children, opts)
+    with {:ok, sup} <- Supervisor.start_link(children, opts) do
+      maybe_replay_log()
+      {:ok, sup}
+    end
   end
 
   # Product: NMEA 2000 standalone, on-board device
@@ -76,5 +79,11 @@ defmodule NauticNet.Application do
     [hostname, port] = String.split(endpoint, ":")
 
     [hostname: hostname, port: String.to_integer(port)]
+  end
+
+  def maybe_replay_log do
+    if filename = Application.get_env(:nautic_net_device, :replay_log) do
+      NauticNet.DeviceCLI.replay_log(filename, realtime?: true)
+    end
   end
 end
