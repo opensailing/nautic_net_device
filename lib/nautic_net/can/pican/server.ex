@@ -76,6 +76,25 @@ defmodule NauticNet.CAN.PiCAN.Server do
     {:noreply, state}
   end
 
+  def handle_cast({:transmit_frame, %Frame{} = frame}, state) do
+    can_id_hex = Integer.to_string(frame.identifier, 16)
+    data_length = Frame.data_length(frame)
+
+    data_hex =
+      frame.data
+      |> :binary.bin_to_list()
+      |> Enum.map(&Integer.to_string(&1, 16))
+      |> Enum.join(" ")
+
+    # https://github.com/dschanoeh/socketcand/blob/master/doc/protocol.md#send-a-single-frame
+    message = "< send #{can_id_hex} #{data_length} #{data_hex} >"
+    :gen_tcp.send(state.socket, message)
+
+    Logger.debug("Sent: #{message}")
+
+    {:noreply, state}
+  end
+
   defp extract_messages(new_data, buffer) do
     # Convert TCP stream like "< foo >< bar >< bat >< ..." into individual messages,
     # and track the leftover buffer to accumulate for next time

@@ -9,4 +9,6 @@ defmodule NauticNet.CAN do
       start: {NauticNet.CAN.Server, :start_link, [config]}
     }
   end
+
+  defdelegate transmit_frame(frame), to: NauticNet.CAN.Server
 end

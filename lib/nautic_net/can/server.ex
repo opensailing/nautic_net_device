@@ -15,12 +15,15 @@ defmodule NauticNet.CAN.Server do
     GenServer.start_link(__MODULE__, config, name: __MODULE__)
   end
 
+  def transmit_frame(frame) do
+    GenServer.cast(__MODULE__, {:transmit_frame, frame})
+  end
+
   @impl GenServer
   def init(config) do
     {:ok, decoder} = FrameDecoder.start_link()
 
-    {driver, driver_config} =
-      get_callback_module_config(config[:driver] || raise(":driver config is required"))
+    {driver, driver_config} = get_callback_module_config(config[:driver] || raise(":driver config is required"))
 
     :ok = driver.init(driver_config)
 
@@ -53,7 +56,7 @@ defmodule NauticNet.CAN.Server do
       :incomplete ->
         nil
 
-      {:discarded, _reason} ->
+      {:discarded, reason} ->
         nil
         # Logger.debug("Frame discarded: #{inspect(reason)}")
     end
@@ -66,6 +69,12 @@ defmodule NauticNet.CAN.Server do
       handler.handle_closed(handler_opts)
     end
 
+    {:noreply, state}
+  end
+
+  @impl GenServer
+  def handle_cast({:transmit_frame, frame}, state) do
+    state.driver.transmit_frame(frame)
     {:noreply, state}
   end
 end
