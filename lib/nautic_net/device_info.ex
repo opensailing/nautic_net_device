@@ -6,7 +6,15 @@ defmodule NauticNet.DeviceInfo do
     :manufacturer_code,
     :manufacturer_name,
     :source_addr,
-    :unique_number
+    :unique_number,
+    :nmea_2000_version,
+    :product_code,
+    :model_id,
+    :software_version_code,
+    :model_version,
+    :model_serial_code,
+    :certification_level,
+    :load_equivalency
   ]
 
   @type id :: {manufacturer_code :: integer, unique_number :: integer}

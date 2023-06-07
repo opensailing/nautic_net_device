@@ -6,6 +6,7 @@ defmodule NauticNet.Discovery.Server do
   alias NauticNet.DeviceInfo
   alias NauticNet.NMEA2000.Manufacturers
   alias NauticNet.NMEA2000.J1939.ISOAddressClaimParams
+  alias NauticNet.NMEA2000.J1939.ProductInformationParams
   alias NauticNet.NMEA2000.Packet
 
   @name __MODULE__
@@ -22,7 +23,11 @@ defmodule NauticNet.Discovery.Server do
   """
 
   def handle_packet(%Packet{parameters: %ISOAddressClaimParams{}} = packet) do
-    GenServer.call(@name, {:handle_address_claim_packet, packet})
+    GenServer.call(@name, {:handle_packet, packet})
+  end
+
+  def handle_packet(%Packet{parameters: %ProductInformationParams{}} = packet) do
+    GenServer.call(@name, {:handle_packet, packet})
   end
 
   def handle_packet(_packet), do: :ignored
@@ -64,26 +69,49 @@ defmodule NauticNet.Discovery.Server do
   end
 
   @impl GenServer
-  def handle_call({:handle_address_claim_packet, packet}, _sender, state) do
+  def handle_call({:handle_packet, %Packet{parameters: %ISOAddressClaimParams{} = params} = packet}, _sender, state) do
+    info =
+      merge_device_info(state.table, packet.source_addr, %{
+        source_addr: packet.source_addr,
+        manufacturer_code: params.manufacturer_code,
+        unique_number: params.unique_number,
+        manufacturer_name: Manufacturers.get(params.manufacturer_code) || "Unknown"
+      })
+
+    {:reply, {:ok, info}, state}
+  end
+
+  def handle_call({:handle_packet, %Packet{parameters: %ProductInformationParams{} = params} = packet}, _sender, state) do
+    info = merge_device_info(state.table, packet.source_addr, Map.from_struct(params))
+
+    {:reply, {:ok, info}, state}
+  end
+
+  defp merge_device_info(table, source_addr, changes) do
     existing_info =
-      case :ets.lookup(state.table, packet.source_addr) do
+      case :ets.lookup(table, source_addr) do
         [] -> %DeviceInfo{}
         [{_key, info}] -> info
       end
 
-    new_info =
-      Map.merge(existing_info, %{
-        source_addr: packet.source_addr,
-        manufacturer_code: packet.parameters.manufacturer_code,
-        unique_number: packet.parameters.unique_number,
-        manufacturer_name: Manufacturers.get(packet.parameters.manufacturer_code) || "Unknown"
-      })
+    # If the hardware identifiers have changed, there is a new device at this source address, so wipe out existing info
+    existing_info =
+      if changes[:unique_number] &&
+           changes[:manufacturer_code] &&
+           changes[:unique_number] != existing_info.unique_number &&
+           changes[:manufacturer_code] != existing_info.manufacturer_code do
+        %DeviceInfo{}
+      else
+        existing_info
+      end
+
+    new_info = Map.merge(existing_info, changes)
 
     if new_info != existing_info do
       Logger.info("New device info: #{inspect(new_info)}")
-      :ets.insert(state.table, {packet.source_addr, new_info})
+      :ets.insert(table, {source_addr, new_info})
     end
 
-    {:reply, {:ok, new_info}, state}
+    new_info
   end
 end

@@ -56,7 +56,7 @@ defmodule NauticNet.CAN.Server do
       :incomplete ->
         nil
 
-      {:discarded, reason} ->
+      {:discarded, _reason} ->
         nil
         # Logger.debug("Frame discarded: #{inspect(reason)}")
     end
