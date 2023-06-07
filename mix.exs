@@ -37,7 +37,7 @@ defmodule NauticNet.Device.MixProject do
       {:ring_logger, "~> 0.8.3"},
       {:toolshed, "~> 0.2.13"},
       {:ssh_subsystem_fwup, "~> 0.6.1"},
-      {:nerves_time, "~> 0.4.5", runtime: false},
+      {:nerves_time, "~> 0.4.5", targets: @all_device_targets},
 
       # Dependencies for all targets except :host
       {:nerves_runtime, "~> 0.11.6", targets: @all_device_targets},
