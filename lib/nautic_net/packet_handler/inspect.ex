@@ -12,7 +12,7 @@ defmodule NauticNet.PacketHandler.Inspect do
   @impl NauticNet.PacketHandler
   def handle_packet(packet, config) do
     if config.only == [] or packet.parameters.__struct__ in config.only do
-      Logger.debug(inspect(packet))
+      Logger.debug(inspect(packet, pretty: true))
     end
   end
 
