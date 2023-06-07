@@ -15,7 +15,8 @@ defmodule NauticNet.Device.MixProject do
       build_embedded: true,
       deps: deps(),
       releases: [{@app, release()}],
-      preferred_cli_target: [run: :host, test: :host]
+      preferred_cli_target: [run: :host, test: :host],
+      aliases: aliases()
     ]
   end
 
@@ -97,6 +98,12 @@ defmodule NauticNet.Device.MixProject do
       include_erts: &Nerves.Release.erts/0,
       steps: [&Nerves.Release.init/1, :assemble],
       strip_beams: Mix.env() == :prod or [keep: ["Docs"]]
+    ]
+  end
+
+  def aliases do
+    [
+      "firmware.upload": ["firmware", "upload"]
     ]
   end
 end
