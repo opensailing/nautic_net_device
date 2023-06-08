@@ -7,9 +7,12 @@ defmodule NauticNet.DeviceCLI do
   alias NauticNet.CAN.CANUSB
   alias NauticNet.CAN.Fake
   alias NauticNet.Discovery
-  alias NauticNet.NMEA2000.J1939.ISOAddressClaimParams
-  alias NauticNet.NMEA2000.J1939.PGN
   alias NauticNet.NMEA2000.Frame
+  alias NauticNet.NMEA2000.J1939.ISOAddressClaimParams
+  alias NauticNet.NMEA2000.J1939.ISORequestParams
+  alias NauticNet.NMEA2000.J1939.PGN
+  alias NauticNet.NMEA2000.J1939.ProductInformationParams
+  alias NauticNet.NMEA2000.Packet
 
   def start_logging_canusb do
     CANUSB.Server.start_logging()
@@ -66,25 +69,24 @@ defmodule NauticNet.DeviceCLI do
      }}
   end
 
-  def iso_request(source_addr, dest_addr) do
-    iso_request = 0xEA00
-    pgn_int = iso_request |> PGN.to_struct() |> Map.put(:pdu_specific, dest_addr) |> PGN.to_integer()
-    <<can_id::29>> = <<6::3, pgn_int::18, source_addr::8>>
+  def request_address_claims do
+    CAN.transmit_packet(%Packet{
+      source_addr: :null,
+      dest_addr: :broadcast,
+      parameters: %ISORequestParams{
+        pgn: ISOAddressClaimParams.pgn()
+      }
+    })
+  end
 
-    frame = %Frame{
-      type: :extended,
-      identifier: can_id
-    }
-
-    CAN.transmit_frame(frame)
-
-    {:ok,
-     %{
-       source_addr: source_addr,
-       dest_addr: dest_addr,
-       pgn: hex(pgn_int),
-       can_id: hex(can_id)
-     }}
+  def request_product_infos do
+    CAN.transmit_packet(%Packet{
+      source_addr: :null,
+      dest_addr: :broadcast,
+      parameters: %ISORequestParams{
+        pgn: ProductInformationParams.pgn()
+      }
+    })
   end
 
   @doc """
