@@ -27,4 +27,17 @@ defmodule NauticNet.DeviceInfo do
   def identifier(%__MODULE__{} = device_info) do
     {device_info.manufacturer_code, device_info.unique_number}
   end
+
+  def hw_id({manufacturer_code, unique_number}) do
+    <<hw_id::32>> = <<
+      unique_number::little-unsigned-integer-21,
+      manufacturer_code::little-unsigned-integer-11
+    >>
+
+    hw_id
+  end
+
+  def hw_id(%__MODULE__{} = info) do
+    info |> identifier() |> hw_id()
+  end
 end

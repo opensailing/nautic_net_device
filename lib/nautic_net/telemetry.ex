@@ -6,6 +6,7 @@ defmodule NauticNet.Telemetry do
   """
 
   alias NauticNet.DataSetRecorder
+  alias NauticNet.DeviceInfo
   alias NauticNet.Protobuf
 
   def child_spec(_opts) do
@@ -153,10 +154,10 @@ defmodule NauticNet.Telemetry do
 
   defp to_proto_data_points(_metric_name, _device_id, _value), do: []
 
-  defp proto_data_point({_, unique_number}, timestamp, fields) do
+  defp proto_data_point(device_id, timestamp, fields) do
     [
       timestamp: Protobuf.to_proto_timestamp(timestamp),
-      hw_unique_number: unique_number
+      hw_id: DeviceInfo.hw_id(device_id)
     ]
     |> Keyword.merge(fields)
     |> Protobuf.DataSet.DataPoint.new()

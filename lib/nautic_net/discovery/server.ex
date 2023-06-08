@@ -4,6 +4,7 @@ defmodule NauticNet.Discovery.Server do
   require Logger
 
   alias NauticNet.DeviceInfo
+  alias NauticNet.Network
   alias NauticNet.NMEA2000.Manufacturers
   alias NauticNet.NMEA2000.J1939.ISOAddressClaimParams
   alias NauticNet.NMEA2000.J1939.ProductInformationParams
@@ -65,6 +66,10 @@ defmodule NauticNet.Discovery.Server do
   @impl GenServer
   def init(_config) do
     table = :ets.new(@table, [:set, :public, :named_table, read_concurrency: true])
+
+    # Wait for CANBUS to initialize on first boot
+    Process.send_after(self(), :poll_all_devices, :timer.seconds(5))
+
     {:ok, %{table: table}}
   end
 
@@ -85,6 +90,33 @@ defmodule NauticNet.Discovery.Server do
     info = merge_device_info(state.table, packet.source_addr, Map.from_struct(params))
 
     {:reply, {:ok, info}, state}
+  end
+
+  @impl GenServer
+  def handle_info(:poll_all_devices, state) do
+    Network.request_address_claims()
+    Network.request_product_infos()
+
+    # Wait a few seconds to give devices an opportunity to asynchronously respond
+    Process.send_after(self(), :upload_devices, :timer.seconds(5))
+
+    # Keep periodically polling the network
+    Process.send_after(self(), :poll_all_devices, :timer.minutes(5))
+
+    {:noreply, state}
+  end
+
+  def handle_info(:upload_devices, state) do
+    all()
+    |> Enum.map(fn {_source_addr, %DeviceInfo{} = device_info} ->
+      NauticNet.Protobuf.NetworkDevice.new(
+        hw_id: DeviceInfo.hw_id(device_info),
+        name: device_info.model_id
+      )
+    end)
+    |> NauticNet.DataSetRecorder.add_network_devices()
+
+    {:noreply, state}
   end
 
   defp merge_device_info(table, source_addr, changes) do

@@ -23,6 +23,10 @@ defmodule NauticNet.DataSetRecorder do
     GenServer.cast(__MODULE__, {:add_data_points, data_points})
   end
 
+  def add_network_devices(network_devices) do
+    GenServer.cast(__MODULE__, {:add_network_devices, network_devices})
+  end
+
   def init(opts) do
     Process.flag(:trap_exit, true)
     temp_dir = opts[:temp_dir] || "/tmp/datasets"
@@ -43,6 +47,13 @@ defmodule NauticNet.DataSetRecorder do
     end
 
     {:noreply, %{state | data_points: next_data_points}}
+  end
+
+  def handle_cast({:add_network_devices, network_devices}, state) do
+    # Don't bother chunking up the DataSet if we are just sending device info
+    save_network_devices(network_devices, state)
+
+    {:noreply, state}
   end
 
   # Returns a tuple of {chunks_of_data_points_to_save, remaining_data_points}
@@ -70,6 +81,20 @@ defmodule NauticNet.DataSetRecorder do
     path = Path.join(state.temp_dir, data_set.ref)
     File.write!(path, DataSet.encode(data_set))
     Logger.info("Saved #{length(data_points)} data points to #{path}")
+
+    DataSetUploader.add_file(path)
+  end
+
+  defp save_network_devices(network_devices, state) do
+    data_set =
+      Protobuf.new_data_set([],
+        boat_identifier: NauticNet.boat_identifier(),
+        network_devices: network_devices
+      )
+
+    path = Path.join(state.temp_dir, data_set.ref)
+    File.write!(path, DataSet.encode(data_set))
+    Logger.info("Saved #{length(network_devices)} network devices to #{path}")
 
     DataSetUploader.add_file(path)
   end
