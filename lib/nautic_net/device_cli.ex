@@ -9,10 +9,7 @@ defmodule NauticNet.DeviceCLI do
   alias NauticNet.Discovery
   alias NauticNet.NMEA2000.Frame
   alias NauticNet.NMEA2000.J1939.ISOAddressClaimParams
-  alias NauticNet.NMEA2000.J1939.ISORequestParams
   alias NauticNet.NMEA2000.J1939.PGN
-  alias NauticNet.NMEA2000.J1939.ProductInformationParams
-  alias NauticNet.NMEA2000.Packet
 
   def start_logging_canusb do
     CANUSB.Server.start_logging()
@@ -21,6 +18,9 @@ defmodule NauticNet.DeviceCLI do
   def stop_logging_canusb do
     CANUSB.Server.stop_logging()
   end
+
+  defdelegate request_address_claims, to: NauticNet.Network
+  defdelegate request_product_infos, to: NauticNet.Network
 
   def claim_address(my_addr) do
     source_addrs = Map.keys(Discovery.all())
@@ -67,26 +67,6 @@ defmodule NauticNet.DeviceCLI do
        pgn: hex(pgn_int),
        can_id: hex(can_id)
      }}
-  end
-
-  def request_address_claims do
-    CAN.transmit_packet(%Packet{
-      source_addr: :null,
-      dest_addr: :broadcast,
-      parameters: %ISORequestParams{
-        pgn: ISOAddressClaimParams.pgn()
-      }
-    })
-  end
-
-  def request_product_infos do
-    CAN.transmit_packet(%Packet{
-      source_addr: :null,
-      dest_addr: :broadcast,
-      parameters: %ISORequestParams{
-        pgn: ProductInformationParams.pgn()
-      }
-    })
   end
 
   @doc """
