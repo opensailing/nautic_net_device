@@ -21,8 +21,9 @@ defmodule NauticNet.WebClients.UDPClient.Server do
     port = opts[:port] || raise "the :port option is required"
 
     # Port 0 binds to a random available port specified by the OS. This is okay since we are not
-    # planning to receive any data on this port.
-    {:ok, socket} = :gen_udp.open(0, mode: :binary)
+    # planning to receive any data on this port. The `:inet` option forces IPv4, because Fly does not
+    # support UDP over IPv6 yet.
+    {:ok, socket} = :gen_udp.open(0, [:inet, mode: :binary])
 
     {:ok,
      %{
