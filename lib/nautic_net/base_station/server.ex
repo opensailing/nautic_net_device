@@ -3,6 +3,7 @@ defmodule NauticNet.BaseStation.Server do
 
   require Logger
 
+  alias Circuits.UART
   alias Circuits.UART.Framing.Line
 
   alias NauticNet.Protobuf.DataSet
@@ -16,22 +17,31 @@ defmodule NauticNet.BaseStation.Server do
     GenServer.start_link(__MODULE__, [], name: __MODULE__)
   end
 
-  @impl true
-  def init(_) do
-    with {:ok, uart_pid} <- open_uart() do
-      {:ok, %{uart_pid: uart_pid}}
-    end
+  def poll_status do
+    GenServer.cast(__MODULE__, :poll_status)
   end
 
   @impl true
-  def handle_info({:circuits_uart, _port, {:error, reason}}, state) do
-    Logger.info("error: #{inspect(reason)}")
+  def init(_) do
+    state = %{uart_pid: nil}
+    {:ok, try_open_uart(state)}
+  end
 
-    {:noreply, state}
+  @impl true
+  def handle_info(:open, state) do
+    {:noreply, try_open_uart(state)}
+  end
+
+  def handle_info({:circuits_uart, _port, {:error, reason}}, state) do
+    Logger.info("UART error: #{inspect(reason)}")
+
+    schedule_open()
+
+    {:noreply, %{state | uart_pid: nil}}
   end
 
   def handle_info({:circuits_uart, _port, "LORA," <> _ = data}, state) do
-    Logger.debug("UART: #{inspect(data)}")
+    Logger.info("UART: #{inspect(data)}")
 
     # Example: "LORA,-45,0D55BC15F512120DBF742742154E4190C220F101289E033003"
     ["LORA", rssi, lora_packet_protobuf_base16 | _future] = String.split(data, ",")
@@ -51,12 +61,19 @@ defmodule NauticNet.BaseStation.Server do
   end
 
   def handle_info({:circuits_uart, _port, data}, state) do
-    Logger.debug("UART: #{inspect(data)}")
+    Logger.info("UART: #{inspect(data)}")
     {:noreply, state}
   end
 
-  defp open_uart do
-    {:ok, pid} = Circuits.UART.start_link()
+  @impl true
+  def handle_cast(:poll_status, state) do
+    {:noreply, println(state, "?")}
+  end
+
+  defp try_open_uart(%{uart_pid: pid} = state) when is_pid(pid), do: state
+
+  defp try_open_uart(%{uart_pid: nil} = state) do
+    {:ok, pid} = UART.start_link()
 
     #
     # "ttyACM0" => %{
@@ -67,17 +84,20 @@ defmodule NauticNet.BaseStation.Server do
     #   vendor_id: 9114
     # },
     #
-    Circuits.UART.enumerate()
+    UART.enumerate()
     |> Enum.find(fn {_, info} -> info[:product_id] == 32779 && info[:vendor_id] == 9114 end)
     |> case do
       {port, _info} ->
         Logger.info("Found Adafruit Feather M0 on port #{port}")
-        :ok = Circuits.UART.open(pid, port, speed: 115_200, active: true, framing: {Line, separator: "\r\n"})
-        {:ok, pid}
+        :ok = UART.open(pid, port, speed: 115_200, active: true, framing: {Line, separator: "\r\n"})
+        Logger.info("Opened port #{port}")
+        poll_status()
+        %{state | uart_pid: pid}
 
       _ ->
         Logger.warn("Could not find Adafruit Feather M0 port")
-        :ignore
+        schedule_open()
+        %{state | uart_pid: nil}
     end
   end
 
@@ -110,4 +130,17 @@ defmodule NauticNet.BaseStation.Server do
   end
 
   defp upload_rover_data_now(_, _), do: :ok
+
+  defp println(%{uart_pid: nil} = state, _cmd) do
+    state
+  end
+
+  defp println(%{uart_pid: uart_pid} = state, cmd) do
+    UART.write(uart_pid, cmd <> "\n")
+    state
+  end
+
+  defp schedule_open do
+    Process.send_after(self(), :open, :timer.seconds(1))
+  end
 end
