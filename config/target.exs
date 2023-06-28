@@ -63,29 +63,21 @@ config :nerves,
 # * See https://hexdocs.pm/nerves_ssh/readme.html for general SSH configuration
 # * See https://hexdocs.pm/ssh_subsystem_fwup/readme.html for firmware updates
 
-keys =
-  [
-    Path.join([System.user_home!(), ".ssh", "id_rsa.pub"]),
-    Path.join([System.user_home!(), ".ssh", "id_ecdsa.pub"]),
-    Path.join([System.user_home!(), ".ssh", "id_ed25519.pub"])
-  ]
-  |> Enum.filter(&File.exists?/1)
+authorized_keys =
+  System.get_env("AUTHORIZED_KEYS", "")
+  |> String.split(";")
+  |> Enum.map(&String.trim/1)
+  |> Enum.reject(&(&1 == ""))
 
-if keys == [],
+if authorized_keys == [],
   do:
     Mix.raise("""
-    No SSH public keys found in ~/.ssh. An ssh authorized key is needed to
+    No SSH public keys found in AUTHORIZED_KEYS environment variable. An ssh authorized key is needed to
     log into the Nerves device and update firmware on it using ssh.
     See your project's config.exs for this error message.
     """)
 
-extra_keys =
-  System.get_env("EXTRA_SSH_KEYS", "")
-  |> String.split(";")
-  |> Enum.reject(&(&1 == ""))
-
-config :nerves_ssh,
-  authorized_keys: Enum.map(keys, &File.read!/1) ++ extra_keys
+config :nerves_ssh, authorized_keys: authorized_keys
 
 # Configure the network using vintage_net
 # See https://github.com/nerves-networking/vintage_net for more information
