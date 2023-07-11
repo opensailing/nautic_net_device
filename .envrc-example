@@ -2,25 +2,68 @@
 export NERVES_DL_DIR='/Volumes/Nerves/dl'
 export NERVES_ARTIFACTS_DIR='/Volumes/Nerves/artifacts'
 
-# Behavior of this device: logger | uplink
-export PRODUCT='logger'
-
 # Uncomment for local development of OpenSailing dependencies (see mix.exs)
 # export NAUTIC_NET_DEPS_PATH='..'
 
-# Device Wi-Fi
-export VINGATE_NET_WIFI_SSID='foo'
-export VINTAGE_NET_WIFI_PSK='bar'
+# Wi-Fi
+export VINTAGE_NET_WIFI_SSID='My Home SSID'
+export VINTAGE_NET_WIFI_PSK='hunter2'
 
-# Nerves system: host | nautic_net_rpi2 | nautic_net_rpi3
-export MIX_TARGET='nautic_net_rpi3'
+# SSH public keys separated by ";" (get from 1Password)
+export AUTHORIZED_KEYS=''
 
-# CAN device driver: disabled | pican-m | canusb
-export CAN_DRIVER='pican-m'
+# export REPLAY_LOG='canusb-000013.log'
 
-# Public SSH keys separated by ";"
-export EXTRA_SSH_KEYS=''
+echo -n "Product: [l]ogger or [u]plink? "
+read
 
-# Domain where nautic_net_web is hosted
-export API_ENDPOINT='http://localhost:4000'
-export UDP_ENDPOINT='localhost:4001'
+case $REPLY in 
+  u)
+    echo 'Configuring uplink product'
+    export PRODUCT='uplink'
+    ;;
+  *)
+    echo 'Configuring logger product'
+    export PRODUCT='logger'
+    ;;
+esac
+
+echo -n "Hardware: [h]ost, rpi[2], or rpi[3]? "
+read
+
+case $REPLY in 
+  h)
+    echo 'Configuring host environment'
+    export MIX_TARGET='host'
+    export CAN_DRIVER='fake' # disabled | fake | pican-m | canusb
+    ;;
+  2)
+    echo 'Configuring rpi2 environment'
+    export MIX_TARGET='nautic_net_rpi2'
+    export CAN_DRIVER='pican-m'
+    ;;
+  3)
+    echo 'Configuring rpi3 environment'
+    export MIX_TARGET='nautic_net_rpi3'
+    export CAN_DRIVER='pican-m'
+    ;;
+esac
+
+
+
+echo -n "Server: [l]ocal or [w]eb? "
+read
+
+case $REPLY in 
+  w)
+    echo 'Configuring web server'
+    export API_ENDPOINT="https://nautic-net-web-dev.fly.dev"
+    export UDP_ENDPOINT="nautic-net-web-dev.fly.dev:4001"
+    ;;
+  *)
+    echo 'Configuring localhost server'
+    export API_ENDPOINT="http://localhost:4000"
+    export UDP_ENDPOINT="localhost:4001"
+    ;;
+esac
+
