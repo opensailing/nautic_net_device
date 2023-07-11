@@ -97,7 +97,7 @@ config :vintage_net,
          networks: [
            %{
              key_mgmt: :wpa_psk,
-             ssid: System.get_env("VINGATE_NET_WIFI_SSID"),
+             ssid: System.get_env("VINTAGE_NET_WIFI_SSID"),
              psk: System.get_env("VINTAGE_NET_WIFI_PSK")
            }
          ]
