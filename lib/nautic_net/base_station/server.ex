@@ -23,7 +23,7 @@ defmodule NauticNet.BaseStation.Server do
 
   @impl true
   def init(_) do
-    state = %{uart_pid: nil}
+    state = %{uart_pid: nil, alive?: false}
     {:ok, try_open_uart(state)}
   end
 
@@ -37,7 +37,7 @@ defmodule NauticNet.BaseStation.Server do
 
     schedule_open()
 
-    {:noreply, %{state | uart_pid: nil}}
+    {:noreply, %{state | uart_pid: nil, alive?: false}}
   end
 
   def handle_info({:circuits_uart, _port, "LORA," <> _ = data}, state) do
@@ -52,16 +52,24 @@ defmodule NauticNet.BaseStation.Server do
     |> LoRaPacket.decode()
     |> upload_rover_data_now(rssi)
 
-    {:noreply, state}
+    {:noreply, %{state | alive?: true}}
   rescue
     _ ->
       # Catch LoRaPacket.decode/1 error
       Logger.warn("Error decoding LoRa packet; ignoring")
-      {:noreply, state}
+      {:noreply, %{state | alive?: true}}
   end
 
   def handle_info({:circuits_uart, _port, data}, state) do
     Logger.info("UART: #{inspect(data)}")
+    {:noreply, %{state | alive?: true}}
+  end
+
+  def handle_info(:check_alive, state) do
+    unless state.alive? do
+      Logger.warning("Did not get a reply from the Feather")
+    end
+
     {:noreply, state}
   end
 
@@ -92,12 +100,13 @@ defmodule NauticNet.BaseStation.Server do
         :ok = UART.open(pid, port, speed: 115_200, active: true, framing: {Line, separator: "\r\n"})
         Logger.info("Opened port #{port}")
         poll_status()
+        Process.send_after(self(), :check_alive, 2_000)
         %{state | uart_pid: pid}
 
       _ ->
         Logger.warn("Could not find Adafruit Feather M0 port")
         schedule_open()
-        %{state | uart_pid: nil}
+        %{state | uart_pid: nil, alive?: false}
     end
   end
 
