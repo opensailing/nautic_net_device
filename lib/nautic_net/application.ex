@@ -20,8 +20,8 @@ defmodule NauticNet.Application do
   end
 
   # Product: NMEA 2000 standalone, on-board device
-  defp children(:logger, target) do
-    http_server = if target == :host, do: [], else: [NauticNet.HttpDataListing]
+  defp children(:logger, _target) do
+    # http_server = if target == :host, do: [], else: [NauticNet.HttpDataListing]
 
     [
       NauticNet.Telemetry,
@@ -30,7 +30,9 @@ defmodule NauticNet.Application do
       {NauticNet.WebClients.UDPClient, udp_config()},
       {NauticNet.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
       {NauticNet.DataSetUploader, via: :udp}
-    ] ++ http_server
+    ]
+
+    # ++ http_server
   end
 
   # Product: Base station receiver node for nautic_net_tracker_mini
