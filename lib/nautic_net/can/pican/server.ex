@@ -150,7 +150,9 @@ defmodule NauticNet.CAN.PiCAN.Server do
           type: :extended,
           identifier: String.to_integer(identifier, 16),
           data: Base.decode16!(data),
-          timestamp_ms: trunc(String.to_float(unix_time) * 1000)
+          timestamp: DateTime.utc_now(),
+          timestamp_ms: trunc(String.to_float(unix_time) * 1000),
+          timestamp_monotonic_ms: System.monotonic_time(:millisecond)
         }
 
       [identifier, unix_time] ->
@@ -158,7 +160,9 @@ defmodule NauticNet.CAN.PiCAN.Server do
           type: :extended,
           identifier: String.to_integer(identifier, 16),
           data: <<>>,
-          timestamp_ms: trunc(String.to_float(unix_time) * 1000)
+          timestamp: DateTime.utc_now(),
+          timestamp_ms: trunc(String.to_float(unix_time) * 1000),
+          timestamp_monotonic_ms: System.monotonic_time(:millisecond)
         }
 
       other ->
