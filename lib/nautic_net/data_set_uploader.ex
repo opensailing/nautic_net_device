@@ -10,6 +10,8 @@ defmodule NauticNet.DataSetUploader do
 
   require Logger
 
+  alias NauticNet.Protobuf
+  alias NauticNet.Protobuf.DataSet
   alias NauticNet.WebClients.HTTPClient
   alias NauticNet.WebClients.UDPClient
 
@@ -35,6 +37,8 @@ defmodule NauticNet.DataSetUploader do
 
     Logger.info("Found #{length(pending_files)} files in #{temp_dir} pending upload")
 
+    send(self(), :ping)
+
     {:ok,
      %{
        temp_dir: temp_dir,
@@ -55,6 +59,7 @@ defmodule NauticNet.DataSetUploader do
     case upload_data_set(binary, state.via) do
       :ok ->
         File.rm!(path)
+
         Logger.info("Uploaded #{path} (#{size} bytes); #{length(File.ls!(state.temp_dir))} file(s) remain")
 
       {:error, reason} ->
@@ -62,6 +67,15 @@ defmodule NauticNet.DataSetUploader do
         Process.send_after(self(), {:upload, path}, @retry_after)
     end
 
+    {:noreply, state}
+  end
+
+  def handle_info(:ping, state) do
+    Protobuf.new_data_set([], boat_identifier: NauticNet.boat_identifier())
+    |> DataSet.encode()
+    |> upload_data_set(state.via)
+
+    Process.send_after(self(), :ping, :timer.seconds(60))
     {:noreply, state}
   end
 
