@@ -12,6 +12,9 @@ export VINTAGE_NET_WIFI_PSK='hunter2'
 # SSH public keys separated by ";" (get from 1Password)
 export AUTHORIZED_KEYS=''
 
+# Tailscale auth key (https://login.tailscale.com/admin/settings/keys)
+export TAILSCALE_AUTH_KEY='tskey-auth-xxxxxx'
+
 # export REPLAY_LOG='canusb-000013.log'
 
 echo -n "Product: [l]ogger or [u]plink? "
