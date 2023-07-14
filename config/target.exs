@@ -5,7 +5,7 @@ import Config
 
 handlers = [
   NauticNet.PacketHandler.DiscoverDevices,
-  # NauticNet.PacketHandler.Inspect,
+  NauticNet.PacketHandler.Inspect,
   NauticNet.PacketHandler.SetTimeFromGPS,
   NauticNet.PacketHandler.EmitTelemetry
 ]
