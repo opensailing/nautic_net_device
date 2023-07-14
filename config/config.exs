@@ -8,12 +8,16 @@ import Config
 # Enable the Nerves integration with Mix
 Application.start(:nerves_bootstrap)
 
+{git_commit, 0} = System.cmd("git", ["rev-parse", "HEAD"])
+git_commit = String.trim(git_commit)
+
 config :nautic_net_device,
   target: Mix.target(),
   api_endpoint: System.fetch_env!("API_ENDPOINT"),
   udp_endpoint: System.fetch_env!("UDP_ENDPOINT"),
   product: System.fetch_env!("PRODUCT"),
-  replay_log: System.get_env("REPLAY_LOG")
+  replay_log: System.get_env("REPLAY_LOG"),
+  git_commit: git_commit
 
 # Customize non-Elixir parts of the firmware. See
 # https://hexdocs.pm/nerves/advanced-configuration.html for details.

@@ -33,7 +33,8 @@ case System.get_env("CAN_DRIVER") do
     raise "the CAN_DRIVER environment variable must be one of: canusb, pican-m, disabled"
 end
 
-config :nautic_net_device, tailscale_auth_key: System.get_env("TAILSCALE_AUTH_KEY")
+config :nautic_net_device,
+  tailscale_auth_key: System.get_env("TAILSCALE_AUTH_KEY")
 
 config :logger, level: :debug
 

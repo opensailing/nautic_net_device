@@ -11,4 +11,8 @@ defmodule NauticNet do
     {:ok, charlist} = :inet.gethostname()
     to_string(charlist)
   end
+
+  def git_commit do
+    Application.get_env(:nautic_net_device, :git_commit)
+  end
 end
