@@ -3,7 +3,7 @@ defmodule NauticNet.Device.MixProject do
 
   @app :nautic_net_device
   @version "0.1.0"
-  @all_device_targets [:nautic_net_rpi2, :nautic_net_rpi3]
+  @all_device_targets [:nautic_net_rpi3]
 
   def project do
     [
@@ -71,9 +71,6 @@ defmodule NauticNet.Device.MixProject do
         {:nautic_net_protobuf, path: Path.join(deps_path, "nautic_net_protobuf")},
         {:nautic_net_system_rpi3,
          path: Path.join(deps_path, "nautic_net_system_rpi3"), runtime: false, targets: :nautic_net_rpi3}
-
-        # TODO: Cannot resolve dependencies... need to update to v1.22.2 to match rpi3
-        # {:nautic_net_system_rpi2, path: Path.join(deps_path, "nautic_net_system_rpi2"), runtime: false, targets: :nautic_net_rpi2},
       ]
     else
       # Pull from GitHub
@@ -82,10 +79,6 @@ defmodule NauticNet.Device.MixProject do
         {:nautic_net_protobuf, github: "opensailing/nautic_net_protobuf"},
         {:nautic_net_system_rpi3, "1.22.2",
          github: "opensailing/nautic_net_system_rpi3", runtime: false, targets: :nautic_net_rpi3}
-
-        # TODO: Cannot resolve dependencies... need to update to v1.22.2 to match rpi3
-        # {:nautic_net_system_rpi2, "1.20.1",
-        #  github: "opensailing/nautic_net_system_rpi2", runtime: false, targets: :nautic_net_rpi2},
       ]
     end
   end
