@@ -10,6 +10,7 @@ defmodule NauticNet.DataSetUploader do
 
   require Logger
 
+  alias NauticNet.DataSetRecorder
   alias NauticNet.Protobuf
   alias NauticNet.Protobuf.DataSet
   alias NauticNet.WebClients.HTTPClient
@@ -27,40 +28,39 @@ defmodule NauticNet.DataSetUploader do
 
   def init(opts) do
     via = opts[:via] || :http
-    temp_dir = opts[:temp_dir] || "/tmp/datasets"
-
-    pending_files = list_pending_files(temp_dir)
+    dataset_dir = DataSetRecorder.dataset_directory(opts)
+    pending_files = list_pending_files(dataset_dir)
 
     for path <- pending_files do
       send(self(), {:upload, path})
     end
 
-    Logger.info("Found #{length(pending_files)} files in #{temp_dir} pending upload")
+    Logger.info("Found #{length(pending_files)} files in #{dataset_dir} pending upload")
 
     send(self(), :ping)
 
     {:ok,
      %{
-       temp_dir: temp_dir,
+       dataset_dir: dataset_dir,
        via: via
      }}
   end
 
-  defp list_pending_files(temp_dir) do
-    temp_dir
+  defp list_pending_files(dir) do
+    dir
     |> File.ls!()
-    |> Enum.map(fn filename -> Path.join(temp_dir, filename) end)
+    |> Enum.map(fn filename -> Path.join(dir, filename) end)
   end
 
-  def handle_info({:upload, path}, state) do
+  def handle_info({:upload, path}, %{via: via, dataset_dir: dir} = state) do
     binary = File.read!(path)
     size = byte_size(binary)
 
-    case upload_data_set(binary, state.via) do
+    case upload_data_set(binary, via) do
       :ok ->
         File.rm!(path)
 
-        Logger.info("Uploaded #{path} (#{size} bytes); #{length(File.ls!(state.temp_dir))} file(s) remain")
+        Logger.info("Uploaded #{path} (#{size} bytes); #{length(File.ls!(dir))} file(s) remain")
 
       {:error, reason} ->
         Logger.warn("Error uploading #{path}: #{inspect(reason)}")

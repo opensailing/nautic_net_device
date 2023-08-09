@@ -17,7 +17,8 @@ config :nautic_net_device,
   udp_endpoint: System.fetch_env!("UDP_ENDPOINT"),
   product: System.fetch_env!("PRODUCT"),
   replay_log: System.get_env("REPLAY_LOG"),
-  git_commit: git_commit
+  git_commit: git_commit,
+  data_set_directory: System.tmp_dir!() |> Path.join("data_set")
 
 # Customize non-Elixir parts of the firmware. See
 # https://hexdocs.pm/nerves/advanced-configuration.html for details.

@@ -34,7 +34,8 @@ case System.get_env("CAN_DRIVER") do
 end
 
 config :nautic_net_device,
-  tailscale_auth_key: System.get_env("TAILSCALE_AUTH_KEY")
+  tailscale_auth_key: System.get_env("TAILSCALE_AUTH_KEY"),
+  data_set_directory: "/root/data_set"
 
 config :logger, level: :debug
 
