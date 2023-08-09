@@ -40,11 +40,6 @@ case $REPLY in
     export MIX_TARGET='host'
     export CAN_DRIVER='fake' # disabled | fake | pican-m | canusb
     ;;
-  2)
-    echo 'Configuring rpi2 environment'
-    export MIX_TARGET='nautic_net_rpi2'
-    export CAN_DRIVER='pican-m'
-    ;;
   3)
     echo 'Configuring rpi3 environment'
     export MIX_TARGET='nautic_net_rpi3'
