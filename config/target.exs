@@ -35,7 +35,7 @@ end
 
 config :nautic_net_device,
   tailscale_auth_key: System.get_env("TAILSCALE_AUTH_KEY"),
-  data_set_directory: "/data/data_set"
+  data_set_directory: "/data/datasets"
 
 config :logger, level: :debug
 

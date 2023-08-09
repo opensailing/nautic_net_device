@@ -18,7 +18,7 @@ config :nautic_net_device,
   product: System.fetch_env!("PRODUCT"),
   replay_log: System.get_env("REPLAY_LOG"),
   git_commit: git_commit,
-  data_set_directory: System.tmp_dir!() |> Path.join("data_set")
+  data_set_directory: System.tmp_dir!() |> Path.join("datasets")
 
 # Customize non-Elixir parts of the firmware. See
 # https://hexdocs.pm/nerves/advanced-configuration.html for details.
