@@ -32,7 +32,7 @@ defmodule NauticNet.CANTest do
       frame_id: 0,
       frame_type: :extended,
       packet_type: :single,
-      parameters: %NauticNet.NMEA2000.J1939.WindDataParams{
+      parameters: %NauticNet.NMEA2000.ParameterGroup.WindDataParams{
         sid: 250,
         wind_angle: 5.7232,
         wind_reference: :apparent,
@@ -58,15 +58,14 @@ defmodule NauticNet.CANTest do
 
     assert_receive %NauticNet.NMEA2000.Packet{
       data:
-        <<201, 227, 74, 128, 42, 234, 31, 128, 255, 209, 139, 175, 114, 221, 5, 128, 84, 110, 204,
-          210, 97, 41, 246, 48, 146, 153, 254, 255, 255, 255, 255, 16, 252, 12, 80, 0, 140, 0,
-          204, 242, 255, 255, 255>>,
+        <<201, 227, 74, 128, 42, 234, 31, 128, 255, 209, 139, 175, 114, 221, 5, 128, 84, 110, 204, 210, 97, 41, 246, 48,
+          146, 153, 254, 255, 255, 255, 255, 16, 252, 12, 80, 0, 140, 0, 204, 242, 255, 255, 255>>,
       data_size: 43,
       description: nil,
       frame_id: 6,
       frame_type: :extended,
       packet_type: :fast,
-      parameters: %NauticNet.NMEA2000.J1939.GNSSPositionDataParams{
+      parameters: %NauticNet.NMEA2000.ParameterGroup.GNSSPositionDataParams{
         altitude: -23.49,
         datetime: ~U[2022-06-28T14:52:24.000000Z],
         latitude: 42.26200383333334,

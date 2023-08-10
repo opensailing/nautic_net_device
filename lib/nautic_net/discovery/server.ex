@@ -6,8 +6,8 @@ defmodule NauticNet.Discovery.Server do
   alias NauticNet.DeviceInfo
   alias NauticNet.Network
   alias NauticNet.NMEA2000.Manufacturers
-  alias NauticNet.NMEA2000.J1939.ISOAddressClaimParams
-  alias NauticNet.NMEA2000.J1939.ProductInformationParams
+  alias NauticNet.NMEA2000.ParameterGroup.ISOAddressClaimParams
+  alias NauticNet.NMEA2000.ParameterGroup.ProductInformationParams
   alias NauticNet.NMEA2000.Packet
 
   @name __MODULE__

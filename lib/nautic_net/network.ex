@@ -4,9 +4,9 @@ defmodule NauticNet.Network do
   """
 
   alias NauticNet.CAN
-  alias NauticNet.NMEA2000.J1939.ISOAddressClaimParams
-  alias NauticNet.NMEA2000.J1939.ISORequestParams
-  alias NauticNet.NMEA2000.J1939.ProductInformationParams
+  alias NauticNet.NMEA2000.ParameterGroup.ISOAddressClaimParams
+  alias NauticNet.NMEA2000.ParameterGroup.ISORequestParams
+  alias NauticNet.NMEA2000.ParameterGroup.ProductInformationParams
   alias NauticNet.NMEA2000.Packet
 
   def request_address_claims do

@@ -1,7 +1,7 @@
 defmodule NauticNet.PacketHandler.CreateGPSLog do
   @behaviour NauticNet.PacketHandler
 
-  alias NauticNet.NMEA2000.J1939.GNSSPositionDataParams
+  alias NauticNet.NMEA2000.ParameterGroup.GNSSPositionDataParams
   alias NauticNet.NMEA2000.Packet
 
   @gpx_header """
@@ -67,8 +67,7 @@ defmodule NauticNet.PacketHandler.CreateGPSLog do
       }) do
     time = params.datetime |> DateTime.truncate(:second) |> DateTime.to_iso8601()
 
-    trkpt =
-      ~s[<trkpt lat="#{params.latitude}" lon="#{params.longitude}"><time>#{time}></time></trkpt>]
+    trkpt = ~s[<trkpt lat="#{params.latitude}" lon="#{params.longitude}"><time>#{time}></time></trkpt>]
 
     IO.puts(file, trkpt)
   end

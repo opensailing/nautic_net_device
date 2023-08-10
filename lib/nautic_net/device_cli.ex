@@ -8,8 +8,8 @@ defmodule NauticNet.DeviceCLI do
   alias NauticNet.CAN.Fake
   alias NauticNet.Discovery
   alias NauticNet.NMEA2000.Frame
-  alias NauticNet.NMEA2000.J1939.ISOAddressClaimParams
-  alias NauticNet.NMEA2000.J1939.PGN
+  alias NauticNet.NMEA2000.ParameterGroup.ISOAddressClaimParams
+  alias NauticNet.NMEA2000.PGN
 
   def start_logging_canusb do
     CANUSB.Server.start_logging()

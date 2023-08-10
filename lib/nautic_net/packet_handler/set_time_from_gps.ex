@@ -3,7 +3,7 @@ defmodule NauticNet.PacketHandler.SetTimeFromGPS do
 
   require Logger
 
-  alias NauticNet.NMEA2000.J1939.GNSSPositionDataParams
+  alias NauticNet.NMEA2000.ParameterGroup.GNSSPositionDataParams
   alias NauticNet.NMEA2000.Packet
 
   @impl NauticNet.PacketHandler

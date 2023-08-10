@@ -4,7 +4,7 @@
 
 import Config
 
-alias NauticNet.NMEA2000.J1939
+alias NauticNet.NMEA2000.ParameterGroup
 
 config :logger, level: :debug, backends: [:console]
 
@@ -18,8 +18,8 @@ config :nautic_net_device, NauticNet.CAN,
     # NauticNet.PacketHandler.SetTimeFromGPS,
     {NauticNet.PacketHandler.Inspect,
      only: [
-       J1939.ISORequestParams,
-       J1939.ISOAddressClaimParams,
-       J1939.ProductInformationParams
+       ParameterGroup.ISORequestParams,
+       ParameterGroup.ISOAddressClaimParams,
+       ParameterGroup.ProductInformationParams
      ]}
   ]

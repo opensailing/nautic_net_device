@@ -4,7 +4,7 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
   alias NauticNet.DeviceInfo
   alias NauticNet.Discovery
   alias NauticNet.NMEA2000.Packet
-  alias NauticNet.NMEA2000.J1939
+  alias NauticNet.NMEA2000.ParameterGroup
 
   @impl NauticNet.PacketHandler
   def init(_opts) do
@@ -12,7 +12,7 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
   end
 
   @impl NauticNet.PacketHandler
-  def handle_packet(%Packet{parameters: %J1939.WindDataParams{} = params} = packet, _config) do
+  def handle_packet(%Packet{parameters: %ParameterGroup.WindDataParams{} = params} = packet, _config) do
     execute([:nautic_net, :wind, params.wind_reference], packet, %{
       vector: %{
         timestamp: packet.timestamp,
@@ -22,7 +22,7 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
     })
   end
 
-  def handle_packet(%Packet{parameters: %J1939.GNSSPositionDataParams{} = params} = packet, _config) do
+  def handle_packet(%Packet{parameters: %ParameterGroup.GNSSPositionDataParams{} = params} = packet, _config) do
     execute([:nautic_net, :gps], packet, %{
       position: %{
         timestamp: packet.timestamp,
@@ -32,7 +32,7 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
     })
   end
 
-  def handle_packet(%Packet{parameters: %J1939.TemperatureParams{} = params} = packet, _config) do
+  def handle_packet(%Packet{parameters: %ParameterGroup.TemperatureParams{} = params} = packet, _config) do
     execute([:nautic_net, :temperature], packet, %{
       timestamp: packet.timestamp,
       kelvin: params.temperature_k
@@ -40,7 +40,10 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
   end
 
   # Discard (UINT16_MAX / 100)
-  def handle_packet(%Packet{parameters: %J1939.SpeedParams{water_speed: water_speed} = params} = packet, _config)
+  def handle_packet(
+        %Packet{parameters: %ParameterGroup.SpeedParams{water_speed: water_speed} = params} = packet,
+        _config
+      )
       when water_speed != 655.35 do
     execute([:nautic_net, :speed, :water], packet, %{
       speed_m_s: %{
@@ -51,7 +54,7 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
   end
 
   # Discard (UINT32_MAX / 100)
-  def handle_packet(%Packet{parameters: %J1939.WaterDepthParams{depth: depth_m}} = packet, _config)
+  def handle_packet(%Packet{parameters: %ParameterGroup.WaterDepthParams{depth: depth_m}} = packet, _config)
       when depth_m != 42_949_672.95 do
     execute([:nautic_net, :water_depth], packet, %{
       depth_m: %{
@@ -61,7 +64,7 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
     })
   end
 
-  def handle_packet(%Packet{parameters: %J1939.VesselHeadingParams{} = params} = packet, _config) do
+  def handle_packet(%Packet{parameters: %ParameterGroup.VesselHeadingParams{} = params} = packet, _config) do
     execute([:nautic_net, :heading], packet, %{
       rad: %{
         timestamp: packet.timestamp,
@@ -70,7 +73,7 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
     })
   end
 
-  def handle_packet(%Packet{parameters: %J1939.VelocityOverGroundParams{} = params} = packet, _config) do
+  def handle_packet(%Packet{parameters: %ParameterGroup.VelocityOverGroundParams{} = params} = packet, _config) do
     execute([:nautic_net, :velocity, :ground], packet, %{
       vector: %{
         timestamp: packet.timestamp,
