@@ -15,8 +15,6 @@ defmodule NauticNet.DataSetRecorder do
   alias NauticNet.Protobuf
   alias NauticNet.Protobuf.DataSet
 
-  @default_dataset_dir Application.get_env(:nautic_net_device, :data_set_directory)
-
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
   end
@@ -113,8 +111,9 @@ defmodule NauticNet.DataSetRecorder do
       :ok = File.mkdir_p!(tmp_dir)
       tmp_dir
     else
-      :ok = File.mkdir_p!(@default_dataset_dir)
-      @default_dataset_dir
+      dir = Application.get_env(:nautic_net_device, :data_set_directory, Path.join(System.tmp_dir!(), "datasets"))
+      :ok = File.mkdir_p!(dir)
+      dir
     end
   end
 end
