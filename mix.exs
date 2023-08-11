@@ -2,7 +2,7 @@ defmodule NauticNet.Device.MixProject do
   use Mix.Project
 
   @app :nautic_net_device
-  @version "0.1.0"
+  @version "0.1.1"
   @all_device_targets [:nautic_net_rpi3]
 
   def project do
@@ -75,10 +75,13 @@ defmodule NauticNet.Device.MixProject do
     else
       # Pull from GitHub
       [
-        {:nautic_net_nmea2000, github: "opensailing/nautic_net_nmea2000"},
-        {:nautic_net_protobuf, github: "opensailing/nautic_net_protobuf"},
-        {:nautic_net_system_rpi3, "1.22.2",
-         github: "opensailing/nautic_net_system_rpi3", runtime: false, targets: :nautic_net_rpi3}
+        {:nautic_net_nmea2000, git: "git@github.com:opensailing/nautic_net_nmea2000.git"},
+        {:nautic_net_protobuf, git: "git@github.com:opensailing/nautic_net_protobuf.git"},
+        {:nautic_net_system_rpi3,
+         git: "git@github.com:opensailing/nautic_net_system_rpi3.git",
+         tag: "v1.22.2",
+         runtime: false,
+         targets: :nautic_net_rpi3}
       ]
     end
   end
