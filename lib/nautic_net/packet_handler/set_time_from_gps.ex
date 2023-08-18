@@ -13,12 +13,13 @@ defmodule NauticNet.PacketHandler.SetTimeFromGPS do
 
   @impl NauticNet.PacketHandler
   def handle_packet(%Packet{parameters: %GNSSPositionDataParams{datetime: gps_datetime = %DateTime{}}}, _config) do
-    # If the system time differs from the GPS time by more than 10 seconds, then we should
+    # If the system time differs from the GPS time by more than 10 seconds and the new time is in the future, then we should
     # definitely update the system time (assumes the system is in the UTC timezone)
 
     diff = abs(DateTime.diff(gps_datetime, DateTime.utc_now()))
+    direction = DateTime.compare(gps_datetime, DateTime.utc_now())
 
-    if diff > 10 do
+    if diff > 10 and direction == :gt do
       gps_datetime
       |> DateTime.to_naive()
       |> NervesTime.set_system_time()
