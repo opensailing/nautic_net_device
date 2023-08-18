@@ -26,7 +26,8 @@ defmodule NauticNet.Telemetry do
       last_value([:nautic_net, :speed, :water, :speed_m_s], reporter_options: [every_ms: 1_000]),
       last_value([:nautic_net, :water_depth, :depth_m], reporter_options: [every_ms: 1_000]),
       last_value([:nautic_net, :heading, :rad], reporter_options: [every_ms: 1_000]),
-      last_value([:nautic_net, :velocity, :ground, :vector], reporter_options: [every_ms: 1_000])
+      last_value([:nautic_net, :velocity, :ground, :vector], reporter_options: [every_ms: 1_000]),
+      last_value([:nautic_net, :attitude, :rad], reporter_options: [every_ms: 1_000])
     ]
   end
 
@@ -47,6 +48,27 @@ defmodule NauticNet.Telemetry do
     metric_name
     |> to_proto_data_points(device_id, value)
     |> DataSetRecorder.add_data_points()
+  end
+
+  ### Attitude
+
+  defp to_proto_data_points([:nautic_net, :attitude, :rad], device_id, %{
+         timestamp: timestamp,
+         yaw: yaw_rad,
+         pitch: pitch_rad,
+         roll: roll_rad
+       }) do
+    [
+      proto_data_point(device_id, timestamp,
+        sample:
+          {:attitude,
+           Protobuf.AttitudeSample.new(
+             yaw_mrad: Protobuf.Convert.encode_unit(yaw_rad, :rad, :mrad),
+             pitch_mrad: Protobuf.Convert.encode_unit(pitch_rad, :rad, :mrad),
+             roll_mrad: Protobuf.Convert.encode_unit(roll_rad, :rad, :mrad)
+           )}
+      )
+    ]
   end
 
   ### GPS POSITION

@@ -80,6 +80,21 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
     })
   end
 
+  def handle_packet(%Packet{parameters: %J1939.AttitudeParams{} = params} = packet, _config) do
+    execute(
+      [:nautic_net, :attitude],
+      packet,
+      %{
+        rad: %{
+          timestamp: packet.timestamp,
+          yaw: params.yaw,
+          pitch: params.pitch,
+          roll: params.roll
+        }
+      }
+    )
+  end
+
   def handle_packet(_packet, _config), do: :ok
 
   @impl NauticNet.PacketHandler
