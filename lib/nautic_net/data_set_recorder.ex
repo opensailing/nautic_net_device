@@ -2,7 +2,7 @@ defmodule NauticNet.DataSetRecorder do
   @moduledoc """
   Writes DataSets to disk so that we don't lose it, and then enqueues it for upload to the server.
 
-  The files are written to /tmp/datasets/{random base-64} in the raw Protobuf format, which can
+  The files are written to /data/datasets/{random base-64} when on device in the raw Protobuf format, which can
   be sent directly to server without any changes.
 
   See also: NauticNet.DataSetUploader
@@ -29,13 +29,11 @@ defmodule NauticNet.DataSetRecorder do
 
   def init(opts) do
     Process.flag(:trap_exit, true)
-    temp_dir = opts[:temp_dir] || "/tmp/datasets"
-    File.mkdir_p!(temp_dir)
 
     # Chunking can be specified as {x, :points} or {x, :bytes}
     chunk_every = opts[:chunk_every] || {500, :points}
 
-    {:ok, %{data_points: [], temp_dir: temp_dir, chunk_every: chunk_every}}
+    {:ok, %{data_points: [], temp_dir: dataset_directory(opts), chunk_every: chunk_every}}
   end
 
   def handle_cast({:add_data_points, new_data_points}, state) do
@@ -101,5 +99,21 @@ defmodule NauticNet.DataSetRecorder do
 
   def terminate(_reason, state) do
     save_data_points(state.data_points, state)
+  end
+
+  @doc """
+  Returns the directory to save the datasets to. If the directory does not exist
+  create it before returning
+  """
+  @spec dataset_directory(Keyword.t()) :: String.t()
+  def dataset_directory(opts) do
+    if tmp_dir = opts[:temp_dir] do
+      :ok = File.mkdir_p!(tmp_dir)
+      tmp_dir
+    else
+      dir = Application.get_env(:nautic_net_device, :data_set_directory, Path.join(System.tmp_dir!(), "datasets"))
+      :ok = File.mkdir_p!(dir)
+      dir
+    end
   end
 end
