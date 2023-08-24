@@ -29,6 +29,7 @@ defmodule NauticNet.Application do
     [
       NauticNet.Telemetry,
       {NauticNet.CAN, can_config()},
+      {NauticNet.Serial, serial_config()},
       {NauticNet.Discovery, discovery_config()},
       {NauticNet.WebClients.UDPClient, udp_config()},
       {NauticNet.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
@@ -73,6 +74,10 @@ defmodule NauticNet.Application do
 
   defp can_config do
     Application.get_env(:nautic_net_device, NauticNet.CAN, [])
+  end
+
+  defp serial_config do
+    Application.get_env(:nautic_net_device, NauticNet.Serial, [])
   end
 
   defp discovery_config do
