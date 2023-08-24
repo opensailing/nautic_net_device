@@ -14,6 +14,11 @@ defmodule NauticNet.PacketHandler.Callbacks do
   end
 
   @impl NauticNet.PacketHandler
+  def handle_data(data, config) do
+    apply_callback(config[:handle_packet], [data])
+  end
+
+  @impl NauticNet.PacketHandler
   def handle_closed(config) do
     apply_callback(config[:handle_closed], [])
   end

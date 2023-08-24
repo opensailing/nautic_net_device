@@ -14,5 +14,8 @@ defmodule NauticNet.PacketHandler.DiscoverDevices do
   end
 
   @impl NauticNet.PacketHandler
+  def handle_data(_data, _config), do: :ok
+
+  @impl NauticNet.PacketHandler
   def handle_closed(_config), do: :ok
 end

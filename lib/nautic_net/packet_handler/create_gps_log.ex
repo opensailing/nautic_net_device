@@ -67,8 +67,7 @@ defmodule NauticNet.PacketHandler.CreateGPSLog do
       }) do
     time = params.datetime |> DateTime.truncate(:second) |> DateTime.to_iso8601()
 
-    trkpt =
-      ~s[<trkpt lat="#{params.latitude}" lon="#{params.longitude}"><time>#{time}></time></trkpt>]
+    trkpt = ~s[<trkpt lat="#{params.latitude}" lon="#{params.longitude}"><time>#{time}></time></trkpt>]
 
     IO.puts(file, trkpt)
   end
@@ -85,6 +84,9 @@ defmodule NauticNet.PacketHandler.CreateGPSLog do
   end
 
   def handle_packet(_packet, _config), do: :ok
+
+  @impl NauticNet.PacketHandler
+  def handle_data(_data, _config), do: :ok
 
   @impl NauticNet.PacketHandler
   def handle_closed(%{format: :gpx, file: file}) do
