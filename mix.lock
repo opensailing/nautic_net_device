@@ -19,7 +19,7 @@
   "mimerl": {:hex, :mimerl, "1.2.0", "67e2d3f571088d5cfd3e550c383094b47159f3eee8ffa08e64106cdf5e981be3", [:rebar3], [], "hexpm", "f278585650aa581986264638ebf698f8bb19df297f66ad91b18910dfc6e19323"},
   "mix_test_watch": {:hex, :mix_test_watch, "1.1.0", "330bb91c8ed271fe408c42d07e0773340a7938d8a0d281d57a14243eae9dc8c3", [:mix], [{:file_system, "~> 0.2.1 or ~> 0.3", [hex: :file_system, repo: "hexpm", optional: false]}], "hexpm", "52b6b1c476cbb70fd899ca5394506482f12e5f6b0d6acff9df95c7f1e0812ec3"},
   "muontrap": {:hex, :muontrap, "1.0.0", "53a05c37f71cc5070aaa0858a774ae1f500160b7186a70565521a14ef7843c5a", [:make, :mix], [{:elixir_make, "~> 0.6", [hex: :elixir_make, repo: "hexpm", optional: false]}], "hexpm", "0d3cd6e335986f9c2af1b61f583375b0f0d91cea95b7ec7bc720f330b4dc9b49"},
-  "nautic_net_nmea2000": {:git, "git@github.com:opensailing/nautic_net_nmea2000.git", "2da5b11140ea0d0f84f5b19565571163027dc8b1", []},
+  "nautic_net_nmea2000": {:git, "git@github.com:opensailing/nautic_net_nmea2000.git", "70fc373092927227b7ba08c8c4c3e9baebea8d06", []},
   "nautic_net_protobuf": {:git, "git@github.com:opensailing/nautic_net_protobuf.git", "478fa1f0c30509bf9ee6b9aaeab2a5888ac0665e", []},
   "nautic_net_system_rpi3": {:git, "git@github.com:opensailing/nautic_net_system_rpi3.git", "e28abc3783e52644c8a798d284ca186d5323c5a5", [tag: "v1.22.2"]},
   "nerves": {:hex, :nerves, "1.8.0", "2735cda2037985411ede03c59937e9cb222f8990d5540e1a0e1ec77db96618cc", [:make, :mix], [{:castore, "~> 0.1", [hex: :castore, repo: "hexpm", optional: false]}, {:elixir_make, "~> 0.6", [hex: :elixir_make, repo: "hexpm", optional: false]}, {:jason, "~> 1.2", [hex: :jason, repo: "hexpm", optional: true]}], "hexpm", "878c82ec079cf75ea48229ce802d2c2edf24bee60c17c33e477b18f83f7a49e1"},
