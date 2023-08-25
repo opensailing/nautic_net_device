@@ -34,7 +34,7 @@ case System.get_env("CAN_DRIVER") do
 end
 
 config :nautic_net_device, NauticNet.Serial,
-  driver: {NauticNet.Serial.SixFab.Driver, [port_name: "TTYUSB1"]},
+  driver: NauticNet.Serial.SixFab.Driver,
   handlers: [NauticNet.PacketHandler.SetTimeFromGPS]
 
 config :nautic_net_device,

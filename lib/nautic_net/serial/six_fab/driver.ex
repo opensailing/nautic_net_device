@@ -5,8 +5,8 @@ defmodule NauticNet.Serial.SixFab.Driver do
   @behaviour NauticNet.Serial.Driver
   require Logger
 
-  @serial_write_name "ttyUSB2"
-  @serial_read_name "ttyUSB1"
+  @modem_serial_port_name "ttyUSB2"
+  @nmea_serial_port_name "ttyUSB1"
 
   @impl NauticNet.Serial.Driver
   def init(_config) do
@@ -17,7 +17,7 @@ defmodule NauticNet.Serial.SixFab.Driver do
 
   def open_read_port() do
     {:ok, pid} = Circuits.UART.start_link()
-    Circuits.UART.open(pid, @serial_write_name, speed: 115_200, active: false)
+    Circuits.UART.open(pid, @modem_serial_port_name, speed: 115_200, active: false)
     Circuits.UART.write(pid, "AT+QGPS=1\r")
     Circuits.UART.close(pid)
     GenServer.stop(pid)
@@ -25,6 +25,6 @@ defmodule NauticNet.Serial.SixFab.Driver do
 
   def open_listener() do
     {:ok, pid} = Circuits.UART.start_link()
-    Circuits.UART.open(pid, @serial_read_name, speed: 115_200, active: true, framing: Circuits.UART.Framing.Line)
+    Circuits.UART.open(pid, @nmea_serial_port_name, speed: 115_200, active: true, framing: Circuits.UART.Framing.Line)
   end
 end
