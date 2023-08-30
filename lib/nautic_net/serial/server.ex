@@ -41,12 +41,9 @@ defmodule NauticNet.Serial.Server do
       :invalid ->
         nil
 
-      params ->
-        for p <- params do
-          data = %NMEA.Data{
-            values: p,
-            metadata: %{type: :nmea_0183, port: port_name}
-          }
+      nmea_datas ->
+        for data <- nmea_datas do
+          data = NMEA.Data.put_metadata(data, %{port: port_name, source_description: "SixFab LTE Modem GPS"})
 
           for {handler, handler_opts} <- state.handlers do
             handler.handle_data(data, handler_opts)
