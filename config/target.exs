@@ -3,7 +3,7 @@
 #
 import Config
 
-handlers = [
+nmea_2000_handlers = [
   NauticNet.PacketHandler.DiscoverDevices,
   NauticNet.PacketHandler.Inspect,
   NauticNet.PacketHandler.SetTimeFromGPS,
@@ -14,17 +14,17 @@ case System.get_env("CAN_DRIVER") do
   "canusb" ->
     config :nautic_net_device, NauticNet.CAN,
       driver: {NauticNet.CAN.CANUSB.Driver, start_logging?: true},
-      handlers: handlers
+      handlers: nmea_2000_handlers
 
   "pican-m" ->
     config :nautic_net_device, NauticNet.CAN,
       driver: {NauticNet.CAN.PiCAN.Driver, []},
-      handlers: handlers
+      handlers: nmea_2000_handlers
 
   "fake" ->
     config :nautic_net_device, NauticNet.CAN,
       driver: NauticNet.CAN.Fake.Driver,
-      handlers: handlers
+      handlers: nmea_2000_handlers
 
   "disabled" ->
     config :nautic_net_device, NauticNet.CAN, false
@@ -32,6 +32,10 @@ case System.get_env("CAN_DRIVER") do
   _else ->
     raise "the CAN_DRIVER environment variable must be one of: canusb, pican-m, disabled"
 end
+
+config :nautic_net_device, NauticNet.Serial,
+  driver: NauticNet.Serial.SixFab.Driver,
+  handlers: [NauticNet.PacketHandler.SetTimeFromGPS]
 
 config :nautic_net_device,
   tailscale_auth_key: System.get_env("TAILSCALE_AUTH_KEY"),

@@ -98,6 +98,9 @@ defmodule NauticNet.PacketHandler.EmitTelemetry do
   def handle_packet(_packet, _config), do: :ok
 
   @impl NauticNet.PacketHandler
+  def handle_data(_data, _config), do: :ok
+
+  @impl NauticNet.PacketHandler
   def handle_closed(_config), do: :ok
 
   defp execute(event_name, packet, measurements, metadata \\ %{}) do

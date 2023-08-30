@@ -17,6 +17,11 @@ defmodule NauticNet.PacketHandler.Inspect do
   end
 
   @impl NauticNet.PacketHandler
+  def handle_data(data, _config) do
+    Logger.debug(inspect(data, pretty: true))
+  end
+
+  @impl NauticNet.PacketHandler
   def handle_closed(_config) do
     Logger.debug("CAN device closed")
   end

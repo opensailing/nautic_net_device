@@ -70,7 +70,8 @@ defmodule NauticNet.Device.MixProject do
         {:nautic_net_nmea2000, path: Path.join(deps_path, "nautic_net_nmea2000")},
         {:nautic_net_protobuf, path: Path.join(deps_path, "nautic_net_protobuf")},
         {:nautic_net_system_rpi3,
-         path: Path.join(deps_path, "nautic_net_system_rpi3"), runtime: false, targets: :nautic_net_rpi3}
+         path: Path.join(deps_path, "nautic_net_system_rpi3"), runtime: false, targets: :nautic_net_rpi3},
+        {:nmea, path: Path.join(deps_path, "nmea")}
       ]
     else
       # Pull from GitHub
@@ -81,7 +82,8 @@ defmodule NauticNet.Device.MixProject do
          git: "git@github.com:opensailing/nautic_net_system_rpi3.git",
          tag: "v1.22.2",
          runtime: false,
-         targets: :nautic_net_rpi3}
+         targets: :nautic_net_rpi3},
+        {:nmea, git: "git@github.com:opensailing/nmea"}
       ]
     end
   end

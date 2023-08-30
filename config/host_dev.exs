@@ -23,3 +23,7 @@ config :nautic_net_device, NauticNet.CAN,
        J1939.ProductInformationParams
      ]}
   ]
+
+config :nautic_net_device, NauticNet.Serial,
+  driver: NauticNet.Serial.Fake.Driver,
+  handlers: [NauticNet.PacketHandler.SetTimeFromGPS]
