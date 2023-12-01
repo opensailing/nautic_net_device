@@ -16,10 +16,22 @@ defmodule NauticNet.Application do
     children = children(product(), target())
 
     with {:ok, sup} <- Supervisor.start_link(children, opts) do
+      start_virtual_device_and_register(sup)
       maybe_replay_log()
       maybe_start_tailscale()
       {:ok, sup}
     end
+  end
+
+  # Handlers must be a list of pids which define a
+  # def handle_info({:data, data})
+  # See NMEA.NMEA2000.VirtualDevice.AddressManager for an example
+  defp start_virtual_device_and_register(sup, handlers \\ []) do
+    {:ok, pid} = on_start = Supervisor.start_child(sup, {NMEA.NMEA2000.VirtualDevice, virtual_device_config()})
+    for handler <- handlers do
+      NMEA.NMEA2000.VirtualDevice.register_handler(pid, handler)
+    end
+    on_start
   end
 
   # Product: NMEA 2000 standalone, on-board device
@@ -27,8 +39,7 @@ defmodule NauticNet.Application do
     # http_server = if target == :host, do: [], else: [NauticNet.HttpDataListing]
 
     [
-      NauticNet.Telemetry,
-      {NauticNet.CAN, can_config()},
+      {NMEA.NMEA2000.Driver.SocketcandTCP, can_config()},
       {NauticNet.Serial, serial_config()},
       {NauticNet.Discovery, discovery_config()},
       {NauticNet.WebClients.UDPClient, udp_config()},
@@ -74,6 +85,38 @@ defmodule NauticNet.Application do
 
   defp can_config do
     Application.get_env(:nautic_net_device, NauticNet.CAN, [])
+  end
+
+  defp virtual_device_config do
+    %{
+      driver: {NMEA.NMEA2000.Driver.SocketcandTCP, []},
+      class_code: 25,
+      function_code: 130,
+      manufacture_code: 999,
+      manufacture_string: "Dockyard - www.dockyard.com",
+      product_code: 888,
+      previous_address: 34,
+      device_instance: 0,
+      data_instance: 0,
+      system_instance: 0,
+      model_id: "proto-123",
+      model_version: "v1.0.0",
+      software_version: "v0.0.1",
+      serial_number: "12345",
+      load_equivelency_number: 0,
+      certification_level: :level_a,
+      save_fn: fn key, value ->
+        File.write("/root/#{key}.setting", :erlang.term_to_binary(value))
+      end,
+      retrieve_fn: fn key ->
+        "/root/#{key}.setting"
+        |> File.read()
+        |> case do
+          {:ok, setting} -> :erlang.binary_to_term(setting)
+          {:error, _reason} -> nil
+        end
+      end
+    }
   end
 
   defp serial_config do
