@@ -18,8 +18,7 @@ case System.get_env("CAN_DRIVER") do
 
   "pican-m" ->
     config :nautic_net_device, NauticNet.CAN,
-      driver: {NauticNet.CAN.PiCAN.Driver, []},
-      handlers: nmea_2000_handlers
+      interface: "can0"
 
   "fake" ->
     config :nautic_net_device, NauticNet.CAN,

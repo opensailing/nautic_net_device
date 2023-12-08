@@ -16,38 +16,43 @@ defmodule NauticNet.Application do
     children = children(product(), target())
 
     with {:ok, sup} <- Supervisor.start_link(children, opts) do
-      start_virtual_device_and_register(sup)
+      start_virtual_device_and_handlers(sup)
       maybe_replay_log()
       maybe_start_tailscale()
       {:ok, sup}
     end
   end
 
-  # Handlers must be a list of pids which define a
-  # def handle_info({:data, data})
-  # See NMEA.NMEA2000.VirtualDevice.AddressManager for an example
-  defp start_virtual_device_and_register(sup, handlers \\ []) do
+  defp start_virtual_device_and_handlers(sup) do
+    {:ok, emit_telemetry_pid} = Supervisor.start_child(sup, NauticNet.PacketHandler.EmitTelemetry)
+    {:ok, system_time_pid} = Supervisor.start_child(sup, NauticNet.PacketHandler.SetTimeFromGPS)
     {:ok, pid} = on_start = Supervisor.start_child(sup, {NMEA.NMEA2000.VirtualDevice, virtual_device_config()})
+    # Discovery is not a handler but requires the VirtualDevice pid
+    {:ok, _discovery_pid} = Supervisor.start_child(sup, {NauticNet.Discovery, %{virtual_device_pid: pid}})
+
+    # Handlers must be a list of pids which define a
+    # def handle_info({:data, data})
+    # See NMEA.NMEA2000.VirtualDevice.AddressManager for an example
+    handlers = [emit_telemetry_pid, system_time_pid]
+
+    # Register the handlers with the virtual device
     for handler <- handlers do
       NMEA.NMEA2000.VirtualDevice.register_handler(pid, handler)
     end
+
     on_start
   end
 
   # Product: NMEA 2000 standalone, on-board device
   defp children(:logger, _target) do
-    # http_server = if target == :host, do: [], else: [NauticNet.HttpDataListing]
-
     [
+      NauticNet.Telemetry,
       {NMEA.NMEA2000.Driver.SocketcandTCP, can_config()},
       {NauticNet.Serial, serial_config()},
-      {NauticNet.Discovery, discovery_config()},
       {NauticNet.WebClients.UDPClient, udp_config()},
       {NauticNet.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
       {NauticNet.DataSetUploader, via: :udp}
     ]
-
-    # ++ http_server
   end
 
   # Product: Base station receiver node for nautic_net_tracker_mini

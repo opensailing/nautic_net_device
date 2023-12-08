@@ -1,28 +1,20 @@
 defmodule NauticNet.PacketHandler.Inspect do
-  @behaviour NauticNet.PacketHandler
-
+  use GenServer
   require Logger
 
-  @impl NauticNet.PacketHandler
+  @impl true
   def init(opts) do
     only = List.flatten([Keyword.get(opts, :only, [])])
-    %{only: only}
+    {:ok, %{only: only}}
   end
 
-  @impl NauticNet.PacketHandler
-  def handle_packet(packet, config) do
-    if config.only == [] or packet.parameters.__struct__ in config.only do
-      Logger.debug(inspect(packet, pretty: true))
-    end
+  def handle_info({:data, data}, state) do
+    Logger.debug("Recieved: #{inspect(data, pretty: true)}")
+    {:noreply, state}
   end
 
-  @impl NauticNet.PacketHandler
-  def handle_data(data, _config) do
-    Logger.debug(inspect(data, pretty: true))
-  end
-
-  @impl NauticNet.PacketHandler
-  def handle_closed(_config) do
-    Logger.debug("CAN device closed")
+  def handle_info(msg, state) do
+    Logger.debug("#{__MODULE__} unexpected message: #{inspect(msg)}")
+    {:noreply, state}
   end
 end
