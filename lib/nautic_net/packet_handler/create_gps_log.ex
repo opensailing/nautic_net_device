@@ -1,8 +1,5 @@
 defmodule NauticNet.PacketHandler.CreateGPSLog do
-  @behaviour NauticNet.PacketHandler
-
-  alias NauticNet.NMEA2000.J1939.GNSSPositionDataParams
-  alias NauticNet.NMEA2000.Packet
+  use GenServer
 
   @gpx_header """
   <?xml version="1.0" encoding="UTF-8"?>
@@ -19,11 +16,12 @@ defmodule NauticNet.PacketHandler.CreateGPSLog do
   time,lat,lon
   """
 
-  @impl NauticNet.PacketHandler
+  @impl true
   def init(opts) do
     {format, opts} = Keyword.pop(opts, :format) || raise "required :format option of :gpx or :csv"
 
-    init_format(format, opts)
+    state = init_format(format, opts)
+    {:ok, state}
   end
 
   defp init_format(:gpx, _opts) do
@@ -60,35 +58,50 @@ defmodule NauticNet.PacketHandler.CreateGPSLog do
     %{format: :csv, file: file}
   end
 
-  @impl NauticNet.PacketHandler
-  def handle_packet(%Packet{parameters: %GNSSPositionDataParams{} = params}, %{
-        format: :gpx,
-        file: file
-      }) do
-    time = params.datetime |> DateTime.truncate(:second) |> DateTime.to_iso8601()
-
-    trkpt = ~s[<trkpt lat="#{params.latitude}" lon="#{params.longitude}"><time>#{time}></time></trkpt>]
+  @impl true
+  def handle_info(
+        {:data,
+         %NMEA.Data{
+           values: %{NMEA.PositionParams => %NMEA.PositionParams{latitude: latitude, longitude: longitude}},
+           source_info: %NMEA.NMEA2000.Frame{timestamp: timestamp}
+         }},
+        %{
+          format: :gpx,
+          file: file
+        } = state
+      ) do
+    time = timestamp |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+    trkpt = ~s[<trkpt lat="#{latitude}" lon="#{longitude}"><time>#{time}></time></trkpt>]
 
     IO.puts(file, trkpt)
+
+    {:noreply, state}
   end
 
-  def handle_packet(%Packet{parameters: %GNSSPositionDataParams{} = params}, %{
-        format: :csv,
-        file: file
-      }) do
-    time = params.datetime |> DateTime.truncate(:second) |> DateTime.to_iso8601()
-
-    line = "#{time},#{params.latitude},#{params.longitude}"
+  def handle_info(
+        {:data,
+         %NMEA.Data{
+           values: %{NMEA.PositionParams => %NMEA.PositionParams{latitude: latitude, longitude: longitude}},
+           source_info: %NMEA.NMEA2000.Frame{timestamp: timestamp}
+         }},
+        %{
+          format: :csv,
+          file: file
+        } = state
+      ) do
+    time = timestamp |> DateTime.truncate(:second) |> DateTime.to_iso8601()
+    line = "#{time},#{latitude},#{longitude}"
 
     IO.puts(file, line)
+
+    {:noreply, state}
   end
 
-  def handle_packet(_packet, _config), do: :ok
+  def handle_info(_, state), do: {:noreply, state}
 
-  @impl NauticNet.PacketHandler
   def handle_data(_data, _config), do: :ok
 
-  @impl NauticNet.PacketHandler
+  # TODO: FIXME: Need to handle stopping of the GenServer to trigger this function
   def handle_closed(%{format: :gpx, file: file}) do
     IO.puts(file, @gpx_footer)
     File.close(file)

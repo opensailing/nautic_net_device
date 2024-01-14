@@ -8,6 +8,7 @@ defmodule NauticNet.PacketHandler.Inspect do
     {:ok, %{only: only}}
   end
 
+  @impl true
   def handle_info({:data, data}, state) do
     Logger.debug("Recieved: #{inspect(data, pretty: true)}")
     {:noreply, state}

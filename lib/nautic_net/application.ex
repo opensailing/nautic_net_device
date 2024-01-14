@@ -16,7 +16,8 @@ defmodule NauticNet.Application do
     children = children(product(), target())
 
     with {:ok, sup} <- Supervisor.start_link(children, opts) do
-      start_virtual_device_and_handlers(sup)
+      {:ok, vd_pid} = start_virtual_device_and_handlers(sup)
+      start_discovery(sup, vd_pid)
       maybe_replay_log()
       maybe_start_tailscale()
       {:ok, sup}
@@ -27,8 +28,6 @@ defmodule NauticNet.Application do
     {:ok, emit_telemetry_pid} = Supervisor.start_child(sup, NauticNet.PacketHandler.EmitTelemetry)
     {:ok, system_time_pid} = Supervisor.start_child(sup, NauticNet.PacketHandler.SetTimeFromGPS)
     {:ok, pid} = on_start = Supervisor.start_child(sup, {NMEA.NMEA2000.VirtualDevice, virtual_device_config()})
-    # Discovery is not a handler but requires the VirtualDevice pid
-    {:ok, _discovery_pid} = Supervisor.start_child(sup, {NauticNet.Discovery, %{virtual_device_pid: pid}})
 
     # Handlers must be a list of pids which define a
     # def handle_info({:data, data})
@@ -43,11 +42,15 @@ defmodule NauticNet.Application do
     on_start
   end
 
+  defp start_discovery(supervisor, vitrual_device_pid) do
+    {:ok, _discovery_pid} =
+      Supervisor.start_child(supervisor, {NauticNet.Discovery, %{virtual_device_pid: virtual_device_pid}})
+  end
+
   # Product: NMEA 2000 standalone, on-board device
   defp children(:logger, _target) do
     [
       NauticNet.Telemetry,
-      {NMEA.NMEA2000.Driver.SocketcandTCP, can_config()},
       {NauticNet.Serial, serial_config()},
       {NauticNet.WebClients.UDPClient, udp_config()},
       {NauticNet.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
@@ -88,31 +91,19 @@ defmodule NauticNet.Application do
     Application.get_env(:nautic_net_device, :target)
   end
 
-  defp can_config do
-    Application.get_env(:nautic_net_device, NauticNet.CAN, [])
+  defp virtual_device_config do
+    Application.get_env(:nmea, NMEA.VirtualDevice, [])
+    |> Kernel.++(virtual_device_save_fns(target()))
+    |> Enum.into(%{})
   end
 
-  defp virtual_device_config do
-    %{
-      driver: {NMEA.NMEA2000.Driver.SocketcandTCP, []},
-      class_code: 25,
-      function_code: 130,
-      manufacture_code: 999,
-      manufacture_string: "Dockyard - www.dockyard.com",
-      product_code: 888,
-      previous_address: 34,
-      device_instance: 0,
-      data_instance: 0,
-      system_instance: 0,
-      model_id: "proto-123",
-      model_version: "v1.0.0",
-      software_version: "v0.0.1",
-      serial_number: "12345",
-      load_equivelency_number: 0,
-      certification_level: :level_a,
-      save_fn: fn key, value ->
-        File.write("/root/#{key}.setting", :erlang.term_to_binary(value))
-      end,
+  # Functions cannot be defined in target.exs so they kept here and to be merged with the previously
+  # defined configs
+  defp virtual_device_save_fns(:rpi_3) do
+    Logger.info("Using RPI3 Save Functions")
+
+    [
+      save_fn: fn key, value -> File.write("/root/#{key}.setting", :erlang.term_to_binary(value)) end,
       retrieve_fn: fn key ->
         "/root/#{key}.setting"
         |> File.read()
@@ -121,15 +112,18 @@ defmodule NauticNet.Application do
           {:error, _reason} -> nil
         end
       end
-    }
+    ]
+  end
+
+  defp virtual_device_save_fns(_) do
+    [
+      save_fn: fn _key, _value -> :ok end,
+      retrieve_fn: fn _key -> nil end
+    ]
   end
 
   defp serial_config do
     Application.get_env(:nautic_net_device, NauticNet.Serial, [])
-  end
-
-  defp discovery_config do
-    Application.get_env(:nautic_net_device, NauticNet.Discovery, [])
   end
 
   defp udp_config do

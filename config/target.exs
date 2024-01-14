@@ -3,27 +3,38 @@
 #
 import Config
 
-nmea_2000_handlers = [
-  NauticNet.PacketHandler.DiscoverDevices,
-  NauticNet.PacketHandler.Inspect,
-  NauticNet.PacketHandler.SetTimeFromGPS,
-  NauticNet.PacketHandler.EmitTelemetry
-]
-
 case System.get_env("CAN_DRIVER") do
   "canusb" ->
     config :nautic_net_device, NauticNet.CAN,
       driver: {NauticNet.CAN.CANUSB.Driver, start_logging?: true},
-      handlers: nmea_2000_handlers
+      handlers: [
+        NauticNet.PacketHandler.DiscoverDevices,
+        NauticNet.PacketHandler.Inspect,
+        NauticNet.PacketHandler.SetTimeFromGPS,
+        NauticNet.PacketHandler.EmitTelemetry
+      ]
 
   "pican-m" ->
-    config :nautic_net_device, NauticNet.CAN,
-      interface: "can0"
+    config :nmea, NMEA.VirtualDevice,
+      driver: {NMEA.NMEA2000.Driver.Socketcand, [method: :tcp]},
+      class_code: 25,
+      function_code: 130,
+      manufacture_code: 999,
+      manufacture_string: "Dockyard - www.dockyard.com",
+      product_code: 888,
+      previous_address: 34,
+      device_instance: 0,
+      data_instance: 0,
+      system_instance: 0,
+      model_id: "proto-123",
+      model_version: "v1.0.0",
+      software_version: "v0.0.1",
+      serial_number: "12345",
+      load_equivelency_number: 0,
+      certification_level: :level_a
 
   "fake" ->
-    config :nautic_net_device, NauticNet.CAN,
-      driver: NauticNet.CAN.Fake.Driver,
-      handlers: nmea_2000_handlers
+    config :nautic_net_device, NauticNet.CAN, driver: NauticNet.CAN.Fake.Driver
 
   "disabled" ->
     config :nautic_net_device, NauticNet.CAN, false

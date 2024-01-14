@@ -4,7 +4,6 @@ defmodule NauticNet.Discovery do
   """
   use GenServer
 
-  alias NauticNet.Discovery
   alias NauticNet.Protobuf.NetworkDevice
   alias NMEA.NMEA2000.VirtualDevice
   alias NMEA.NMEA2000.VirtualDevice.NetworkMonitor.DeviceInfo
@@ -15,7 +14,7 @@ defmodule NauticNet.Discovery do
 
   def init(args) do
     vd_pid = Map.get(args, :virtual_device_pid)
-    {:ok, {:interval, timer_ref}}= :timer.send_interval(5000, :update_devices)
+    {:ok, {:interval, timer_ref}} = :timer.send_interval(5000, :update_devices)
     {:ok, %{timer_ref: timer_ref, virtual_device_pid: vd_pid}}
   end
 

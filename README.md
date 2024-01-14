@@ -41,6 +41,6 @@ If you need to work on the `nautic_net_*` libraries locally, you can specify `NA
 dependencies as sibling directories to this repo.
 
     nautic_net_device/         <-- you are here
-    nautic_net_nmea2000/
     nautic_net_protobuf/
     nautic_net_system_rpi3/
+    nmea/
