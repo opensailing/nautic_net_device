@@ -24,7 +24,7 @@ defmodule NauticNet.Discovery do
     |> Enum.map(fn {_source_addr, %DeviceInfo{} = device_info} ->
       NetworkDevice.new(
         hw_id: NauticNet.DeviceInfo.hw_id(device_info.nmea_name),
-        name: device_info.model_id
+        name: "#{device_info.manufacture_name} - #{device_info.model_id}"
       )
     end)
     |> NauticNet.DataSetRecorder.add_network_devices()
