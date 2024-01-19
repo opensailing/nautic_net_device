@@ -42,7 +42,7 @@ defmodule NauticNet.Application do
     on_start
   end
 
-  defp start_discovery(supervisor, vitrual_device_pid) do
+  defp start_discovery(supervisor, virtual_device_pid) do
     {:ok, _discovery_pid} =
       Supervisor.start_child(supervisor, {NauticNet.Discovery, %{virtual_device_pid: virtual_device_pid}})
   end
@@ -99,9 +99,7 @@ defmodule NauticNet.Application do
 
   # Functions cannot be defined in target.exs so they kept here and to be merged with the previously
   # defined configs
-  defp virtual_device_save_fns(:rpi_3) do
-    Logger.info("Using RPI3 Save Functions")
-
+  defp virtual_device_save_fns(:nautic_net_rpi3) do
     [
       save_fn: fn key, value -> File.write("/root/#{key}.setting", :erlang.term_to_binary(value)) end,
       retrieve_fn: fn key ->
