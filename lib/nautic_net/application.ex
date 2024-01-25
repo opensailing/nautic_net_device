@@ -25,7 +25,9 @@ defmodule NauticNet.Application do
   end
 
   defp start_virtual_device_and_handlers(sup) do
-    {:ok, emit_telemetry_pid} = Supervisor.start_child(sup, NauticNet.PacketHandler.EmitTelemetry)
+    {:ok, emit_telemetry_pid} =
+      Supervisor.start_child(sup, {NauticNet.PacketHandler.EmitTelemetry, emit_telemetry_config()})
+
     {:ok, system_time_pid} = Supervisor.start_child(sup, NauticNet.PacketHandler.SetTimeFromGPS)
     {:ok, pid} = on_start = Supervisor.start_child(sup, {NMEA.NMEA2000.VirtualDevice, virtual_device_config()})
 
@@ -89,6 +91,13 @@ defmodule NauticNet.Application do
 
   defp target do
     Application.get_env(:nautic_net_device, :target)
+  end
+
+  # Get the filtering configuration / settings for NMEA data being
+  # set to the cloud.
+  # FUTURETODO: Load the current fitters from disk
+  defp emit_telemetry_config do
+    Application.get_env(:nautic_net_device, :data_filtering)
   end
 
   defp virtual_device_config do
