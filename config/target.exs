@@ -51,7 +51,7 @@ config :nautic_net_device,
   tailscale_auth_key: System.get_env("TAILSCALE_AUTH_KEY"),
   data_set_directory: "/data/datasets"
 
-config :logger, level: :debug
+config :logger, level: :info
 
 # Use shoehorn to start the main application. See the shoehorn
 # docs for separating out critical OTP applications such as those
