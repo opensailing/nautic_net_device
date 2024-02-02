@@ -115,6 +115,7 @@ defmodule NauticNet.Application do
         "/root/#{key}.setting"
         |> File.read()
         |> case do
+          {:ok, ""} -> nil
           {:ok, setting} -> :erlang.binary_to_term(setting)
           {:error, _reason} -> nil
         end
