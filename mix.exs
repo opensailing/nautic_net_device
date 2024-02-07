@@ -32,7 +32,7 @@ defmodule NauticNet.Device.MixProject do
   defp deps do
     [
       # Dependencies for all targets
-      {:nerves, "~> 1.8.0", runtime: false},
+      {:nerves, "~> 1.10", runtime: false},
       {:shoehorn, "~> 0.8.0"},
       {:ring_logger, "~> 0.8.3"},
       {:toolshed, "~> 0.2.13"},
