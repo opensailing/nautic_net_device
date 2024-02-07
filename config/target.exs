@@ -16,7 +16,7 @@ case System.get_env("CAN_DRIVER") do
 
   "pican-m" ->
     config :nmea, NMEA.VirtualDevice,
-      driver: {NMEA.NMEA2000.Driver.Socketcand, [method: :can_sock_drv]},
+      driver: {NMEA.NMEA2000.Driver.NgCan, []},
       class_code: 25,
       function_code: 130,
       manufacture_code: 999,
