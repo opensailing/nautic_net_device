@@ -1,6 +1,8 @@
 # NauticNet device
 
-This is the parent/main repository for the "keelboat" tracker. This is designed to run on a Raspberry Pi 3 b+ with SixFab LTE and a Pican-M hats.
+This is the parent/main repository for the "keelboat" tracker (aka "logger"). This is designed to run on a Raspberry Pi 3 b+ with SixFab LTE and a Pican-M hats.
+
+__TODO:__ This repository used to support 2 products and is now designed only to support the keelboat variant. There is still cruft in here surrounding the "upload" variant that needs to be removed to be more hygenic.
 
 __When this library is used in a project it must be compiled on a Linux machine (physical or VM). This is due to the dependency on the linux kernel header files required to compile the CAN C driver. See the Development section of this document for further information.__
 
