@@ -2,7 +2,7 @@ defmodule NauticNet.Device.MixProject do
   use Mix.Project
 
   @app :nautic_net_device
-  @version "0.1.2"
+  @version "0.2.0"
   @all_device_targets [:nautic_net_rpi3]
 
   def project do
