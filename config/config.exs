@@ -19,6 +19,12 @@ config :nautic_net_device,
   replay_log: System.get_env("REPLAY_LOG"),
   git_commit: git_commit
 
+# Data upload filter modes:
+# :permissive - Allow data to be uploaded by any sensor for a data type
+# :strict - Only allow data to be uploaded if a sensor is selected -- via a filter -- for the data type
+# FUTURETODO: This should probably move to a runtime configuration value
+config :nautic_net_device, :data_filtering, filter_mode: :permissive
+
 # Customize non-Elixir parts of the firmware. See
 # https://hexdocs.pm/nerves/advanced-configuration.html for details.
 

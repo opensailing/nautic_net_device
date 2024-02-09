@@ -1,122 +1,241 @@
 defmodule NauticNet.PacketHandler.EmitTelemetry do
-  @behaviour NauticNet.PacketHandler
+  use GenServer
+  require Logger
 
-  alias NauticNet.DeviceInfo
-  alias NauticNet.Discovery
-  alias NauticNet.NMEA2000.Packet
-  alias NauticNet.NMEA2000.J1939
-
-  @impl NauticNet.PacketHandler
-  def init(_opts) do
-    %{}
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(args) do
+    GenServer.start_link(__MODULE__, args)
   end
 
-  @impl NauticNet.PacketHandler
-  def handle_packet(%Packet{parameters: %J1939.WindDataParams{} = params} = packet, _config) do
-    execute([:nautic_net, :wind, params.wind_reference], packet, %{
-      vector: %{
-        timestamp: packet.timestamp,
-        angle: params.wind_angle,
-        magnitude: params.wind_speed
-      }
-    })
+  @impl true
+  def init(args) do
+    filters = Keyword.get(args, :filters, %{})
+    filter_mode = Keyword.get(args, :filter_mode)
+    Logger.info("Starting #{__MODULE__} in #{inspect(filter_mode)} mode\nwith filters: #{inspect(filters)}")
+    {:ok, %{filters: filters, filter_mode: filter_mode}}
   end
 
-  def handle_packet(%Packet{parameters: %J1939.GNSSPositionDataParams{} = params} = packet, _config) do
-    execute([:nautic_net, :gps], packet, %{
-      position: %{
-        timestamp: packet.timestamp,
-        lat: params.latitude,
-        lon: params.longitude
-      }
-    })
-  end
-
-  def handle_packet(%Packet{parameters: %J1939.TemperatureParams{} = params} = packet, _config) do
-    execute([:nautic_net, :temperature], packet, %{
-      timestamp: packet.timestamp,
-      kelvin: params.temperature_k
-    })
-  end
-
-  # Discard (UINT16_MAX / 100)
-  def handle_packet(%Packet{parameters: %J1939.SpeedParams{water_speed: water_speed} = params} = packet, _config)
-      when water_speed != 655.35 do
-    execute([:nautic_net, :speed, :water], packet, %{
-      speed_m_s: %{
-        timestamp: packet.timestamp,
-        value: params.water_speed
-      }
-    })
-  end
-
-  # Discard (UINT32_MAX / 100)
-  def handle_packet(%Packet{parameters: %J1939.WaterDepthParams{depth: depth_m}} = packet, _config)
-      when depth_m != 42_949_672.95 do
-    execute([:nautic_net, :water_depth], packet, %{
-      depth_m: %{
-        timestamp: packet.timestamp,
-        value: depth_m
-      }
-    })
-  end
-
-  def handle_packet(%Packet{parameters: %J1939.VesselHeadingParams{} = params} = packet, _config) do
-    execute([:nautic_net, :heading], packet, %{
-      rad: %{
-        timestamp: packet.timestamp,
-        value: params.heading
-      }
-    })
-  end
-
-  def handle_packet(%Packet{parameters: %J1939.VelocityOverGroundParams{} = params} = packet, _config) do
-    execute([:nautic_net, :velocity, :ground], packet, %{
-      vector: %{
-        timestamp: packet.timestamp,
-        angle: params.course_over_ground,
-        magnitude: params.speed_over_ground
-      }
-    })
-  end
-
-  def handle_packet(%Packet{parameters: %J1939.AttitudeParams{} = params} = packet, _config) do
-    execute(
-      [:nautic_net, :attitude],
-      packet,
-      %{
-        rad: %{
-          timestamp: packet.timestamp,
-          yaw: params.yaw,
-          pitch: params.pitch,
-          roll: params.roll
-        }
-      }
-    )
-  end
-
-  def handle_packet(_packet, _config), do: :ok
-
-  @impl NauticNet.PacketHandler
-  def handle_data(_data, _config), do: :ok
-
-  @impl NauticNet.PacketHandler
-  def handle_closed(_config), do: :ok
-
-  defp execute(event_name, packet, measurements, metadata \\ %{}) do
-    # TODO: Factor in some sort of unique sensor ID, because the device_id is not nearly specific enough
-
-    with {:ok, device_info} <- Discovery.fetch(packet.source_addr) do
-      device_id = DeviceInfo.identifier(device_info)
-
+  @impl true
+  def handle_info(
+        {:data,
+         %NMEA.Data{
+           values: %{NMEA.WindParams => %NMEA.WindParams{speed: speed, angle: angle, reference: reference}},
+           source_info: %NMEA.NMEA2000.Frame{timestamp: timestamp, timestamp_monotonic_ms: timestamp_monotonic_ms},
+           metadata: %{source_nmea_name: source_name}
+         }},
+        state
+      ) do
+    if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
       :telemetry.execute(
-        event_name,
-        measurements,
-        Map.merge(
-          %{device_id: device_id, timestamp_monotonic_ms: packet.timestamp_monotonic_ms},
-          metadata
-        )
+        [:nautic_net, :wind, reference],
+        %{
+          vector: %{
+            timestamp: timestamp,
+            angle: angle,
+            magnitude: speed
+          }
+        },
+        %{device_id: source_name, timestamp_monotonic_ms: timestamp_monotonic_ms}
       )
     end
+
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:data,
+         %NMEA.Data{
+           values: %{NMEA.PositionParams => %NMEA.PositionParams{latitude: latitude, longitude: longitude}},
+           source_info: %NMEA.NMEA2000.Frame{timestamp: timestamp, timestamp_monotonic_ms: timestamp_monotonic_ms},
+           metadata: %{source_nmea_name: source_name}
+         }},
+        state
+      ) do
+    if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      :telemetry.execute(
+        [:nautic_net, :gps],
+        %{
+          position: %{
+            timestamp: timestamp,
+            lat: latitude,
+            lon: longitude
+          }
+        },
+        %{device_id: source_name, timestamp_monotonic_ms: timestamp_monotonic_ms}
+      )
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:data,
+         %NMEA.Data{
+           values: %{NMEA.TemperatureParams => %NMEA.TemperatureParams{temperature_k: temp}},
+           source_info: %NMEA.NMEA2000.Frame{timestamp: timestamp, timestamp_monotonic_ms: timestamp_monotonic_ms},
+           metadata: %{source_nmea_name: source_name}
+         }},
+        state
+      ) do
+    if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      :telemetry.execute(
+        [:nautic_net, :temperature],
+        %{
+          timestamp: timestamp,
+          kelvin: temp
+        },
+        %{device_id: source_name, timestamp_monotonic_ms: timestamp_monotonic_ms}
+      )
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:data,
+         %NMEA.Data{
+           values: %{
+             NMEA.CourseParams => %NMEA.CourseParams{
+               course: course
+             },
+             NMEA.SpeedParams => %NMEA.SpeedParams{
+               speed: speed,
+               speed_reference: :speed_over_ground
+             }
+           },
+           source_info: %NMEA.NMEA2000.Frame{timestamp: timestamp, timestamp_monotonic_ms: timestamp_monotonic_ms},
+           metadata: %{source_nmea_name: source_name}
+         }},
+        state
+      ) do
+    if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      :telemetry.execute(
+        [:nautic_net, :velocity, :ground],
+        %{
+          vector: %{
+            timestamp: timestamp,
+            angle: course,
+            magnitude: speed
+          }
+        },
+        %{device_id: source_name, timestamp_monotonic_ms: timestamp_monotonic_ms}
+      )
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:data,
+         %NMEA.Data{
+           values: %{NMEA.SpeedParams => %NMEA.SpeedParams{speed: water_speed}},
+           source_info: %NMEA.NMEA2000.Frame{timestamp: timestamp, timestamp_monotonic_ms: timestamp_monotonic_ms},
+           metadata: %{source_nmea_name: source_name}
+         }},
+        state
+      ) do
+    if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      :telemetry.execute(
+        [:nautic_net, :speed, :water],
+        %{
+          speed_m_s: %{
+            timestamp: timestamp,
+            value: water_speed
+          }
+        },
+        %{device_id: source_name, timestamp_monotonic_ms: timestamp_monotonic_ms}
+      )
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:data,
+         %NMEA.Data{
+           values: %{NMEA.DepthParams => %NMEA.DepthParams{depth: depth_m}},
+           source_info: %NMEA.NMEA2000.Frame{timestamp: timestamp, timestamp_monotonic_ms: timestamp_monotonic_ms},
+           metadata: %{source_nmea_name: source_name}
+         }},
+        state
+      ) do
+    if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      :telemetry.execute(
+        [:nautic_net, :water_depth],
+        %{
+          depth_m: %{
+            timestamp: timestamp,
+            value: depth_m
+          }
+        },
+        %{device_id: source_name, timestamp_monotonic_ms: timestamp_monotonic_ms}
+      )
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:data,
+         %NMEA.Data{
+           values: %{NMEA.HeadingParams => %NMEA.HeadingParams{heading: heading}},
+           source_info: %NMEA.NMEA2000.Frame{timestamp: timestamp, timestamp_monotonic_ms: timestamp_monotonic_ms},
+           metadata: %{source_nmea_name: source_name}
+         }},
+        state
+      ) do
+    if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      :telemetry.execute(
+        [:nautic_net, :heading],
+        %{
+          rad: %{
+            timestamp: timestamp,
+            value: heading
+          }
+        },
+        %{device_id: source_name, timestamp_monotonic_ms: timestamp_monotonic_ms}
+      )
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:data,
+         %NMEA.Data{
+           values: %{NMEA.AttitudeParams => %NMEA.AttitudeParams{yaw: yaw, pitch: pitch, roll: roll}},
+           source_info: %NMEA.NMEA2000.Frame{timestamp: timestamp, timestamp_monotonic_ms: timestamp_monotonic_ms},
+           metadata: %{source_nmea_name: source_name}
+         }},
+        state
+      ) do
+    if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      :telemetry.execute(
+        [:nautic_net, :heading],
+        %{
+          rad: %{
+            timestamp: timestamp,
+            yaw: yaw,
+            pitch: pitch,
+            roll: roll
+          }
+        },
+        %{device_id: source_name, timestamp_monotonic_ms: timestamp_monotonic_ms}
+      )
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info(_msg, state) do
+    # Logger.debug("Unknown Data received: #{inspect(msg)}")
+    {:noreply, state}
+  end
+
+  defp desired_device_or_permissive_mode?(_filters, :permissive, _, _), do: true
+
+  defp desired_device_or_permissive_mode?(filters, _, data_type, data_source) do
+    allowed_source = Map.get(filters, data_type)
+    allowed_source == data_source
   end
 end

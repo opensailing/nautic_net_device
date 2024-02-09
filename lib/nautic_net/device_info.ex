@@ -17,27 +17,22 @@ defmodule NauticNet.DeviceInfo do
     :load_equivalency
   ]
 
-  @type id :: {manufacturer_code :: integer, unique_number :: integer}
+  @type id :: integer
   @type t :: %__MODULE__{}
 
+  # @doc """
+  # Returns a unique identifier for this device for internal use.
+  # """
+  # @spec identifier(t) :: id
+  # def identifier(%__MODULE__{} = device_info) do
+  #   {device_info.manufacturer_code, device_info.unique_number}
+  # end
+
   @doc """
-  Returns a unique identifier for this device for internal use.
+  Convert the NMEA NAME from the 64bit binary to an integer
   """
-  @spec identifier(t) :: id
-  def identifier(%__MODULE__{} = device_info) do
-    {device_info.manufacturer_code, device_info.unique_number}
-  end
-
-  def hw_id({manufacturer_code, unique_number}) do
-    <<hw_id::32>> = <<
-      unique_number::little-unsigned-integer-21,
-      manufacturer_code::little-unsigned-integer-11
-    >>
-
-    hw_id
-  end
-
-  def hw_id(%__MODULE__{} = info) do
-    info |> identifier() |> hw_id()
+  def hw_id(nmea_name) do
+    <<i::integer-size(64)-unit(1)>> = nmea_name
+    i
   end
 end

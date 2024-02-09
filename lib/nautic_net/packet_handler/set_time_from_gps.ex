@@ -1,35 +1,54 @@
 defmodule NauticNet.PacketHandler.SetTimeFromGPS do
-  @behaviour NauticNet.PacketHandler
+  @moduledoc """
+  Packet Handler that accepts data from either a NMEA.NMEA2000.VirtualDevice (via handle_info) or
+  from an 0183 source (via handle_data) and sets the system clock if the time is "reasonable".
 
+  A "reasonable" time is computes as being more then 10 seconds in the future. This threshold is used
+  to throw out GPSs that report erronious times (like years in the past).
+
+  Future work should include unifying the handle_info and handle_data into. They are seperate only because
+  a full refactor has not been completed.
+  """
+  use GenServer
   require Logger
 
-  alias NauticNet.NMEA2000.J1939.GNSSPositionDataParams
-  alias NauticNet.NMEA2000.Packet
-  alias NMEA.Data
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(_) do
+    GenServer.start_link(__MODULE__, [])
+  end
 
-  @impl NauticNet.PacketHandler
+  @impl true
   def init(_opts) do
-    %{}
+    {:ok, %{}}
   end
 
-  @impl NauticNet.PacketHandler
-  def handle_packet(%Packet{parameters: %GNSSPositionDataParams{datetime: gps_datetime = %DateTime{}}}, _config) do
-    maybe_set_system_clock(gps_datetime)
+  @impl true
+  def handle_info(
+        {:data,
+         %NMEA.Data{
+           values: %{NMEA.DateTimeParams => %NMEA.DateTimeParams{datetime: datetime}}
+         }},
+        state
+      ) do
+    maybe_set_system_clock(datetime)
+    {:noreply, state}
   end
 
-  def handle_packet(_packet, _config), do: :ok
+  def handle_info(_data, state), do: {:noreply, state}
 
-  @impl NauticNet.PacketHandler
-  def handle_data(%Data{values: %NMEA.DateTimeParams{datetime: gps_datetime = %DateTime{}} = data}, _config) do
-    Logger.debug("Recieved NMEA 0183 sentence to set DateTime: #{inspect(data)}")
+  @spec handle_data(%NMEA.Data{}, any()) :: :ok
+  def handle_data(%NMEA.Data{values: %NMEA.DateTimeParams{datetime: gps_datetime = %DateTime{}}}, _config) do
     maybe_set_system_clock(gps_datetime)
   end
 
   def handle_data(_packet, _config), do: :ok
 
+  @spec handle_closed(any()) :: :ok
+  def handle_closed(_config), do: :ok
+
+  # If the system time differs from the GPS time by more than 10 seconds and the new time is in the future
+  # then update the system time (assumes the system is in the UTC timezone)
   defp maybe_set_system_clock(gps_datetime) do
-    # If the system time differs from the GPS time by more than 10 seconds and the new time is in the future, then we should
-    # definitely update the system time (assumes the system is in the UTC timezone)
     diff = abs(DateTime.diff(gps_datetime, DateTime.utc_now()))
     direction = DateTime.compare(gps_datetime, DateTime.utc_now())
 
@@ -41,7 +60,4 @@ defmodule NauticNet.PacketHandler.SetTimeFromGPS do
 
     :ok
   end
-
-  @impl NauticNet.PacketHandler
-  def handle_closed(_config), do: :ok
 end

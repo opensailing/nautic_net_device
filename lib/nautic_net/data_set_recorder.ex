@@ -78,7 +78,7 @@ defmodule NauticNet.DataSetRecorder do
 
     path = Path.join(state.temp_dir, data_set.ref)
     File.write!(path, DataSet.encode(data_set))
-    Logger.info("Saved #{length(data_points)} data points to #{path}")
+    Logger.debug("Saved #{length(data_points)} data points to #{path}")
 
     DataSetUploader.add_file(path)
   end
@@ -92,7 +92,7 @@ defmodule NauticNet.DataSetRecorder do
 
     path = Path.join(state.temp_dir, data_set.ref)
     File.write!(path, DataSet.encode(data_set))
-    Logger.info("Saved #{length(network_devices)} network devices to #{path}")
+    Logger.debug("Saved #{length(network_devices)} network devices to #{path}")
 
     DataSetUploader.add_file(path)
   end

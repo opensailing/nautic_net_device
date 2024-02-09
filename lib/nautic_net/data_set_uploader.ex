@@ -60,7 +60,7 @@ defmodule NauticNet.DataSetUploader do
       :ok ->
         File.rm!(path)
 
-        Logger.info("Uploaded #{path} (#{size} bytes); #{length(File.ls!(dir))} file(s) remain")
+        Logger.debug("Uploaded #{path} (#{size} bytes); #{length(File.ls!(dir))} file(s) remain")
 
       {:error, reason} ->
         Logger.warn("Error uploading #{path}: #{inspect(reason)}")
