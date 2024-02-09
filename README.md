@@ -41,3 +41,7 @@ dependencies as sibling directories to this repo.
     nautic_net_protobuf/
     nautic_net_system_rpi3/
     nmea/
+
+## Legacy Support
+
+If you are looking to build the dighy tracking firmware the main branch no longer supports that. However, that code has been retained in the `prototype_final` branch.
