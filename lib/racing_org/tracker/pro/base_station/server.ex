@@ -56,7 +56,7 @@ defmodule RacingOrg.Tracker.Pro.BaseStation.Server do
   rescue
     _ ->
       # Catch LoRaPacket.decode/1 error
-      Logger.warn("Error decoding LoRa packet; ignoring")
+      Logger.warning("Error decoding LoRa packet; ignoring")
       {:noreply, %{state | alive?: true}}
   end
 
@@ -104,7 +104,7 @@ defmodule RacingOrg.Tracker.Pro.BaseStation.Server do
         %{state | uart_pid: pid}
 
       _ ->
-        Logger.warn("Could not find Adafruit Feather M0 port")
+        Logger.warning("Could not find Adafruit Feather M0 port")
         schedule_open()
         %{state | uart_pid: nil, alive?: false}
     end

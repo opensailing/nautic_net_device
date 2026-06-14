@@ -3,7 +3,7 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler do
   Callback module for dealing with business logic after a known NMEA2000 packet has been fully received and decoded.
   """
 
-  alias RacingOrg.NMEA2000.Packet
+  alias RacingOrg.Tracker.NMEA2000.Packet
   alias NMEA.Data
 
   @doc """
@@ -21,7 +21,7 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler do
   @callback handle_packet(packet :: Packet.t(), config :: term) :: term
 
   @doc """
-  Handles a decoded data packet (NMEA 2000 or NMEA 0183). %NMEA.Data{} is a newer version of %RacingOrg.NMEA2000.Packet
+  Handles a decoded data packet (NMEA 2000 or NMEA 0183). %NMEA.Data{} is a newer version of %RacingOrg.Tracker.NMEA2000.Packet
   that can handle NMEA 2000 and NMEA 0183 data with a different structure.
   """
   @callback handle_data(data :: Data.t(), config :: term) :: term

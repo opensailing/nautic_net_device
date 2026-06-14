@@ -3,7 +3,7 @@ defmodule RacingOrg.Tracker.Pro.CAN.Driver do
   The abstraction layer behind which the CAN bus physical layer can be implemented.
   """
 
-  alias RacingOrg.NMEA2000.Frame
+  alias RacingOrg.Tracker.NMEA2000.Frame
 
   @doc """
   Configure and prepare the CAN bus driver for use.

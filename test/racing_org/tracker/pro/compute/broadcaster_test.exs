@@ -2,7 +2,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.BroadcasterTest do
   use ExUnit.Case, async: true
 
   alias RacingOrg.Tracker.Pro.Compute.Broadcaster
-  alias RacingOrg.NMEA2000.J1939
+  alias RacingOrg.Tracker.NMEA2000.J1939
 
   @deg_per_rad 180.0 / :math.pi()
 

@@ -5,7 +5,7 @@ defmodule RacingOrg.Tracker.Pro.CAN.CANUSB.Protocol do
   Documentation: http://www.can232.com/docs/canusb_manual.pdf
   """
 
-  alias RacingOrg.NMEA2000.Frame
+  alias RacingOrg.Tracker.NMEA2000.Frame
 
   def separator, do: "\r"
 

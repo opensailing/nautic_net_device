@@ -11,8 +11,15 @@ Application.start(:nerves_bootstrap)
 {git_commit, 0} = System.cmd("git", ["rev-parse", "HEAD"])
 git_commit = String.trim(git_commit)
 
+target =
+  if Mix.env() == :test do
+    :host
+  else
+    Mix.target()
+  end
+
 config :racing_org_tracker,
-  target: Mix.target(),
+  target: target,
   api_endpoint: System.fetch_env!("API_ENDPOINT"),
   udp_endpoint: System.fetch_env!("UDP_ENDPOINT"),
   product: System.fetch_env!("PRODUCT"),
@@ -71,7 +78,9 @@ config :nerves, source_date_epoch: "1655934717"
 # See https://hexdocs.pm/ring_logger/readme.html for more information on
 # configuring ring_logger.
 
-config :logger, backends: [RingLogger]
+if target != :host do
+  config :logger, backends: [RingLogger]
+end
 
 # Mint adapter (pure-Elixir, no NIFs). On the device Mint auto-uses castore for
 # HTTPS certificate verification (verify_peer by default), resolved at runtime.
@@ -84,7 +93,7 @@ config :tesla, adapter: Tesla.Adapter.Mint
 # in RacingOrg.Tracker.Pro.WebClients.HTTPClient, so silence the per-compile warning.
 config :tesla, disable_deprecated_builder_warning: true
 
-if Mix.target() == :host or Mix.target() == :"" do
+if target == :host or target == :"" do
   import_config "host_#{Mix.env()}.exs"
 else
   import_config "target.exs"

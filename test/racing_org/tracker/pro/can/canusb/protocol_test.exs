@@ -2,7 +2,7 @@ defmodule RacingOrg.Tracker.Pro.CAN.CANUSB.ProtocolTest do
   use ExUnit.Case
 
   alias RacingOrg.Tracker.Pro.CAN.CANUSB.Protocol
-  alias RacingOrg.NMEA2000.Frame
+  alias RacingOrg.Tracker.NMEA2000.Frame
 
   test "separator/0" do
     assert Protocol.separator() == "\r"
@@ -115,7 +115,7 @@ defmodule RacingOrg.Tracker.Pro.CAN.CANUSB.ProtocolTest do
     test "a received standard frame" do
       assert Protocol.parse("t01281020304050607080") ==
                {:ok,
-                %RacingOrg.NMEA2000.Frame{
+                %RacingOrg.Tracker.NMEA2000.Frame{
                   data: <<0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80>>,
                   identifier: 0x12,
                   timestamp_ms: 0,
@@ -126,7 +126,7 @@ defmodule RacingOrg.Tracker.Pro.CAN.CANUSB.ProtocolTest do
     test "a received extended frame" do
       assert Protocol.parse("T0000123481020304050607080") ==
                {:ok,
-                %RacingOrg.NMEA2000.Frame{
+                %RacingOrg.Tracker.NMEA2000.Frame{
                   data: <<0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80>>,
                   identifier: 0x1234,
                   timestamp_ms: 0,

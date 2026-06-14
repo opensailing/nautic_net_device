@@ -19,20 +19,20 @@ defmodule RacingOrg.Tracker.Pro.CANTest do
   test "can churn through a big log file without blowing up" do
     replay_until_completion(log_filename())
 
-    assert_receive %RacingOrg.NMEA2000.Packet{}
+    assert_receive %RacingOrg.Tracker.NMEA2000.Packet{}
   end
 
   test "can decode a WindDataParams packet" do
     replay_until_completion(["<- 54 T09FD02028FAB30090DFFAFFFF"])
 
-    assert_receive %RacingOrg.NMEA2000.Packet{
+    assert_receive %RacingOrg.Tracker.NMEA2000.Packet{
       data: <<250, 179, 0, 144, 223, 250, 255, 255>>,
       data_size: 8,
       description: nil,
       frame_id: 0,
       frame_type: :extended,
       packet_type: :single,
-      parameters: %RacingOrg.NMEA2000.J1939.WindDataParams{
+      parameters: %RacingOrg.Tracker.NMEA2000.J1939.WindDataParams{
         sid: 250,
         wind_angle: 5.7232,
         wind_reference: :apparent,
@@ -56,7 +56,7 @@ defmodule RacingOrg.Tracker.Pro.CANTest do
       "<- 67179 T0DF805018A6FFFFFFFFFFFFFF"
     ])
 
-    assert_receive %RacingOrg.NMEA2000.Packet{
+    assert_receive %RacingOrg.Tracker.NMEA2000.Packet{
       data:
         <<201, 227, 74, 128, 42, 234, 31, 128, 255, 209, 139, 175, 114, 221, 5, 128, 84, 110, 204, 210, 97, 41, 246, 48,
           146, 153, 254, 255, 255, 255, 255, 16, 252, 12, 80, 0, 140, 0, 204, 242, 255, 255, 255>>,
@@ -65,7 +65,7 @@ defmodule RacingOrg.Tracker.Pro.CANTest do
       frame_id: 6,
       frame_type: :extended,
       packet_type: :fast,
-      parameters: %RacingOrg.NMEA2000.J1939.GNSSPositionDataParams{
+      parameters: %RacingOrg.Tracker.NMEA2000.J1939.GNSSPositionDataParams{
         altitude: -23.49,
         datetime: ~U[2022-06-28 14:52:24Z],
         latitude: 42.26200383333334,

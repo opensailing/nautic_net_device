@@ -38,15 +38,15 @@ defmodule RacingOrg.Tracker.Pro.Serial.Server do
 
   def handle_info({:circuits_uart, port_name, sentence}, %{port_name: port_name} = state) do
     case NMEA.to_data(:nmea_0183, sentence) do
-      :invalid ->
-        nil
-
-      data ->
+      %NMEA.Data{} = data ->
         data = NMEA.Data.put_metadata(data, %{port: port_name, source_description: "SixFab LTE Modem GPS"})
 
         for {handler, handler_opts} <- state.handlers do
           handler.handle_data(data, handler_opts)
         end
+
+      _ ->
+        :ok
     end
 
     {:noreply, state}

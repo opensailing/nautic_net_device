@@ -5,9 +5,9 @@ defmodule RacingOrg.Tracker.Pro.HttpDataListing do
   def child_spec(_opts) do
     httpd_opts = [
       port: 80,
-      server_name: 'data',
-      server_root: '/data',
-      document_root: '/data',
+      server_name: ~c"data",
+      server_root: ~c"/data",
+      document_root: ~c"/data",
       bind_address: :any,
       modules: [:mod_dir, :mod_get]
     ]

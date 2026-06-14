@@ -7,7 +7,7 @@ defmodule RacingOrg.Tracker.Pro.CAN.CANUSB.Server do
 
   require Logger
 
-  alias RacingOrg.NMEA2000.Frame
+  alias RacingOrg.Tracker.NMEA2000.Frame
   alias RacingOrg.Tracker.Pro.CAN.CANUSB.Protocol
 
   @name __MODULE__
@@ -115,7 +115,7 @@ defmodule RacingOrg.Tracker.Pro.CAN.CANUSB.Server do
   end
 
   def handle_info({:circuits_uart, _port, unknown}, state) do
-    Logger.warn("Unexpected UART data: " <> inspect(unknown))
+    Logger.warning("Unexpected UART data: " <> inspect(unknown))
     {:noreply, state}
   end
 
@@ -136,7 +136,7 @@ defmodule RacingOrg.Tracker.Pro.CAN.CANUSB.Server do
   end
 
   defp handle_parsed({:ok, :error}, state) do
-    Logger.warn("CANUSB error response")
+    Logger.warning("CANUSB error response")
     state
   end
 
@@ -151,7 +151,7 @@ defmodule RacingOrg.Tracker.Pro.CAN.CANUSB.Server do
   end
 
   defp handle_parsed({:error, data}, state) do
-    Logger.warn("CANUSB cannot parse: #{inspect(data)}")
+    Logger.warning("CANUSB cannot parse: #{inspect(data)}")
     state
   end
 

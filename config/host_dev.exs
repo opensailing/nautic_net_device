@@ -4,9 +4,9 @@
 
 import Config
 
-alias RacingOrg.NMEA2000.J1939
+alias RacingOrg.Tracker.NMEA2000.J1939
 
-config :logger, level: :debug, backends: [:console]
+config :logger, level: :debug
 
 config :nmea, NMEA.VirtualDevice,
   driver: {NMEA.NMEA2000.Driver.Fake, []},

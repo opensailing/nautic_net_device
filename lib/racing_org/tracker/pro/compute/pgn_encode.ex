@@ -2,7 +2,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.PgnEncode do
   @moduledoc """
   Encodes a single computed value to the on-wire NMEA 2000 payload for its target PGN
   (Phase 8). This is the INVERSE of the decoders the device uses to RECEIVE these PGNs
-  (`RacingOrg.NMEA2000.J1939.*Params` in the `racing_org_nmea2000` dep), so a payload
+  (`RacingOrg.Tracker.NMEA2000.J1939.*Params` in the `racing_org_tracker_nmea2000` dep), so a payload
   produced here decodes back to the input within scaling tolerance — the property the
   test-suite asserts via round-trip.
 

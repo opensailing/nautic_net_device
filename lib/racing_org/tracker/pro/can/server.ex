@@ -7,7 +7,7 @@ defmodule RacingOrg.Tracker.Pro.CAN.Server do
 
   require Logger
 
-  alias RacingOrg.NMEA2000.FrameDecoder
+  alias RacingOrg.Tracker.NMEA2000.FrameDecoder
 
   def start_link(false), do: :ignore
 

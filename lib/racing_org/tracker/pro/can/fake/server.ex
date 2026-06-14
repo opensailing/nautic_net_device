@@ -8,7 +8,7 @@ defmodule RacingOrg.Tracker.Pro.CAN.Fake.Server do
   require Logger
 
   alias RacingOrg.Tracker.Pro.CAN.CANUSB.Protocol
-  alias RacingOrg.NMEA2000.Frame
+  alias RacingOrg.Tracker.NMEA2000.Frame
 
   @name __MODULE__
   @one_day_in_seconds 24 * 60 * 60

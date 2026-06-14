@@ -62,7 +62,7 @@ defmodule RacingOrg.Tracker.Pro.DataSetUploader do
         Logger.debug("Uploaded #{path} (#{size} bytes); #{length(File.ls!(dir))} file(s) remain")
 
       {:error, reason} ->
-        Logger.warn("Error uploading #{path}: #{inspect(reason)}")
+        Logger.warning("Error uploading #{path}: #{inspect(reason)}")
         Process.send_after(self(), {:upload, path}, @retry_after)
     end
 

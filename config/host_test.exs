@@ -3,6 +3,8 @@
 #
 import Config
 
+config :logger, :default_handler, false
+
 # Don't start these servers for testing; we will supervise them manually
 # in the test cases
 config :racing_org_tracker, RacingOrg.Tracker.Pro.CAN, false

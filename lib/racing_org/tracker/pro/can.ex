@@ -3,7 +3,7 @@ defmodule RacingOrg.Tracker.Pro.CAN do
   Entrypoint for reading and writing from the CAN bus.
   """
 
-  alias RacingOrg.NMEA2000.Packet
+  alias RacingOrg.Tracker.NMEA2000.Packet
 
   def child_spec(config) do
     %{

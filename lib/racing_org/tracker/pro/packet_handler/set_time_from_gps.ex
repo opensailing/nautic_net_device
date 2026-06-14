@@ -55,9 +55,19 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.SetTimeFromGPS do
     if diff > 10 and direction == :gt do
       gps_datetime
       |> DateTime.to_naive()
-      |> NervesTime.set_system_time()
+      |> set_system_time()
     end
 
     :ok
+  end
+
+  defp set_system_time(datetime) do
+    nerves_time = Module.concat([NervesTime])
+
+    if Code.ensure_loaded?(nerves_time) and function_exported?(nerves_time, :set_system_time, 1) do
+      apply(nerves_time, :set_system_time, [datetime])
+    else
+      :ok
+    end
   end
 end

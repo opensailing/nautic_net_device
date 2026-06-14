@@ -6,7 +6,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.PgnEncodeTest do
   # We assert round-trip correctness: PgnEncode emits a payload that, decoded by the
   # SAME deps' decoders the device uses to RECEIVE these PGNs, recovers the input
   # within scaling tolerance. That guarantees ENCODE is the inverse of DECODE.
-  alias RacingOrg.NMEA2000.J1939
+  alias RacingOrg.Tracker.NMEA2000.J1939
 
   @deg_per_rad 180.0 / :math.pi()
 
