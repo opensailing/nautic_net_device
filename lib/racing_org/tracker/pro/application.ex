@@ -59,6 +59,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
       {RacingOrg.Tracker.Pro.Sampling, name: RacingOrg.Tracker.Pro.Sampling},
       archive_child(),
       {RacingOrg.Tracker.Pro.Nav.Broadcaster, name: RacingOrg.Tracker.Pro.Nav.Broadcaster},
+      {RacingOrg.Tracker.Pro.Nav.DeviationMonitor, name: RacingOrg.Tracker.Pro.Nav.DeviationMonitor},
       {RacingOrg.Tracker.Pro.Compute.Broadcaster, name: RacingOrg.Tracker.Pro.Compute.Broadcaster},
       race_timer_broadcaster_child(),
       waypoint_broadcaster_child(),
@@ -217,6 +218,15 @@ defmodule RacingOrg.Tracker.Pro.Application do
   defp waypoint_broadcaster_child do
     {RacingOrg.Tracker.Pro.Compute.WaypointBroadcaster, name: RacingOrg.Tracker.Pro.Compute.WaypointBroadcaster}
   end
+
+  # RacingOrg.Tracker.Pro.Nav.DeviationMonitor (on-water P3): every 10 s, while RACING, it
+  # compares the boat's cross-track error (the same Nav.State the Nav.Broadcaster derives)
+  # against the server-pushed deviation_threshold_meters (from Tracking.Config) and asks
+  # the backend for a route recalc — ONCE per excursion (a new route or a cooldown re-arms
+  # it). It is wired with all default-named collaborators (Commands / Sampling /
+  # Tracking.Config / ChannelClient); cheap + idle until a race is underway, and the recalc
+  # push is best-effort + session-gated so it never couples to channel state. Must start
+  # AFTER Commands + Sampling + Tracking.Config (it subscribes to / reads them in init).
 
   defp product do
     case Application.get_env(:racing_org_tracker, :product) do

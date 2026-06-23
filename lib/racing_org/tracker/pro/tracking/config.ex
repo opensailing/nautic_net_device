@@ -44,11 +44,20 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
   # Safe defaults until the server pushes a config: 1 Hz, no smoothing.
   @default_state %{damping_seconds: 0.0, send_rate_hz: 1.0}
 
+  # Route-deviation threshold (meters of cross-track error) at which the device
+  # requests a route recalc (P3). Pushed in the same set_tracking payload; this is
+  # the default when the server omits it (older server) or sends a bad value.
+  @default_deviation_threshold_m 50.0
+
   @default_store_dir "/data/tracking"
 
   @type state_name :: :pre_race | :starting | :race
   @type state_config :: %{damping_seconds: float(), send_rate_hz: float()}
-  @type config :: %{version: integer(), states: %{state_name() => state_config()}}
+  @type config :: %{
+          version: integer(),
+          states: %{state_name() => state_config()},
+          deviation_threshold_meters: float()
+        }
 
   # --- Client API ---
 
@@ -89,8 +98,19 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
     GenServer.call(server, :applied_version)
   end
 
-  @doc "The full status: applied version + all three states."
-  @spec status(GenServer.server()) :: %{applied_version: integer() | nil, states: map()}
+  @doc """
+  The current route-deviation threshold in meters of cross-track error (the
+  `RacingOrg.Tracker.Pro.Nav.DeviationMonitor` reads this). Defaults to 50.0 m
+  until the server pushes a config carrying `deviation_threshold_meters`.
+  """
+  @spec deviation_threshold(GenServer.server()) :: float()
+  def deviation_threshold(server \\ __MODULE__) do
+    GenServer.call(server, :deviation_threshold)
+  end
+
+  @doc "The full status: applied version + all three states + deviation threshold."
+  @spec status(GenServer.server()) ::
+          %{applied_version: integer() | nil, states: map(), deviation_threshold_meters: float()}
   def status(server \\ __MODULE__) do
     GenServer.call(server, :status)
   end
@@ -104,7 +124,8 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
       on_apply: Keyword.get(opts, :on_apply, fn _config -> :ok end),
       # nil = nothing applied yet, so any incoming version (incl. 0) is newer.
       applied_version: nil,
-      states: default_states()
+      states: default_states(),
+      deviation_threshold_meters: @default_deviation_threshold_m
     }
 
     {:ok, reconcile(opts, state)}
@@ -124,8 +145,18 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
     {:reply, state.applied_version, state}
   end
 
+  def handle_call(:deviation_threshold, _from, state) do
+    {:reply, state.deviation_threshold_meters, state}
+  end
+
   def handle_call(:status, _from, state) do
-    {:reply, %{applied_version: state.applied_version, states: state.states}, state}
+    status = %{
+      applied_version: state.applied_version,
+      states: state.states,
+      deviation_threshold_meters: state.deviation_threshold_meters
+    }
+
+    {:reply, status, state}
   end
 
   # --- Reconcile / apply pipeline ---
@@ -137,7 +168,7 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
     cond do
       cfg = opts[:initial_config] ->
         case normalize(cfg) do
-          {:ok, config} -> %{state | states: config.states, applied_version: config.version}
+          {:ok, config} -> apply_config_to_state(state, config)
           {:error, _} -> state
         end
 
@@ -148,12 +179,26 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
         case Store.load(state.store_dir) do
           {:ok, config} ->
             Logger.info("[Tracking.Config] reconciling persisted config (version=#{config.version})")
-            %{state | states: config.states, applied_version: config.version}
+            # A config persisted by an older build has no threshold key; fall back to
+            # the default so the in-memory value is always a real float.
+            apply_config_to_state(state, Map.put_new(config, :deviation_threshold_meters, @default_deviation_threshold_m))
 
           :empty ->
             state
         end
     end
+  end
+
+  # Apply a normalized config map onto the GenServer state (states + version +
+  # deviation threshold). Used by both boot reconciliation and a live apply.
+  defp apply_config_to_state(state, config) do
+    %{
+      state
+      | states: config.states,
+        applied_version: config.version,
+        deviation_threshold_meters:
+          Map.get(config, :deviation_threshold_meters, state.deviation_threshold_meters)
+    }
   end
 
   # Malformed payload: do not half-apply. A version <= the last-applied version is
@@ -169,7 +214,7 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
 
       {:ok, config} ->
         _ = maybe_persist(state.store_dir, config)
-        state = %{state | states: config.states, applied_version: config.version}
+        state = apply_config_to_state(state, config)
         _ = safe_on_apply(state.on_apply, config)
         {{:ok, config}, state}
     end
@@ -192,11 +237,26 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
     with {:ok, version} <- fetch_version(raw),
          {:ok, states_map} <- fetch_states(raw),
          {:ok, states} <- normalize_states(states_map) do
-      {:ok, %{version: version, states: states}}
+      {:ok,
+       %{
+         version: version,
+         states: states,
+         deviation_threshold_meters: fetch_deviation_threshold(raw)
+       }}
     end
   end
 
   defp normalize(_), do: {:error, :malformed}
+
+  # The route-deviation threshold is OPTIONAL (an older server omits it) and never
+  # invalidates the whole config: a missing / non-numeric / non-positive value falls
+  # back to the safe default rather than rejecting the payload.
+  defp fetch_deviation_threshold(raw) do
+    case fetch(raw, :deviation_threshold_meters, "deviation_threshold_meters") do
+      n when is_number(n) and n > 0 -> n / 1
+      _ -> @default_deviation_threshold_m
+    end
+  end
 
   defp fetch_version(raw) do
     case fetch(raw, :version, "version") do

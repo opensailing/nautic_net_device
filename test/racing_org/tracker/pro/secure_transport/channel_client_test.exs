@@ -664,6 +664,92 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     end
   end
 
+  # --- route-deviation recalc (P3): request_route_recalc over the channel ---
+
+  describe "request_route_recalc (SocketTest)" do
+    # Bring a client to a LIVE session, reusing the streamback fakes/flow.
+    defmodule RecalcFakeWiFi do
+      use Agent
+
+      def start_link(_opts),
+        do: Agent.start_link(fn -> %{enabled: false, ssid: nil, connection: :disconnected, signal: nil} end)
+
+      def current_status(agent), do: Agent.get(agent, & &1)
+    end
+
+    defp connect_live_recalc(ctx) do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      {:ok, wifi} = start_supervised(RecalcFakeWiFi)
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           wifi: {RecalcFakeWiFi, wifi},
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+
+      {:ok, hello_wire, rstate} =
+        Handshake.responder_hello(
+          server_identity_private: ctx.srv_priv,
+          server_identity_public: ctx.srv_pub,
+          device_identity_public: ctx.identity.public_key,
+          epoch: 0
+        )
+
+      push(client, topic, "handshake_hello", %{"hello" => Base.encode64(hello_wire)})
+      assert_push(^topic, "handshake_init", %{"init" => init_b64})
+      {:ok, init_wire} = Base.decode64(init_b64)
+      {:ok, server_session} = Handshake.responder_finalize(rstate, init_wire)
+      push(client, topic, "handshake_ok", %{"session_id" => Base.encode64(server_session.session_id)})
+
+      assert_push(^topic, "wifi_status", _wifi)
+      assert eventually(fn -> SessionHolder.live?(holder) end)
+      {client, topic}
+    end
+
+    test "pushes request_route_recalc with the current position when a session is live", ctx do
+      {client, topic} = connect_live_recalc(ctx)
+
+      assert :ok = ChannelClient.request_route_recalc(client, {42.5, -70.83})
+
+      assert_push(^topic, "request_route_recalc", payload)
+      assert payload.position.latitude == 42.5
+      assert payload.position.longitude == -70.83
+    end
+
+    test "pushes request_route_recalc with no position when none is available", ctx do
+      {client, topic} = connect_live_recalc(ctx)
+
+      assert :ok = ChannelClient.request_route_recalc(client, nil)
+
+      assert_push(^topic, "request_route_recalc", payload)
+      # The server resolves the device→active race + position from telemetry, so an
+      # absent position is a valid (empty) request, never a crash.
+      refute Map.has_key?(payload, :position)
+    end
+
+    test "no-ops (no push) when there is no live session", ctx do
+      client =
+        start_supervised!({ChannelClient, name: nil, auto_connect?: false, keystore_opts: [base_path: ctx.base]})
+
+      assert :ok = ChannelClient.request_route_recalc(client, {42.0, -71.0})
+      refute_push("request_route_recalc", _payload, 50)
+      assert Process.alive?(client)
+    end
+
+    test "no-ops safely when the target process is not running" do
+      assert :ok = ChannelClient.request_route_recalc(:no_such_channel_client, {42.0, -71.0})
+    end
+  end
+
   defp eventually(fun, retries \\ 50) do
     cond do
       fun.() ->

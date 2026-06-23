@@ -136,4 +136,74 @@ defmodule RacingOrg.Tracker.Pro.Tracking.ConfigTest do
       assert status.states.race == %{damping_seconds: 0.5, send_rate_hz: 10.0}
     end
   end
+
+  # P3: the server pushes the route-deviation threshold (meters) in the SAME
+  # set_tracking payload. The Config parses + persists + exposes it; the
+  # DeviationMonitor reads it. Absent (older server) -> a safe 50.0 m default.
+  describe "deviation_threshold_meters" do
+    test "defaults to 50.0 m before any config is applied", %{dir: dir} do
+      pid = start(dir: dir)
+      assert Config.deviation_threshold(pid) == 50.0
+    end
+
+    test "reads deviation_threshold_meters from the set_tracking payload", %{dir: dir} do
+      pid = start(dir: dir)
+      payload = Map.put(payload(0), "deviation_threshold_meters", 75.0)
+      assert {:ok, applied} = Config.apply_config(pid, payload)
+      assert applied.deviation_threshold_meters == 75.0
+      assert Config.deviation_threshold(pid) == 75.0
+    end
+
+    test "defaults to 50.0 m when the payload omits the threshold (older server)", %{dir: dir} do
+      pid = start(dir: dir)
+      assert {:ok, applied} = Config.apply_config(pid, payload(0))
+      assert applied.deviation_threshold_meters == 50.0
+      assert Config.deviation_threshold(pid) == 50.0
+    end
+
+    test "accepts an integer threshold and coerces it to a float", %{dir: dir} do
+      pid = start(dir: dir)
+      payload = Map.put(payload(0), "deviation_threshold_meters", 40)
+      assert {:ok, applied} = Config.apply_config(pid, payload)
+      assert applied.deviation_threshold_meters == 40.0
+    end
+
+    test "ignores a non-positive / malformed threshold and keeps the default", %{dir: dir} do
+      pid = start(dir: dir)
+      payload = Map.put(payload(0), "deviation_threshold_meters", -5.0)
+      assert {:ok, applied} = Config.apply_config(pid, payload)
+      assert applied.deviation_threshold_meters == 50.0
+    end
+
+    test "a newer config updates the threshold (mid-race change takes effect)", %{dir: dir} do
+      pid = start(dir: dir)
+      assert {:ok, _} = Config.apply_config(pid, Map.put(payload(0), "deviation_threshold_meters", 60.0))
+      assert Config.deviation_threshold(pid) == 60.0
+
+      assert {:ok, _} = Config.apply_config(pid, Map.put(payload(1), "deviation_threshold_meters", 120.0))
+      assert Config.deviation_threshold(pid) == 120.0
+    end
+
+    test "persists + reloads the threshold across a reboot", %{dir: dir} do
+      pid = start(dir: dir)
+      assert {:ok, _} = Config.apply_config(pid, Map.put(payload(0), "deviation_threshold_meters", 88.0))
+      assert {:ok, persisted} = Store.load(dir)
+      assert persisted.deviation_threshold_meters == 88.0
+
+      # A fresh manager started on the same dir reconciles the persisted threshold.
+      pid2 =
+        start_supervised!(
+          {Config, name: nil, store_dir: dir, on_apply: fn _ -> :ok end},
+          id: {Config, :reload}
+        )
+
+      assert Config.deviation_threshold(pid2) == 88.0
+    end
+
+    test "status includes the deviation threshold", %{dir: dir} do
+      pid = start(dir: dir)
+      assert {:ok, _} = Config.apply_config(pid, Map.put(payload(0), "deviation_threshold_meters", 65.0))
+      assert Config.status(pid).deviation_threshold_meters == 65.0
+    end
+  end
 end

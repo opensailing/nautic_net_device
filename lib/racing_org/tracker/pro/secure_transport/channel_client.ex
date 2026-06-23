@@ -135,6 +135,28 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     :ok
   end
 
+  @doc """
+  Request a route recalc from the backend (P3), as the `"request_route_recalc"`
+  event. `position` is `{lat, lon}` (the boat's exact position at the deviation) or
+  `nil`; when present it is sent as `%{position: %{latitude: lat, longitude: lon}}`,
+  otherwise the payload is empty and the server resolves the position from telemetry.
+
+  Best-effort + session-gated, exactly like `send_computed_values_data/2`: it casts to
+  the running client, which pushes ONLY when a secure session is live. With no live
+  session — or no running client — it is a no-op. Always returns `:ok` and never
+  raises (the `RacingOrg.Tracker.Pro.Nav.DeviationMonitor` calls this and must never be
+  coupled to channel state).
+  """
+  @spec request_route_recalc(GenServer.server(), {number(), number()} | nil) :: :ok
+  def request_route_recalc(server \\ __MODULE__, position) do
+    case GenServer.whereis(server) do
+      pid when is_pid(pid) -> send(pid, {:request_route_recalc, position})
+      _ -> :ok
+    end
+
+    :ok
+  end
+
   # --- Slipstream callbacks ---
 
   @impl Slipstream
@@ -375,6 +397,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     {:noreply, push_computed_values_data(socket, values)}
   end
 
+  # The DeviationMonitor asks for a recalc when the boat deviates past the threshold.
+  # Push it as "request_route_recalc" ONLY when a secure session is live; otherwise
+  # drop it (best-effort, like telemetry).
+  def handle_info({:request_route_recalc, position}, socket) do
+    {:noreply, push_request_route_recalc(socket, position)}
+  end
+
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   # --- internal ---
@@ -404,6 +433,25 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
     socket
   end
+
+  # Push a "request_route_recalc". Gated on a LIVE secure session (joined topic +
+  # holder-confirmed session), exactly like the streamback. A `{lat, lon}` position is
+  # sent as %{position: %{latitude, longitude}}; nil sends an empty payload (the server
+  # resolves the device→race + position from telemetry). No-op with no live session.
+  defp push_request_route_recalc(%{assigns: %{topic: nil}} = socket, _position), do: socket
+
+  defp push_request_route_recalc(socket, position) do
+    if session_live?(socket) do
+      push(socket, socket.assigns.topic, "request_route_recalc", recalc_payload(position))
+    end
+
+    socket
+  end
+
+  defp recalc_payload({lat, lon}) when is_number(lat) and is_number(lon),
+    do: %{position: %{latitude: lat, longitude: lon}}
+
+  defp recalc_payload(_), do: %{}
 
   # The session is live once the handshake has completed and published it to the
   # holder (and not since been evicted/disconnected). Defaults to false if the holder
