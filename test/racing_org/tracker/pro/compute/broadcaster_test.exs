@@ -243,6 +243,120 @@ defmodule RacingOrg.Tracker.Pro.Compute.BroadcasterTest do
     end
   end
 
+  describe "B&G 130824 target/VMG/next-leg key-value broadcast" do
+    # B&G = 381, Marine = 4 -> manufacturer header bytes 7D 99 (see PgnEncode).
+    @bandg_header <<0x7D, 0x99>>
+
+    test "a 130824 next_leg_awa def broadcasts a B&G key-value frame on tick" do
+      values = [
+        result(
+          %{output_pgn: 130_824, output_field: "next_leg_awa", broadcast_enabled: true, damping_seconds: 0.0},
+          %{"next_leg_awa" => 30.0},
+          true
+        )
+      ]
+
+      %{bcast: b} = start_bcast(values)
+      assert Broadcaster.tick_now(b) >= 1
+
+      assert_receive {:tx, _priority, 130_824, payload}
+      # Key 111, length 2 (descriptor 6F 20), 30 deg -> 0.5236 rad -> 5236 = LE 74 14.
+      assert payload == @bandg_header <> <<0x6F, 0x20, 0x74, 0x14>>
+    end
+
+    test "a 130824 target_boat_speed def broadcasts its Key 125 frame" do
+      values = [
+        result(
+          %{output_pgn: 130_824, output_field: "target_boat_speed", broadcast_enabled: true, damping_seconds: 0.0},
+          %{"target_boat_speed" => 5.0},
+          true
+        )
+      ]
+
+      %{bcast: b} = start_bcast(values)
+      Broadcaster.tick_now(b)
+
+      assert_receive {:tx, _p, 130_824, payload}
+      # Key 125 -> descriptor 7D 20; 5.0 m/s -> 500 = LE F4 01.
+      assert payload == @bandg_header <> <<0x7D, 0x20, 0xF4, 0x01>>
+    end
+
+    test "the standard PGNs still encode/broadcast as before (no regression)" do
+      values = [
+        result(%{output_pgn: 128_259, output_field: "speed_water_referenced"}, %{"value" => 4.0}, true),
+        result(
+          %{output_pgn: 130_824, output_field: "vmg", broadcast_enabled: true, damping_seconds: 0.0},
+          %{"vmg" => 3.21},
+          true
+        )
+      ]
+
+      %{bcast: b} = start_bcast(values)
+      Broadcaster.tick_now(b)
+
+      # The standard speed PGN is unchanged...
+      assert_receive {:tx, _p, 128_259, speed_payload}
+      assert_in_delta J1939.SpeedParams.decode(speed_payload).water_speed, 4.0, 0.01
+      # ...and the new 130824 vmg frame is also emitted (Key 127 -> 7F 20; 3.21 -> 321 = 41 01).
+      assert_receive {:tx, _p, 130_824, vmg_payload}
+      assert vmg_payload == @bandg_header <> <<0x7F, 0x20, 0x41, 0x01>>
+    end
+
+    test "target_twa / next_leg_awa are damped CIRCULARLY (short way across the wrap)" do
+      clock = :counters.new(1, [])
+      :counters.put(clock, 1, 0)
+      now_fn = fn -> :counters.get(clock, 1) end
+
+      mk = fn angle ->
+        [
+          result(
+            %{
+              id: "twa-circular",
+              output_pgn: 130_824,
+              output_field: "target_twa",
+              broadcast_enabled: true,
+              damping_seconds: 2.0,
+              broadcast_rate_hz: 100.0
+            },
+            %{"target_twa" => angle},
+            true
+          )
+        ]
+      end
+
+      {:ok, engine} = StubEngine.start(mk.(170.0))
+      test_pid = self()
+
+      b =
+        start_supervised!(
+          {Broadcaster,
+           engine: {StubEngine, engine},
+           tick_ms: 3_600_000,
+           now_fn: now_fn,
+           transmit_fn: fn _p, pgn, payload -> send(test_pid, {:tx, pgn, payload}) end,
+           name: nil},
+          id: {Broadcaster, System.unique_integer([:positive])}
+        )
+
+      # Seed at 170 deg.
+      Broadcaster.tick_now(b)
+      assert_receive {:tx, 130_824, _p0}
+
+      # Step to -170 deg (i.e. 190). The SHORT way from 170 to -170 crosses ±180, so a
+      # circular blend lands NEAR ±180 (|deg| > 170), not back through 0. A linear mean
+      # of 170 and -170 would give ~0 — this proves circular damping is applied.
+      StubEngine.set(engine, mk.(-170.0))
+      :counters.put(clock, 1, 1_000)
+      Broadcaster.tick_now(b)
+      assert_receive {:tx, 130_824, p1}
+      # Decode the i16 rad value out of the B&G frame and back to degrees.
+      <<_hdr::binary-2, _desc::binary-2, raw::little-signed-16>> = p1
+      deg = raw * 1.0e-4 * @deg_per_rad
+      assert abs(deg) > 170.0
+      refute abs(deg) < 90.0
+    end
+  end
+
   describe "broadcasting status" do
     test "broadcasting? is true after a tick actually sent something" do
       values = [result(%{}, %{"value" => 4.0}, true)]

@@ -317,10 +317,37 @@ defmodule RacingOrg.Tracker.Pro.Compute.PgnEncode do
     end
   end
 
-  # --- 130824 B&G (best effort — NEEDS ON-HARDWARE VALIDATION) ----------------------
+  # --- 130824 B&G target / VMG / next-leg key-value entries -------------------------
 
-  defp do_encode(130_824, _def, outputs) do
-    proprietary(@mfg_bandg, outputs)
+  # The Phase-2 polar TARGET/VMG/next-leg outputs have NO standard PGN — their only home
+  # on a B&G/Zeus display is PGN 130824 "B&G: key-value data" as a key-value entry,
+  # exactly like the race timer (Key 117). Each `output_field` below maps to a canboat
+  # BANDG_KEY_VALUE key + wire type + resolution; we quantize the catalog value (speeds
+  # m/s, ANGLES converted DEG→RAD, percent %) and serialize ONE entry with the SAME
+  # `serialize_with_entry/3` / `manufacturer_word/1` machinery the race timer uses.
+  #
+  # HARDWARE-VALIDATION: these keys/resolutions are reverse-engineered (like Key 117) and
+  # need a bench sniff against a real B&G display; the encode tests lock the wire layout.
+  # {key, wire-type, resolution}. :u16 ×1/res unsigned; :i16 signed; :rad_i16 converts
+  # the catalog DEGREES to radians before quantizing.
+  @bandg_target_keys %{
+    "target_boat_speed" => {125, :u16, 0.01},
+    "target_twa" => {83, :rad_i16, 0.0001},
+    "vmg" => {127, :u16, 0.01},
+    "vmg_performance" => {285, :u16, 0.1},
+    "next_leg_awa" => {111, :rad_i16, 0.0001},
+    "next_leg_aws" => {113, :u16, 0.01}
+  }
+
+  defp do_encode(130_824, def, outputs) do
+    case Map.fetch(@bandg_target_keys, def.output_field) do
+      {:ok, {key, wire, resolution}} ->
+        bandg_key_value(key, wire, resolution, def.output_field, outputs)
+
+      :error ->
+        # Best-effort fallback (e.g. a generic "value" def): manufacturer header + scalar.
+        proprietary(@mfg_bandg, outputs)
+    end
   end
 
   # --- 65305 Simrad (best effort — NEEDS ON-HARDWARE VALIDATION) --------------------
@@ -330,6 +357,24 @@ defmodule RacingOrg.Tracker.Pro.Compute.PgnEncode do
   end
 
   defp do_encode(_pgn, _def, _outputs), do: :error
+
+  # One B&G PGN 130824 key-value entry: quantize the catalog output for `field` to its
+  # u16/i16 wire value (clamped to range — never wrapped/garbled), then serialize the
+  # B&G manufacturer header + the Key/Length descriptor + value via the SAME
+  # `serialize_with_entry/3` the race timer uses. A missing/invalid output is :error
+  # (nothing to encode), consistent with every other PGN here.
+  defp bandg_key_value(key, wire, resolution, field, outputs) do
+    with {:ok, value} <- first_value(outputs, [field]) do
+      raw = quantize_bandg(wire, value, resolution)
+      {:ok, serialize_with_entry(manufacturer_word(@mfg_bandg), key, <<raw::little-16>>)}
+    end
+  end
+
+  # Quantize a catalog value to its 2-byte B&G wire integer. :rad_i16 first converts the
+  # ANGLE from DEGREES to radians (wrapped to (-π, π]) — the wire unit for B&G angle keys;
+  # :u16 takes the (m/s or %) value as-is. Both clamp to range — never wrap/garble.
+  defp quantize_bandg(:rad_i16, deg, resolution), do: clamp_i16(round(wrap_pi(deg * @rad_per_deg) / resolution))
+  defp quantize_bandg(:u16, value, resolution), do: clamp_u16(round(value / resolution))
 
   # Best-effort proprietary frame: 2-byte manufacturer/industry header word, then the
   # scalar as an i16 (×100), padded to 8 bytes. The real layout is manufacturer-

@@ -203,6 +203,117 @@ defmodule RacingOrg.Tracker.Pro.Compute.PgnEncodeTest do
     end
   end
 
+  # PGN 130824 "B&G: key-value data" carrying the Phase-2 polar TARGET/VMG/next-leg
+  # outputs as key-value entries — the ONLY home this data has on a B&G/Zeus display
+  # (there is no standard PGN for it). Each frame is the 2-byte B&G/Marine manufacturer
+  # header, then ONE Key/Length descriptor + little-endian value, built by the SAME
+  # `serialize_with_entry/3` machinery the race timer (Key 117) uses.
+  #
+  # HARDWARE-VALIDATION: these keys/resolutions are reverse-engineered from the canboat
+  # BANDG_KEY_VALUE enum (like race-timer Key 117) and need a bench sniff against a real
+  # B&G display. These tests LOCK the exact byte layout we currently believe is correct.
+  describe "130824 B&G target/VMG/next-leg key-value entries — exact bytes" do
+    # B&G = 381, Marine = 4: serialized little-endian -> bytes 7D 99 (see race timer).
+    @bandg_header <<0x7D, 0x99>>
+
+    # Descriptor for a 2-byte value: low = key[0..7], high = key[8..11] | (2 << 4).
+    defp descriptor2(key) do
+      import Bitwise
+      <<key &&& 0xFF, (key >>> 8 &&& 0x0F) ||| 2 <<< 4>>
+    end
+
+    defp encode_field(field, value) do
+      d = def_for(130_824, %{output_field: field})
+      PgnEncode.encode(d, %{field => value})
+    end
+
+    test "target_boat_speed -> Key 125, u16 m/s ×100" do
+      # 5.0 m/s -> round(5.0 / 0.01) = 500 = 0x01F4 -> LE F4 01.
+      assert {:ok, payload} = encode_field("target_boat_speed", 5.0)
+      assert payload == @bandg_header <> descriptor2(125) <> <<0xF4, 0x01>>
+    end
+
+    test "vmg -> Key 127, u16 m/s ×100" do
+      # 3.21 m/s -> round(3.21 / 0.01) = 321 = 0x0141 -> LE 41 01.
+      assert {:ok, payload} = encode_field("vmg", 3.21)
+      assert payload == @bandg_header <> descriptor2(127) <> <<0x41, 0x01>>
+    end
+
+    test "next_leg_aws -> Key 113, u16 m/s ×100" do
+      # 12.0 m/s -> round(12.0 / 0.01) = 1200 = 0x04B0 -> LE B0 04.
+      assert {:ok, payload} = encode_field("next_leg_aws", 12.0)
+      assert payload == @bandg_header <> descriptor2(113) <> <<0xB0, 0x04>>
+    end
+
+    test "vmg_performance -> Key 285, u16 percent ×10" do
+      # 95.0 % -> round(95.0 / 0.1) = 950 = 0x03B6 -> LE B6 03.
+      assert {:ok, payload} = encode_field("vmg_performance", 95.0)
+      assert payload == @bandg_header <> descriptor2(285) <> <<0xB6, 0x03>>
+    end
+
+    test "target_twa -> Key 83, i16 radians ×10000 (deg→rad)" do
+      # 42.0 deg -> 0.733038... rad -> round(0.733038 / 0.0001) = 7330 = 0x1CA2 -> LE A2 1C.
+      assert {:ok, payload} = encode_field("target_twa", 42.0)
+      assert payload == @bandg_header <> descriptor2(83) <> <<0xA2, 0x1C>>
+    end
+
+    test "next_leg_awa -> Key 111, i16 radians ×10000 (deg→rad)" do
+      # The worked example: 30 deg -> 0.5235987 rad -> round(/1e-4) = 5236 = 0x1474 -> LE 74 14.
+      assert {:ok, payload} = encode_field("next_leg_awa", 30.0)
+      assert payload == @bandg_header <> descriptor2(111) <> <<0x74, 0x14>>
+    end
+
+    test "angle keys are SIGNED i16: a negative angle encodes a negative raw value" do
+      # next_leg_awa -30 deg -> -0.5235987 rad -> -5236 -> i16 LE = 0xEB8C bytes 8C EB.
+      assert {:ok, payload} = encode_field("next_leg_awa", -30.0)
+      <<_hdr::binary-2, _desc::binary-2, raw::little-signed-16>> = payload
+      assert raw == -5236
+    end
+
+    test "every target frame is exactly 6 bytes (2 header + 2 descriptor + 2 value)" do
+      for {field, v} <- [
+            {"target_boat_speed", 5.0},
+            {"target_twa", 42.0},
+            {"vmg", 3.0},
+            {"vmg_performance", 90.0},
+            {"next_leg_awa", 30.0},
+            {"next_leg_aws", 10.0}
+          ] do
+        assert {:ok, payload} = encode_field(field, v)
+        assert byte_size(payload) == 6
+      end
+    end
+
+    test "an out-of-range speed clamps to the u16 max, never wraps/garbles" do
+      # 700 m/s -> round(/0.01) = 70_000 > u16 max -> clamps to 0xFFFE.
+      assert {:ok, payload} = encode_field("target_boat_speed", 700.0)
+      <<_hdr::binary-2, _desc::binary-2, raw::little-16>> = payload
+      assert raw == 0xFFFE
+    end
+
+    test "an angle past ±180 wraps the short way into (-π, π], keeping i16 in range" do
+      # 200 deg wraps to -160 deg = -2.7925 rad -> round(/1e-4) = -27925. Wrapping keeps
+      # |rad| <= π so the raw can never exceed the i16 range — no garbled wide-angle frame.
+      assert {:ok, payload} = encode_field("target_twa", 200.0)
+      <<_hdr::binary-2, _desc::binary-2, raw::little-signed-16>> = payload
+      assert raw == -27_925
+      assert raw in -0x8000..(0x7FFF - 1)
+    end
+
+    test "a missing/invalid target output is :error (nothing to encode, no garbage)" do
+      d = def_for(130_824, %{output_field: "next_leg_awa"})
+      assert :error = PgnEncode.encode(d, %{})
+      assert :error = PgnEncode.encode(d, %{"next_leg_awa" => "nan"})
+    end
+
+    test "the best-effort 'value' field still encodes (no regression to the fallback)" do
+      d = def_for(130_824, %{output_field: "value"})
+      assert {:ok, payload} = PgnEncode.encode(d, %{"value" => 3.3})
+      assert byte_size(payload) == 8
+      <<_mfg_word::little-16, _rest::binary>> = payload
+    end
+  end
+
   # PGN 129284 "Navigation Data" — the bearing/distance/destination data-box that a
   # B&G/Zeus plotter renders for the active waypoint. 34-byte fast packet. Field order
   # and encodings per canboat + the ttlappalainen library (see PgnEncode.navigation_data_129284/1).

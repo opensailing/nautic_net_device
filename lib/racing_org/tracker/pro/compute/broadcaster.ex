@@ -29,10 +29,12 @@ defmodule RacingOrg.Tracker.Pro.Compute.Broadcaster do
   output, so smoothing is cadence-independent. Each output is classified as
 
     * `:circular` — angles/bearings that wrap 0⇄360: `true_wind_angle`,
-      `true_wind_direction`, `wind_angle`, `heading`, `cog`, `yaw` (smoothed via the
-      unit-vector sin/cos components so the mean goes "the short way" across the wrap);
+      `true_wind_direction`, `wind_angle`, `heading`, `cog`, `yaw`, `target_twa`,
+      `next_leg_awa` (smoothed via the unit-vector sin/cos components so the mean goes
+      "the short way" across the wrap);
     * `:linear` — everything else: speeds (`true_wind_speed`, `sog`, `boat_speed`,
-      `value`), `depth`, temperature, `vmg`, `vmc`, `pitch`, `roll`.
+      `value`, `target_boat_speed`, `next_leg_aws`), `depth`, temperature, `vmg`,
+      `vmg_performance`, `vmc`, `pitch`, `roll`.
 
   The Ewma works in RADIANS for circular quantities; outputs are catalog DEGREES, so a
   circular output is converted deg→rad before the filter and rad→deg after.
@@ -65,7 +67,10 @@ defmodule RacingOrg.Tracker.Pro.Compute.Broadcaster do
   # due values are batched into ONE message per flush to keep channel traffic minimal.
   @default_stream_interval_ms 500
 
-  # Outputs whose values are compass/relative bearings and must be damped circularly.
+  # Outputs whose values are compass/relative bearings and must be damped circularly
+  # (averaged the short way across the 0⇄360 wrap), never linearly. `target_twa` and
+  # `next_leg_awa` are the Phase-2 polar ANGLE outputs (relative wind angles, like
+  # `true_wind_angle`); the speeds/percent targets stay linear.
   @circular_outputs MapSet.new([
                       "true_wind_angle",
                       "true_wind_direction",
@@ -73,7 +78,9 @@ defmodule RacingOrg.Tracker.Pro.Compute.Broadcaster do
                       "wind_direction",
                       "heading",
                       "cog",
-                      "yaw"
+                      "yaw",
+                      "target_twa",
+                      "next_leg_awa"
                     ])
 
   @deg_per_rad 180.0 / :math.pi()
