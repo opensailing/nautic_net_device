@@ -476,8 +476,10 @@ defmodule RacingOrg.Tracker.Pro.Polar.Lookup do
     {hs, deltas} = secants(pairs)
     n = length(xs)
 
+    # Only n >= 3 has interior nodes; for n == 2 this must be EMPTY (a descending
+    # `1..0` range would otherwise iterate [1, 0] and index out of bounds).
     interior =
-      for k <- 1..(n - 2) do
+      for k <- 1..(n - 2)//1 do
         fc_interior_tangent(Enum.at(hs, k - 1), Enum.at(hs, k), Enum.at(deltas, k - 1), Enum.at(deltas, k))
       end
 

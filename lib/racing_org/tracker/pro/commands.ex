@@ -66,6 +66,27 @@ defmodule RacingOrg.Tracker.Pro.Commands do
   @spec current_polar(GenServer.server()) :: Polar.t() | nil
   def current_polar(server \\ __MODULE__), do: GenServer.call(server, :current_polar)
 
+  @doc """
+  The precompiled polar interpolant (`RacingOrg.Tracker.Pro.Polar.Lookup`) for the
+  current polar, or `nil` (no polar, or a polar whose grid did not compile).
+
+  This is built ONCE — when a polar is applied (or rehydrated on boot) — and cached
+  in state, NOT rebuilt per read. The compute engine reads it once per polar version
+  and caches it locally, so the live compute hot path never rebuilds the interpolant
+  and never copies the source polar. See `Polar.Lookup.build/1`.
+  """
+  @spec current_polar_lookup(GenServer.server()) :: Polar.Lookup.t() | nil
+  def current_polar_lookup(server \\ __MODULE__), do: GenServer.call(server, :current_polar_lookup)
+
+  @doc "The current polar's monotonic version, or `nil` when no polar is loaded."
+  @spec current_polar_version(GenServer.server()) :: non_neg_integer() | nil
+  def current_polar_version(server \\ __MODULE__) do
+    case current_polar(server) do
+      %Polar{version: v} -> v
+      nil -> nil
+    end
+  end
+
   @doc "Subscribe `pid` to `{:racing_org_command, %DeviceCommand{}}` notifications."
   def subscribe(server \\ __MODULE__, pid \\ self()), do: GenServer.call(server, {:subscribe, pid})
 
@@ -86,6 +107,9 @@ defmodule RacingOrg.Tracker.Pro.Commands do
       applied_command_ids: MapSet.new(),
       assignment: nil,
       polar: nil,
+      # The compiled Polar.Lookup for `polar`, built ONCE on apply/restore (off the
+      # hot path) and cached here; nil when there is no polar or it didn't compile.
+      polar_lookup: nil,
       ack: nil,
       subscribers: MapSet.new(),
       now_fn: opts[:now_fn] || (&DateTime.utc_now/0),
@@ -122,9 +146,24 @@ defmodule RacingOrg.Tracker.Pro.Commands do
 
   defp restore_polar(%{polar_dir: dir} = state) do
     case Polar.Store.load(dir) do
-      {:ok, %Polar{} = polar} -> %{state | polar: polar}
+      {:ok, %Polar{} = polar} -> %{state | polar: polar, polar_lookup: build_lookup(polar)}
       :empty -> state
     end
+  end
+
+  # Build the compiled interpolant once; a polar whose grid does not compile (empty /
+  # degenerate) yields a nil lookup (the raw polar is still kept). The polar arrives
+  # from the network, so guard the build defensively: a malformed grid must never
+  # crash the command pipeline — it just leaves the lookup nil.
+  defp build_lookup(%Polar{} = polar) do
+    case Polar.Lookup.build(polar) do
+      {:ok, lookup} -> lookup
+      {:error, _reason} -> nil
+    end
+  rescue
+    error ->
+      Logger.warning("[Commands] polar lookup build failed: #{inspect(error)}")
+      nil
   end
 
   @impl true
@@ -136,6 +175,7 @@ defmodule RacingOrg.Tracker.Pro.Commands do
   def handle_call(:current_ack, _from, state), do: {:reply, state.ack, state}
   def handle_call(:current_assignment, _from, state), do: {:reply, state.assignment, state}
   def handle_call(:current_polar, _from, state), do: {:reply, state.polar, state}
+  def handle_call(:current_polar_lookup, _from, state), do: {:reply, state.polar_lookup, state}
 
   def handle_call({:subscribe, pid}, _from, state) do
     {:reply, :ok, %{state | subscribers: MapSet.put(state.subscribers, pid)}}
@@ -259,7 +299,9 @@ defmodule RacingOrg.Tracker.Pro.Commands do
   defp apply_polar(state, %DeviceCommand{payload: {:polar_table, %PolarTable{} = table}}) do
     polar = Polar.from_protobuf(table)
     maybe_persist_polar(state.polar_dir, polar)
-    %{state | polar: polar}
+    # Compile the interpolant ONCE here, on the apply path (off the hot path), and
+    # cache it so the compute engine never rebuilds it per tick.
+    %{state | polar: polar, polar_lookup: build_lookup(polar)}
   end
 
   defp apply_polar(state, %DeviceCommand{}), do: state

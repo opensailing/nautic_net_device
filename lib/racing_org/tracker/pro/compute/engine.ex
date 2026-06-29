@@ -58,16 +58,32 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
   signals come from a network-published true-wind PGN if one is present; the
   `true_wind` LIBRARY calc computes its own.)
 
-  All side effects (clock, persistence dir, max-age) are injectable via `start_link/1`
-  opts so the engine is fully unit-testable on host.
+  ## Polar interpolant (device state, not a signal)
+
+  The polar-aware calcs (`polar_performance`, `target_boat_speed`, `target_twa`,
+  `vmg_performance`) need the precompiled `RacingOrg.Tracker.Pro.Polar.Lookup`, which
+  is BOAT-scoped device state held by `RacingOrg.Tracker.Pro.Commands`, NOT a
+  telemetry signal. To keep the compute hot path cheap the engine caches the compiled
+  lookup (and its polar version) in its OWN state and refreshes it ONLY when the polar
+  changes — it subscribes to `Commands` and, on a `:polar_table` command
+  notification, does ONE `current_polar_lookup/1` fetch (off the hot path). Per
+  compute tick the cached lookup is threaded into the calcs via `Library.compute/3`;
+  there is no per-tick `GenServer.call`, no per-tick `Polar.Lookup.build/1`, and no
+  per-tick copy of the source polar. The `:commands` collaborator is injectable for
+  host tests (`{module, server}` or a bare module).
+
+  All side effects (clock, persistence dir, max-age, commands) are injectable via
+  `start_link/1` opts so the engine is fully unit-testable on host.
   """
 
   use GenServer
   require Logger
 
+  alias RacingOrg.Tracker.Pro.Commands
   alias RacingOrg.Tracker.Pro.Compute.Expr
   alias RacingOrg.Tracker.Pro.Compute.Library
   alias RacingOrg.Tracker.Pro.Compute.Store
+  alias RacingOrg.Tracker.Protobuf.DeviceCommand
 
   @default_store_dir "/data/computed_values"
   # A signal not updated within this many ms is STALE (any dependent computed value
@@ -204,6 +220,13 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
       max_age_ms: Keyword.get(opts, :max_age_ms, @default_max_age_ms),
       now_fn: Keyword.get(opts, :now_fn, fn -> System.monotonic_time(:millisecond) end),
       handler_id: handler_id,
+      # The Commands collaborator the cached polar lookup is fetched from. Pass `nil`
+      # to disable polar entirely (the polar calcs are then always invalid).
+      commands: normalize_commands(Keyword.get(opts, :commands, Commands)),
+      # The compiled polar interpolant + its polar version, cached locally so the hot
+      # path never rebuilds/refetches. Refreshed only on a polar-change notification.
+      polar_lookup: nil,
+      polar_version: nil,
       # nil = nothing applied yet, so any incoming version (incl. 0) is newer.
       applied_version: nil,
       defs: [],
@@ -213,6 +236,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
 
     state = reconcile(opts, state)
     attach_telemetry(handler_id, opts)
+    state = init_polar(state)
 
     {:ok, state}
   end
@@ -261,7 +285,62 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
     {:noreply, %{state | signals: signals}}
   end
 
+  # A polar-table command was applied -> the polar may have changed; refresh the
+  # cached lookup ONCE (off the hot path). Other commands are ignored here.
+  def handle_info({:racing_org_command, %DeviceCommand{payload: {:polar_table, _table}}}, state) do
+    {:noreply, refresh_polar(state)}
+  end
+
+  def handle_info({:racing_org_command, _command}, state), do: {:noreply, state}
+
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # --- polar lookup cache (built once per polar version, NOT per tick) ---
+
+  # On boot: subscribe to Commands for polar-change notifications, then prime the
+  # cache once. Disabled (commands == nil) leaves the lookup nil.
+  defp init_polar(%{commands: nil} = state), do: state
+
+  defp init_polar(%{commands: {module, server}} = state) do
+    subscribe_commands(module, server)
+    refresh_polar(state)
+  end
+
+  # Refresh the cached lookup + version from Commands. A single cross-process call,
+  # invoked ONLY on boot and on a polar-change notification — never per compute tick.
+  defp refresh_polar(%{commands: nil} = state), do: state
+
+  defp refresh_polar(%{commands: {module, server}} = state) do
+    %{state | polar_lookup: fetch_polar_lookup(module, server), polar_version: fetch_polar_version(module, server)}
+  end
+
+  defp subscribe_commands(module, server) do
+    if function_exported?(module, :subscribe, 2) do
+      module.subscribe(server, self())
+    end
+
+    :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp fetch_polar_lookup(module, server) do
+    module.current_polar_lookup(server)
+  catch
+    :exit, _ -> nil
+  end
+
+  defp fetch_polar_version(module, server) do
+    if function_exported?(module, :current_polar_version, 1) do
+      module.current_polar_version(server)
+    end
+  catch
+    :exit, _ -> nil
+  end
+
+  defp normalize_commands(nil), do: nil
+  defp normalize_commands({module, server}) when is_atom(module), do: {module, server}
+  defp normalize_commands(module) when is_atom(module), do: {module, module}
 
   # --- telemetry attach + decode (signal mapping + unit conversion) ---
 
@@ -371,10 +450,11 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
   end
 
   # Library: gather the def's required signals (FRESH only, honoring input_bindings)
-  # into a name=>value map and hand it to the native calc.
+  # into a name=>value map and hand it to the native calc, along with the cached
+  # polar context (the polar-aware calcs read `polar_lookup`; the others ignore it).
   defp eval_library(def, state, now) do
     signal_values = resolve_library_signals(def, state, now)
-    Library.compute(library_key_atom(def.library_key), signal_values)
+    Library.compute(library_key_atom(def.library_key), signal_values, %{polar_lookup: state.polar_lookup})
   end
 
   # Build the signals map a library calc sees. Each required raw signal is resolved
@@ -411,6 +491,10 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
   defp library_key_atom("true_wind"), do: :true_wind
   defp library_key_atom("vmg"), do: :vmg
   defp library_key_atom("vmc"), do: :vmc
+  defp library_key_atom("polar_performance"), do: :polar_performance
+  defp library_key_atom("target_boat_speed"), do: :target_boat_speed
+  defp library_key_atom("target_twa"), do: :target_twa
+  defp library_key_atom("vmg_performance"), do: :vmg_performance
   defp library_key_atom(key) when is_atom(key), do: key
   defp library_key_atom(_), do: :unknown
 
@@ -563,10 +647,16 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
     end
   end
 
+  @library_keys ~w(true_wind vmg vmc polar_performance target_boat_speed target_twa vmg_performance)
+
   defp fetch_type_fields(:library, raw) do
     case fetch(raw, :library_key, "library_key") do
-      key when key in ["true_wind", "vmg", "vmc", :true_wind, :vmg, :vmc] ->
-        {:ok, %{library_key: to_string(key), rpn: nil}}
+      key when is_binary(key) or is_atom(key) ->
+        if to_string(key) in @library_keys do
+          {:ok, %{library_key: to_string(key), rpn: nil}}
+        else
+          {:error, :bad_library_key}
+        end
 
       _ ->
         {:error, :bad_library_key}
