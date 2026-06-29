@@ -27,18 +27,22 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
 
   ## true_wind  (`true_wind`)
 
-  Flat-water vector triangle plus a heel correction. Inputs:
-  `apparent_wind_speed` (AWS), `apparent_wind_angle` (AWA), `boat_speed` (STW),
-  `heel`, `pitch` (`heading` optional, only needed for the direction output).
+  Flat-water vector triangle plus an OPTIONAL heel correction. The ESSENTIAL inputs
+  are `apparent_wind_speed` (AWS), `apparent_wind_angle` (AWA), `boat_speed` (STW);
+  `heel`, `pitch`, and `heading` are all optional refinements.
 
     * The masthead measures AWA in the HEELED mast frame; projecting the apparent
       vector onto the horizontal scales the athwartships component by `cos(heel)`
       (a heeled masthead reads a larger athwartships angle than the true horizontal
       one). So the horizontal apparent-wind components are
-      `ax = AWS·cos(AWA)`, `ay = AWS·sin(AWA)·cos(heel)`.
-      (`pitch` is accepted/required by the catalog and reserved for a later, fuller
-      correction; the in-scope correction here is the heel term. Deep upwash /
-      mast-twist corrections are explicitly DEFERRED to a later phase.)
+      `ax = AWS·cos(AWA)`, `ay = AWS·sin(AWA)·cos(heel)`. `heel` is a REFINEMENT and
+      DEFAULTS to `0.0` when absent (no athwartships correction) — a boat with no
+      heel sensor still computes true wind, and the flat-water output (`heel = 0`) is
+      identical whether heel is published as `0.0` or absent.
+      (`pitch` is a catalog-available input reserved for a later, fuller correction;
+      it is NOT required and never participates today, so its absence never makes the
+      calc invalid. Deep upwash / mast-twist corrections are explicitly DEFERRED to a
+      later phase.)
     * Subtract the boat's through-water velocity `(STW, 0)` to get the true-wind
       vector `(tx, ty) = (ax − STW, ay)`.
     * `true_wind_speed = hypot(tx, ty)`,
@@ -163,15 +167,18 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
   # --- true_wind ---
 
   defp true_wind(signals) do
+    # ESSENTIAL inputs only: apparent wind + STW. `heel` is an optional refinement
+    # (default 0.0 → no athwartships correction); `pitch` is reserved for a future
+    # correction and is NOT required; `heading` is optional (adds the direction
+    # output). None of heel/pitch/heading may make the calc invalid by their absence.
     with {:ok, aws} <- fetch(signals, "apparent_wind_speed"),
          {:ok, awa_deg} <- fetch(signals, "apparent_wind_angle"),
-         {:ok, stw} <- fetch(signals, "boat_speed"),
-         {:ok, heel_deg} <- fetch(signals, "heel"),
-         {:ok, _pitch_deg} <- fetch(signals, "pitch") do
+         {:ok, stw} <- fetch(signals, "boat_speed") do
       awa = awa_deg * @rad_per_deg
-      heel = heel_deg * @rad_per_deg
+      heel = fetch_or(signals, "heel", 0.0) * @rad_per_deg
 
-      # Horizontal apparent-wind components (boat frame), heel-corrected athwartships.
+      # Horizontal apparent-wind components (boat frame). The athwartships term is
+      # heel-corrected only when heel is present (else cos(0) = 1, a no-op).
       ax = aws * :math.cos(awa)
       ay = aws * :math.sin(awa) * :math.cos(heel)
 
@@ -365,6 +372,15 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
     case Map.fetch(signals, name) do
       {:ok, v} when is_number(v) -> {:ok, v / 1}
       _ -> :error
+    end
+  end
+
+  # Like `fetch/2` for OPTIONAL refinement signals: the value when present + numeric,
+  # else `default`. A non-numeric value also falls back to the default.
+  defp fetch_or(signals, name, default) do
+    case fetch(signals, name) do
+      {:ok, v} -> v
+      :error -> default
     end
   end
 

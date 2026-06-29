@@ -172,6 +172,38 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverTest do
       assert [{@cell_a, _, _}] = Observer.cells(pid)
     end
 
+    test "apparent-only stream WITHOUT a pitch signal still derives true wind and bins" do
+      # A boat with NO pitch sensor: only apparent wind + STW + heading + heel (the
+      # Gate's level filter still wants heel). Before the fix, the absent `pitch`
+      # forced :true_wind → :invalid, so every sample was rejected `:no_true_wind`
+      # and the Observer stalled. The STW triangle must now derive true wind without
+      # pitch and the Observer must admit + bin fixture A's cell.
+      stream =
+        for i <- 0..11 do
+          %{
+            "apparent_wind_speed" => 8.0,
+            "apparent_wind_angle" => 30.0,
+            "boat_speed" => 4.0,
+            "heel" => 0.0,
+            "heading" => 0.0
+          }
+          |> Map.new(fn {k, v} -> {k, {v, i * 1000}} end)
+        end
+
+      pid = start_observer(signals_fn: scripted(stream))
+
+      for _ <- 0..11, do: Observer.tick(pid)
+
+      # True wind was derived from apparent alone (no pitch) and the cell matches A.
+      assert [{@cell_a, _, %{count: count}}] = Observer.cells(pid)
+      assert count >= 1
+
+      stats = Observer.stats(pid)
+      assert stats.admitted >= 1
+      # The pitch absence never stalled the pipeline with :no_true_wind.
+      refute Map.has_key?(stats.reject_reasons, :no_true_wind)
+    end
+
     test "live true_wind_* signals are used when present" do
       # Force a true wind that bins to a DIFFERENT cell than the apparent triangle:
       # TWS 10.3 -> bin floor(10.3/0.514444)=20; TWA 92 -> bin floor(92/5)=18.

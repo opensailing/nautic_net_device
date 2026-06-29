@@ -6,15 +6,33 @@ defmodule RacingOrg.Tracker.Pro.Compute.LibraryTest do
   # All signal values are in CATALOG UNITS: speeds in m/s, angles in DEGREES.
 
   describe "true_wind (flat-water vector triangle + heel correction)" do
+    # The ESSENTIAL inputs are apparent_wind_speed / apparent_wind_angle / boat_speed.
+    # heel is an OPTIONAL refinement (default 0.0 → no athwartships correction) and
+    # pitch/heading are not required. So the minimal apparent-only signal set must
+    # compute (the apparent-only pipeline + the sailed-polar Observer depend on this).
+    test "apparent-only (no heel, no pitch, no heading): TWS/TWA still compute" do
+      signals = %{
+        "apparent_wind_speed" => 10.0,
+        "apparent_wind_angle" => 90.0,
+        "boat_speed" => 10.0
+      }
+
+      assert {:ok, out} = Library.compute(:true_wind, signals)
+      # Heel absent → no athwartships correction → flat-water triangle:
+      #   TW = (0 - 10, 10 - 0) = (-10, 10); TWS = hypot, TWA = 135.
+      assert_in_delta out["true_wind_speed"], :math.sqrt(200.0), 1.0e-6
+      assert_in_delta out["true_wind_angle"], 135.0, 1.0e-6
+      # No heading → no direction output.
+      refute Map.has_key?(out, "true_wind_direction")
+    end
+
     # Head-to-wind: AWA = 0, AWS = 10, boat moving 5 m/s straight into the wind.
     # TWS = AWS - boat_speed = 5 m/s; TWA = 0.
     test "head to wind: TWS = AWS - STW, TWA = 0" do
       signals = %{
         "apparent_wind_speed" => 10.0,
         "apparent_wind_angle" => 0.0,
-        "boat_speed" => 5.0,
-        "heel" => 0.0,
-        "pitch" => 0.0
+        "boat_speed" => 5.0
       }
 
       assert {:ok, out} = Library.compute(:true_wind, signals)
@@ -32,9 +50,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.LibraryTest do
       signals = %{
         "apparent_wind_speed" => 10.0,
         "apparent_wind_angle" => 90.0,
-        "boat_speed" => 10.0,
-        "heel" => 0.0,
-        "pitch" => 0.0
+        "boat_speed" => 10.0
       }
 
       assert {:ok, out} = Library.compute(:true_wind, signals)
@@ -47,9 +63,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.LibraryTest do
         "apparent_wind_speed" => 10.0,
         "apparent_wind_angle" => 90.0,
         "boat_speed" => 10.0,
-        "heading" => 50.0,
-        "heel" => 0.0,
-        "pitch" => 0.0
+        "heading" => 50.0
       }
 
       assert {:ok, out} = Library.compute(:true_wind, signals)
@@ -66,8 +80,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.LibraryTest do
         "apparent_wind_speed" => 12.0,
         "apparent_wind_angle" => 45.0,
         "boat_speed" => 6.0,
-        "heel" => 0.0,
-        "pitch" => 0.0
+        "heel" => 0.0
       }
 
       heeled = %{flat | "heel" => 25.0}
@@ -81,6 +94,21 @@ defmodule RacingOrg.Tracker.Pro.Compute.LibraryTest do
       assert is_float(out_heel["true_wind_speed"])
     end
 
+    # Heel is an OPTIONAL refinement defaulting to 0.0: a boat with no heel sensor
+    # must produce the SAME output as one explicitly publishing heel = 0.0.
+    test "heel absent == heel 0.0 (default, no athwartships correction)" do
+      base = %{
+        "apparent_wind_speed" => 12.0,
+        "apparent_wind_angle" => 45.0,
+        "boat_speed" => 6.0
+      }
+
+      assert {:ok, out_absent} = Library.compute(:true_wind, base)
+      assert {:ok, out_zero} = Library.compute(:true_wind, Map.put(base, "heel", 0.0))
+
+      assert out_absent == out_zero
+    end
+
     test "a hand-verified heel case (AWA 90, heel 60 -> athwartships halved)" do
       # cos(60deg) = 0.5, so the athwartships apparent component halves:
       #   corrected apparent y = AWS*sin(90)*cos(60) = 10*1*0.5 = 5
@@ -91,8 +119,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.LibraryTest do
         "apparent_wind_speed" => 10.0,
         "apparent_wind_angle" => 90.0,
         "boat_speed" => 10.0,
-        "heel" => 60.0,
-        "pitch" => 0.0
+        "heel" => 60.0
       }
 
       assert {:ok, out} = Library.compute(:true_wind, signals)
@@ -100,7 +127,24 @@ defmodule RacingOrg.Tracker.Pro.Compute.LibraryTest do
       assert_in_delta out["true_wind_angle"], :math.atan2(5.0, -10.0) * 180.0 / :math.pi(), 1.0e-6
     end
 
-    test "missing a required input is invalid" do
+    # Regression lock: the heel-present output is byte-identical to the prior
+    # (heel-and-pitch-required) implementation — pitch never participated, so its
+    # absence cannot change a thing.
+    test "heel-present output is unchanged whether pitch is present or absent" do
+      heeled = %{
+        "apparent_wind_speed" => 10.0,
+        "apparent_wind_angle" => 90.0,
+        "boat_speed" => 10.0,
+        "heel" => 60.0
+      }
+
+      assert {:ok, out_without_pitch} = Library.compute(:true_wind, heeled)
+      assert {:ok, out_with_pitch} = Library.compute(:true_wind, Map.put(heeled, "pitch", 12.0))
+
+      assert out_with_pitch == out_without_pitch
+    end
+
+    test "an ESSENTIAL input missing is invalid (no apparent_wind_angle)" do
       assert :invalid =
                Library.compute(:true_wind, %{"apparent_wind_speed" => 10.0, "boat_speed" => 5.0})
     end

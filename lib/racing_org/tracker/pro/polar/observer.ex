@@ -117,8 +117,10 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
     * `:gate` — `Gate` opts (thresholds) or a `Gate.t()`.
     * `:signals_fn` — 0-arity fn returning the raw-signal map (default reads
       `Compute.Engine.signals/0`). Injectable for tests.
-    * `:sender` — 2-arity fn `(boat_identifier_unused?, update) -> :ok` used to emit a
-      sync. Default `&ChannelClient.send_sailed_polar_update/2`. Injectable for tests.
+    * `:sender` — 2-arity fn `(channel_client_module, update) -> :ok` used to emit a
+      sync. The first arg is the `ChannelClient` collaborator module (NOT a boat id —
+      the boat is already carried in `state.boat_identifier` / `update.boat_identifier`).
+      Default `&ChannelClient.send_sailed_polar_update/2`. Injectable for tests.
     * `:now_fn` — 0-arity monotonic-ms clock (default `System.monotonic_time/1`).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
