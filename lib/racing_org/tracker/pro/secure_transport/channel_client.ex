@@ -136,6 +136,32 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   end
 
   @doc """
+  Stream an incremental SAILED-POLAR update back to the backend over the channel
+  (Phase 4), as the `"sailed_polar_update"` event with payload
+  `%{boat_identifier: id, seq: monotonic_int, cells: cells}`, where each cell is
+  `%{tws_mps: float, twa_deg: float, boat_speed_mps: float, count: int}` — the
+  binned wind operating point (bin center), its percentile boat speed, and the
+  cell's sample count. `seq` is a per-device monotonic sequence so the server can
+  order/merge deltas (later `seq` wins for a given cell).
+
+  Best-effort + session-gated, exactly like `send_computed_values_data/2`: it casts
+  the batch to the running client, which pushes ONLY when a secure session is live.
+  With no live session — or no running client — it is a no-op (the delta is simply
+  dropped, like telemetry; the `Observer` re-emits it on its next sync). Always
+  returns `:ok` and never raises (the `Observer` calls this on each throttled sync
+  and must never be coupled to channel state).
+  """
+  @spec send_sailed_polar_update(GenServer.server(), map()) :: :ok
+  def send_sailed_polar_update(server \\ __MODULE__, %{} = update) do
+    case GenServer.whereis(server) do
+      pid when is_pid(pid) -> send(pid, {:send_sailed_polar_update, update})
+      _ -> :ok
+    end
+
+    :ok
+  end
+
+  @doc """
   Request a route recalc from the backend (P3), as the `"request_route_recalc"`
   event. `position` is `{lat, lon}` (the boat's exact position at the deviation) or
   `nil`; when present it is sent as `%{position: %{latitude: lat, longitude: lon}}`,
@@ -397,6 +423,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     {:noreply, push_computed_values_data(socket, values)}
   end
 
+  # The Phase 4 Observer streams a throttled incremental sailed-polar delta.
+  # Push it as "sailed_polar_update" ONLY when a secure session is live; otherwise
+  # drop it (best-effort, like telemetry — the Observer re-emits on the next sync).
+  def handle_info({:send_sailed_polar_update, update}, socket) do
+    {:noreply, push_sailed_polar_update(socket, update)}
+  end
+
   # The DeviationMonitor asks for a recalc when the boat deviates past the threshold.
   # Push it as "request_route_recalc" ONLY when a secure session is live; otherwise
   # drop it (best-effort, like telemetry).
@@ -429,6 +462,21 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   defp push_computed_values_data(socket, values) do
     if session_live?(socket) do
       push(socket, socket.assigns.topic, "computed_values_data", %{values: values})
+    end
+
+    socket
+  end
+
+  # Push an incremental "sailed_polar_update". Gated on a LIVE secure session (joined
+  # topic + holder-confirmed session), exactly like the streamback. With no live
+  # session / no cells this is a no-op (the delta is dropped; the Observer re-emits the
+  # unchanged cells on its next throttled sync).
+  defp push_sailed_polar_update(%{assigns: %{topic: nil}} = socket, _update), do: socket
+  defp push_sailed_polar_update(socket, %{cells: []}), do: socket
+
+  defp push_sailed_polar_update(socket, update) do
+    if session_live?(socket) do
+      push(socket, socket.assigns.topic, "sailed_polar_update", update)
     end
 
     socket

@@ -56,6 +56,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
       RacingOrg.Tracker.Pro.Telemetry,
       tracking_config_child(),
       compute_engine_child(),
+      polar_observer_child(),
       {RacingOrg.Tracker.Pro.Sampling, name: RacingOrg.Tracker.Pro.Sampling},
       archive_child(),
       {RacingOrg.Tracker.Pro.Nav.Broadcaster, name: RacingOrg.Tracker.Pro.Nav.Broadcaster},
@@ -194,6 +195,22 @@ defmodule RacingOrg.Tracker.Pro.Application do
     {RacingOrg.Tracker.Pro.Compute.Engine,
      name: RacingOrg.Tracker.Pro.Compute.Engine,
      store_dir: Application.get_env(:racing_org_tracker, :computed_values_directory)}
+  end
+
+  # SECONDARY observational ("sailed") polar (Phase 4): on its own ~1 Hz timer it
+  # samples the compute engine's raw signals, derives STW-based true wind, gates each
+  # sample for steady-state sailing (and a moving-boat min-STW floor), and accumulates
+  # a streaming boat-speed percentile per (TWS, TWA) cell. It persists the sailed cells
+  # to /data (survives reboots) THROTTLED to spare flash, and syncs CHANGED cells
+  # upstream over the WSS channel as throttled incremental deltas. Started in EVERY
+  # environment so it accumulates whenever sailing; cheap + idle at rest. The `:dir` is
+  # the polar directory (nil on host/test disables persistence, mirroring Commands).
+  # Must start AFTER Compute.Engine (it reads its signals).
+  defp polar_observer_child do
+    {RacingOrg.Tracker.Pro.Polar.Observer,
+     name: RacingOrg.Tracker.Pro.Polar.Observer,
+     dir: Application.get_env(:racing_org_tracker, :polar_directory),
+     boat_identifier: RacingOrg.Tracker.Pro.boat_identifier()}
   end
 
   # Durable local race archiving + reconciliation with RacingOrg.
