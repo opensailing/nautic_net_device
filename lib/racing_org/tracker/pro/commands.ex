@@ -63,6 +63,7 @@ defmodule RacingOrg.Tracker.Pro.Commands do
   Boat-scoped config, independent of the race assignment — for later phases that
   interpolate target speeds / VMG from the reference grid.
   """
+  @spec current_polar(GenServer.server()) :: Polar.t() | nil
   def current_polar(server \\ __MODULE__), do: GenServer.call(server, :current_polar)
 
   @doc "Subscribe `pid` to `{:racing_org_command, %DeviceCommand{}}` notifications."

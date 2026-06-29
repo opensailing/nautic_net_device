@@ -162,4 +162,54 @@ defmodule RacingOrg.Tracker.Pro.Commands.PolarTest do
     assert :applied = Commands.apply_reply(c, polar_reply(command_id: "mem", version: 1))
     assert Commands.current_polar(c).version == 1
   end
+
+  test "applies a polar with no expires_at — polar config is intentionally non-expiring", %{
+    dir: dir
+  } do
+    # The backend deliberately queues polar commands with NO expires_at (durable
+    # config), so the device must treat a nil expiry as never-expiring and apply it
+    # even when the command is arbitrarily old by wall-clock. Pin "now" far in the
+    # future to prove a stale-by-time, nil-expiry polar is NOT dropped.
+    far_future = ~U[2099-01-01 00:00:00Z]
+    c = start_supervised!({Commands, device_id: "dev", polar_dir: dir, now_fn: fn -> far_future end})
+
+    assert :applied = Commands.apply_reply(c, polar_reply(command_id: "no-exp", version: 1))
+    assert Commands.current_polar(c).version == 1
+  end
+
+  test "applying a polar with empty rows is accepted and stored as an (empty) polar", %{dir: dir} do
+    c = start(dir)
+
+    assert :applied = Commands.apply_reply(c, polar_reply(command_id: "empty", version: 1, rows: []))
+
+    polar = Commands.current_polar(c)
+    assert %Polar{version: 1, rows: []} = polar
+  end
+
+  test "applying a polar whose optima count != rows count is stored as-is (no crash)", %{
+    dir: dir
+  } do
+    c = start(dir)
+
+    # Two TWS rows but only one optimum — a legitimate degenerate shape the device
+    # must persist verbatim rather than reject or crash on.
+    rows = [
+      struct(PolarRow, tws_mps: 5.0, cells: [struct(PolarCell, twa_deg: 45.0, boat_speed_mps: 4.0)]),
+      struct(PolarRow, tws_mps: 6.0, cells: [struct(PolarCell, twa_deg: 45.0, boat_speed_mps: 5.0)])
+    ]
+
+    optima = [
+      struct(PolarOptimum, tws_mps: 5.0, beat_twa: 42.0, beat_vmg: 3.0, run_twa: 165.0, run_vmg: 5.0)
+    ]
+
+    assert :applied =
+             Commands.apply_reply(
+               c,
+               polar_reply(command_id: "mismatch", version: 1, rows: rows, optima: optima)
+             )
+
+    polar = Commands.current_polar(c)
+    assert length(polar.rows) == 2
+    assert length(polar.optima) == 1
+  end
 end
