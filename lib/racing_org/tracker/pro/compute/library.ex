@@ -72,8 +72,16 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
   All four are INVALID when no polar is loaded (`polar_lookup` is `nil`/absent) or a
   required signal is missing — never a divide-by-zero or a fabricated number.
 
+  Each resolves the true-wind ANGLE through the shared `resolve_twa/1` (the same
+  resolution `vmg` uses): it prefers the live `true_wind_angle` signal and otherwise
+  derives it from `true_wind_direction − heading`. On a real boat the network
+  true-wind PGN publishes direction + speed but no angle, so the derived path is what
+  makes these calcs work in production; an on-device `:true_wind` calc whose outputs
+  are fed back as signals supplies `true_wind_angle` directly. TWS always comes from
+  the `true_wind_speed` signal.
+
     * **`polar_performance`** (percent): `100 · boat_speed / target` where `target =
-      Lookup.boat_speed(twa, tws)` at the live `true_wind_angle`/`true_wind_speed`.
+      Lookup.boat_speed(twa, tws)` at the resolved TWA + `true_wind_speed`.
       When `target` is ~0 (the no-go zone) the ratio is undefined, so the value is
       INVALID rather than a blow-up.
     * **`target_boat_speed`** (m/s): the VMG-optimal target speed for the current leg
@@ -190,20 +198,25 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
 
   # --- vmg ---
 
-  # Prefer the live true_wind_angle (the polar pipeline's TWA source); otherwise
-  # derive TWA from true_wind_direction − heading. Reported as a NON-NEGATIVE
-  # magnitude (progress along the wind axis); see the module doc on the sign
-  # convention.
+  # Reported as a NON-NEGATIVE magnitude (progress along the wind axis); see the
+  # module doc on the sign convention. TWA is resolved via the shared `resolve_twa/1`
+  # helper (live signal, else derived from direction − heading).
   defp vmg(signals) do
     with {:ok, stw} <- fetch(signals, "boat_speed"),
-         {:ok, twa_deg} <- twa_for_vmg(signals) do
+         {:ok, twa_deg} <- resolve_twa(signals) do
       finite_map(%{"vmg" => abs(stw * :math.cos(twa_deg * @rad_per_deg))})
     else
       :error -> :invalid
     end
   end
 
-  defp twa_for_vmg(signals) do
+  # The single source of truth for the true-wind ANGLE every TWA-driven calc uses
+  # (`vmg` and the polar/leg-optimum calcs). Prefer the live `true_wind_angle`
+  # signal — the canonical source when a device/feedback publishes it; otherwise
+  # derive it from `true_wind_direction − heading` (the common instrumented-boat
+  # case, where the network true-wind PGN gives direction + speed but no angle).
+  # Returns `{:ok, twa_deg}` (a signed angle off the bow) or `:error`.
+  defp resolve_twa(signals) do
     case fetch(signals, "true_wind_angle") do
       {:ok, twa_deg} ->
         {:ok, twa_deg}
@@ -236,7 +249,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
   defp polar_performance(signals, ctx) do
     with {:ok, lookup} <- polar_lookup(ctx),
          {:ok, stw} <- fetch(signals, "boat_speed"),
-         {:ok, twa} <- fetch(signals, "true_wind_angle"),
+         {:ok, twa} <- resolve_twa(signals),
          {:ok, tws} <- fetch(signals, "true_wind_speed"),
          {:ok, target} <- Lookup.boat_speed(lookup, twa, tws) |> ok_or_error(),
          true <- target > @target_eps do
@@ -269,7 +282,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
   defp vmg_performance(signals, ctx) do
     with {:ok, leg} <- leg_optimum(signals, ctx),
          {:ok, stw} <- fetch(signals, "boat_speed"),
-         {:ok, twa} <- fetch(signals, "true_wind_angle"),
+         {:ok, twa} <- resolve_twa(signals),
          true <- leg.vmg > @target_eps do
       actual_vmg = abs(stw * :math.cos(twa * @rad_per_deg))
       finite_map(%{"vmg_performance" => 100.0 * actual_vmg / leg.vmg})
@@ -282,7 +295,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
   # at the live TWS. Returns {:ok, %{twa, bsp, vmg}} or :error.
   defp leg_optimum(signals, ctx) do
     with {:ok, lookup} <- polar_lookup(ctx),
-         {:ok, twa} <- fetch(signals, "true_wind_angle"),
+         {:ok, twa} <- resolve_twa(signals),
          {:ok, tws} <- fetch(signals, "true_wind_speed"),
          {:ok, %{beat: beat, run: run}} <- Lookup.optimum(lookup, tws) |> ok_or_error() do
       {:ok, if(abs(twa) < @beat_run_boundary_deg, do: beat, else: run)}

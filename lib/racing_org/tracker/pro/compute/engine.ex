@@ -58,6 +58,20 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
   signals come from a network-published true-wind PGN if one is present; the
   `true_wind` LIBRARY calc computes its own.)
 
+  ### Output -> signal feedback (apparent-only boats)
+
+  A boat that publishes only APPARENT wind has no network true-wind signals at all,
+  so the polar/next-leg calcs would have nothing to read. To make that case work, the
+  engine re-injects the on-device `:true_wind` calc's outputs (`true_wind_speed`,
+  `true_wind_angle`, `true_wind_direction`) back into the signal map as CANONICAL
+  signals after each signal-update pass (`feed_back_outputs/2`). This is done only
+  when a `:true_wind` def is configured, is event-driven (on a signal change, never
+  per `current_values` read), fresh-timestamped, and adds NO cross-process call and NO
+  polar rebuild. There is no feedback-loop hazard: `:true_wind` consumes apparent wind
+  + boat motion + heading, none of its own outputs. The fed-back signals are visible
+  on the NEXT update's read — a one-tick lag, exactly as if an external device had
+  published a true-wind PGN.
+
   ## Polar interpolant (device state, not a signal)
 
   The polar-aware calcs (`polar_performance`, `target_boat_speed`, `target_twa`,
@@ -279,6 +293,13 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
         Map.put(acc, name, {value, mono_ms})
       end)
 
+    # Re-inject designated calc outputs (currently the on-device `:true_wind` calc's
+    # true_wind_* outputs) back into the signal map as canonical signals so the
+    # polar/next-leg calcs drive off an APPARENT-only boat too (no network true-wind
+    # PGN). Event-driven (only on a signal change), fresh-timestamped, with NO
+    # cross-process call and NO polar rebuild — see feed_back_outputs/3.
+    signals = feed_back_outputs(%{state | signals: signals}, mono_ms)
+
     # Event-driven recompute happens implicitly: current_values/status recompute fresh
     # against state.signals. (Holding per-def cached results is unnecessary for Phase 7
     # and would only risk staleness; Phase 8 reads current_values which is always live.)
@@ -417,6 +438,62 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
 
   defp mono_ms(%{timestamp_monotonic_ms: ms}) when is_integer(ms), do: ms
   defp mono_ms(_metadata), do: System.monotonic_time(:millisecond)
+
+  # --- output -> signal feedback (designated calc outputs re-injected as signals) ---
+
+  # Library keys whose outputs are re-injected into the signal map as canonical
+  # signals after each signal-update pass. Only the on-device `:true_wind` calc
+  # qualifies today: it OUTPUTS true_wind_* but CONSUMES none of them (it reads
+  # apparent wind + boat motion + heading), so there is NO feedback-loop hazard.
+  # Restricting feedback to this fixed set keeps the loop-free guarantee explicit.
+  @feedback_library_keys ~w(true_wind)
+
+  # The output names eligible to become signals (the canonical wind signals the
+  # polar/next-leg calcs read). An output is fed back only if it both is produced by
+  # a feedback calc AND names a canonical wind signal — never an arbitrary key.
+  @feedback_signal_names ~w(true_wind_speed true_wind_angle true_wind_direction)
+
+  # Recompute the feedback `:true_wind` defs against the just-updated signals and
+  # re-inject their designated outputs as fresh-timestamped signals. Skipped entirely
+  # (no allocation, no compute) when the config has no feedback def — the common case.
+  # One-tick lag is acceptable: the fed-back signals are visible on the NEXT update's
+  # read, exactly like any externally-published true-wind PGN. NO GenServer.call, NO
+  # Polar.Lookup.build, NO Commands fetch on this path.
+  defp feed_back_outputs(state, mono_ms) do
+    case feedback_defs(state.defs) do
+      [] ->
+        state.signals
+
+      defs ->
+        # Recompute against a fixed `now` = mono_ms so freshness checks pass for the
+        # signals just delivered in THIS pass (they carry mono_ms too).
+        Enum.reduce(defs, state.signals, fn def, signals ->
+          inject_feedback(def, %{state | signals: signals}, mono_ms)
+        end)
+    end
+  end
+
+  defp feedback_defs(defs) do
+    Enum.filter(defs, fn def ->
+      def.definition_type == :library and def.library_key in @feedback_library_keys
+    end)
+  end
+
+  defp inject_feedback(def, state, mono_ms) do
+    case eval_library(def, state, mono_ms) do
+      {:ok, outputs} ->
+        Enum.reduce(outputs, state.signals, fn {name, value}, acc ->
+          if name in @feedback_signal_names and is_number(value) do
+            Map.put(acc, name, {value, mono_ms})
+          else
+            acc
+          end
+        end)
+
+      :invalid ->
+        state.signals
+    end
+  end
 
   # --- recompute (shared by current_values + status) ---
 
