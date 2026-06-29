@@ -58,6 +58,7 @@ defmodule RacingOrg.Tracker.Pro.Device.MixProject do
 
       # Dev tools
       {:mix_test_watch, "~> 1.0", only: [:dev, :test], runtime: false},
+      {:stream_data, "~> 1.3", only: [:dev, :test], runtime: false},
 
       # Telemetry
       {:telemetry, "~> 1.0"},
