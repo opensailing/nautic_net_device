@@ -50,6 +50,7 @@ config :racing_org_tracker, RacingOrg.Tracker.Pro.Serial,
 config :racing_org_tracker,
   data_set_directory: "/data/datasets",
   assignment_directory: "/data/assignment",
+  polar_directory: "/data/polars",
   race_archive_directory: "/data/races",
   tracking_directory: "/data/tracking",
   computed_values_directory: "/data/computed_values"

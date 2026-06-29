@@ -158,7 +158,8 @@ defmodule RacingOrg.Tracker.Pro.Application do
     {RacingOrg.Tracker.Pro.Commands,
      name: RacingOrg.Tracker.Pro.Commands,
      device_id: RacingOrg.Tracker.Pro.boat_identifier(),
-     store_dir: Application.get_env(:racing_org_tracker, :assignment_directory)}
+     store_dir: Application.get_env(:racing_org_tracker, :assignment_directory),
+     polar_dir: Application.get_env(:racing_org_tracker, :polar_directory)}
   end
 
   # Per-tracking-state damping + send-rate config pushed by the server over the WSS

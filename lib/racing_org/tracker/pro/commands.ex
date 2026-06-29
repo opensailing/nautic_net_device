@@ -10,6 +10,13 @@ defmodule RacingOrg.Tracker.Pro.Commands do
   in-memory command state and notifies subscribers; durable persistence and
   behavioural effects (sampling, archiving, NMEA2000 output) live in later
   phases that subscribe via `subscribe/2` or read `current_assignment/1`.
+
+  The reference performance polar (`:polar_table` command) is BOAT-scoped config,
+  kept as a SEPARATE piece of device state (`current_polar/1`) with its OWN
+  monotonic version and its own durable store (`RacingOrg.Tracker.Pro.Polar.Store`).
+  It is deliberately decoupled from the race-assignment lifecycle: a polar is
+  never discarded, rejected, or mutated by assignment staleness/expiry/cancel
+  logic, and applying a polar never touches an active assignment.
   """
   use GenServer
 
@@ -17,8 +24,10 @@ defmodule RacingOrg.Tracker.Pro.Commands do
 
   alias RacingOrg.Tracker.Pro.Commands.Assignment
   alias RacingOrg.Tracker.Pro.Commands.Store
+  alias RacingOrg.Tracker.Pro.Polar
   alias RacingOrg.Tracker.Protobuf.CommandAck
   alias RacingOrg.Tracker.Protobuf.DeviceCommand
+  alias RacingOrg.Tracker.Protobuf.PolarTable
   alias RacingOrg.Tracker.Protobuf.ServerReply
 
   @protocol_version 1
@@ -48,6 +57,14 @@ defmodule RacingOrg.Tracker.Pro.Commands do
   @doc "The currently-applied assignment state, or `nil`."
   def current_assignment(server \\ __MODULE__), do: GenServer.call(server, :current_assignment)
 
+  @doc """
+  The current reference performance polar (`RacingOrg.Tracker.Pro.Polar`), or `nil`.
+
+  Boat-scoped config, independent of the race assignment — for later phases that
+  interpolate target speeds / VMG from the reference grid.
+  """
+  def current_polar(server \\ __MODULE__), do: GenServer.call(server, :current_polar)
+
   @doc "Subscribe `pid` to `{:racing_org_command, %DeviceCommand{}}` notifications."
   def subscribe(server \\ __MODULE__, pid \\ self()), do: GenServer.call(server, {:subscribe, pid})
 
@@ -67,20 +84,22 @@ defmodule RacingOrg.Tracker.Pro.Commands do
       protocol_version: opts[:protocol_version] || @protocol_version,
       applied_command_ids: MapSet.new(),
       assignment: nil,
+      polar: nil,
       ack: nil,
       subscribers: MapSet.new(),
       now_fn: opts[:now_fn] || (&DateTime.utc_now/0),
-      store_dir: opts[:store_dir]
+      store_dir: opts[:store_dir],
+      polar_dir: opts[:polar_dir]
     }
 
-    {:ok, restore(state)}
+    {:ok, state |> restore_assignment() |> restore_polar()}
   end
 
   # Re-hydrate the persisted assignment at boot so applied state, the ACK, and
   # version-based de-duplication survive reboots.
-  defp restore(%{store_dir: nil} = state), do: state
+  defp restore_assignment(%{store_dir: nil} = state), do: state
 
-  defp restore(%{store_dir: dir} = state) do
+  defp restore_assignment(%{store_dir: dir} = state) do
     case Store.load(dir) do
       {:ok, %Assignment{} = assignment} ->
         %{
@@ -95,6 +114,18 @@ defmodule RacingOrg.Tracker.Pro.Commands do
     end
   end
 
+  # Re-hydrate the persisted polar at boot so the boat-scoped reference grid and
+  # its version-based de-duplication survive reboots, independently of the
+  # assignment.
+  defp restore_polar(%{polar_dir: nil} = state), do: state
+
+  defp restore_polar(%{polar_dir: dir} = state) do
+    case Polar.Store.load(dir) do
+      {:ok, %Polar{} = polar} -> %{state | polar: polar}
+      :empty -> state
+    end
+  end
+
   @impl true
   def handle_call({:apply_reply, reply}, _from, state) do
     {result, state} = do_apply(reply, state)
@@ -103,6 +134,7 @@ defmodule RacingOrg.Tracker.Pro.Commands do
 
   def handle_call(:current_ack, _from, state), do: {:reply, state.ack, state}
   def handle_call(:current_assignment, _from, state), do: {:reply, state.assignment, state}
+  def handle_call(:current_polar, _from, state), do: {:reply, state.polar, state}
 
   def handle_call({:subscribe, pid}, _from, state) do
     {:reply, :ok, %{state | subscribers: MapSet.put(state.subscribers, pid)}}
@@ -131,7 +163,8 @@ defmodule RacingOrg.Tracker.Pro.Commands do
          :ok <- check_command_id(command),
          :ok <- check_not_expired(command, state),
          :ok <- check_not_duplicate(command, state),
-         :ok <- check_not_stale(command, state) do
+         :ok <- check_not_stale(command, state),
+         :ok <- check_polar_not_stale(command, state) do
       apply_command(command, state)
     else
       {:ignored, reason} ->
@@ -182,6 +215,17 @@ defmodule RacingOrg.Tracker.Pro.Commands do
 
   defp check_not_stale(_command, _state), do: :ok
 
+  # The polar carries its OWN monotonic version (independent of assignment_version);
+  # ignore an already-applied (older/equal) version. Non-polar commands are a
+  # no-op here.
+  defp check_polar_not_stale(%DeviceCommand{payload: {:polar_table, %PolarTable{version: version}}}, %{
+         polar: %Polar{version: applied_version}
+       }) do
+    if version <= applied_version, do: {:ignored, :stale_polar_version}, else: :ok
+  end
+
+  defp check_polar_not_stale(_command, _state), do: :ok
+
   defp apply_command(%DeviceCommand{} = command, state) do
     state = %{
       state
@@ -190,18 +234,34 @@ defmodule RacingOrg.Tracker.Pro.Commands do
     }
 
     state =
-      case Assignment.update(state.assignment, command) do
-        {:updated, assignment} ->
-          maybe_persist(state.store_dir, assignment)
-          %{state | assignment: assignment}
-
-        :no_change ->
-          state
-      end
+      state
+      |> apply_assignment(command)
+      |> apply_polar(command)
 
     notify(state, command)
     {:applied, state}
   end
+
+  defp apply_assignment(state, %DeviceCommand{} = command) do
+    case Assignment.update(state.assignment, command) do
+      {:updated, assignment} ->
+        maybe_persist(state.store_dir, assignment)
+        %{state | assignment: assignment}
+
+      :no_change ->
+        state
+    end
+  end
+
+  # A polar command updates ONLY the boat-scoped polar state + its store, never the
+  # assignment. Any other command leaves the polar untouched.
+  defp apply_polar(state, %DeviceCommand{payload: {:polar_table, %PolarTable{} = table}}) do
+    polar = Polar.from_protobuf(table)
+    maybe_persist_polar(state.polar_dir, polar)
+    %{state | polar: polar}
+  end
+
+  defp apply_polar(state, %DeviceCommand{}), do: state
 
   defp build_ack(%DeviceCommand{} = command) do
     struct(CommandAck,
@@ -221,6 +281,9 @@ defmodule RacingOrg.Tracker.Pro.Commands do
 
   defp maybe_persist(nil, _assignment), do: :ok
   defp maybe_persist(dir, assignment), do: Store.save(dir, assignment)
+
+  defp maybe_persist_polar(nil, _polar), do: :ok
+  defp maybe_persist_polar(dir, polar), do: Polar.Store.save(dir, polar)
 
   defp notify(state, command) do
     for pid <- state.subscribers, do: send(pid, {:racing_org_command, command})
