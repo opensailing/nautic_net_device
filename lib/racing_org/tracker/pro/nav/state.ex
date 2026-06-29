@@ -19,9 +19,12 @@ defmodule RacingOrg.Tracker.Pro.Nav.State do
             origin: nil,
             origin_mark_code: nil,
             origin_wp_number: nil,
+            next_destination: nil,
+            next_destination_mark_code: nil,
             total_waypoints: 0,
             bearing_origin_to_dest_rad: nil,
             bearing_position_to_dest_rad: nil,
+            bearing_dest_to_next_rad: nil,
             distance_to_dest_m: nil,
             cross_track_m: nil
 
@@ -46,6 +49,7 @@ defmodule RacingOrg.Tracker.Pro.Nav.State do
 
   defp build(marks, dest_idx, dest_mark, dest, position) do
     {origin, origin_code, origin_wp} = origin_for(marks, dest_idx)
+    {next, next_code} = next_for(marks, dest_idx)
 
     %__MODULE__{
       active?: true,
@@ -56,9 +60,12 @@ defmodule RacingOrg.Tracker.Pro.Nav.State do
       origin: origin,
       origin_mark_code: origin_code,
       origin_wp_number: origin_wp,
+      next_destination: next,
+      next_destination_mark_code: next_code,
       total_waypoints: length(marks),
       bearing_origin_to_dest_rad: origin && Geo.bearing_rad(origin, dest),
       bearing_position_to_dest_rad: position && Geo.bearing_rad(position, dest),
+      bearing_dest_to_next_rad: next && Geo.bearing_rad(dest, next),
       distance_to_dest_m: position && Geo.distance_m(position, dest),
       cross_track_m: origin && position && Geo.cross_track_m(origin, dest, position)
     }
@@ -72,6 +79,22 @@ defmodule RacingOrg.Tracker.Pro.Nav.State do
     case latlon(mark.position) do
       nil -> {nil, nil, nil}
       origin -> {origin, mark.code, dest_idx}
+    end
+  end
+
+  # The FOLLOWING mark in sequence (the next leg's destination). `nil` when the
+  # active mark is the last in sequence (no next leg) or the next mark has no
+  # position — mirrors `origin_for/2`.
+  defp next_for(marks, dest_idx) do
+    case marks |> Enum.at(dest_idx + 1) do
+      nil ->
+        {nil, nil}
+
+      mark ->
+        case latlon(mark.position) do
+          nil -> {nil, nil}
+          next -> {next, mark.code}
+        end
     end
   end
 

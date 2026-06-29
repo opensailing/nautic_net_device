@@ -495,6 +495,9 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
   defp library_key_atom("target_boat_speed"), do: :target_boat_speed
   defp library_key_atom("target_twa"), do: :target_twa
   defp library_key_atom("vmg_performance"), do: :vmg_performance
+  defp library_key_atom("next_leg_twa"), do: :next_leg_twa
+  defp library_key_atom("next_leg_aws"), do: :next_leg_aws
+  defp library_key_atom("next_leg_awa"), do: :next_leg_awa
   defp library_key_atom(key) when is_atom(key), do: key
   defp library_key_atom(_), do: :unknown
 
@@ -647,7 +650,8 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
     end
   end
 
-  @library_keys ~w(true_wind vmg vmc polar_performance target_boat_speed target_twa vmg_performance)
+  @library_keys ~w(true_wind vmg vmc polar_performance target_boat_speed target_twa vmg_performance
+                   next_leg_twa next_leg_aws next_leg_awa)
 
   defp fetch_type_fields(:library, raw) do
     case fetch(raw, :library_key, "library_key") do

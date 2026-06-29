@@ -230,6 +230,95 @@ defmodule RacingOrg.Tracker.Pro.Compute.PolarEngineTest do
     end
   end
 
+  describe "next-leg apparent wind flows through the engine (next_leg_bearing injected as a signal)" do
+    test "next_leg_aws/awa compute from injected next_leg_bearing + live wind + polar" do
+      %{engine: pid} = start_engine(lookup: lookup(), version: 1)
+
+      defs = [
+        library_value("nlaws", "next_leg_aws", ["true_wind_direction", "true_wind_speed", "next_leg_bearing"]),
+        library_value("nlawa", "next_leg_awa", ["true_wind_direction", "true_wind_speed", "next_leg_bearing"])
+      ]
+
+      assert {:ok, _} = Engine.apply_config(pid, payload(0, defs))
+
+      # Live wind: TWS 10, wind FROM the east (90). next_leg_bearing 0 (north) -> twa 90.
+      Engine.put_signal(pid, "true_wind_direction", 90.0, 1_000)
+      Engine.put_signal(pid, "true_wind_speed", 10.0, 1_000)
+
+      # No next_leg_bearing yet -> both INVALID (no next leg known).
+      assert eventually(fn -> Enum.all?(Engine.current_values(pid), &(&1.valid? == false)) end)
+
+      # Nav.Broadcaster injects the next-leg bearing as a signal (same path as bearing_to_mark).
+      Engine.put_signal(pid, "next_leg_bearing", 0.0, 1_000)
+
+      assert eventually(fn -> Enum.all?(Engine.current_values(pid), & &1.valid?) end)
+
+      vals = Map.new(Engine.current_values(pid), &{&1.def.id, &1.outputs})
+      # twa 90, BSP(90,10) = 7.0: AWS = sqrt(149) = 12.2066, AWA = atan2(10,7) = 55.008.
+      assert_in_delta vals["nlaws"]["next_leg_aws"], :math.sqrt(149.0), 1.0e-2
+      assert_in_delta vals["nlawa"]["next_leg_awa"], :math.atan2(10.0, 7.0) * 180.0 / :math.pi(), 1.0e-2
+    end
+
+    test "next-leg geometry refresh is OFF the hot path: a burst of ticks never re-fetches" do
+      %{engine: pid, cmds: cmds} = start_engine(lookup: lookup(), version: 1)
+
+      def = library_value("nlaws", "next_leg_aws", ["true_wind_direction", "true_wind_speed", "next_leg_bearing"])
+      assert {:ok, _} = Engine.apply_config(pid, payload(0, [def]))
+
+      Engine.put_signal(pid, "true_wind_direction", 90.0, 1_000)
+      Engine.put_signal(pid, "true_wind_speed", 10.0, 1_000)
+      Engine.put_signal(pid, "next_leg_bearing", 0.0, 1_000)
+
+      assert eventually(fn -> match?([%{valid?: true}], Engine.current_values(pid)) end)
+
+      fetches_before = StubCommands.fetches(cmds)
+
+      # The next-leg bearing arrives as an injected SIGNAL (Nav.Broadcaster pushes it on
+      # assignment/active-mark change), so recompute ticks never cross into Commands.
+      for _ <- 1..200, do: _ = Engine.current_values(pid)
+
+      assert StubCommands.fetches(cmds) == fetches_before
+    end
+
+    test "stream-up: an enabled next-leg calc reaches the SAME backend stream path" do
+      %{engine: pid} = start_engine(lookup: lookup(), version: 1)
+
+      def =
+        library_value("nlaws", "next_leg_aws", ["true_wind_direction", "true_wind_speed", "next_leg_bearing"], %{
+          "broadcast_enabled" => false,
+          "stream_to_backend" => true,
+          "output_field" => "next_leg_aws"
+        })
+
+      assert {:ok, _} = Engine.apply_config(pid, payload(0, [def]))
+
+      Engine.put_signal(pid, "true_wind_direction", 90.0, 1_000)
+      Engine.put_signal(pid, "true_wind_speed", 10.0, 1_000)
+      Engine.put_signal(pid, "next_leg_bearing", 0.0, 1_000)
+
+      assert eventually(fn -> match?([%{valid?: true}], Engine.current_values(pid)) end)
+
+      test_pid = self()
+
+      bcast =
+        start_supervised!(
+          {Broadcaster,
+           engine: {Engine, pid},
+           tick_ms: 3_600_000,
+           now_fn: fn -> 0 end,
+           transmit_fn: fn _p, _pgn, _payload -> :ok end,
+           stream_fn: fn streamed -> send(test_pid, {:stream, streamed}) end,
+           name: nil},
+          id: {Broadcaster, System.unique_integer([:positive])}
+        )
+
+      assert 0 == Broadcaster.tick_now(bcast)
+      assert_receive {:stream, streamed}
+      assert [%{id: "nlaws", value: value}] = streamed
+      assert_in_delta value, :math.sqrt(149.0), 1.0e-2
+    end
+  end
+
   describe "HOT-PATH: build-once / no per-tick fetch or rebuild" do
     test "a burst of compute ticks does NOT re-fetch the lookup from Commands" do
       %{engine: pid, cmds: cmds} = start_engine(lookup: lookup(), version: 1)

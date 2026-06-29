@@ -84,6 +84,30 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
     * **`vmg_performance`** (percent): `100 · actual_vmg / optimum_vmg` for the
       current leg, where `actual_vmg = boat_speed · |cos(twa)|` and `optimum_vmg` is
       `.beat.vmg` / `.run.vmg`. INVALID when the optimum VMG is ~0.
+
+  ## Next-leg predicted apparent wind (B&G "Next Leg AWA/AWS")
+
+  Predicts the apparent wind you'd experience on the FOLLOWING leg of the course
+  (from the active mark to the next mark in `sequence` order). The leg geometry
+  enters as the `next_leg_bearing` signal (deg, geographic 0–360) — injected by
+  `RacingOrg.Tracker.Pro.Nav.Broadcaster` the same way `bearing_to_mark` is, refreshed
+  only on assignment / active-mark change (off the compute hot path). When there is no
+  next leg (active mark is the finish) the signal is ABSENT, so these are INVALID.
+
+  Angle convention: TWA/AWA are measured FROM THE BOW, `0` = head to wind, folded into
+  `[0, 180]` (no port/starboard sign — the leg geometry already fixes the side).
+
+    * **`next_leg_twa`** (deg, 0–180): `|wrap180(true_wind_direction − next_leg_bearing)|`.
+    * **`next_leg_aws`** (m/s) / **`next_leg_awa`** (deg, 0–180): the apparent-wind
+      triangle with `TWS = true_wind_speed`, `TWA = next_leg_twa`, and predicted boat
+      speed `BSP = Lookup.boat_speed(next_leg_twa, TWS)` (the polar speed on that leg):
+
+          AWS = √(TWS² + BSP² + 2·TWS·BSP·cos(TWA))
+          AWA = atan2(TWS·sin(TWA), BSP + TWS·cos(TWA))   → degrees
+
+      INVALID when there is no next leg, no polar, or `BSP` is degenerate (the next-leg
+      TWA lands in the no-go zone → the polar interpolates to ~0; the prediction is
+      meaningless), rather than a NaN or a divide-by-zero.
   """
 
   alias RacingOrg.Tracker.Pro.Polar.Lookup
@@ -123,6 +147,9 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
   def compute(:target_boat_speed, signals, ctx), do: target_boat_speed(signals, ctx)
   def compute(:target_twa, signals, ctx), do: target_twa(signals, ctx)
   def compute(:vmg_performance, signals, ctx), do: vmg_performance(signals, ctx)
+  def compute(:next_leg_twa, signals, _ctx), do: next_leg_twa(signals)
+  def compute(:next_leg_aws, signals, ctx), do: next_leg_apparent(signals, ctx, "next_leg_aws")
+  def compute(:next_leg_awa, signals, ctx), do: next_leg_apparent(signals, ctx, "next_leg_awa")
   def compute(_unknown, _signals, _ctx), do: :invalid
 
   # --- true_wind ---
@@ -262,6 +289,53 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
     else
       _ -> :error
     end
+  end
+
+  # --- next-leg predicted apparent wind (B&G "Next Leg AWA/AWS") ---
+
+  # The TWA you'd sail on the NEXT leg: fold of (true_wind_direction − next_leg_bearing)
+  # into [0, 180] (absolute, no port/starboard sign — the leg geometry fixes the side).
+  # `next_leg_bearing` is injected by Nav.Broadcaster (deg, geographic 0–360) and is
+  # ABSENT when there is no next leg, so this is INVALID then (not garbage).
+  defp next_leg_twa(signals) do
+    with {:ok, twd} <- fetch(signals, "true_wind_direction"),
+         {:ok, brg} <- fetch(signals, "next_leg_bearing") do
+      finite_map(%{"next_leg_twa" => abs(wrap180(twd - brg))})
+    else
+      :error -> :invalid
+    end
+  end
+
+  # Predicted apparent wind on the next leg via the standard apparent-wind triangle,
+  # with TWS = current true_wind_speed, TWA = next_leg_twa, and BSP = the polar boat
+  # speed you'd make on that leg (`Lookup.boat_speed(next_leg_twa, tws)`):
+  #
+  #   AWS = sqrt(TWS² + BSP² + 2·TWS·BSP·cos(TWA))
+  #   AWA = atan2(TWS·sin(TWA), BSP + TWS·cos(TWA))   (deg, 0–180, from the bow)
+  #
+  # INVALID when there is no next leg (no next_leg_bearing), no polar, or BSP is
+  # degenerate (the no-go zone — Lookup interpolates to ~0; the prediction is
+  # meaningless), rather than emitting a NaN or a divide-by-zero.
+  defp next_leg_apparent(signals, ctx, output_name) do
+    with {:ok, lookup} <- polar_lookup(ctx),
+         {:ok, %{"next_leg_twa" => twa_deg}} <- next_leg_twa(signals),
+         {:ok, tws} <- fetch(signals, "true_wind_speed"),
+         {:ok, bsp} <- Lookup.boat_speed(lookup, twa_deg, tws) |> ok_or_error(),
+         true <- bsp > @target_eps do
+      twa = twa_deg * @rad_per_deg
+      value = next_leg_output(output_name, tws, bsp, twa)
+      finite_map(%{output_name => value})
+    else
+      _ -> :invalid
+    end
+  end
+
+  defp next_leg_output("next_leg_aws", tws, bsp, twa) do
+    :math.sqrt(tws * tws + bsp * bsp + 2.0 * tws * bsp * :math.cos(twa))
+  end
+
+  defp next_leg_output("next_leg_awa", tws, bsp, twa) do
+    :math.atan2(tws * :math.sin(twa), bsp + tws * :math.cos(twa)) * @deg_per_rad
   end
 
   defp polar_lookup(%{polar_lookup: %Lookup{} = lookup}), do: {:ok, lookup}

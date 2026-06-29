@@ -82,5 +82,32 @@ defmodule RacingOrg.Tracker.Pro.Nav.StateTest do
       # origin->dest bearing does not need a position
       assert is_number(state.bearing_origin_to_dest_rad)
     end
+
+    # --- next leg (active mark -> the FOLLOWING mark in sequence) ---
+
+    test "derives the next mark and the great-circle bearing from active to next" do
+      state = State.derive(assignment("2"), {42.05, -70.001})
+
+      assert state.next_destination_mark_code == "3"
+      assert state.next_destination == {42.2, -70.0}
+      # Mark "3" (42.2,-70.0) is due NORTH of mark "2" (42.1,-70.0) -> bearing ~0.
+      assert_in_delta state.bearing_dest_to_next_rad, 0.0, 0.001
+      # It is the same value the Geo helper produces for active->next (reused helper).
+      assert state.bearing_dest_to_next_rad == Geo.bearing_rad({42.1, -70.0}, {42.2, -70.0})
+    end
+
+    test "next-leg bearing does not need a position (geometry is mark-to-mark)" do
+      state = State.derive(assignment("2"), nil)
+      assert state.next_destination_mark_code == "3"
+      assert is_number(state.bearing_dest_to_next_rad)
+    end
+
+    test "the last mark in sequence has no next leg" do
+      state = State.derive(assignment("3"), {42.2, -70.0})
+      assert state.active?
+      assert state.next_destination == nil
+      assert state.next_destination_mark_code == nil
+      assert state.bearing_dest_to_next_rad == nil
+    end
   end
 end

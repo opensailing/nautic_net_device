@@ -25,13 +25,14 @@ defmodule RacingOrg.Tracker.Pro.Nav.BroadcasterTest do
     %{commands: commands, broadcaster: broadcaster}
   end
 
-  defp assign_course(commands) do
+  defp assign_course(commands, active_code \\ "2") do
     marks = [
       struct(CourseMark, code: "1", sequence: 1, position: struct(LatLon, latitude: 42.0, longitude: -70.0)),
-      struct(CourseMark, code: "2", sequence: 2, position: struct(LatLon, latitude: 42.1, longitude: -70.0))
+      struct(CourseMark, code: "2", sequence: 2, position: struct(LatLon, latitude: 42.1, longitude: -70.0)),
+      struct(CourseMark, code: "3", sequence: 3, position: struct(LatLon, latitude: 42.1, longitude: -69.9))
     ]
 
-    race = struct(RaceAssignment, course_marks: marks, active_mark_code: "2", route_hash: "rh")
+    race = struct(RaceAssignment, course_marks: marks, active_mark_code: active_code, route_hash: "rh")
 
     command =
       struct(DeviceCommand,
@@ -133,5 +134,53 @@ defmodule RacingOrg.Tracker.Pro.Nav.BroadcasterTest do
     %{broadcaster: b} = start_broadcaster_with_compute(agent)
     Broadcaster.broadcast_now(b)
     refute List.keyfind(StubCompute.pushed(agent), "bearing_to_mark", 0)
+  end
+
+  # The Nav.Broadcaster is also the natural source of `next_leg_bearing`: the SAME
+  # mark-to-mark geometry it derives includes the bearing from the active mark to the
+  # FOLLOWING mark in sequence. It pushes that (in DEGREES) into the compute engine so
+  # the next-leg apparent-wind calcs can compute. No position is needed (it is a
+  # mark-to-mark bearing), refreshed only on each broadcast / assignment change.
+  test "pushes next_leg_bearing (degrees) into the compute engine while navigating" do
+    {:ok, agent} = Agent.start_link(fn -> [] end)
+    %{commands: c, broadcaster: b} = start_broadcaster_with_compute(agent)
+    # Active mark "2" (42.1,-70.0); next mark "3" (42.1,-69.9) is due EAST -> bearing ~90.
+    assign_course(c, "2")
+    send(b, {:nav_position, {42.05, -70.0}})
+
+    Broadcaster.broadcast_now(b)
+
+    pushed = StubCompute.pushed(agent)
+    assert {"next_leg_bearing", bearing} = List.keyfind(pushed, "next_leg_bearing", 0)
+    assert is_number(bearing)
+    assert_in_delta bearing, 90.0, 0.1
+  end
+
+  test "next_leg_bearing is pushed even with no position (mark-to-mark geometry)" do
+    {:ok, agent} = Agent.start_link(fn -> [] end)
+    %{commands: c, broadcaster: b} = start_broadcaster_with_compute(agent)
+    assign_course(c, "2")
+
+    Broadcaster.broadcast_now(b)
+
+    assert {"next_leg_bearing", _} = List.keyfind(StubCompute.pushed(agent), "next_leg_bearing", 0)
+  end
+
+  test "does not push next_leg_bearing when the active mark is the LAST in sequence" do
+    {:ok, agent} = Agent.start_link(fn -> [] end)
+    %{commands: c, broadcaster: b} = start_broadcaster_with_compute(agent)
+    assign_course(c, "3")
+    send(b, {:nav_position, {42.05, -70.0}})
+
+    Broadcaster.broadcast_now(b)
+
+    refute List.keyfind(StubCompute.pushed(agent), "next_leg_bearing", 0)
+  end
+
+  test "does not push next_leg_bearing when there is no active waypoint" do
+    {:ok, agent} = Agent.start_link(fn -> [] end)
+    %{broadcaster: b} = start_broadcaster_with_compute(agent)
+    Broadcaster.broadcast_now(b)
+    refute List.keyfind(StubCompute.pushed(agent), "next_leg_bearing", 0)
   end
 end

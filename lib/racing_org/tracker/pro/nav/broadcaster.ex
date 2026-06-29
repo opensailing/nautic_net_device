@@ -91,6 +91,14 @@ defmodule RacingOrg.Tracker.Pro.Nav.Broadcaster do
     # pushed (and vmc stays invalid — correct).
     feed_bearing_to_mark(state.compute, nav)
 
+    # Feed the bearing of the NEXT leg (active mark -> the following mark in sequence,
+    # `bearing_dest_to_next_rad`) into the compute engine so the next-leg apparent-wind
+    # calcs (`next_leg_twa`/`next_leg_aws`/`next_leg_awa`) can compute. Same source
+    # geometry / same injection path as `bearing_to_mark`; mark-to-mark so no position
+    # is needed. Absent when there is no next mark (active mark is the finish) -> the
+    # signal is simply not pushed and the dependent calcs stay invalid.
+    feed_next_leg_bearing(state.compute, nav)
+
     {nav, length(messages)}
   end
 
@@ -98,18 +106,32 @@ defmodule RacingOrg.Tracker.Pro.Nav.Broadcaster do
 
   defp feed_bearing_to_mark({module, server}, %{active?: true, bearing_position_to_dest_rad: rad})
        when is_number(rad) do
+    push_signal({module, server}, "bearing_to_mark", rad)
+  end
+
+  defp feed_bearing_to_mark(_compute, _nav), do: :ok
+
+  defp feed_next_leg_bearing(nil, _nav), do: :ok
+
+  defp feed_next_leg_bearing({module, server}, %{active?: true, bearing_dest_to_next_rad: rad})
+       when is_number(rad) do
+    push_signal({module, server}, "next_leg_bearing", rad)
+  end
+
+  defp feed_next_leg_bearing(_compute, _nav), do: :ok
+
+  # Push a radian bearing into the compute engine as a DEGREE signal (the catalog unit).
+  defp push_signal({module, server}, name, rad) do
     deg = rad * 180.0 / :math.pi()
 
     try do
-      module.put_signal(server, "bearing_to_mark", deg, System.monotonic_time(:millisecond))
+      module.put_signal(server, name, deg, System.monotonic_time(:millisecond))
     catch
       :exit, _ -> :ok
     end
 
     :ok
   end
-
-  defp feed_bearing_to_mark(_compute, _nav), do: :ok
 
   defp waypoints(nil), do: []
   defp waypoints(%{race_assignment: nil}), do: []
