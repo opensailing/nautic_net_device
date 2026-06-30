@@ -2,7 +2,7 @@ defmodule RacingOrg.Tracker.Pro.Device.MixProject do
   use Mix.Project
 
   @app :racing_org_tracker
-  @version "0.4.0"
+  @version "0.5.0"
   @all_device_targets [:racing_org_rpi3]
 
   def project do
