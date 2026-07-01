@@ -154,32 +154,67 @@ defmodule RacingOrg.Tracker.Pro.ClockSource.ConfigTest do
     assert Config.resolve_timestamp(pid, @fallback, 3000) == @fallback
   end
 
-  # --- source matching ---
+  # --- source matching (backend uppercase-hex hardware ids) ---
 
-  test "matches a configured source by NMEA NAME against hardware_identifier" do
+  # NMEA NAME integer 0x1A2B (== 6699) as its on-bus 8-byte binary NAME.
+  @name_1a2b <<0, 0, 0, 0, 0, 0, 0x1A, 0x2B>>
+
+  test "backend hardware_identifier (uppercase hex) matches an 8-byte binary NMEA NAME" do
     pid = start_config()
-    {:ok, _} = Config.apply_config(pid, sensor_config(1, [src(1, %{"hardware_identifier" => "1234567890"})]))
+    {:ok, _} = Config.apply_config(pid, sensor_config(1, [src(1, %{"hardware_identifier" => "1A2B"})]))
 
-    # different source_address, but the NMEA NAME matches the hardware_identifier
-    observe(pid, time_data(@gps, 77, 1_234_567_890, 1000))
+    # Different source_address, but the NAME canonicalizes to the backend hex id.
+    observe(pid, time_data(@gps, 77, @name_1a2b, 1000))
     assert Config.resolve_timestamp(pid, @fallback, 1500) == DateTime.add(@gps, 500, :millisecond)
   end
 
-  test "matches a configured source by metadata.source_nmea_name and by sensor_uid" do
-    for field <- ["sensor_uid", "label"] do
-      pid = start_config()
-      {:ok, _} = Config.apply_config(pid, sensor_config(1, [src(1, %{field => "aabbccdd"})]))
-      observe(pid, time_data(@gps, 12, "aabbccdd", 1000))
-      assert Config.resolve_timestamp(pid, @fallback, 1500) == DateTime.add(@gps, 500, :millisecond)
-    end
+  test "backend hardware_identifier (uppercase hex) matches an integer NMEA NAME" do
+    pid = start_config()
+    {:ok, _} = Config.apply_config(pid, sensor_config(1, [src(1, %{"hardware_identifier" => "1A2B"})]))
 
+    observe(pid, time_data(@gps, 77, 0x1A2B, 1000))
+    assert Config.resolve_timestamp(pid, @fallback, 1500) == DateTime.add(@gps, 500, :millisecond)
+  end
+
+  test "metadata.source_nmea_name given as prefixed lowercase hex matches a binary NMEA NAME" do
     pid = start_config()
 
     {:ok, _} =
-      Config.apply_config(pid, sensor_config(1, [src(1, %{"metadata" => %{"source_nmea_name" => "99887766"}})]))
+      Config.apply_config(pid, sensor_config(1, [src(1, %{"metadata" => %{"source_nmea_name" => "0x1a2b"}})]))
 
-    observe(pid, time_data(@gps, 12, 99_887_766, 1000))
+    observe(pid, time_data(@gps, 12, @name_1a2b, 1000))
     assert Config.resolve_timestamp(pid, @fallback, 1500) == DateTime.add(@gps, 500, :millisecond)
+  end
+
+  test "backend sensor_uid (uppercase hex) matches an integer NMEA NAME" do
+    pid = start_config()
+    {:ok, _} = Config.apply_config(pid, sensor_config(1, [src(1, %{"sensor_uid" => "1A2B"})]))
+
+    observe(pid, time_data(@gps, 12, 0x1A2B, 1000))
+    assert Config.resolve_timestamp(pid, @fallback, 1500) == DateTime.add(@gps, 500, :millisecond)
+  end
+
+  test "source_address matching still works when the NAME matches no identity" do
+    pid = start_config()
+    {:ok, _} = Config.apply_config(pid, sensor_config(1, [src(1, %{"source_address" => "35"})]))
+
+    observe(pid, time_data(@gps, 35, <<9, 9, 9, 9, 9, 9, 9, 9>>, 1000))
+    assert Config.resolve_timestamp(pid, @fallback, 1500) == DateTime.add(@gps, 500, :millisecond)
+  end
+
+  test "non-hex label-style names do not crash, and literal label matching still works" do
+    pid = start_config()
+    {:ok, _} = Config.apply_config(pid, sensor_config(1, [src(1, %{"label" => "Dockyard GPS"})]))
+
+    # A non-hex textual NAME must not crash canonicalization; the label matches it literally.
+    observe(pid, time_data(@gps, 12, "Dockyard GPS", 1000))
+    assert Config.resolve_timestamp(pid, @fallback, 1500) == DateTime.add(@gps, 500, :millisecond)
+
+    # A non-matching label leaves the timebase unset -> falls back.
+    pid2 = start_config()
+    {:ok, _} = Config.apply_config(pid2, sensor_config(1, [src(1, %{"label" => "Other"})]))
+    observe(pid2, time_data(@gps, 12, "Dockyard GPS", 1000))
+    assert Config.resolve_timestamp(pid2, @fallback, 1500) == @fallback
   end
 
   # --- status ---
