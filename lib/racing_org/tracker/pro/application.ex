@@ -34,7 +34,10 @@ defmodule RacingOrg.Tracker.Pro.Application do
     # Handlers must be a list of pids which define a
     # def handle_info({:data, data})
     # See NMEA.NMEA2000.VirtualDevice.AddressManager for an example
-    handlers = [emit_telemetry_pid, system_time_pid]
+    # The clock-source manager also observes decoded time messages to maintain the
+    # boat-time timebase (nil on products where it isn't started).
+    clock_source_pid = Process.whereis(RacingOrg.Tracker.Pro.ClockSource.Config)
+    handlers = Enum.reject([emit_telemetry_pid, system_time_pid, clock_source_pid], &is_nil/1)
 
     # Register the handlers with the virtual device
     for handler <- handlers do
@@ -55,6 +58,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
       commands_child(),
       RacingOrg.Tracker.Pro.Telemetry,
       tracking_config_child(),
+      clock_source_config_child(),
       compute_engine_child(),
       polar_observer_child(),
       {RacingOrg.Tracker.Pro.Sampling, name: RacingOrg.Tracker.Pro.Sampling},
@@ -191,6 +195,12 @@ defmodule RacingOrg.Tracker.Pro.Application do
   # def for Phase 8 (N2K broadcast) to consume via current_values/1. Started in EVERY
   # environment so the channel + Phase 8 can read it; cheap + idle with no defs. Must
   # start AFTER Telemetry (it attaches :telemetry handlers).
+  defp clock_source_config_child do
+    {RacingOrg.Tracker.Pro.ClockSource.Config,
+     name: RacingOrg.Tracker.Pro.ClockSource.Config,
+     store_dir: Application.get_env(:racing_org_tracker, :clock_source_directory)}
+  end
+
   defp compute_engine_child do
     {RacingOrg.Tracker.Pro.Compute.Engine,
      name: RacingOrg.Tracker.Pro.Compute.Engine,
@@ -273,7 +283,8 @@ defmodule RacingOrg.Tracker.Pro.Application do
   # set to the cloud.
   # FUTURETODO: Load the current fitters from disk
   defp emit_telemetry_config do
-    Application.get_env(:racing_org_tracker, :data_filtering)
+    (Application.get_env(:racing_org_tracker, :data_filtering) || [])
+    |> Keyword.put(:clock_source, RacingOrg.Tracker.Pro.ClockSource.Config)
   end
 
   defp virtual_device_config do

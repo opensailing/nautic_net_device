@@ -198,6 +198,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       # are {module, server} pairs (a bare module is used as both module + name).
       tracking: normalize_collaborator(Keyword.get(opts, :tracking, RacingOrg.Tracker.Pro.Tracking.Config)),
       tracking_status: normalize_collaborator(Keyword.get(opts, :tracking_status, RacingOrg.Tracker.Pro.Sampling)),
+      # The clock-source policy: applies the server-pushed "set_clock_source" config
+      # (default RacingOrg.Tracker.Pro.ClockSource.Config, which is ALSO the status
+      # source) and reports the active boat-time timebase back as
+      # "clock_source_status". A {module, server} pair (bare module = both).
+      clock_source: normalize_collaborator(Keyword.get(opts, :clock_source, RacingOrg.Tracker.Pro.ClockSource.Config)),
       # The on-device compute engine: applies the server-pushed computed-value defs
       # ("set_computed_values") and reports applied_version + active_count back as
       # "computed_values_status". A {module, server} pair (bare module = both).
@@ -354,6 +359,17 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   def handle_message(topic, "set_computed_values", payload, socket) do
     {_result, socket} = apply_computed(payload, socket)
     push(socket, topic, "computed_values_status", computed_values_status(socket))
+    {:ok, socket}
+  end
+
+  # Server pushes the clock-source policy (which time source drives telemetry
+  # timestamps). Apply it through RacingOrg.Tracker.Pro.ClockSource.Config
+  # (versioned, idempotent), then report the active timebase back as
+  # "clock_source_status". On an apply error we still report the current status so
+  # the server is not left stale, and we never crash the channel.
+  def handle_message(topic, "set_clock_source", payload, socket) do
+    {_result, socket} = apply_clock_source(payload, socket)
+    push(socket, topic, "clock_source_status", clock_source_status(socket))
     {:ok, socket}
   end
 
@@ -595,6 +611,49 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       active_state: Map.get(base, :active_state),
       active_rate_hz: Map.get(base, :active_rate_hz),
       active_damping_seconds: Map.get(base, :active_damping_seconds),
+      reported_at: DateTime.utc_now() |> DateTime.to_iso8601()
+    }
+  end
+
+  # --- Clock-source collaborator ---
+
+  defp apply_clock_source(payload, socket) do
+    {module, server} = socket.assigns.clock_source
+    result = module.apply_config(server, payload)
+    {result, socket}
+  rescue
+    error ->
+      Logger.warning("[ChannelClient] ClockSource apply_config failed: #{inspect(error)}")
+      {{:error, :apply_failed}, socket}
+  end
+
+  # Build the "clock_source_status" the server allowlists: applied_version, mode,
+  # the active source's identity, the current timebase, fallback_reason,
+  # last_gps_time, status, and reported_at (ISO-8601). Falls back to a minimal map
+  # if the status source is unavailable, and always stamps reported_at.
+  defp clock_source_status(socket) do
+    {module, server} = socket.assigns.clock_source
+
+    base =
+      try do
+        module.status(server)
+      rescue
+        error ->
+          Logger.warning("[ChannelClient] clock_source status read failed: #{inspect(error)}")
+          %{}
+      end
+
+    %{
+      applied_version: Map.get(base, :applied_version),
+      mode: Map.get(base, :mode),
+      active_source_sensor_id: Map.get(base, :active_source_sensor_id),
+      active_source_label: Map.get(base, :active_source_label),
+      active_hw_id: Map.get(base, :active_hw_id),
+      active_source_address: Map.get(base, :active_source_address),
+      timebase: Map.get(base, :timebase),
+      fallback_reason: Map.get(base, :fallback_reason),
+      last_gps_time: Map.get(base, :last_gps_time),
+      status: Map.get(base, :status, "ok"),
       reported_at: DateTime.utc_now() |> DateTime.to_iso8601()
     }
   end

@@ -53,7 +53,8 @@ config :racing_org_tracker,
   polar_directory: "/data/polars",
   race_archive_directory: "/data/races",
   tracking_directory: "/data/tracking",
-  computed_values_directory: "/data/computed_values"
+  computed_values_directory: "/data/computed_values",
+  clock_source_directory: "/data/clock_source"
 
 # NervesHub remote management (OTA firmware updates + remote console).
 #

@@ -11,8 +11,9 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetry do
   def init(args) do
     filters = Keyword.get(args, :filters, %{})
     filter_mode = Keyword.get(args, :filter_mode)
+    clock_source = Keyword.get(args, :clock_source, RacingOrg.Tracker.Pro.ClockSource.Config)
     Logger.info("Starting #{__MODULE__} in #{inspect(filter_mode)} mode\nwith filters: #{inspect(filters)}")
-    {:ok, %{filters: filters, filter_mode: filter_mode}}
+    {:ok, %{filters: filters, filter_mode: filter_mode, clock_source: clock_source}}
   end
 
   @impl true
@@ -26,6 +27,8 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetry do
         state
       ) do
     if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      timestamp = boat_time(state.clock_source, timestamp, timestamp_monotonic_ms)
+
       :telemetry.execute(
         [:racing_org, :wind, reference],
         %{
@@ -52,6 +55,8 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetry do
         state
       ) do
     if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      timestamp = boat_time(state.clock_source, timestamp, timestamp_monotonic_ms)
+
       :telemetry.execute(
         [:racing_org, :gps],
         %{
@@ -78,6 +83,8 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetry do
         state
       ) do
     if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      timestamp = boat_time(state.clock_source, timestamp, timestamp_monotonic_ms)
+
       :telemetry.execute(
         [:racing_org, :temperature],
         %{
@@ -109,6 +116,8 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetry do
         state
       ) do
     if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      timestamp = boat_time(state.clock_source, timestamp, timestamp_monotonic_ms)
+
       :telemetry.execute(
         [:racing_org, :velocity, :ground],
         %{
@@ -135,6 +144,8 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetry do
         state
       ) do
     if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      timestamp = boat_time(state.clock_source, timestamp, timestamp_monotonic_ms)
+
       :telemetry.execute(
         [:racing_org, :speed, :water],
         %{
@@ -160,6 +171,8 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetry do
         state
       ) do
     if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      timestamp = boat_time(state.clock_source, timestamp, timestamp_monotonic_ms)
+
       :telemetry.execute(
         [:racing_org, :water_depth],
         %{
@@ -185,6 +198,8 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetry do
         state
       ) do
     if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      timestamp = boat_time(state.clock_source, timestamp, timestamp_monotonic_ms)
+
       :telemetry.execute(
         [:racing_org, :heading],
         %{
@@ -210,6 +225,8 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetry do
         state
       ) do
     if desired_device_or_permissive_mode?(state.filters, state.filter_mode, NMEA.WindData, source_name) do
+      timestamp = boat_time(state.clock_source, timestamp, timestamp_monotonic_ms)
+
       :telemetry.execute(
         [:racing_org, :attitude],
         %{
@@ -230,6 +247,15 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetry do
   def handle_info(_msg, state) do
     # Logger.debug("Unknown Data received: #{inspect(msg)}")
     {:noreply, state}
+  end
+
+  # The telemetry wall-clock timestamp: the boat clock resolved by the clock-source
+  # policy (default RacingOrg.Tracker.Pro.ClockSource.Config). Falls back to the
+  # frame's own receive timestamp (the current behavior) when no GPS timebase is
+  # active or the clock-source server is unavailable. `timestamp_monotonic_ms` is
+  # left untouched for ordering/damping.
+  defp boat_time(clock_source, receive_ts, monotonic_ms) do
+    RacingOrg.Tracker.Pro.ClockSource.Config.resolve_timestamp(clock_source, receive_ts, monotonic_ms)
   end
 
   defp desired_device_or_permissive_mode?(_filters, :permissive, _, _), do: true

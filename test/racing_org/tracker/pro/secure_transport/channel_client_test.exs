@@ -433,6 +433,123 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     end
   end
 
+  # --- clock-source policy: set_clock_source / clock_source_status ---
+
+  describe "set_clock_source / clock_source_status (SocketTest)" do
+    # A fake ClockSource collaborator mirroring the API the channel uses:
+    # apply_config/2 (records the call) + status/1.
+    defmodule FakeClockSource do
+      use GenServer
+
+      def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+      @impl true
+      def init(opts) do
+        {:ok,
+         %{
+           parent: Keyword.fetch!(opts, :parent),
+           status:
+             Keyword.get(opts, :status, %{
+               applied_version: 2,
+               mode: "sensor_priority",
+               active_source_sensor_id: "sensor-abc",
+               active_source_label: "Masthead GPS",
+               active_hw_id: "hw-1",
+               active_source_address: "35",
+               timebase: "sensor",
+               fallback_reason: nil,
+               last_gps_time: "2026-06-30T12:00:00.000Z",
+               status: "ok"
+             }),
+           apply_result: Keyword.get(opts, :apply_result, {:ok, %{version: 2}})
+         }}
+      end
+
+      def apply_config(server, config), do: GenServer.call(server, {:apply_config, config})
+      def status(server), do: GenServer.call(server, :status)
+
+      @impl true
+      def handle_call({:apply_config, config}, _from, state) do
+        send(state.parent, {:apply_clock_source_called, config})
+        {:reply, state.apply_result, state}
+      end
+
+      def handle_call(:status, _from, state), do: {:reply, state.status, state}
+    end
+
+    defp connect_clock_source_client(ctx, clock_opts) do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      {:ok, clock} = start_supervised({FakeClockSource, [parent: self()] ++ clock_opts})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           clock_source: {FakeClockSource, clock},
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      {client, topic, clock}
+    end
+
+    test "server set_clock_source → apply_config called + clock_source_status pushed", ctx do
+      {client, topic, _clock} = connect_clock_source_client(ctx, [])
+
+      push(client, topic, "set_clock_source", %{
+        "version" => 2,
+        "mode" => "sensor_priority",
+        "fallback" => "tracker_receive_time",
+        "sources" => [
+          %{"priority" => 1, "sensor_id" => "sensor-abc", "source_address" => "35", "label" => "Masthead GPS"}
+        ]
+      })
+
+      assert_receive {:apply_clock_source_called, config}
+      assert config["version"] == 2
+      assert config["mode"] == "sensor_priority"
+
+      assert_push(^topic, "clock_source_status", status)
+      assert status.applied_version == 2
+      assert status.mode == "sensor_priority"
+      assert status.timebase == "sensor"
+      assert status.active_source_sensor_id == "sensor-abc"
+      assert status.active_source_label == "Masthead GPS"
+      assert status.active_hw_id == "hw-1"
+      assert status.active_source_address == "35"
+      assert status.fallback_reason == nil
+      assert status.last_gps_time == "2026-06-30T12:00:00.000Z"
+      assert status.status == "ok"
+      assert Map.has_key?(status, :reported_at)
+    end
+
+    test "set_clock_source apply error → still pushes status (no crash)", ctx do
+      {client, topic, _clock} =
+        connect_clock_source_client(ctx,
+          apply_result: {:error, :bad_version},
+          status: %{
+            applied_version: nil,
+            mode: "tracker_receive_time",
+            timebase: "tracker_receive_time",
+            fallback_reason: "default_mode"
+          }
+        )
+
+      push(client, topic, "set_clock_source", %{"mode" => "sensor_priority"})
+
+      assert_receive {:apply_clock_source_called, _config}
+      assert_push(^topic, "clock_source_status", status)
+      assert status.mode == "tracker_receive_time"
+      assert status.timebase == "tracker_receive_time"
+      assert Process.alive?(client)
+    end
+  end
+
   # --- computed values (Phase 7): set_computed_values / computed_values_status ---
 
   describe "set_computed_values / computed_values_status (SocketTest)" do
