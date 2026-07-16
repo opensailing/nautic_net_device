@@ -203,6 +203,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       # source) and reports the active boat-time timebase back as
       # "clock_source_status". A {module, server} pair (bare module = both).
       clock_source: normalize_collaborator(Keyword.get(opts, :clock_source, RacingOrg.Tracker.Pro.ClockSource.Config)),
+      # The calibration policy: applies the server-pushed "set_calibration" config
+      # (default RacingOrg.Tracker.Pro.Calibration.Config, which is ALSO the status
+      # source) and reports the learned/locked per-sensor state back as
+      # "calibration_status". A {module, server} pair (bare module = both).
+      calibration: normalize_collaborator(Keyword.get(opts, :calibration, RacingOrg.Tracker.Pro.Calibration.Config)),
       # The on-device compute engine: applies the server-pushed computed-value defs
       # ("set_computed_values") and reports applied_version + active_count back as
       # "computed_values_status". A {module, server} pair (bare module = both).
@@ -370,6 +375,18 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   def handle_message(topic, "set_clock_source", payload, socket) do
     {_result, socket} = apply_clock_source(payload, socket)
     push(socket, topic, "clock_source_status", clock_source_status(socket))
+    {:ok, socket}
+  end
+
+  # Server pushes the calibration policy (which parameters may auto-apply, plus
+  # explicit per-sensor locks). Apply it through
+  # RacingOrg.Tracker.Pro.Calibration.Config (versioned, idempotent), then report
+  # the learned/locked per-sensor state back as "calibration_status". On an apply
+  # error we still report the current status so the server is not left stale, and
+  # we never crash the channel.
+  def handle_message(topic, "set_calibration", payload, socket) do
+    {_result, socket} = apply_calibration(payload, socket)
+    push(socket, topic, "calibration_status", calibration_status(socket))
     {:ok, socket}
   end
 
@@ -653,6 +670,44 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       timebase: Map.get(base, :timebase),
       fallback_reason: Map.get(base, :fallback_reason),
       last_gps_time: Map.get(base, :last_gps_time),
+      status: Map.get(base, :status, "ok"),
+      reported_at: DateTime.utc_now() |> DateTime.to_iso8601()
+    }
+  end
+
+  # --- Calibration collaborator ---
+
+  defp apply_calibration(payload, socket) do
+    {module, server} = socket.assigns.calibration
+    result = module.apply_config(server, payload)
+    {result, socket}
+  rescue
+    error ->
+      Logger.warning("[ChannelClient] Calibration apply_config failed: #{inspect(error)}")
+      {{:error, :apply_failed}, socket}
+  end
+
+  # Build the "calibration_status" the server allowlists: applied_version, modes
+  # (parameter => mode string), sensors (hardware_identifier / parameter / state /
+  # value / confidence / sample_count), status, and reported_at (ISO-8601). Falls
+  # back to a minimal map if the status source is unavailable, and always stamps
+  # reported_at.
+  defp calibration_status(socket) do
+    {module, server} = socket.assigns.calibration
+
+    base =
+      try do
+        module.status(server)
+      rescue
+        error ->
+          Logger.warning("[ChannelClient] calibration status read failed: #{inspect(error)}")
+          %{}
+      end
+
+    %{
+      applied_version: Map.get(base, :applied_version),
+      modes: Map.get(base, :modes, %{}),
+      sensors: Map.get(base, :sensors, []),
       status: Map.get(base, :status, "ok"),
       reported_at: DateTime.utc_now() |> DateTime.to_iso8601()
     }

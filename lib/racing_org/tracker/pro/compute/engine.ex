@@ -86,17 +86,46 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
   per-tick copy of the source polar. The `:commands` collaborator is injectable for
   host tests (`{module, server}` or a bare module).
 
-  All side effects (clock, persistence dir, max-age, commands) are injectable via
-  `start_link/1` opts so the engine is fully unit-testable on host.
+  ## Calibration corrections (device state, not a signal)
+
+  The auto-calibration layer (`RacingOrg.Tracker.Pro.Calibration.Config`) compiles
+  per-sensor corrections `%{hex => %{awa_offset_deg: f, awa_upwash_deg: f,
+  stw_gains: [{band_center_mps, gain}]}}`. The engine applies them to decoded
+  telemetry BEFORE folding values into the signal map, keyed by the event's
+  `metadata.device_id` (the raw NMEA NAME, canonicalized to the backend's
+  uppercase-hex id via `RacingOrg.Tracker.Pro.NmeaIdentity`):
+
+    * `apparent_wind_angle`: folded to signed (−180, 180], then
+      `awa + awa_offset_deg + awa_upwash_deg * sign(awa)` (no upwash dead-ahead),
+      returned in the ORIGINAL convention (0..360 in from the bus -> 0..360 out);
+    * `boat_speed`: `v * gain`, gain piecewise-linear over the `stw_gains` bands
+      (flat extrapolation; a single pair is a uniform gain), defensively clamped
+      to [0.8, 1.2];
+    * everything else passes through untouched.
+
+  Exactly like the polar lookup, the corrections map is CACHED in engine state and
+  refreshed ONLY on a `{:racing_org_calibration, :updated}` notification — one
+  cross-process fetch per change, never per telemetry event. With no calibration
+  collaborator (`calibration: nil`) or an empty corrections map every signal value
+  is BIT-IDENTICAL to the uncorrected path. Because `feed_back_outputs/2` and all
+  calcs read the signal map, true wind and every downstream calc automatically
+  compute from the corrected inputs. The raw DataSet upload path
+  (`RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetry` consumers) is a PARALLEL
+  consumer and stays raw.
+
+  All side effects (clock, persistence dir, max-age, commands, calibration) are
+  injectable via `start_link/1` opts so the engine is fully unit-testable on host.
   """
 
   use GenServer
   require Logger
 
+  alias RacingOrg.Tracker.Pro.Calibration
   alias RacingOrg.Tracker.Pro.Commands
   alias RacingOrg.Tracker.Pro.Compute.Expr
   alias RacingOrg.Tracker.Pro.Compute.Library
   alias RacingOrg.Tracker.Pro.Compute.Store
+  alias RacingOrg.Tracker.Pro.NmeaIdentity
   alias RacingOrg.Tracker.Protobuf.DeviceCommand
 
   @default_store_dir "/data/computed_values"
@@ -241,6 +270,13 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
       # path never rebuilds/refetches. Refreshed only on a polar-change notification.
       polar_lookup: nil,
       polar_version: nil,
+      # The Calibration.Config collaborator the cached corrections are fetched from.
+      # Pass `nil` to disable calibration entirely (every signal passes through).
+      calibration: normalize_calibration(Keyword.get(opts, :calibration, Calibration.Config)),
+      # The compiled per-sensor corrections map, cached locally so the telemetry hot
+      # path is one map lookup + arithmetic. Refreshed only on a calibration-change
+      # notification.
+      corrections: %{},
       # nil = nothing applied yet, so any incoming version (incl. 0) is newer.
       applied_version: nil,
       defs: [],
@@ -251,6 +287,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
     state = reconcile(opts, state)
     attach_telemetry(handler_id, opts)
     state = init_polar(state)
+    state = init_calibration(state)
 
     {:ok, state}
   end
@@ -286,24 +323,18 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
 
   # Telemetry handler runs in the publishing process and just forwards the decoded,
   # unit-converted signal updates here as a message; the GenServer owns the map.
+  # Direct injections (put_signal) carry no source identity, so no corrections apply.
   @impl true
   def handle_info({:signal_updates, updates, mono_ms}, state) do
-    signals =
-      Enum.reduce(updates, state.signals, fn {name, value}, acc ->
-        Map.put(acc, name, {value, mono_ms})
-      end)
+    {:noreply, ingest_updates(updates, mono_ms, state)}
+  end
 
-    # Re-inject designated calc outputs (currently the on-device `:true_wind` calc's
-    # true_wind_* outputs) back into the signal map as canonical signals so the
-    # polar/next-leg calcs drive off an APPARENT-only boat too (no network true-wind
-    # PGN). Event-driven (only on a signal change), fresh-timestamped, with NO
-    # cross-process call and NO polar rebuild — see feed_back_outputs/3.
-    signals = feed_back_outputs(%{state | signals: signals}, mono_ms)
-
-    # Event-driven recompute happens implicitly: current_values/status recompute fresh
-    # against state.signals. (Holding per-def cached results is unnecessary for Phase 7
-    # and would only risk staleness; Phase 8 reads current_values which is always live.)
-    {:noreply, %{state | signals: signals}}
+  # Decoded telemetry additionally carries the source sensor identity (the raw
+  # `metadata.device_id` NMEA NAME); per-sensor calibration corrections are applied
+  # BEFORE the values fold into the signal map. With no corrections cached this is
+  # a pass-through (bit-identical values).
+  def handle_info({:signal_updates, updates, mono_ms, device_id}, state) do
+    {:noreply, ingest_updates(apply_corrections(updates, device_id, state.corrections), mono_ms, state)}
   end
 
   # A polar-table command was applied -> the polar may have changed; refresh the
@@ -314,7 +345,33 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
 
   def handle_info({:racing_org_command, _command}, state), do: {:noreply, state}
 
+  # The calibration state changed -> refresh the cached corrections ONCE (off the
+  # hot path).
+  def handle_info({:racing_org_calibration, :updated}, state) do
+    {:noreply, refresh_calibration(state)}
+  end
+
   def handle_info(_msg, state), do: {:noreply, state}
+
+  # Fold the (possibly corrected) signal updates into the map, then re-inject
+  # designated calc outputs (currently the on-device `:true_wind` calc's
+  # true_wind_* outputs) back as canonical signals so the polar/next-leg calcs
+  # drive off an APPARENT-only boat too (no network true-wind PGN). Event-driven
+  # (only on a signal change), fresh-timestamped, with NO cross-process call and
+  # NO polar rebuild — see feed_back_outputs/2.
+  #
+  # Event-driven recompute happens implicitly: current_values/status recompute fresh
+  # against state.signals. (Holding per-def cached results is unnecessary for Phase 7
+  # and would only risk staleness; Phase 8 reads current_values which is always live.)
+  defp ingest_updates(updates, mono_ms, state) do
+    signals =
+      Enum.reduce(updates, state.signals, fn {name, value}, acc ->
+        Map.put(acc, name, {value, mono_ms})
+      end)
+
+    signals = feed_back_outputs(%{state | signals: signals}, mono_ms)
+    %{state | signals: signals}
+  end
 
   # --- polar lookup cache (built once per polar version, NOT per tick) ---
 
@@ -363,6 +420,135 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
   defp normalize_commands({module, server}) when is_atom(module), do: {module, server}
   defp normalize_commands(module) when is_atom(module), do: {module, module}
 
+  # --- calibration corrections cache (fetched once per change, NOT per event) ---
+
+  # On boot: subscribe to Calibration.Config for change notifications, then prime
+  # the cache once. Disabled (calibration == nil) leaves the corrections empty, so
+  # every signal passes through untouched.
+  defp init_calibration(%{calibration: nil} = state), do: state
+
+  defp init_calibration(%{calibration: {module, server}} = state) do
+    subscribe_calibration(module, server)
+    refresh_calibration(state)
+  end
+
+  # Refresh the cached corrections from the collaborator. A single cross-process
+  # call, invoked ONLY on boot and on a calibration-change notification — never
+  # per telemetry event.
+  defp refresh_calibration(%{calibration: nil} = state), do: state
+
+  defp refresh_calibration(%{calibration: {module, server}} = state) do
+    %{state | corrections: fetch_corrections(module, server)}
+  end
+
+  defp subscribe_calibration(module, server) do
+    if function_exported?(module, :subscribe, 2) do
+      module.subscribe(server, self())
+    end
+
+    :ok
+  catch
+    :exit, _ -> :ok
+  end
+
+  defp fetch_corrections(module, server) do
+    case module.corrections(server) do
+      %{} = corrections -> corrections
+      _ -> %{}
+    end
+  catch
+    :exit, _ -> %{}
+  end
+
+  defp normalize_calibration(nil), do: nil
+  defp normalize_calibration({module, server}) when is_atom(module), do: {module, server}
+  defp normalize_calibration(module) when is_atom(module), do: {module, module}
+
+  # --- calibration correction application (the telemetry hot path) ---
+  #
+  # Per event: one canonicalization + one map lookup + arithmetic; NO GenServer
+  # call. With no corrections cached (the common case) the updates pass through
+  # UNTOUCHED — bit-identical to the uncorrected path.
+
+  @min_stw_gain 0.8
+  @max_stw_gain 1.2
+
+  defp apply_corrections(updates, _device_id, corrections) when map_size(corrections) == 0, do: updates
+
+  defp apply_corrections(updates, device_id, corrections) do
+    case Map.get(corrections, NmeaIdentity.canonical_hardware_id(device_id)) do
+      nil -> updates
+      %{} = entry -> Enum.map(updates, &correct_update(&1, entry))
+    end
+  end
+
+  defp correct_update({"apparent_wind_angle", awa}, entry), do: {"apparent_wind_angle", correct_awa(awa, entry)}
+  defp correct_update({"boat_speed", stw}, entry), do: {"boat_speed", correct_stw(stw, entry)}
+  defp correct_update(update, _entry), do: update
+
+  # Fold to signed (−180, 180], apply `awa + offset + upwash * sign(awa)` (the
+  # upwash flips with the tack side; sign(0) = 0 so dead-ahead gets no upwash),
+  # re-fold, then return in the ORIGINAL convention: a non-negative input (the
+  # bus's 0..360 form) comes back in [0, 360); a negative (signed) input stays
+  # signed. A sensor entry with no AWA correction leaves the value untouched.
+  defp correct_awa(awa, entry) do
+    offset = Map.get(entry, :awa_offset_deg, 0.0)
+    upwash = Map.get(entry, :awa_upwash_deg, 0.0)
+
+    if offset == 0.0 and upwash == 0.0 do
+      awa
+    else
+      signed = fold_signed_deg(awa)
+      corrected = fold_signed_deg(signed + offset + upwash * tack_sign(signed))
+      restore_awa_convention(awa, corrected)
+    end
+  end
+
+  defp fold_signed_deg(deg) do
+    folded = :math.fmod(deg, 360.0)
+
+    cond do
+      folded > 180.0 -> folded - 360.0
+      folded <= -180.0 -> folded + 360.0
+      true -> folded
+    end
+  end
+
+  defp tack_sign(signed) when signed > 0, do: 1.0
+  defp tack_sign(signed) when signed < 0, do: -1.0
+  defp tack_sign(_signed), do: 0.0
+
+  defp restore_awa_convention(original, corrected) when original < 0, do: corrected
+  defp restore_awa_convention(_original, corrected) when corrected < 0, do: corrected + 360.0
+  defp restore_awa_convention(_original, corrected), do: corrected
+
+  # `v * gain`: piecewise-linear interpolation of the {band_center_mps, gain}
+  # bands over v, flat extrapolation beyond the first/last center (a single pair
+  # is a uniform gain), with the final gain defensively clamped to
+  # [@min_stw_gain, @max_stw_gain]. No stw_gains -> untouched.
+  defp correct_stw(stw, entry) do
+    case Map.get(entry, :stw_gains) do
+      [_ | _] = gains -> stw * clamp_gain(stw_gain(gains, stw))
+      _ -> stw
+    end
+  end
+
+  defp stw_gain([{_center, gain}], _v), do: gain
+  defp stw_gain([{center, gain} | _rest], v) when v <= center, do: gain
+
+  defp stw_gain([{c0, g0}, {c1, g1} | rest], v) do
+    cond do
+      v <= c1 and c1 == c0 -> g1
+      v <= c1 -> g0 + (g1 - g0) * (v - c0) / (c1 - c0)
+      rest == [] -> g1
+      true -> stw_gain([{c1, g1} | rest], v)
+    end
+  end
+
+  defp clamp_gain(gain) when gain < @min_stw_gain, do: @min_stw_gain
+  defp clamp_gain(gain) when gain > @max_stw_gain, do: @max_stw_gain
+  defp clamp_gain(gain), do: gain
+
   # --- telemetry attach + decode (signal mapping + unit conversion) ---
 
   defp attach_telemetry(handler_id, opts) do
@@ -382,13 +568,15 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
 
   @doc false
   # Telemetry callback (NOT run in the GenServer). Decodes the measurement into
-  # canonical signals (converting units) and forwards them to the engine process.
+  # canonical signals (converting units) and forwards them to the engine process,
+  # along with the source sensor identity (`metadata.device_id`, the raw NMEA
+  # NAME) so per-sensor calibration corrections can key off it.
   def handle_event(event, measurements, metadata, %{target: target}) do
     mono_ms = mono_ms(metadata)
 
     case decode_signals(event, measurements) do
       [] -> :ok
-      updates -> send(target, {:signal_updates, updates, mono_ms})
+      updates -> send(target, {:signal_updates, updates, mono_ms, device_id(metadata)})
     end
   end
 
@@ -438,6 +626,9 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
 
   defp mono_ms(%{timestamp_monotonic_ms: ms}) when is_integer(ms), do: ms
   defp mono_ms(_metadata), do: System.monotonic_time(:millisecond)
+
+  defp device_id(%{device_id: id}), do: id
+  defp device_id(_metadata), do: nil
 
   # --- output -> signal feedback (designated calc outputs re-injected as signals) ---
 

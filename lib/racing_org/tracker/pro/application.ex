@@ -59,6 +59,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
       RacingOrg.Tracker.Pro.Telemetry,
       tracking_config_child(),
       clock_source_config_child(),
+      calibration_config_child(),
       compute_engine_child(),
       polar_observer_child(),
       {RacingOrg.Tracker.Pro.Sampling, name: RacingOrg.Tracker.Pro.Sampling},
@@ -201,10 +202,23 @@ defmodule RacingOrg.Tracker.Pro.Application do
      store_dir: Application.get_env(:racing_org_tracker, :clock_source_directory)}
   end
 
+  # Sensor-calibration state (server-pushed "set_calibration" policy + on-device
+  # learned corrections). It persists both to /data (survives reboots) and compiles
+  # the per-sensor corrections the compute engine caches and applies to decoded
+  # telemetry. Started in EVERY environment so the channel + engine can read it;
+  # cheap + idle with no config (no corrections -> every signal passes through).
+  # Must start BEFORE Compute.Engine (the engine subscribes to / reads it in init).
+  defp calibration_config_child do
+    {RacingOrg.Tracker.Pro.Calibration.Config,
+     name: RacingOrg.Tracker.Pro.Calibration.Config,
+     store_dir: Application.get_env(:racing_org_tracker, :calibration_directory)}
+  end
+
   defp compute_engine_child do
     {RacingOrg.Tracker.Pro.Compute.Engine,
      name: RacingOrg.Tracker.Pro.Compute.Engine,
-     store_dir: Application.get_env(:racing_org_tracker, :computed_values_directory)}
+     store_dir: Application.get_env(:racing_org_tracker, :computed_values_directory),
+     calibration: RacingOrg.Tracker.Pro.Calibration.Config}
   end
 
   # SECONDARY observational ("sailed") polar (Phase 4): on its own ~1 Hz timer it

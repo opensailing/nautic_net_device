@@ -550,6 +550,131 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     end
   end
 
+  # --- calibration policy: set_calibration / calibration_status ---
+
+  describe "set_calibration / calibration_status (SocketTest)" do
+    # A fake Calibration.Config collaborator mirroring the API the channel uses:
+    # apply_config/2 (records the call) + status/1.
+    defmodule FakeCalibration do
+      use GenServer
+
+      def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+      @impl true
+      def init(opts) do
+        {:ok,
+         %{
+           parent: Keyword.fetch!(opts, :parent),
+           status:
+             Keyword.get(opts, :status, %{
+               applied_version: 3,
+               modes: %{
+                 "awa_offset" => "auto",
+                 "awa_upwash" => "auto",
+                 "stw_scale" => "auto",
+                 "aws_scale" => "shadow"
+               },
+               sensors: [
+                 %{
+                   hardware_identifier: "1A2B",
+                   parameter: "awa_offset",
+                   state: "applied",
+                   value: 2.5,
+                   confidence: 0.9,
+                   sample_count: 500
+                 }
+               ],
+               status: "ok"
+             }),
+           apply_result: Keyword.get(opts, :apply_result, {:ok, %{version: 3}})
+         }}
+      end
+
+      def apply_config(server, config), do: GenServer.call(server, {:apply_config, config})
+      def status(server), do: GenServer.call(server, :status)
+
+      @impl true
+      def handle_call({:apply_config, config}, _from, state) do
+        send(state.parent, {:apply_calibration_called, config})
+        {:reply, state.apply_result, state}
+      end
+
+      def handle_call(:status, _from, state), do: {:reply, state.status, state}
+    end
+
+    defp connect_calibration_client(ctx, calibration_opts) do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      {:ok, calibration} = start_supervised({FakeCalibration, [parent: self()] ++ calibration_opts})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           calibration: {FakeCalibration, calibration},
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      {client, topic, calibration}
+    end
+
+    test "server set_calibration → apply_config called + calibration_status pushed", ctx do
+      {client, topic, _calibration} = connect_calibration_client(ctx, [])
+
+      push(client, topic, "set_calibration", %{
+        "version" => 3,
+        "parameters" => %{"awa_offset" => %{"mode" => "auto"}, "aws_scale" => %{"mode" => "shadow"}},
+        "sensors" => [
+          %{"hardware_identifier" => "1A2B", "parameter" => "awa_offset", "locked" => true, "value" => 2.5}
+        ]
+      })
+
+      assert_receive {:apply_calibration_called, config}
+      assert config["version"] == 3
+      assert config["parameters"]["awa_offset"]["mode"] == "auto"
+
+      assert_push(^topic, "calibration_status", status)
+      assert status.applied_version == 3
+      assert status.modes["awa_offset"] == "auto"
+      assert status.modes["aws_scale"] == "shadow"
+      assert [%{hardware_identifier: "1A2B", parameter: "awa_offset", state: "applied"}] = status.sensors
+      assert status.status == "ok"
+      assert Map.has_key?(status, :reported_at)
+      # Allowlist: nothing beyond the contract fields.
+      assert Map.keys(status) |> Enum.sort() == [:applied_version, :modes, :reported_at, :sensors, :status]
+    end
+
+    test "set_calibration apply error → still pushes status (no crash)", ctx do
+      {client, topic, _calibration} =
+        connect_calibration_client(ctx,
+          apply_result: {:error, :bad_version},
+          status: %{
+            applied_version: nil,
+            modes: %{
+              "awa_offset" => "auto",
+              "awa_upwash" => "auto",
+              "stw_scale" => "auto",
+              "aws_scale" => "shadow"
+            },
+            sensors: []
+          }
+        )
+
+      push(client, topic, "set_calibration", %{"parameters" => %{}})
+
+      assert_receive {:apply_calibration_called, _config}
+      assert_push(^topic, "calibration_status", status)
+      assert status.applied_version == nil
+      assert status.sensors == []
+      assert Process.alive?(client)
+    end
+  end
+
   # --- computed values (Phase 7): set_computed_values / computed_values_status ---
 
   describe "set_computed_values / computed_values_status (SocketTest)" do
