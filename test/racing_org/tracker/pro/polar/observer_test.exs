@@ -157,6 +157,49 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverTest do
       assert Observer.cells(pid) == []
       assert Observer.stats(pid).reject_reasons[:no_go_angle] >= 1
     end
+
+    test "a stream WITHOUT any heel signal still admits and bins (heel is optional)" do
+      # A boat with NO heel sensor: heel must be an accuracy enhancer, never an
+      # availability gate. The sample carries heel: nil, the Gate SKIPS its heel
+      # band check (mirroring the motoring skip), and the otherwise-steady stream
+      # accumulates into fixture A's cell (heel absent -> the true-wind correction
+      # is a no-op, so the derived cell is identical to the heel-0 fixture).
+      stream =
+        for i <- 0..11 do
+          %{
+            "apparent_wind_speed" => 8.0,
+            "apparent_wind_angle" => 30.0,
+            "boat_speed" => 4.0,
+            "heading" => 0.0
+          }
+          |> Map.new(fn {k, v} -> {k, {v, i * 1000}} end)
+        end
+
+      pid = start_observer(signals_fn: scripted(stream))
+
+      for _ <- 0..11, do: Observer.tick(pid)
+
+      assert [{@cell_a, _, %{count: count}}] = Observer.cells(pid)
+      assert count >= 1
+
+      stats = Observer.stats(pid)
+      assert stats.admitted >= 1
+      # The missing heel never surfaced as a rejection or stalled the pipeline.
+      refute Map.has_key?(stats.reject_reasons, :heel_out_of_band)
+      refute Map.has_key?(stats.reject_reasons, :no_true_wind)
+    end
+
+    test "with heel PRESENT, an out-of-band heel still rejects :heel_out_of_band" do
+      # No behavior change when the signal exists: a knockdown-grade heel reading
+      # (60° > the default ±45° band) keeps every sample out of the polar.
+      stream = for i <- 0..11, do: signals(i * 1000, %{"heel" => 60.0})
+      pid = start_observer(signals_fn: scripted(stream))
+
+      for _ <- 0..11, do: Observer.tick(pid)
+
+      assert Observer.cells(pid) == []
+      assert Observer.stats(pid).reject_reasons[:heel_out_of_band] >= 1
+    end
   end
 
   # --- true wind is STW-based --------------------------------------------
@@ -173,11 +216,11 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverTest do
     end
 
     test "apparent-only stream WITHOUT a pitch signal still derives true wind and bins" do
-      # A boat with NO pitch sensor: only apparent wind + STW + heading + heel (the
-      # Gate's level filter still wants heel). Before the fix, the absent `pitch`
-      # forced :true_wind → :invalid, so every sample was rejected `:no_true_wind`
-      # and the Observer stalled. The STW triangle must now derive true wind without
-      # pitch and the Observer must admit + bin fixture A's cell.
+      # A boat with NO pitch sensor: only apparent wind + STW + heading + heel.
+      # Before the fix, the absent `pitch` forced :true_wind → :invalid, so every
+      # sample was rejected `:no_true_wind` and the Observer stalled. The STW
+      # triangle must now derive true wind without pitch and the Observer must
+      # admit + bin fixture A's cell.
       stream =
         for i <- 0..11 do
           %{

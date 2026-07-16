@@ -15,21 +15,26 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
 
     1. **Sample.** Read the current raw-signal map from the compute engine
        (`Compute.Engine.signals/1`) once. Derive **STW-based true wind** from it via
-       `Compute.Library.compute(:true_wind, …)` — apparent wind + boat speed (STW) +
-       heel + pitch + heading. This is deliberately STW-based (NOT SOG-based) and is
-       computed HERE from raw signals, so the sailed polar works WITHOUT depending on
-       the reference polar or a server-pushed `:true_wind` computed-value def. If the
-       network already publishes `true_wind_*` signals they are used as-is; otherwise
-       the STW triangle supplies them.
+       `Compute.Library.compute(:true_wind, …)` — apparent wind + boat speed (STW)
+       are ESSENTIAL; heel, pitch, and heading are optional refinements. This is
+       deliberately STW-based (NOT SOG-based) and is computed HERE from raw signals,
+       so the sailed polar works WITHOUT depending on the reference polar or a
+       server-pushed `:true_wind` computed-value def. If the network already
+       publishes `true_wind_*` signals they are used as-is; otherwise the STW
+       triangle supplies them. A boat with no heel sensor still samples: the sample
+       simply carries `heel_deg: nil`.
 
     2. **Window + admission.** Push the sample onto a rolling window
        (most-recent-last, capped at `:window_size`). A sample is accumulated only if
        (a) the boat is MOVING — `stw_mps > :min_stw_mps` (default 0.3 m/s, ≈ 0.6 kn)
        — AND (b) `Observer.Gate.evaluate/2` returns `:admit` over the window (settled,
-       on-angle, level, steady wind, no turn, no accel, not motoring). The min-STW
-       floor is applied in the Observer (NOT folded into the Gate) so the Gate stays a
-       pure STEADINESS filter; see "Min-STW" below. Reject reasons are tallied cheaply
-       for observability (`stats/1`).
+       on-angle, level, steady wind, no turn, no accel, not motoring). Heel is an
+       accuracy ENHANCER, never an availability gate: the Gate's heel-band check runs
+       only when the sample carries a heel and is skipped when it is absent (like its
+       motoring skip), so heel-less boats still accumulate. The min-STW floor is
+       applied in the Observer (NOT folded into the Gate) so the Gate stays a pure
+       STEADINESS filter; see "Min-STW" below. Reject reasons are tallied cheaply for
+       observability (`stats/1`).
 
     3. **Accumulate.** On `:admit`, map `(tws, twa)` to a `Bins` cell key, fold the
        sample's `boat_speed` (STW) into that cell's streaming `PSquare` quantile
@@ -263,8 +268,10 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
 
   # Build the Gate sample from the current raw signals. True wind is STW-based:
   # prefer live network `true_wind_*` signals, else derive them from the apparent-wind
-  # / STW / heel / pitch / heading triangle via Library.compute(:true_wind, …). Without
-  # boat_speed (STW) or a derivable true wind there is no admissible sample.
+  # / STW triangle via Library.compute(:true_wind, …) (heel/pitch/heading are optional
+  # refinements there). Without boat_speed (STW) or a derivable true wind there is no
+  # admissible sample. heel/heading/motoring are carried as-is (nil when absent) — the
+  # Gate skips the checks it has no signal for, so none of them gate availability.
   defp build_sample(signals, state) do
     plain = strip_timestamps(signals)
 

@@ -24,7 +24,8 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Gate do
       `:angle_key` selects `:awa_deg`).
     * `:stw_mps` — speed through water (m/s).
     * `:heading_deg` — heading (deg, 0–360; wrap-aware turn rate).
-    * `:heel_deg` — heel angle (deg, signed).
+    * `:heel_deg` (optional, number) — heel angle (deg, signed); see "Heel band"
+      below — absent/nil heel SKIPS the band check.
     * `:under_power?` (optional, boolean) and/or `:engine_rpm` (optional, number)
       — motoring signals; see "Motoring exclusion" below.
 
@@ -54,7 +55,11 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Gate do
     * **Heel band** (`:heel_band_deg`, default `{-45.0, 45.0}`): reject heel
       outside a wide, sane band. Expected heel varies a lot by boat and breeze,
       so the default is deliberately permissive (it mainly catches a knockdown /
-      bad-sensor reading), and is meant to be tightened per boat.
+      bad-sensor reading), and is meant to be tightened per boat. The check runs
+      ONLY when the sample carries a numeric heel and is SKIPPED when heel is
+      absent/nil — heel is an accuracy enhancer, never an availability gate
+      (mirroring the motoring skip), so a boat with no heel sensor still
+      accumulates a sailed polar.
 
     * **Minimum dwell** (`:min_dwell`, default `10`): require at least `N`
       samples in the window AND that **every** sample in it independently passes
@@ -227,13 +232,17 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Gate do
     end
   end
 
+  # Heel is an accuracy ENHANCER, never an availability gate: when the sample has
+  # no numeric heel (no heel sensor on board) the band check is SKIPPED, mirroring
+  # how the motoring check skips without an engine signal. Only a PRESENT heel can
+  # reject.
   defp check_heel(%__MODULE__{heel_band_deg: {lo, hi}}, sample) do
-    heel = sample[:heel_deg]
+    case sample[:heel_deg] do
+      heel when is_number(heel) ->
+        if heel >= lo and heel <= hi, do: :ok, else: {:reject, :heel_out_of_band}
 
-    if is_number(heel) and heel >= lo and heel <= hi do
-      :ok
-    else
-      {:reject, :heel_out_of_band}
+      _absent ->
+        :ok
     end
   end
 

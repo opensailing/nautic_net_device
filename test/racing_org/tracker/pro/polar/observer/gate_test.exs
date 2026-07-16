@@ -166,6 +166,28 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.GateTest do
       assert :admit = Gate.evaluate(g, [sample(%{heel_deg: 45.0})])
       assert :admit = Gate.evaluate(g, [sample(%{heel_deg: -45.0})])
     end
+
+    test "admits (skips the check) when no heel signal is present" do
+      # Heel is an accuracy ENHANCER, never an availability gate: with no heel
+      # sensor the gate cannot judge the band and must not reject on that basis —
+      # mirroring how the motoring check skips without an engine signal. A boat
+      # with no heel feed still accumulates a sailed polar.
+      g = gate(min_dwell: 1)
+      assert :admit = Gate.evaluate(g, [Map.delete(sample(), :heel_deg)])
+    end
+
+    test "an explicit nil heel is 'absent' too (skipped, not rejected)" do
+      g = gate(min_dwell: 1)
+      assert :admit = Gate.evaluate(g, [sample(%{heel_deg: nil})])
+    end
+
+    test "a full heel-less window still dwells and admits" do
+      # Every sample in the window lacks heel: the per-sample sweep must not turn
+      # the missing signal into a dwell-breaking rejection.
+      g = gate(min_dwell: 10)
+      window = for s <- steady_window(10), do: Map.delete(s, :heel_deg)
+      assert :admit = Gate.evaluate(g, window)
+    end
   end
 
   describe "minimum dwell (N consecutive qualifying samples)" do
