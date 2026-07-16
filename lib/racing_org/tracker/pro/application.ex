@@ -35,9 +35,16 @@ defmodule RacingOrg.Tracker.Pro.Application do
     # def handle_info({:data, data})
     # See NMEA.NMEA2000.VirtualDevice.AddressManager for an example
     # The clock-source manager also observes decoded time messages to maintain the
-    # boat-time timebase (nil on products where it isn't started).
+    # boat-time timebase, and the calibration Observer consumes RAW per-sensor
+    # data to fit instrument corrections (nil on products where they aren't started).
     clock_source_pid = Process.whereis(RacingOrg.Tracker.Pro.ClockSource.Config)
-    handlers = Enum.reject([emit_telemetry_pid, system_time_pid, clock_source_pid], &is_nil/1)
+    calibration_observer_pid = Process.whereis(RacingOrg.Tracker.Pro.Calibration.Observer)
+
+    handlers =
+      Enum.reject(
+        [emit_telemetry_pid, system_time_pid, clock_source_pid, calibration_observer_pid],
+        &is_nil/1
+      )
 
     # Register the handlers with the virtual device
     for handler <- handlers do
@@ -60,6 +67,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
       tracking_config_child(),
       clock_source_config_child(),
       calibration_config_child(),
+      calibration_observer_child(),
       compute_engine_child(),
       polar_observer_child(),
       {RacingOrg.Tracker.Pro.Sampling, name: RacingOrg.Tracker.Pro.Sampling},
@@ -212,6 +220,16 @@ defmodule RacingOrg.Tracker.Pro.Application do
     {RacingOrg.Tracker.Pro.Calibration.Config,
      name: RacingOrg.Tracker.Pro.Calibration.Config,
      store_dir: Application.get_env(:racing_org_tracker, :calibration_directory)}
+  end
+
+  # The auto-calibration Observer: harvests steady legs / tack pairs / reciprocal
+  # runs from RAW per-sensor bus data (it is also registered as a VirtualDevice
+  # handler below), fits corrections, and promotes them into Calibration.Config.
+  # Shares :calibration_directory with the Config (distinct filenames).
+  defp calibration_observer_child do
+    {RacingOrg.Tracker.Pro.Calibration.Observer,
+     name: RacingOrg.Tracker.Pro.Calibration.Observer,
+     dir: Application.get_env(:racing_org_tracker, :calibration_directory)}
   end
 
   defp compute_engine_child do

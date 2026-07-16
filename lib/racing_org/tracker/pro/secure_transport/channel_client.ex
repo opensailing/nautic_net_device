@@ -162,6 +162,31 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   end
 
   @doc """
+  Stream a throttled AUTO-CALIBRATION update back to the backend over the channel,
+  as the `"calibration_update"` event with payload
+  `%{boat_identifier: id, seq: monotonic_int, entries: entries}`, where each entry
+  is `%{hardware_identifier:, parameter:, value:, confidence:, sample_count:,
+  state:, residual:}` (stw_scale entries additionally carry the full `curve`).
+  `seq` is a per-device advisory sequence; the server merges idempotently per
+  (sensor, parameter), so a reboot-reset seq is harmless.
+
+  Best-effort + session-gated, exactly like `send_sailed_polar_update/2`: pushes
+  ONLY when a secure session is live; with no live session — or no running
+  client — the update is simply dropped (the `Calibration.Observer` re-emits
+  changed entries on its next throttled sync). Always returns `:ok` and never
+  raises (the Observer must never be coupled to channel state).
+  """
+  @spec send_calibration_update(GenServer.server(), map()) :: :ok
+  def send_calibration_update(server \\ __MODULE__, %{} = update) do
+    case GenServer.whereis(server) do
+      pid when is_pid(pid) -> send(pid, {:send_calibration_update, update})
+      _ -> :ok
+    end
+
+    :ok
+  end
+
+  @doc """
   Request a route recalc from the backend (P3), as the `"request_route_recalc"`
   event. `position` is `{lat, lon}` (the boat's exact position at the deviation) or
   `nil`; when present it is sent as `%{position: %{latitude: lat, longitude: lon}}`,
@@ -463,6 +488,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     {:noreply, push_sailed_polar_update(socket, update)}
   end
 
+  def handle_info({:send_calibration_update, update}, socket) do
+    {:noreply, push_calibration_update(socket, update)}
+  end
+
   # The DeviationMonitor asks for a recalc when the boat deviates past the threshold.
   # Push it as "request_route_recalc" ONLY when a secure session is live; otherwise
   # drop it (best-effort, like telemetry).
@@ -510,6 +539,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   defp push_sailed_polar_update(socket, update) do
     if session_live?(socket) do
       push(socket, socket.assigns.topic, "sailed_polar_update", update)
+    end
+
+    socket
+  end
+
+  # Calibration updates follow the sailed-polar rules exactly: no joined topic or
+  # an empty batch -> drop; push only over a live secure session.
+  defp push_calibration_update(%{assigns: %{topic: nil}} = socket, _update), do: socket
+  defp push_calibration_update(socket, %{entries: []}), do: socket
+
+  defp push_calibration_update(socket, update) do
+    if session_live?(socket) do
+      push(socket, socket.assigns.topic, "calibration_update", update)
     end
 
     socket

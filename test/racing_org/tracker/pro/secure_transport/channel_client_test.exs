@@ -1080,6 +1080,135 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     end
   end
 
+  # --- calibration streamback (auto-calibration): send_calibration_update/2 ---
+
+  describe "send_calibration_update (SocketTest)" do
+    defmodule CalibrationFakeWiFi do
+      use Agent
+
+      def start_link(_opts),
+        do: Agent.start_link(fn -> %{enabled: false, ssid: nil, connection: :disconnected, signal: nil} end)
+
+      def current_status(agent), do: Agent.get(agent, & &1)
+    end
+
+    defp connect_live_calibration(ctx) do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      {:ok, wifi} = start_supervised(CalibrationFakeWiFi)
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           wifi: {CalibrationFakeWiFi, wifi},
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+
+      {:ok, hello_wire, rstate} =
+        Handshake.responder_hello(
+          server_identity_private: ctx.srv_priv,
+          server_identity_public: ctx.srv_pub,
+          device_identity_public: ctx.identity.public_key,
+          epoch: 0
+        )
+
+      push(client, topic, "handshake_hello", %{"hello" => Base.encode64(hello_wire)})
+      assert_push(^topic, "handshake_init", %{"init" => init_b64})
+      {:ok, init_wire} = Base.decode64(init_b64)
+      {:ok, server_session} = Handshake.responder_finalize(rstate, init_wire)
+      push(client, topic, "handshake_ok", %{"session_id" => Base.encode64(server_session.session_id)})
+
+      assert_push(^topic, "wifi_status", _wifi)
+      assert eventually(fn -> SessionHolder.live?(holder) end)
+      {client, topic}
+    end
+
+    test "pushes calibration_update over the channel when a session is live", ctx do
+      {client, topic} = connect_live_calibration(ctx)
+
+      update = %{
+        boat_identifier: "boat-42",
+        seq: 3,
+        entries: [
+          %{
+            hardware_identifier: "1A2B",
+            parameter: "awa_offset",
+            value: 2.5,
+            confidence: 1.0,
+            sample_count: 9,
+            state: "applied",
+            residual: 0.1
+          },
+          %{
+            hardware_identifier: "3C4D",
+            parameter: "stw_scale",
+            value: 1.05,
+            confidence: 0.9,
+            sample_count: 7,
+            state: "applied",
+            residual: 0.01,
+            curve: [%{center: 1, gain: 1.05}]
+          }
+        ]
+      }
+
+      assert :ok = ChannelClient.send_calibration_update(client, update)
+
+      assert_push(^topic, "calibration_update", payload)
+      assert payload.boat_identifier == "boat-42"
+      assert payload.seq == 3
+      assert [awa, stw] = payload.entries
+      assert awa.parameter == "awa_offset"
+      assert awa.state == "applied"
+      assert stw.parameter == "stw_scale"
+      assert stw.curve == [%{center: 1, gain: 1.05}]
+    end
+
+    test "an empty-entries update is not pushed", ctx do
+      {client, _topic} = connect_live_calibration(ctx)
+
+      assert :ok = ChannelClient.send_calibration_update(client, %{boat_identifier: "boat-42", seq: 1, entries: []})
+      refute_push("calibration_update", _payload, 50)
+    end
+
+    test "no-ops (no push) when there is no live session", ctx do
+      client =
+        start_supervised!({ChannelClient, name: nil, auto_connect?: false, keystore_opts: [base_path: ctx.base]})
+
+      update = %{
+        boat_identifier: "boat-42",
+        seq: 1,
+        entries: [
+          %{
+            hardware_identifier: "1A2B",
+            parameter: "awa_offset",
+            value: 2.5,
+            confidence: 1.0,
+            sample_count: 9,
+            state: "applied",
+            residual: 0.1
+          }
+        ]
+      }
+
+      assert :ok = ChannelClient.send_calibration_update(client, update)
+      refute_push("calibration_update", _payload, 50)
+      assert Process.alive?(client)
+    end
+
+    test "no-ops safely when the target process is not running" do
+      update = %{boat_identifier: "boat-42", seq: 1, entries: []}
+      assert :ok = ChannelClient.send_calibration_update(:no_such_channel_client, update)
+    end
+  end
+
   defp eventually(fun, retries \\ 50) do
     cond do
       fun.() ->
