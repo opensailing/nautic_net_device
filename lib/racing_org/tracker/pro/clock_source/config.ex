@@ -54,7 +54,7 @@ defmodule RacingOrg.Tracker.Pro.ClockSource.Config do
   require Logger
 
   alias RacingOrg.Tracker.Pro.ClockSource.Store
-  alias RacingOrg.Tracker.Pro.DeviceInfo
+  alias RacingOrg.Tracker.Pro.NmeaIdentity
 
   @default_store_dir "/data/clock_source"
   # A matched source silent for longer than this (ms of monotonic time since its
@@ -269,7 +269,7 @@ defmodule RacingOrg.Tracker.Pro.ClockSource.Config do
   # if the source is at least as high priority as the active one, or if the active
   # timebase has gone stale.
   defp observe_time(state, dt, sa, name, mono) do
-    observed_hex = canonical_nmea_hardware_id(name)
+    observed_hex = NmeaIdentity.canonical_hardware_id(name)
     observed_text = to_str_or_nil(name)
     sa_s = to_str_or_nil(sa)
 
@@ -299,14 +299,15 @@ defmodule RacingOrg.Tracker.Pro.ClockSource.Config do
   #
   # NMEA NAME identities — the observed `metadata.source_nmea_name` and the
   # configured `hardware_identifier` / `sensor_uid` / `metadata.source_nmea_name` —
-  # are CANONICALIZED to the backend's uppercase-hex hardware-id form before
-  # comparison, so a backend-selected sensor matches the live NAME whether it
-  # arrives on the bus as an 8-byte binary or an integer (the backend derives its
-  # hex id from the same NAME during DataSet ingest). `label` is matched as literal
-  # text (not hex). The CAN `source_address` is an independent fallback. The backend
-  # `sensor_id` is a server-internal id with no on-bus counterpart, so it is not
-  # used for matching. NMEA 0183 time sources are not matched (no per-message source
-  # identity is available on that path).
+  # are CANONICALIZED to the backend's uppercase-hex hardware-id form (via the
+  # shared `NmeaIdentity.canonical_hardware_id/1`) before comparison, so a
+  # backend-selected sensor matches the live NAME whether it arrives on the bus as
+  # an 8-byte binary or an integer (the backend derives its hex id from the same
+  # NAME during DataSet ingest). `label` is matched as literal text (not hex). The
+  # CAN `source_address` is an independent fallback. The backend `sensor_id` is a
+  # server-internal id with no on-bus counterpart, so it is not used for matching.
+  # NMEA 0183 time sources are not matched (no per-message source identity is
+  # available on that path).
   defp match_source?(source, observed_hex, observed_text, sa_s) do
     identity_matches?(source, observed_hex) or label_matches?(source, observed_text) or
       address_matches?(source, sa_s)
@@ -316,7 +317,7 @@ defmodule RacingOrg.Tracker.Pro.ClockSource.Config do
 
   defp identity_matches?(source, observed_hex) do
     [source.hardware_identifier, source.sensor_uid, metadata_name(source)]
-    |> Enum.map(&canonical_nmea_hardware_id/1)
+    |> Enum.map(&NmeaIdentity.canonical_hardware_id/1)
     |> Enum.reject(&is_nil/1)
     |> Enum.any?(&(&1 == observed_hex))
   end
@@ -333,51 +334,6 @@ defmodule RacingOrg.Tracker.Pro.ClockSource.Config do
     do: Map.get(m, "source_nmea_name") || Map.get(m, :source_nmea_name)
 
   defp metadata_name(_), do: nil
-
-  # Canonicalize an NMEA NAME identity — the observed name from the bus OR a
-  # configured identifier — into the backend's uppercase-hex hardware-id form, so
-  # both sides compare equal:
-  #
-  #   * `nil` -> `nil`
-  #   * a non-negative integer NMEA NAME -> uppercase hex
-  #   * a printable hex string (optional `0x`/`0X` prefix) -> trimmed, unprefixed,
-  #     UPPERCASE (the configured-identifier case, e.g. `"0x1a2b"` -> `"1A2B"`)
-  #   * an 8-byte binary NMEA NAME -> unsigned 64-bit integer -> uppercase hex
-  #     (the observed on-bus case; reuses `DeviceInfo.hw_id/1`)
-  #   * any other binary (not hex, not 8 bytes) -> its original string, so literal
-  #     label-style names still match and invalid text never crashes matching
-  #   * anything else -> `to_string/1`
-  defp canonical_nmea_hardware_id(nil), do: nil
-
-  defp canonical_nmea_hardware_id(name) when is_integer(name) and name >= 0, do: integer_to_hex(name)
-
-  defp canonical_nmea_hardware_id(name) when is_binary(name) do
-    case printable_hex(name) do
-      nil -> if byte_size(name) == 8, do: name |> DeviceInfo.hw_id() |> integer_to_hex(), else: name
-      hex -> hex
-    end
-  end
-
-  defp canonical_nmea_hardware_id(name), do: to_str_or_nil(name)
-
-  # The uppercase-hex form of `name` if it is a printable hex string (optional
-  # `0x`/`0X` prefix), else `nil`. Guarded on `String.printable?/1` so it is safe to
-  # call on a raw (non-UTF-8) NAME binary.
-  defp printable_hex(name) do
-    if String.printable?(name) do
-      candidate = name |> String.trim() |> strip_hex_prefix()
-      if hex_string?(candidate), do: String.upcase(candidate)
-    end
-  end
-
-  defp integer_to_hex(i) when is_integer(i) and i >= 0, do: i |> Integer.to_string(16) |> String.upcase()
-
-  defp strip_hex_prefix("0x" <> rest), do: rest
-  defp strip_hex_prefix("0X" <> rest), do: rest
-  defp strip_hex_prefix(other), do: other
-
-  defp hex_string?(""), do: false
-  defp hex_string?(s) when is_binary(s), do: match?({_int, ""}, Integer.parse(s, 16))
 
   # --- Timestamp resolution ---
 
