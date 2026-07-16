@@ -31,14 +31,18 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
   are `apparent_wind_speed` (AWS), `apparent_wind_angle` (AWA), `boat_speed` (STW);
   `heel`, `pitch`, and `heading` are all optional refinements.
 
-    * The masthead measures AWA in the HEELED mast frame; projecting the apparent
-      vector onto the horizontal scales the athwartships component by `cos(heel)`
-      (a heeled masthead reads a larger athwartships angle than the true horizontal
-      one). So the horizontal apparent-wind components are
-      `ax = AWS·cos(AWA)`, `ay = AWS·sin(AWA)·cos(heel)`. `heel` is a REFINEMENT and
-      DEFAULTS to `0.0` when absent (no athwartships correction) — a boat with no
-      heel sensor still computes true wind, and the flat-water output (`heel = 0`) is
-      identical whether heel is published as `0.0` or absent.
+    * The masthead measures AWA in the HEELED mast frame, where the athwartships
+      component of the horizontal wind appears COMPRESSED by `cos(heel)` (a heeled
+      vane reads a SMALLER athwartships component than the true horizontal one).
+      The Gentry / Pedrick–McCurdy recovery therefore DIVIDES the measured
+      athwartships term by `cos(heel)` to restore the horizontal components:
+      `ax = AWS·cos(AWA)`, `ay = AWS·sin(AWA) / max(cos(heel), 0.5)`. The
+      `max(cos(heel), 0.5)` clamp bounds the correction at extreme heel (≥ 60°) so
+      a bad heel reading can never blow the wind vector up — the athwartships
+      component is at most doubled. `heel` is a REFINEMENT and DEFAULTS to `0.0`
+      when absent (no athwartships correction) — a boat with no heel sensor still
+      computes true wind, and the flat-water output (`heel = 0`) is identical
+      whether heel is published as `0.0` or absent.
       (`pitch` is a catalog-available input reserved for a later, fuller correction;
       it is NOT required and never participates today, so its absence never makes the
       calc invalid. Deep upwash / mast-twist corrections are explicitly DEFERRED to a
@@ -177,10 +181,14 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
       awa = awa_deg * @rad_per_deg
       heel = fetch_or(signals, "heel", 0.0) * @rad_per_deg
 
-      # Horizontal apparent-wind components (boat frame). The athwartships term is
-      # heel-corrected only when heel is present (else cos(0) = 1, a no-op).
+      # Horizontal apparent-wind components (boat frame). The heeled vane measures a
+      # COMPRESSED athwartships component, so the recovery DIVIDES by cos(heel)
+      # (Gentry / Pedrick–McCurdy) — only when heel is present (else cos(0) = 1, a
+      # no-op). The max(cos, 0.5) clamp bounds the correction at extreme heel
+      # (>= 60 deg): a bad heel reading can at most DOUBLE the athwartships
+      # component, never blow the wind vector up.
       ax = aws * :math.cos(awa)
-      ay = aws * :math.sin(awa) * :math.cos(heel)
+      ay = aws * :math.sin(awa) / max(:math.cos(heel), 0.5)
 
       # Subtract the boat's through-water velocity (bow-ward) to get true wind.
       tx = ax - stw
