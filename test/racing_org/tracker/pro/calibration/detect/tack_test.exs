@@ -136,7 +136,9 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.TackTest do
     end
 
     test "a total span longer than max_pair_span_s rejects the pair" do
-      b = port_leg(started_ms: 130_000, ended_ms: 310_000, duration_s: 180.0)
+      # Transition stays within max_transition_s; only the 600 s span gate
+      # rejects (b alone runs 130 s -> 720 s).
+      b = port_leg(started_ms: 130_000, ended_ms: 720_000, duration_s: 590.0)
       assert {%{pending: ^b}, []} = pair_up(stbd_leg(), b)
     end
 

@@ -225,16 +225,17 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ReplayTest do
       assert Enum.max(Enum.take(errors, -5)) < Enum.max(Enum.take(errors, 5))
     end
 
-    test "FINDING: under fully-default gates the same beat yields zero tack pairs" do
-      # max_pair_span_s 300 rejects every 220 s + 20 s + 220 s pair, so a
-      # 4-minute-tack race day is invisible to AwaOffset out of the box:
-      # honest non-detection (everything stays :learning), but a gate the
-      # live Observer will want to revisit for real race data.
+    test "under fully-default gates the 4-minute-tack beat pairs and validates out of the box" do
+      # The default max_pair_span_s was raised 300 -> 600 s off the replay
+      # findings: 300 s rejected every 220 s + 20 s + 220 s pair, leaving a
+      # normal race day invisible to AwaOffset. Under the shipped defaults
+      # the same beat now learns with no tuning.
       result = Replay.run(race_day_samples())
 
       assert result.events.legs == 30
-      assert result.events.tack_pairs == 0
-      assert %Estimate{state: :learning, sample_count: 0} = result.awa.rotation
+      assert result.events.tack_pairs == 15
+      assert %Estimate{state: :validated, value: rot} = result.awa.rotation
+      assert_in_delta rot, 3.0, 0.5
     end
   end
 
@@ -384,28 +385,15 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ReplayTest do
       race_day_samples(Keyword.merge([wave: {4.0, 8.0}, turn_s: 10], overrides))
     end
 
-    test "FINDING: default gates reject every wave-oscillated leg — no data, no false validation" do
-      # The Legs rate gate (2 deg/s) trips on nearly every sample of +-4 deg
-      # @ 8 s yaw, so NO leg ever completes: the pipeline reports zero events
-      # and stays honestly in :learning. Safe (no false validation), but it
-      # means an ordinary seaway silences auto-calibration entirely — the
-      # live Observer needs a rate gate above the wave-yaw band (or yaw
-      # low-pass filtering upstream) to learn anything offshore.
-      result = Replay.run(wavy_samples(), @beat_tack_opts)
-
-      assert result.events == %{legs: 0, tack_pairs: 0, gybe_pairs: 0, reciprocal_pairs: 0}
-      assert %Estimate{state: :learning, sample_count: 0} = result.awa.rotation
-      assert result.stw.gain_curve == []
-    end
-
-    test "with the rate gate above the wave band (4 deg/s) recovery matches flat water" do
-      # 4.0 deg/s sits between the wave yaw peak (~3.9) and the 10 s tack
-      # sweep (~9.3), so waves pass and maneuvers still segment the stream.
-      result =
-        Replay.run(
-          wavy_samples(),
-          [legs: [max_heading_rate_dps: 4.0], trace: true] ++ @beat_tack_opts
-        )
+    test "under fully-default gates wave-oscillated recovery matches flat water" do
+      # The default Legs rate gate was raised 2 -> 4 deg/s off the replay
+      # findings: 2 deg/s tripped on nearly every sample of +-4 deg @ 8 s yaw
+      # (peak ~3.1 deg/s, ~3.9 with helm noise), so an ordinary seaway
+      # silenced auto-calibration entirely. The shipped 4 deg/s default sits
+      # between the wave-yaw band and the 10 s tack sweep (~9.3 deg/s), so
+      # waves pass while maneuvers still segment the stream — and defaults
+      # now learn offshore with no tuning.
+      result = Replay.run(wavy_samples(), [trace: true] ++ @beat_tack_opts)
 
       # 10 s tacks make the cycle 230 s: 31 full legs fit in 2 h and the
       # 70 s tail leg is flushed at end-of-stream, giving 32 legs / 16 pairs.

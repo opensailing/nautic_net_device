@@ -43,9 +43,10 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.Tack do
     * **Steady wind** (`:tws_match_mps`, default `1.0`): the legs' mean TWS
       must agree within this bound when both are known (skipped when either
       is `nil`) — comparing boards in different wind biases the estimate.
-    * **Total span** (`:max_pair_span_s`, default `300.0`): first sample of
-      `a` to last of `b` within five minutes, so the wind direction has had
-      little time to walk.
+    * **Total span** (`:max_pair_span_s`, default `600.0`): first sample of
+      `a` to last of `b` within ten minutes — wide enough for a normal
+      race-day tacking cadence (4-min legs), while the transition/swing/TWS
+      gates keep the pair honest against wind walk.
 
   Classification by point of sail, from each leg's `awa_abs_mean`:
 
@@ -78,7 +79,11 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.Tack do
   @default_min_swing_deg 50.0
   @default_min_leg_s 30.0
   @default_tws_match_mps 1.0
-  @default_max_pair_span_s 300.0
+  # 600 s admits a normal race-day tacking cadence (4-min legs: ~220 s + 20 s
+  # transition + 220 s ≈ 460 s span). The original 300 s default produced ZERO
+  # tack pairs for that cadence (locked by the replay findings); pair validity
+  # is still protected by the transition/swing/TWS-match gates.
+  @default_max_pair_span_s 600.0
 
   defstruct close_hauled_max_deg: @default_close_hauled_max_deg,
             gybe_min_awa_deg: @default_gybe_min_awa_deg,

@@ -42,9 +42,11 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.Legs do
 
     * **Minimum duration** (`:min_duration_s`, default `60.0`): calibration
       wants settled averages; a minute at 1 Hz gives ~60 samples per leg.
-    * **Peak heading rate** (`:max_heading_rate_dps`, default `2.0` °/s):
-      wrap-aware sample-to-sample heading rate. Tacks/gybes slew at 10–30 °/s;
-      2 °/s excludes maneuvers while tolerating helm corrections.
+    * **Peak heading rate** (`:max_heading_rate_dps`, default `4.0` °/s):
+      wrap-aware sample-to-sample heading rate. Tacks/gybes slew at 5–30 °/s
+      so 4 °/s still excludes maneuvers, while admitting ordinary wave-induced
+      heading oscillation (±4° at 8 s peaks at ~3.1 °/s); sustained slow
+      curves are caught by the heading-dispersion gate instead.
     * **Heading dispersion** (`:max_heading_sd_deg`, default `8.0`): circular
       standard deviation across the whole segment. Catches slow wander that
       never trips the rate check but still isn't a straight leg.
@@ -92,7 +94,12 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.Legs do
   alias RacingOrg.Tracker.Pro.Calibration.Detect.Leg
 
   @default_min_duration_s 60.0
-  @default_max_heading_rate_dps 2.0
+  # 4°/s admits ordinary wave-induced heading oscillation (±4° at an 8 s period
+  # peaks at ~3.1°/s, which the original 2°/s default rejected outright — the
+  # replay findings showed zero legs, hence zero learning, in any seaway).
+  # Real maneuvers still break legs: a tack turns at ~5–10°/s, and sustained
+  # slow curves are rejected by the heading circular-sd gate.
+  @default_max_heading_rate_dps 4.0
   @default_max_heading_sd_deg 8.0
   @default_max_stw_accel_mps2 0.05
   @default_awa_side_min_deg 5.0

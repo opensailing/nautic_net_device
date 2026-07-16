@@ -38,10 +38,13 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.LegsTest do
     truth = %{stw: 3.0, twd: 0.0, tws: 6.0}
 
     [
+      # Realistic 10 s tacks (80 deg / 10 s = 8 deg/s) stay well above the
+      # 4 deg/s rate gate, so the turn samples break legs crisply and the
+      # leg means match the scripted steady headings.
       {:steady, 90, Map.put(truth, :heading, 320.0)},
-      {:turn, 30, Map.merge(truth, %{from: 320.0, to: 40.0})},
+      {:turn, 10, Map.merge(truth, %{from: 320.0, to: 40.0})},
       {:steady, 90, Map.put(truth, :heading, 40.0)},
-      {:turn, 30, Map.merge(truth, %{from: 40.0, to: 320.0})},
+      {:turn, 10, Map.merge(truth, %{from: 40.0, to: 320.0})},
       {:steady, 90, Map.put(truth, :heading, 320.0)}
     ]
   end
