@@ -89,15 +89,27 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
   ## Calibration corrections (device state, not a signal)
 
   The auto-calibration layer (`RacingOrg.Tracker.Pro.Calibration.Config`) compiles
-  per-sensor corrections `%{hex => %{awa_offset_deg: f, awa_upwash_deg: f,
-  stw_gains: [{band_center_mps, gain}]}}`. The engine applies them to decoded
-  telemetry BEFORE folding values into the signal map, keyed by the event's
-  `metadata.device_id` (the raw NMEA NAME, canonicalized to the backend's
-  uppercase-hex id via `RacingOrg.Tracker.Pro.NmeaIdentity`):
+  per-sensor corrections `%{hex => %{awa_offset_deg: f,
+  awa_upwash: [{tws_center_mps, deg}], stw_gains: [{band_center_mps, gain}]}}`.
+  The engine applies them to decoded telemetry BEFORE folding values into the
+  signal map, keyed by the event's `metadata.device_id` (the raw NMEA NAME,
+  canonicalized to the backend's uppercase-hex id via
+  `RacingOrg.Tracker.Pro.NmeaIdentity`):
 
     * `apparent_wind_angle`: folded to signed (−180, 180], then
-      `awa + awa_offset_deg + awa_upwash_deg * sign(awa)` (no upwash dead-ahead),
-      returned in the ORIGINAL convention (0..360 in from the bus -> 0..360 out);
+      `awa + awa_offset_deg + upwash_at(tws) * shape(|awa|) * sign(awa)`
+      (no upwash dead-ahead), the TOTAL correction defensively clamped to ±15°,
+      returned in the ORIGINAL convention (0..360 in from the bus -> 0..360 out).
+      `upwash_at(tws)` interpolates the `awa_upwash` TWS curve (flat hold beyond
+      the ends; a single point — the compiled form of a flat scalar — is a
+      constant) at the LAST-KNOWN `true_wind_speed` signal, read from the signal
+      map at correction time (one tick stale by construction, which is fine for
+      a slowly-varying curve; staleness is deliberately not checked — an aging
+      TWS still beats none). With NO TWS ever heard the curve's middle point
+      applies: a flat prior beats extrapolating an unheard wind.
+      `shape(a) = sin(0.6·(180−a)·π/180)^2.5` (the Ockam angle shape) fades the
+      close-hauled-fitted upwash off the wind — it applies to flat single-point
+      curves too;
     * `boat_speed`: `v * gain`, gain piecewise-linear over the `stw_gains` bands
       (flat extrapolation; a single pair is a uniform gain), defensively clamped
       to [0.8, 1.2];
@@ -334,7 +346,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
   # BEFORE the values fold into the signal map. With no corrections cached this is
   # a pass-through (bit-identical values).
   def handle_info({:signal_updates, updates, mono_ms, device_id}, state) do
-    {:noreply, ingest_updates(apply_corrections(updates, device_id, state.corrections), mono_ms, state)}
+    {:noreply, ingest_updates(apply_corrections(updates, device_id, state), mono_ms, state)}
   end
 
   # A polar-table command was applied -> the polar may have changed; refresh the
@@ -472,37 +484,78 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
 
   @min_stw_gain 0.8
   @max_stw_gain 1.2
+  # The total AWA correction (offset + shaped upwash) is defensively clamped:
+  # anything beyond this is a broken sensor, not a calibration.
+  @max_awa_correction_deg 15.0
 
-  defp apply_corrections(updates, _device_id, corrections) when map_size(corrections) == 0, do: updates
+  defp apply_corrections(updates, _device_id, %{corrections: corrections}) when map_size(corrections) == 0,
+    do: updates
 
-  defp apply_corrections(updates, device_id, corrections) do
-    case Map.get(corrections, NmeaIdentity.canonical_hardware_id(device_id)) do
+  defp apply_corrections(updates, device_id, state) do
+    case Map.get(state.corrections, NmeaIdentity.canonical_hardware_id(device_id)) do
       nil -> updates
-      %{} = entry -> Enum.map(updates, &correct_update(&1, entry))
+      %{} = entry -> Enum.map(updates, &correct_update(&1, entry, state))
     end
   end
 
-  defp correct_update({"apparent_wind_angle", awa}, entry), do: {"apparent_wind_angle", correct_awa(awa, entry)}
-  defp correct_update({"boat_speed", stw}, entry), do: {"boat_speed", correct_stw(stw, entry)}
-  defp correct_update(update, _entry), do: update
+  defp correct_update({"apparent_wind_angle", awa}, entry, state),
+    do: {"apparent_wind_angle", correct_awa(awa, entry, last_tws(state))}
 
-  # Fold to signed (−180, 180], apply `awa + offset + upwash * sign(awa)` (the
-  # upwash flips with the tack side; sign(0) = 0 so dead-ahead gets no upwash),
-  # re-fold, then return in the ORIGINAL convention: a non-negative input (the
-  # bus's 0..360 form) comes back in [0, 360); a negative (signed) input stays
-  # signed. A sensor entry with no AWA correction leaves the value untouched.
-  defp correct_awa(awa, entry) do
+  defp correct_update({"boat_speed", stw}, entry, _state), do: {"boat_speed", correct_stw(stw, entry)}
+  defp correct_update(update, _entry, _state), do: update
+
+  # The LAST-KNOWN true wind speed from the engine's own signal map (already in
+  # scope on the ingest path — no process call). One tick stale by construction
+  # and deliberately not staleness-checked: the upwash curve varies slowly with
+  # TWS, so an aging value still picks a better curve point than none. `nil`
+  # only when no TWS signal has EVER been heard.
+  defp last_tws(%{signals: %{"true_wind_speed" => {tws, _mono_ms}}}), do: tws
+  defp last_tws(_state), do: nil
+
+  # Fold to signed (−180, 180], apply
+  # `awa + offset + upwash_at(tws) * shape(|awa|) * sign(awa)` (the upwash flips
+  # with the tack side; sign(0) = 0 so dead-ahead gets no upwash), clamp the
+  # total correction to ±@max_awa_correction_deg, re-fold, then return in the
+  # ORIGINAL convention: a non-negative input (the bus's 0..360 form) comes back
+  # in [0, 360); a negative (signed) input stays signed. A sensor entry with no
+  # AWA correction leaves the value untouched.
+  defp correct_awa(awa, entry, tws) do
     offset = Map.get(entry, :awa_offset_deg, 0.0)
-    upwash = Map.get(entry, :awa_upwash_deg, 0.0)
+    upwash = upwash_at(Map.get(entry, :awa_upwash), tws)
 
     if offset == 0.0 and upwash == 0.0 do
       awa
     else
       signed = fold_signed_deg(awa)
-      corrected = fold_signed_deg(signed + offset + upwash * tack_sign(signed))
+      correction = offset + upwash * upwash_shape(abs(signed)) * tack_sign(signed)
+      corrected = fold_signed_deg(signed + clamp_awa_correction(correction))
       restore_awa_convention(awa, corrected)
     end
   end
+
+  # The upwash correction at the current TWS: piecewise-linear over the compiled
+  # `awa_upwash` curve (flat hold beyond the ends; a single point — the compiled
+  # form of a flat scalar — is a constant). With no TWS ever heard, hold the
+  # curve's MIDDLE point flat: a flat prior beats extrapolating an unheard wind
+  # toward either curve end.
+  defp upwash_at(nil, _tws), do: 0.0
+  defp upwash_at([], _tws), do: 0.0
+  defp upwash_at(curve, tws) when is_number(tws), do: interpolate_curve(curve, tws)
+  defp upwash_at(curve, nil), do: curve |> Enum.at(div(length(curve), 2)) |> elem(1)
+
+  # The Ockam angle shape `sin(0.6·(180−a)·π/180)^2.5` for a = |AWA| in
+  # [0, 180]: ≈0.88 dead-ahead, 1.0 at 30°, ≈0.59 at 90°, ≈0.05 at 150°, 0 dead
+  # astern — the upwash correction is fitted close-hauled and must fade off the
+  # wind. The sine is non-negative over the whole domain (its argument stays in
+  # [0°, 108°]); the guard keeps the fractional power total anyway.
+  defp upwash_shape(abs_awa) do
+    s = :math.sin(0.6 * (180.0 - abs_awa) * :math.pi() / 180.0)
+    if s <= 0.0, do: 0.0, else: :math.pow(s, 2.5)
+  end
+
+  defp clamp_awa_correction(deg) when deg > @max_awa_correction_deg, do: @max_awa_correction_deg
+  defp clamp_awa_correction(deg) when deg < -@max_awa_correction_deg, do: -@max_awa_correction_deg
+  defp clamp_awa_correction(deg), do: deg
 
   defp fold_signed_deg(deg) do
     folded = :math.fmod(deg, 360.0)
@@ -528,20 +581,23 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
   # [@min_stw_gain, @max_stw_gain]. No stw_gains -> untouched.
   defp correct_stw(stw, entry) do
     case Map.get(entry, :stw_gains) do
-      [_ | _] = gains -> stw * clamp_gain(stw_gain(gains, stw))
+      [_ | _] = gains -> stw * clamp_gain(interpolate_curve(gains, stw))
       _ -> stw
     end
   end
 
-  defp stw_gain([{_center, gain}], _v), do: gain
-  defp stw_gain([{center, gain} | _rest], v) when v <= center, do: gain
+  # Shared piecewise-linear lookup over an ascending `[{x, y}]` curve (the
+  # stw_gains bands AND the awa_upwash TWS curve): flat hold beyond the first
+  # and last points; a single point is a constant.
+  defp interpolate_curve([{_x, y}], _v), do: y
+  defp interpolate_curve([{x, y} | _rest], v) when v <= x, do: y
 
-  defp stw_gain([{c0, g0}, {c1, g1} | rest], v) do
+  defp interpolate_curve([{x0, y0}, {x1, y1} | rest], v) do
     cond do
-      v <= c1 and c1 == c0 -> g1
-      v <= c1 -> g0 + (g1 - g0) * (v - c0) / (c1 - c0)
-      rest == [] -> g1
-      true -> stw_gain([{c1, g1} | rest], v)
+      v <= x1 and x1 == x0 -> y1
+      v <= x1 -> y0 + (y1 - y0) * (v - x0) / (x1 - x0)
+      rest == [] -> y1
+      true -> interpolate_curve([{x1, y1} | rest], v)
     end
   end
 

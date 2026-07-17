@@ -649,6 +649,47 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       assert Map.keys(status) |> Enum.sort() == [:applied_version, :modes, :reported_at, :sensors, :status]
     end
 
+    test "calibration_status with curve-valued learned entries is JSON-encodable", ctx do
+      # A REAL Calibration.Config holding CURVE-valued learned entries (tuple
+      # lists internally): the status it reports must already be rendered into
+      # JSON-encodable maps, or the channel push would crash the serializer.
+      alias RacingOrg.Tracker.Pro.Calibration.Config, as: CalConfig
+
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      {:ok, calibration} = start_supervised({CalConfig, name: nil, store_dir: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      entry = %{confidence: 0.9, sample_count: 8, state: "applied"}
+
+      assert :ok =
+               CalConfig.put_learned(calibration, "1A2B", "awa_upwash", Map.put(entry, :value, [{5, 3.0}, {9, 1.0}]))
+
+      assert :ok = CalConfig.put_learned(calibration, "3C4D", "stw_scale", Map.put(entry, :value, [{1, 1.05}]))
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           calibration: {CalConfig, calibration},
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      push(client, topic, "set_calibration", %{"version" => 1, "parameters" => %{}, "sensors" => []})
+
+      assert_push(^topic, "calibration_status", status)
+
+      assert %{value: [%{center: 5, value: 3.0}, %{center: 9, value: 1.0}]} =
+               Enum.find(status.sensors, &(&1.parameter == "awa_upwash"))
+
+      assert %{value: [%{center: 1, gain: 1.05}]} = Enum.find(status.sensors, &(&1.parameter == "stw_scale"))
+      assert is_binary(Jason.encode!(status))
+    end
+
     test "set_calibration apply error → still pushes status (no crash)", ctx do
       {client, topic, _calibration} =
         connect_calibration_client(ctx,

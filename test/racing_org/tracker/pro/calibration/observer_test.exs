@@ -149,14 +149,17 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverTest do
     if r < 0, do: r + 360.0, else: r + 0.0
   end
 
-  # Close-hauled truth: TWD 0, TWS 6, STW 3.5, 45 deg off the wind on each tack,
-  # with a vane ROTATION error injected on the measured AWA
-  # (`awa_meas = awa_true - rotation`; the additive correction is +rotation).
-  defp beat_channels(side, rotation) do
+  # Close-hauled truth: TWD 0, TWS `:tws` (default 6), STW 3.5, 45 deg off the
+  # wind on each tack, with vane ROTATION and UPWASH errors injected on the
+  # measured AWA (`awa_meas = awa_true - rotation + upwash_err * sign(awa_true)`;
+  # the additive corrections are +rotation and -upwash_err).
+  defp beat_channels(side, rotation, opts \\ []) do
+    tws = Keyword.get(opts, :tws, 6.0)
+    upwash_err = Keyword.get(opts, :upwash_err, 0.0)
     sign = if side == :starboard, do: 1.0, else: -1.0
     heading = wrap360(0.0 - sign * 45.0)
-    {aws, awa_true} = apparent(6.0, sign * 45.0, 3.5)
-    %{awa: awa_true - rotation, aws: aws, stw: 3.5, heading: heading, cog: heading, sog: 3.5}
+    {aws, awa_true} = apparent(tws, sign * 45.0, 3.5)
+    %{awa: awa_true - rotation + upwash_err * sign, aws: aws, stw: 3.5, heading: heading, cog: heading, sog: 3.5}
   end
 
   # Drive `legs` alternating-tack legs of `leg_s` samples each at 1 Hz. Leg k's
@@ -169,11 +172,12 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverTest do
     t0 = Keyword.get(opts, :t0_ms, 0)
     first_leg = Keyword.get(opts, :first_leg, 0)
     wind_name = Keyword.get(opts, :wind_name, @wind_name)
+    channel_opts = Keyword.take(opts, [:tws, :upwash_err])
 
     for leg <- 0..(legs - 1), i <- 0..(leg_s - 1) do
       side = if rem(first_leg + leg, 2) == 0, do: :starboard, else: :port
       t = t0 + (leg * leg_s + i) * 1000
-      step(pid, clock, t, beat_channels(side, rotation) |> Map.put(:wind_name, wind_name))
+      step(pid, clock, t, beat_channels(side, rotation, channel_opts) |> Map.put(:wind_name, wind_name))
     end
 
     :ok
@@ -374,12 +378,15 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverTest do
       assert_in_delta upwash.value, 0.0, 1.0e-6
 
       # Mode auto -> the APPLIED value creeps: validated at pair 8, slewed 0.5 per
-      # pair -> 1.5 after pair 10 (never a 3.0 jump).
+      # pair -> 1.5 after pair 10 (never a 3.0 jump). The upwash validated too
+      # (single band at TWS 6 through the classic gate), promoting a ~0 curve.
       assert %{@wind_hex => corrections} = Config.corrections(config)
       assert_in_delta corrections.awa_offset_deg, 1.5, 1.0e-9
-      assert_in_delta corrections.awa_upwash_deg, 0.0, 1.0e-9
+      assert [{7, upwash7}] = corrections.awa_upwash
+      assert_in_delta upwash7, 0.0, 1.0e-6
 
-      # A REAL Engine wired to the REAL Config sees the corrected AWA.
+      # A REAL Engine wired to the REAL Config sees the corrected AWA
+      # (emitted at |awa| = 30 where the upwash angle shape is exactly 1.0).
       engine =
         start_supervised!(
           {Engine, name: nil, store_dir: nil, commands: nil, attach_telemetry?: false, calibration: {Config, config}},
@@ -388,7 +395,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverTest do
 
       send(engine, {:signal_updates, [{"apparent_wind_angle", 30.0}], 0, @wind_name})
       assert {awa, _mono} = Engine.signals(engine)["apparent_wind_angle"]
-      assert_in_delta awa, 31.5, 1.0e-9
+      assert_in_delta awa, 31.5, 1.0e-5
 
       # One more pair slews to 2.0; the Config change notifies the Engine, which
       # refreshes its cached corrections and applies the new offset live.
@@ -398,8 +405,128 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverTest do
       assert eventually(fn ->
                send(engine, {:signal_updates, [{"apparent_wind_angle", 30.0}], 0, @wind_name})
                {awa, _} = Engine.signals(engine)["apparent_wind_angle"]
-               abs(awa - 32.0) < 1.0e-9
+               abs(awa - 32.0) < 1.0e-5
              end)
+    end
+
+    test "a TWS-dependent upwash curve promotes into Config and the Engine applies the band value at the current TWS" do
+      clock = start_clock()
+      {:ok, config} = Config.start_link(name: nil, store_dir: nil)
+      pid = start_observer(clock, calibration: {Config, config})
+
+      # Two TWS regimes with DIFFERENT injected upwash errors: 9 legs -> 4 pairs
+      # at TWS 4.5 (band 5) with error -3 (correction +3), then 9 legs -> 4
+      # pairs at TWS 9.0 (band 9) with error -1 (correction +1). The cross-band
+      # boundary pair is rejected by the tack detector's TWS-match gate, so each
+      # band learns only its own regime; with two published bands the backbone
+      # publishes both through the pooled posterior gate.
+      drive_beat(pid, clock, legs: 9, rotation: 0.0, tws: 4.5, upwash_err: -3.0)
+
+      drive_beat(pid, clock,
+        legs: 9,
+        rotation: 0.0,
+        tws: 9.0,
+        upwash_err: -1.0,
+        t0_ms: 9 * 40 * 1000,
+        first_leg: 9
+      )
+
+      assert %{awa_upwash: [{5, v5}, {9, v9}]} = corrections = Config.corrections(config)[@wind_hex]
+      assert_in_delta v5, 3.0, 0.4
+      assert_in_delta v9, 1.0, 0.4
+      offset = Map.get(corrections, :awa_offset_deg, 0.0)
+
+      engine =
+        start_supervised!(
+          {Engine, name: nil, store_dir: nil, commands: nil, attach_telemetry?: false, calibration: {Config, config}},
+          id: {Engine, System.unique_integer([:positive])}
+        )
+
+      # All asserted at |awa| = 30 where the upwash angle shape is exactly 1.0.
+      # At TWS 4.5 the band-5 value applies (flat hold below the first center).
+      send(engine, {:signal_updates, [{"true_wind_speed", 4.5}], 0})
+      send(engine, {:signal_updates, [{"apparent_wind_angle", 30.0}], 0, @wind_name})
+      assert {awa, _mono} = Engine.signals(engine)["apparent_wind_angle"]
+      assert_in_delta awa, 30.0 + offset + v5, 1.0e-9
+
+      # At TWS 9.0 the band-9 value applies instead — same sensor, same AWA.
+      send(engine, {:signal_updates, [{"true_wind_speed", 9.0}], 0})
+      send(engine, {:signal_updates, [{"apparent_wind_angle", 30.0}], 0, @wind_name})
+      assert {awa, _mono} = Engine.signals(engine)["apparent_wind_angle"]
+      assert_in_delta awa, 30.0 + offset + v9, 1.0e-9
+
+      # Between the centers (TWS 7.0) the engine interpolates the curve.
+      send(engine, {:signal_updates, [{"true_wind_speed", 7.0}], 0})
+      send(engine, {:signal_updates, [{"apparent_wind_angle", 30.0}], 0, @wind_name})
+      assert {awa, _mono} = Engine.signals(engine)["apparent_wind_angle"]
+      assert_in_delta awa, 30.0 + offset + (v5 + v9) / 2, 1.0e-9
+    end
+  end
+
+  # =====================================================================
+  # Upwash curve promotion (scalar slew path until the curve publishes)
+  # =====================================================================
+
+  describe "upwash curve promotion" do
+    test "the learned value is the scalar estimate until the curve publishes, then the {center, deg} list" do
+      clock = start_clock()
+      {:ok, config} = Config.start_link(name: nil, store_dir: nil)
+      pid = start_observer(clock, calibration: {Config, config}, sender: collecting_sender())
+
+      # 5 legs -> 2 pairs at TWS 6: the single band is far from the classic
+      # k = 1 gate (>= 8 validated pairs), so the curve is empty and the learned
+      # entry is TODAY'S scalar path — a float, honestly "learning".
+      drive_beat(pid, clock, legs: 5, rotation: 0.0, upwash_err: 2.0)
+      assert Config.corrections(config) == %{}
+
+      assert %{state: "learning", value: value} =
+               Enum.find(Config.status(config).sensors, &(&1.parameter == "awa_upwash"))
+
+      assert is_number(value)
+      assert_in_delta value, -2.0, 0.4
+
+      # Through the classic gate (10 pairs total): the curve publishes and the
+      # learned value becomes the curve list, applied under auto mode — no slew
+      # (the curve is already shrunk + clamped).
+      drive_beat(pid, clock, legs: 16, rotation: 0.0, upwash_err: 2.0, t0_ms: 5 * 40 * 1000, first_leg: 5)
+
+      assert %{awa_upwash: [{7, v7}]} = Config.corrections(config)[@wind_hex]
+      assert_in_delta v7, -2.0, 0.4
+
+      # The sync entry carries the representative scalar (the curve point
+      # nearest 6.17 m/s) as value plus the full curve as maps with VALUE keys
+      # (the backend's awa_upwash contract; stw curves use gain keys).
+      :ok = Observer.sync_now(pid)
+      assert_received {:calibration_update, update}
+
+      assert %{state: "applied", sample_count: 10, curve: curve, value: rep} =
+               Enum.find(update.entries, &(&1.parameter == "awa_upwash"))
+
+      assert curve == [%{center: 7, value: v7}]
+      assert rep == v7
+    end
+  end
+
+  # =====================================================================
+  # Upwash screen/light-air observability
+  # =====================================================================
+
+  describe "upwash counters in stats" do
+    test "light-air pairs are tallied as excluded_light (rotation still learns)" do
+      clock = start_clock()
+      pid = start_observer(clock)
+
+      # TWS 1.5 m/s < the 2 m/s cutoff: both pairs feed rotation but their
+      # upwash raws are excluded from the bands.
+      drive_beat(pid, clock, legs: 5, rotation: 3.0, tws: 1.5)
+
+      stats = Observer.stats(pid)
+      assert stats.excluded_light == 2
+      assert stats.screened == 0
+
+      %{awa: %{@wind_hex => snap}} = Observer.estimates(pid)
+      assert snap.rotation.sample_count == 2
+      assert snap.upwash.sample_count == 0
     end
   end
 
@@ -433,10 +560,18 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverTest do
       assert %{state: "shadow", value: value} = Enum.find(sensors, &(&1.parameter == "awa_offset"))
       assert_in_delta value, 3.0, 1.0e-6
 
+      # The published upwash curve is recorded as a shadow LIST too (rendered
+      # as maps in the status), never compiled into corrections.
+      assert %{state: "shadow", value: [%{center: 7, value: _}]} =
+               Enum.find(sensors, &(&1.parameter == "awa_upwash"))
+
       # The upstream sync still reports the shadow estimates.
       :ok = Observer.sync_now(pid)
       assert_received {:calibration_update, update}
       assert %{state: "shadow"} = Enum.find(update.entries, &(&1.parameter == "awa_offset"))
+
+      assert %{state: "shadow", curve: [%{center: 7, value: _}]} =
+               Enum.find(update.entries, &(&1.parameter == "awa_upwash"))
     end
   end
 
@@ -555,6 +690,11 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverTest do
   describe "persistence" do
     setup do
       dir = Path.join(System.tmp_dir!(), "nn_cal_observer_#{System.unique_integer([:positive])}")
+      # The Observer's terminate flush is asynchronous (linked + trap_exit) and
+      # can land AFTER on_exit's cleanup; unique_integer sequences repeat across
+      # BEAM runs, so a later run can inherit that leftover file. Pre-clean so
+      # every test starts from a genuinely empty dir.
+      File.rm_rf(dir)
       on_exit(fn -> File.rm_rf(dir) end)
       %{dir: dir}
     end

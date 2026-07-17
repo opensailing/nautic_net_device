@@ -68,6 +68,13 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
   `Calibration.Config.status/1` and refreshed on the standard
   `{:racing_org_calibration, :updated}` notification.
 
+  `"awa_upwash"` promotes in two phases: while the estimator's published TWS
+  curve is empty the GLOBAL upwash tracker takes the scalar slew path above;
+  once the curve publishes, the learned value is the `[{tws_center_mps, deg}]`
+  list itself — no slew, the curve is already shrunk + clamped (mirroring
+  `"stw_scale"`'s gain curve) — with sample_count summed and confidence
+  min'ed over the published bands.
+
   ## Upstream sync (throttled, changed-only, batched)
 
   Changed estimates are batched upstream as a `"calibration_update"` at most
@@ -76,7 +83,10 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
   session-gated). Each entry carries
   `hardware_identifier / parameter / value / confidence / sample_count / state /
   residual` (the estimate spread); `stw_scale` entries send the representative
-  gain (the most-sampled band) as `value` plus the full `curve`.
+  gain (the most-sampled band) as `value` plus the full `curve` as
+  `[%{center:, gain:}]`; curve-phase `awa_upwash` entries send the curve point
+  nearest 6.17 m/s (12 kn) as `value` plus the full `curve` as
+  `[%{center:, value:}]` (the backend expects `value` keys for awa_upwash).
 
   ## Persistence
 
@@ -194,8 +204,11 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
 
   @doc """
   Observability: `%{samples, accepted, rejected, reject_reasons, legs,
-  tack_pairs, gybe_pairs, reciprocal_pairs, source_resets}` — reject reasons
-  tallied per tick (`:no_awa | :no_aws | :no_stw | :no_heading | :at_rest`).
+  tack_pairs, gybe_pairs, reciprocal_pairs, source_resets, screened,
+  excluded_light}` — reject reasons tallied per tick
+  (`:no_awa | :no_aws | :no_stw | :no_heading | :at_rest`); `screened` /
+  `excluded_light` are the upwash raws rejected by the shear-day screen / the
+  light-air TWS exclusion, summed over the AWA estimators.
   """
   @spec stats(GenServer.server()) :: map()
   def stats(server \\ __MODULE__), do: GenServer.call(server, :stats)
@@ -296,7 +309,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
      }, state}
   end
 
-  def handle_call(:stats, _from, state), do: {:reply, state.stats, state}
+  def handle_call(:stats, _from, state), do: {:reply, build_stats(state), state}
 
   # --- Raw intake (VirtualDevice handler) ---
   #
@@ -554,7 +567,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
     %{state | awa_estimators: Map.put(state.awa_estimators, awa_hex, est), dirty_persist: true}
     |> bump(:tack_pairs)
     |> publish_awa_param(awa_hex, "awa_offset", est.rotation)
-    |> publish_awa_param(awa_hex, "awa_upwash", est.upwash)
+    |> publish_upwash(awa_hex, est)
   end
 
   # Gybe pairs are detected but not consumed by any v1 estimator.
@@ -606,6 +619,57 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
 
       {_learning, _mode} ->
         {Map.merge(base, %{value: snap.value, state: "learning"}), state}
+    end
+  end
+
+  # UpwashBands' backbone anchor (6.17 m/s = 12 kn): the sync entry's scalar
+  # representative is the published curve point nearest this TWS.
+  @upwash_anchor_mps 6.17
+
+  # Record the TWS-banded upwash fit. While the published curve is empty this
+  # is TODAY'S scalar path — the GLOBAL upwash tracker through the
+  # Estimate.applied_value slew (unchanged legacy behavior). Once the curve
+  # publishes, the learned value is the `[{center_mps, deg}]` list itself,
+  # promoted per mode with NO slew (the curve is already shrunk + clamped,
+  # mirroring stw_scale's gain_curve); sample_count sums the published bands'
+  # trackers and confidence is their minimum. The sync entry carries the
+  # representative scalar (the curve point nearest #{@upwash_anchor_mps} m/s)
+  # as `value` plus the full curve as `[%{center:, value:}]` maps — the
+  # backend expects `value` keys for awa_upwash (stw curves use `gain`).
+  defp publish_upwash(state, hex, est) do
+    snap = AwaOffset.snapshot(est)
+
+    case snap.upwash_curve do
+      [] ->
+        publish_awa_param(state, hex, "awa_upwash", est.upwash)
+
+      curve ->
+        published = Enum.map(curve, fn {center, _deg} -> snap.upwash_bands[center] end)
+        sample_count = published |> Enum.map(& &1.sample_count) |> Enum.sum()
+        confidence = published |> Enum.map(& &1.confidence) |> Enum.min()
+
+        state_s =
+          case mode(state, "awa_upwash") do
+            "auto" -> "applied"
+            "shadow" -> "shadow"
+            _ -> "validated"
+          end
+
+        entry = %{value: curve, confidence: confidence, sample_count: sample_count, state: state_s}
+        {rep_center, rep_value} = Enum.min_by(curve, fn {center, _deg} -> abs(center - @upwash_anchor_mps) end)
+
+        state
+        |> put_learned(hex, "awa_upwash", entry)
+        |> record_sync(hex, "awa_upwash", %{
+          hardware_identifier: hex,
+          parameter: "awa_upwash",
+          value: rep_value,
+          confidence: confidence,
+          sample_count: sample_count,
+          state: state_s,
+          residual: snap.upwash_bands[rep_center].spread,
+          curve: Enum.map(curve, fn {center, deg} -> %{center: center, value: deg} end)
+        })
     end
   end
 
@@ -862,6 +926,19 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
 
   defp bump(state, :samples), do: %{state | stats: Map.update!(state.stats, :samples, &(&1 + 1))}
   defp bump(state, key), do: %{state | stats: Map.update!(state.stats, key, &(&1 + 1))}
+
+  # The tick counters plus the upwash rejection counters, which live inside the
+  # per-sensor estimators (summed across AWA sensors at read time — stats is
+  # never on the intake hot path).
+  defp build_stats(state) do
+    {screened, excluded_light} =
+      Enum.reduce(state.awa_estimators, {0, 0}, fn {_hex, est}, {screened, excluded} ->
+        snap = AwaOffset.snapshot(est)
+        {screened + snap.screened, excluded + snap.excluded_light}
+      end)
+
+    Map.merge(state.stats, %{screened: screened, excluded_light: excluded_light})
+  end
 
   defp tally_reject(state, reason) do
     stats =

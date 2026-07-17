@@ -46,7 +46,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.StoreTest do
   test "the persisted term is term_to_binary/:safe round-trippable", %{dir: dir} do
     assert :ok = Store.save(dir, snapshot())
     binary = File.read!(Path.join(dir, "observer.calibration"))
-    assert {1, %{}} = :erlang.binary_to_term(binary, [:safe])
+    assert {2, %{}} = :erlang.binary_to_term(binary, [:safe])
   end
 
   test "load returns :empty when nothing is persisted", %{dir: dir} do
@@ -68,6 +68,14 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.StoreTest do
   test "load ignores an unknown format version", %{dir: dir} do
     File.mkdir_p!(dir)
     File.write!(Path.join(dir, "observer.calibration"), :erlang.term_to_binary({999, %{}}))
+    assert :empty = Store.load(dir)
+  end
+
+  test "load ignores a format-1 snapshot (pre-banded-upwash estimators) — clean start", %{dir: dir} do
+    # Format 1 persisted %AwaOffset{} structs WITHOUT the :bands field; restoring
+    # them would KeyError inside the estimators, so v1 snapshots must be dropped.
+    File.mkdir_p!(dir)
+    File.write!(Path.join(dir, "observer.calibration"), :erlang.term_to_binary({1, snapshot()}))
     assert :empty = Store.load(dir)
   end
 

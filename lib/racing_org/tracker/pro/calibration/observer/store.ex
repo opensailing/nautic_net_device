@@ -38,7 +38,9 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.Store do
   @filename "observer.calibration"
   # Bump if the persisted representation changes incompatibly; older/unknown
   # versions are ignored on load (the Observer restarts from empty).
-  @format_version 1
+  # v2: %AwaOffset{} gained the :bands field (TWS-banded upwash) — restoring a
+  # v1 snapshot would resurrect band-less estimator structs that KeyError.
+  @format_version 2
 
   @doc "Atomically persist the Observer `snapshot` under `dir`. Best-effort; never raises."
   @spec save(Path.t(), map()) :: :ok | {:error, term()}

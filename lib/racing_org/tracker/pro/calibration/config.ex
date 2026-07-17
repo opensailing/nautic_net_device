@@ -36,7 +36,13 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
   `corrections/1` compiles the state into the map
   `RacingOrg.Tracker.Pro.Compute.Engine` caches:
 
-      %{hex => %{awa_offset_deg: f, awa_upwash_deg: f, stw_gains: [{band_center_mps, gain}]}}
+      %{hex => %{awa_offset_deg: f,
+                 awa_upwash: [{tws_center_mps, deg}],
+                 stw_gains: [{band_center_mps, gain}]}}
+
+  `awa_upwash` is a TWS curve the engine interpolates at apply time (a learned
+  or locked flat float compiles to the single point `[{0.0, deg}]`); every
+  point is clamped to ±10° at compile time.
 
   including ONLY:
 
@@ -91,7 +97,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
   @type corrections :: %{
           optional(String.t()) => %{
             optional(:awa_offset_deg) => number(),
-            optional(:awa_upwash_deg) => number(),
+            optional(:awa_upwash) => [{number(), number()}],
             optional(:stw_gains) => [{number(), number()}]
           }
         }
@@ -127,8 +133,10 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
   on-device estimation layer. `entry` is `%{value: v, confidence: f,
   sample_count: n, state: s}` with `state` one of `"learning" | "validated" |
   "applied" | "shadow"`. For `stw_scale` the value may be a single float (a
-  uniform gain) or a list of `{band_center_mps, gain}` pairs — normalized to a
-  sorted list. The sensor id is canonicalized to uppercase hex. A LOCKED
+  uniform gain) or a list of `{band_center_mps, gain}` pairs; for `awa_upwash`
+  a single float (flat) or a list of `{tws_center_mps, deg}` curve points —
+  lists are normalized to sorted pair lists. The sensor id is canonicalized to
+  uppercase hex. A LOCKED
   (sensor, parameter) still stores the entry, but the lock always wins in the
   compiled corrections. Persisted; subscribers are notified ONLY when the
   APPLIED corrections map actually changes.
@@ -298,18 +306,23 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
 
   defp validate_entry(_parameter, _entry), do: {:error, :bad_entry}
 
-  # stw_scale accepts a uniform float gain OR a {band_center_mps, gain} list,
-  # normalized here to a sorted pair list so the engine interpolates directly.
-  defp validate_value("stw_scale", value) when is_list(value) do
-    if value != [] and Enum.all?(value, &match?({c, g} when is_number(c) and is_number(g), &1)) do
+  # stw_scale accepts a uniform float gain OR a {band_center_mps, gain} list;
+  # awa_upwash accepts a flat float OR a {band_center_mps, deg} TWS curve.
+  # Lists are normalized here to sorted pair lists so the engine interpolates
+  # directly.
+  defp validate_value("stw_scale", value) when is_list(value), do: validate_curve(value)
+  defp validate_value("awa_upwash", value) when is_list(value), do: validate_curve(value)
+
+  defp validate_value(_parameter, value) when is_number(value), do: {:ok, value}
+  defp validate_value(_parameter, _value), do: {:error, :bad_entry}
+
+  defp validate_curve(value) do
+    if value != [] and Enum.all?(value, &match?({c, v} when is_number(c) and is_number(v), &1)) do
       {:ok, value |> Enum.sort_by(&elem(&1, 0)) |> Enum.uniq_by(&elem(&1, 0))}
     else
       {:error, :bad_entry}
     end
   end
-
-  defp validate_value(_parameter, value) when is_number(value), do: {:ok, value}
-  defp validate_value(_parameter, _value), do: {:error, :bad_entry}
 
   defp maybe_persist(%{store_dir: nil}), do: :ok
 
@@ -378,15 +391,30 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
     end
   end
 
+  # The compiled upwash curve is clamped point-by-point: corrections beyond a
+  # few degrees are physically implausible and must not reach the engine even
+  # via a locked pin.
+  @max_upwash_deg 10.0
+
   defp correction_field("awa_offset"), do: :awa_offset_deg
-  defp correction_field("awa_upwash"), do: :awa_upwash_deg
+  defp correction_field("awa_upwash"), do: :awa_upwash
   defp correction_field("stw_scale"), do: :stw_gains
 
-  # stw_scale compiles to a gain-band list: a (locked or learned) uniform float
-  # becomes a single flat band; learned lists are already normalized on write.
+  # stw_scale compiles to a gain-band list and awa_upwash to a {center_mps, deg}
+  # TWS curve: a (locked or learned) uniform float becomes a single flat point;
+  # learned lists are already normalized (sorted + uniq) on write. Every upwash
+  # point is clamped to +/-#{@max_upwash_deg} degrees at compile time.
   defp normalize_correction("stw_scale", value) when is_number(value), do: [{0.0, value}]
   defp normalize_correction("stw_scale", value) when is_list(value), do: value
+
+  defp normalize_correction("awa_upwash", value) when is_number(value), do: [{0.0, clamp_upwash(value)}]
+
+  defp normalize_correction("awa_upwash", value) when is_list(value),
+    do: Enum.map(value, fn {center, deg} -> {center, clamp_upwash(deg)} end)
+
   defp normalize_correction(_parameter, value), do: value
+
+  defp clamp_upwash(deg), do: deg |> min(@max_upwash_deg) |> max(-@max_upwash_deg)
 
   # --- Status ---
 
@@ -423,12 +451,24 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
         hardware_identifier: hex,
         parameter: parameter,
         state: state_s,
-        value: value,
+        value: status_value(parameter, value),
         confidence: learned && learned.confidence,
         sample_count: learned && learned.sample_count
       }
     end)
   end
+
+  # Curve values are {center, y} tuple lists internally — not JSON-encodable.
+  # The status (pushed verbatim as "calibration_status") renders them as maps:
+  # stw curves as [%{center:, gain:}], upwash curves as [%{center:, value:}]
+  # (the keys the backend expects). Scalars pass through.
+  defp status_value("stw_scale", value) when is_list(value),
+    do: Enum.map(value, fn {center, gain} -> %{center: center, gain: gain} end)
+
+  defp status_value("awa_upwash", value) when is_list(value),
+    do: Enum.map(value, fn {center, deg} -> %{center: center, value: deg} end)
+
+  defp status_value(_parameter, value), do: value
 
   # --- Normalization (string OR atom keys -> canonical) ---
 

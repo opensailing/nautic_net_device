@@ -284,6 +284,53 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ConfigTest do
     assert Config.corrections(pid) == %{"1A2B" => %{stw_gains: [{2.0, 1.1}, {6.0, 1.02}]}}
   end
 
+  test "learned awa_upwash supports a single float (flat) and a {center_mps, deg} curve" do
+    pid = start_config()
+
+    # A float compiles to a single flat curve point, exactly like stw_gains.
+    assert :ok = Config.put_learned(pid, "1A2B", "awa_upwash", learned_entry(%{value: -2.0}))
+    assert Config.corrections(pid) == %{"1A2B" => %{awa_upwash: [{0.0, -2.0}]}}
+
+    # A curve is normalized (sorted + uniq by center) on write.
+    assert :ok = Config.put_learned(pid, "1A2B", "awa_upwash", learned_entry(%{value: [{9, 1.0}, {5, 3.0}]}))
+    assert Config.corrections(pid) == %{"1A2B" => %{awa_upwash: [{5, 3.0}, {9, 1.0}]}}
+  end
+
+  test "malformed awa_upwash curve values are rejected" do
+    pid = start_config()
+
+    assert {:error, :bad_entry} = Config.put_learned(pid, "1A2B", "awa_upwash", learned_entry(%{value: []}))
+    assert {:error, :bad_entry} = Config.put_learned(pid, "1A2B", "awa_upwash", learned_entry(%{value: [{5, "x"}]}))
+    assert {:error, :bad_entry} = Config.put_learned(pid, "1A2B", "awa_upwash", learned_entry(%{value: [5.0]}))
+    assert Config.corrections(pid) == %{}
+  end
+
+  test "compiled awa_upwash points are clamped to +/-10 degrees" do
+    pid = start_config()
+
+    assert :ok = Config.put_learned(pid, "1A2B", "awa_upwash", learned_entry(%{value: [{5, 12.0}, {9, -11.0}]}))
+    assert Config.corrections(pid) == %{"1A2B" => %{awa_upwash: [{5, 10.0}, {9, -10.0}]}}
+
+    assert :ok = Config.put_learned(pid, "1A2B", "awa_upwash", learned_entry(%{value: 25.0}))
+    assert Config.corrections(pid) == %{"1A2B" => %{awa_upwash: [{0.0, 10.0}]}}
+  end
+
+  test "a locked awa_upwash pin compiles to a flat clamped curve" do
+    pid = start_config()
+
+    {:ok, _} =
+      Config.apply_config(
+        pid,
+        calibration_config(1, %{
+          "sensors" => [
+            %{"hardware_identifier" => "1A2B", "parameter" => "awa_upwash", "locked" => true, "value" => -3.0}
+          ]
+        })
+      )
+
+    assert Config.corrections(pid) == %{"1A2B" => %{awa_upwash: [{0.0, -3.0}]}}
+  end
+
   test "aws_scale never compiles into corrections (shadow-only parameter)" do
     pid = start_config()
     assert :ok = Config.put_learned(pid, "1A2B", "aws_scale", learned_entry(%{value: 1.1}))
@@ -299,7 +346,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ConfigTest do
     assert :ok = Config.put_learned(pid, "1A2B", "stw_scale", learned_entry(%{value: 1.03}))
 
     assert Config.corrections(pid) == %{
-             "1A2B" => %{awa_offset_deg: 2.0, awa_upwash_deg: 1.5, stw_gains: [{0.0, 1.03}]}
+             "1A2B" => %{awa_offset_deg: 2.0, awa_upwash: [{0.0, 1.5}], stw_gains: [{0.0, 1.03}]}
            }
   end
 
@@ -339,6 +386,24 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ConfigTest do
 
     learning = Enum.find(status.sensors, &(&1.hardware_identifier == "3C4D"))
     assert %{parameter: "stw_scale", state: "learning", value: 1.02} = learning
+  end
+
+  test "status renders curve values as maps (tuple lists are not JSON-encodable)" do
+    pid = start_config()
+
+    assert :ok = Config.put_learned(pid, "1A2B", "awa_upwash", learned_entry(%{value: [{5, 3.0}, {9, 1.0}]}))
+    assert :ok = Config.put_learned(pid, "3C4D", "stw_scale", learned_entry(%{value: [{1, 1.05}]}))
+
+    sensors = Config.status(pid).sensors
+
+    upwash = Enum.find(sensors, &(&1.parameter == "awa_upwash"))
+    assert upwash.value == [%{center: 5, value: 3.0}, %{center: 9, value: 1.0}]
+
+    stw = Enum.find(sensors, &(&1.parameter == "stw_scale"))
+    assert stw.value == [%{center: 1, gain: 1.05}]
+
+    # The whole status must survive JSON encoding (the channel pushes it verbatim).
+    assert is_binary(Jason.encode!(Config.status(pid)))
   end
 
   # --- subscribe / notify ---

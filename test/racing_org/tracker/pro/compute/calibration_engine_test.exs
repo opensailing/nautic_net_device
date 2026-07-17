@@ -131,54 +131,129 @@ defmodule RacingOrg.Tracker.Pro.Compute.CalibrationEngineTest do
     signal(pid, name)
   end
 
+  # The documented Ockam angle shape the engine scales the upwash term by
+  # (recomputed here independently of the module under test).
+  defp shape(abs_awa), do: :math.pow(:math.sin(0.6 * (180.0 - abs_awa) * :math.pi() / 180.0), 2.5)
+
+  defp put_tws(pid, tws) do
+    Engine.put_signal(pid, "true_wind_speed", tws, 1_000)
+    assert eventually(fn -> signal(pid, "true_wind_speed") == tws end)
+  end
+
   # --- apparent wind angle corrections ---
 
   describe "apparent_wind_angle corrections" do
-    test "0..360 convention: offset applies and wraps correctly (+170 + 20 -> 190)" do
-      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 20.0}})
+    test "0..360 convention: offset applies and wraps correctly (+170 + 14 -> 184)" do
+      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 14.0}})
 
       emit_wind(170.0, 8.0, @name_1a2b)
-      assert_in_delta await_signal(pid, "apparent_wind_angle"), 190.0, 1.0e-9
+      assert_in_delta await_signal(pid, "apparent_wind_angle"), 184.0, 1.0e-9
     end
 
-    test "signed convention: a negative AWA stays signed and wraps correctly (-170 - 20 -> 170)" do
-      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: -20.0}})
+    test "signed convention: a negative AWA stays signed and wraps correctly (-170 - 14 -> 176)" do
+      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: -14.0}})
 
       emit_wind(-170.0, 8.0, @name_1a2b)
-      assert_in_delta await_signal(pid, "apparent_wind_angle"), 170.0, 1.0e-9
+      assert_in_delta await_signal(pid, "apparent_wind_angle"), 176.0, 1.0e-9
     end
 
-    test "upwash sign flips with the tack side (starboard +, port -)" do
-      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_upwash_deg: 5.0}})
+    test "upwash sign flips with the tack side (starboard +, port -), scaled by the angle shape" do
+      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_upwash: [{0.0, 5.0}]}})
 
-      # Starboard: +10 deg -> +15 deg.
+      # Starboard: +10 deg -> +10 + 5*shape(10).
+      expected = 10.0 + 5.0 * shape(10.0)
       emit_wind(10.0, 8.0, @name_1a2b)
-      assert_in_delta await_signal(pid, "apparent_wind_angle"), 15.0, 1.0e-9
+      assert_in_delta await_signal(pid, "apparent_wind_angle"), expected, 1.0e-9
 
-      # Port (0..360 convention): 350 deg == -10 signed -> -15 -> 345.
+      # Port (0..360 convention): 350 deg == -10 signed -> mirrored -> 360 - expected.
       emit_wind(350.0, 8.0, @name_1a2b)
-      assert eventually(fn -> abs(signal(pid, "apparent_wind_angle") - 345.0) < 1.0e-9 end)
+      assert eventually(fn -> abs(signal(pid, "apparent_wind_angle") - (360.0 - expected)) < 1.0e-9 end)
+    end
+
+    test "the upwash angle shape at |awa| 30/90/150 is ~1.0/0.588/0.053 (fades off the wind)" do
+      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_upwash: [{0.0, 5.0}]}})
+
+      # Hand-computed: shape(a) = sin(0.6*(180-a)*pi/180)^2.5.
+      for {awa, factor} <- [{30.0, 1.0}, {90.0, 0.5887}, {150.0, 0.0531}] do
+        emit_wind(awa, 8.0, @name_1a2b)
+
+        assert eventually(fn -> abs(signal(pid, "apparent_wind_angle") - (awa + 5.0 * factor)) < 5.0e-3 end),
+               "expected #{awa} + 5*#{factor}, got #{signal(pid, "apparent_wind_angle")}"
+      end
     end
 
     test "no upwash at dead-ahead (sign(0) = 0); the offset still applies" do
-      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 2.0, awa_upwash_deg: 5.0}})
+      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 2.0, awa_upwash: [{0.0, 5.0}]}})
 
       emit_wind(0.0, 8.0, @name_1a2b)
       assert_in_delta await_signal(pid, "apparent_wind_angle"), 2.0, 1.0e-9
     end
 
+    test "the total AWA correction is defensively clamped to +/-15 degrees" do
+      # offset 12 + upwash 8*shape(30) = 8 -> 20 total, clamped to 15.
+      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 12.0, awa_upwash: [{0.0, 8.0}]}})
+
+      emit_wind(30.0, 8.0, @name_1a2b)
+      assert_in_delta await_signal(pid, "apparent_wind_angle"), 45.0, 1.0e-9
+    end
+
     test "a sensor without a correction entry passes through untouched" do
-      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 20.0}})
+      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 14.0}})
 
       emit_wind(170.0, 8.0, @other_name)
       assert_in_delta await_signal(pid, "apparent_wind_angle"), 170.0, 1.0e-9
     end
 
     test "an integer NMEA NAME device_id canonicalizes to the same hex identity" do
-      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 20.0}})
+      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 10.0}})
 
       emit_wind(10.0, 8.0, 0x1A2B)
-      assert_in_delta await_signal(pid, "apparent_wind_angle"), 30.0, 1.0e-9
+      assert_in_delta await_signal(pid, "apparent_wind_angle"), 20.0, 1.0e-9
+    end
+  end
+
+  # --- TWS-banded upwash (awa_upwash is a {tws_center_mps, deg} curve) ---
+
+  describe "TWS-banded upwash" do
+    setup do
+      %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_upwash: [{5.0, 4.0}, {9.0, 2.0}]}})
+      %{pid: pid}
+    end
+
+    # shape(30) == 1.0 exactly, so the corrected AWA is 30 + upwash_at(tws).
+
+    test "below the first curve center: flat hold", %{pid: pid} do
+      put_tws(pid, 4.0)
+      emit_wind(30.0, 8.0, @name_1a2b)
+      assert_in_delta await_signal(pid, "apparent_wind_angle"), 34.0, 1.0e-9
+    end
+
+    test "between curve centers: linear interpolation", %{pid: pid} do
+      put_tws(pid, 7.0)
+      emit_wind(30.0, 8.0, @name_1a2b)
+      assert_in_delta await_signal(pid, "apparent_wind_angle"), 33.0, 1.0e-9
+    end
+
+    test "above the last curve center: flat hold", %{pid: pid} do
+      put_tws(pid, 12.0)
+      emit_wind(30.0, 8.0, @name_1a2b)
+      assert_in_delta await_signal(pid, "apparent_wind_angle"), 32.0, 1.0e-9
+    end
+
+    test "with no TWS ever heard: the curve's middle point applies (flat prior)", %{pid: pid} do
+      # Middle element of a 2-point curve = index div(2, 2) = 1 -> {9.0, 2.0}.
+      emit_wind(30.0, 8.0, @name_1a2b)
+      assert_in_delta await_signal(pid, "apparent_wind_angle"), 32.0, 1.0e-9
+    end
+
+    test "the last-known TWS keeps applying until a fresh one arrives", %{pid: pid} do
+      put_tws(pid, 4.0)
+      emit_wind(30.0, 8.0, @name_1a2b)
+      assert_in_delta await_signal(pid, "apparent_wind_angle"), 34.0, 1.0e-9
+
+      put_tws(pid, 9.0)
+      emit_wind(30.0, 8.0, @name_1a2b)
+      assert eventually(fn -> abs(signal(pid, "apparent_wind_angle") - 32.0) < 1.0e-9 end)
     end
   end
 
@@ -254,10 +329,10 @@ defmodule RacingOrg.Tracker.Pro.Compute.CalibrationEngineTest do
 
   describe "hot path" do
     test "a burst of telemetry events never re-fetches corrections from the collaborator" do
-      %{engine: pid, cal: cal} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 20.0}})
+      %{engine: pid, cal: cal} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 10.0}})
 
       emit_wind(10.0, 8.0, @name_1a2b)
-      assert_in_delta await_signal(pid, "apparent_wind_angle"), 30.0, 1.0e-9
+      assert_in_delta await_signal(pid, "apparent_wind_angle"), 20.0, 1.0e-9
 
       fetches_before = StubCalibration.fetches(cal)
 
@@ -269,7 +344,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.CalibrationEngineTest do
       end
 
       # Synchronize: the last event has been folded in (corrected).
-      assert eventually(fn -> abs(signal(pid, "apparent_wind_angle") - 30.2) < 1.0e-9 end)
+      assert eventually(fn -> abs(signal(pid, "apparent_wind_angle") - 20.2) < 1.0e-9 end)
 
       assert StubCalibration.fetches(cal) == fetches_before,
              "engine re-fetched calibration corrections on the hot path " <>
@@ -277,10 +352,10 @@ defmodule RacingOrg.Tracker.Pro.Compute.CalibrationEngineTest do
     end
 
     test "the cached corrections refresh ONLY when a calibration change is notified" do
-      %{engine: pid, cal: cal} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 20.0}})
+      %{engine: pid, cal: cal} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 10.0}})
 
       emit_wind(10.0, 8.0, @name_1a2b)
-      assert_in_delta await_signal(pid, "apparent_wind_angle"), 30.0, 1.0e-9
+      assert_in_delta await_signal(pid, "apparent_wind_angle"), 20.0, 1.0e-9
 
       fetches_before = StubCalibration.fetches(cal)
       StubCalibration.set(cal, %{"1A2B" => %{awa_offset_deg: -5.0}})

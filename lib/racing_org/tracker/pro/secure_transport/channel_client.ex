@@ -166,9 +166,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   as the `"calibration_update"` event with payload
   `%{boat_identifier: id, seq: monotonic_int, entries: entries}`, where each entry
   is `%{hardware_identifier:, parameter:, value:, confidence:, sample_count:,
-  state:, residual:}` (stw_scale entries additionally carry the full `curve`).
-  `seq` is a per-device advisory sequence; the server merges idempotently per
-  (sensor, parameter), so a reboot-reset seq is harmless.
+  state:, residual:}`. Banded parameters additionally carry the full `curve`:
+  `stw_scale` as `[%{center:, gain:}]` and (once its TWS curve has published)
+  `awa_upwash` as `[%{center:, value:}]` — awa_upwash curve points use `value`
+  keys, which is what the backend expects. `seq` is a per-device advisory
+  sequence; the server merges idempotently per (sensor, parameter), so a
+  reboot-reset seq is harmless.
 
   Best-effort + session-gated, exactly like `send_sailed_polar_update/2`: pushes
   ONLY when a secure session is live; with no live session — or no running
