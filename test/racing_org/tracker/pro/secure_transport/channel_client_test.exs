@@ -550,6 +550,155 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     end
   end
 
+  # --- wind-shift policy: set_wind_shift / wind_shift_status ---
+
+  describe "set_wind_shift / wind_shift_status (SocketTest)" do
+    # A fake WindShift.Config collaborator mirroring the API the channel uses:
+    # apply_config/2 (records the call) + status/1 (the POLICY half).
+    defmodule FakeWindShift do
+      use GenServer
+
+      def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+      @impl true
+      def init(opts) do
+        {:ok,
+         %{
+           parent: Keyword.fetch!(opts, :parent),
+           status: Keyword.get(opts, :status, %{applied_version: 3, wally_mode: "shadow", status: "ok"}),
+           apply_result: Keyword.get(opts, :apply_result, {:ok, %{version: 3}})
+         }}
+      end
+
+      def apply_config(server, config), do: GenServer.call(server, {:apply_config, config})
+      def status(server), do: GenServer.call(server, :status)
+
+      @impl true
+      def handle_call({:apply_config, config}, _from, state) do
+        send(state.parent, {:apply_wind_shift_called, config})
+        {:reply, state.apply_result, state}
+      end
+
+      def handle_call(:status, _from, state), do: {:reply, state.status, state}
+    end
+
+    # A fake WindShift.Observer collaborator: status/1 (the LIVE half).
+    defmodule FakeWindShiftObserver do
+      use Agent
+
+      @default %{
+        regime: "oscillating",
+        confidence: 0.72,
+        oscillation_period_s: 480.0,
+        oscillation_amplitude_deg: 9.5,
+        trend_deg_per_hr: 1.2,
+        wind_phase_deg: 4.0,
+        wind_lift_deg: 4.0,
+        twd_range_deg: 21.0,
+        status: "ok"
+      }
+
+      def start_link(opts), do: Agent.start_link(fn -> Keyword.get(opts, :status, @default) end)
+      def status(agent), do: Agent.get(agent, & &1)
+    end
+
+    defp connect_wind_shift_client(ctx, wind_shift_opts, observer_opts \\ []) do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      {:ok, wind_shift} = start_supervised({FakeWindShift, [parent: self()] ++ wind_shift_opts})
+      {:ok, observer} = start_supervised({FakeWindShiftObserver, observer_opts})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           wind_shift: {FakeWindShift, wind_shift},
+           wind_shift_observer: {FakeWindShiftObserver, observer},
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      {client, topic, wind_shift}
+    end
+
+    test "server set_wind_shift → apply_config called + the exact 12-key status pushed", ctx do
+      {client, topic, _wind_shift} = connect_wind_shift_client(ctx, [])
+
+      push(client, topic, "set_wind_shift", %{
+        "version" => 3,
+        "windows" => %{"fast_s" => 30, "mid_s" => 300, "slow_s" => 1500, "envelope_s" => 1800},
+        "alarms" => %{"new_extreme_margin_deg" => 2.0, "enabled" => true},
+        "wally" => %{"mode" => "shadow"}
+      })
+
+      assert_receive {:apply_wind_shift_called, config}
+      assert config["version"] == 3
+      assert config["wally"]["mode"] == "shadow"
+
+      assert_push(^topic, "wind_shift_status", status)
+      assert status.applied_version == 3
+      assert status.regime == "oscillating"
+      assert status.confidence == 0.72
+      assert status.oscillation_period_s == 480.0
+      assert status.oscillation_amplitude_deg == 9.5
+      assert status.trend_deg_per_hr == 1.2
+      assert status.wind_phase_deg == 4.0
+      assert status.wind_lift_deg == 4.0
+      assert status.twd_range_deg == 21.0
+      assert status.wally_mode == "shadow"
+      assert status.status == "ok"
+      assert Map.has_key?(status, :reported_at)
+
+      # Allowlist: EXACTLY the 12 contract fields, nothing more.
+      assert Map.keys(status) |> Enum.sort() == [
+               :applied_version,
+               :confidence,
+               :oscillation_amplitude_deg,
+               :oscillation_period_s,
+               :regime,
+               :reported_at,
+               :status,
+               :trend_deg_per_hr,
+               :twd_range_deg,
+               :wally_mode,
+               :wind_lift_deg,
+               :wind_phase_deg
+             ]
+    end
+
+    test "set_wind_shift apply error → still pushes status (no crash)", ctx do
+      {client, topic, _wind_shift} =
+        connect_wind_shift_client(
+          ctx,
+          [apply_result: {:error, :bad_wally_mode}, status: %{applied_version: nil, wally_mode: "off", status: "ok"}],
+          status: %{
+            regime: "insufficient_history",
+            confidence: 0.0,
+            oscillation_period_s: nil,
+            oscillation_amplitude_deg: nil,
+            trend_deg_per_hr: nil,
+            wind_phase_deg: nil,
+            wind_lift_deg: nil,
+            twd_range_deg: nil,
+            status: "ok"
+          }
+        )
+
+      push(client, topic, "set_wind_shift", %{"version" => 1, "wally" => %{"mode" => "bogus"}})
+
+      assert_receive {:apply_wind_shift_called, _config}
+      assert_push(^topic, "wind_shift_status", status)
+      assert status.applied_version == nil
+      assert status.regime == "insufficient_history"
+      assert status.wally_mode == "off"
+      assert Process.alive?(client)
+    end
+  end
+
   # --- calibration policy: set_calibration / calibration_status ---
 
   describe "set_calibration / calibration_status (SocketTest)" do

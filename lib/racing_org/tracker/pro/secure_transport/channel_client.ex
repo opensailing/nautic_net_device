@@ -263,6 +263,17 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       # source) and reports the learned/locked per-sensor state back as
       # "calibration_status". A {module, server} pair (bare module = both).
       calibration: normalize_collaborator(Keyword.get(opts, :calibration, RacingOrg.Tracker.Pro.Calibration.Config)),
+      # The wind-shift policy: applies the server-pushed "set_wind_shift" config
+      # (default RacingOrg.Tracker.Pro.WindShift.Config — the POLICY half of the
+      # status: applied_version + wally_mode). The LIVE half (regime, confidence,
+      # oscillation, phase/lift, range) comes from the separate
+      # :wind_shift_observer collaborator (default
+      # RacingOrg.Tracker.Pro.WindShift.Observer); "wind_shift_status" composes
+      # the two, exactly like tracking (Tracking.Config applies, Sampling
+      # reports). Both are {module, server} pairs (bare module = both).
+      wind_shift: normalize_collaborator(Keyword.get(opts, :wind_shift, RacingOrg.Tracker.Pro.WindShift.Config)),
+      wind_shift_observer:
+        normalize_collaborator(Keyword.get(opts, :wind_shift_observer, RacingOrg.Tracker.Pro.WindShift.Observer)),
       # The on-device compute engine: applies the server-pushed computed-value defs
       # ("set_computed_values") and reports applied_version + active_count back as
       # "computed_values_status". A {module, server} pair (bare module = both).
@@ -442,6 +453,17 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   def handle_message(topic, "set_calibration", payload, socket) do
     {_result, socket} = apply_calibration(payload, socket)
     push(socket, topic, "calibration_status", calibration_status(socket))
+    {:ok, socket}
+  end
+
+  # Server pushes the wind-shift policy (predictor windows / envelope alarms /
+  # wally mode). Apply it through RacingOrg.Tracker.Pro.WindShift.Config
+  # (versioned, idempotent), then report the composed policy+live state back as
+  # "wind_shift_status". On an apply error we still report the current status so
+  # the server is not left stale, and we never crash the channel.
+  def handle_message(topic, "set_wind_shift", payload, socket) do
+    {_result, socket} = apply_wind_shift(payload, socket)
+    push(socket, topic, "wind_shift_status", wind_shift_status(socket))
     {:ok, socket}
   end
 
@@ -802,6 +824,53 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       status: Map.get(base, :status, "ok"),
       reported_at: DateTime.utc_now() |> DateTime.to_iso8601()
     }
+  end
+
+  # --- Wind-shift collaborators (policy config + live observer) ---
+
+  defp apply_wind_shift(payload, socket) do
+    {module, server} = socket.assigns.wind_shift
+    result = module.apply_config(server, payload)
+    {result, socket}
+  rescue
+    error ->
+      Logger.warning("[ChannelClient] WindShift apply_config failed: #{inspect(error)}")
+      {{:error, :apply_failed}, socket}
+  end
+
+  # Build the "wind_shift_status" the server allowlists — EXACTLY the 12 contract
+  # fields: applied_version + wally_mode from the policy (WindShift.Config.status),
+  # the live predictor fields from the Observer (WindShift.Observer.status), plus
+  # status and reported_at (ISO-8601). Falls back to minimal maps if either source
+  # is unavailable, and always stamps reported_at.
+  defp wind_shift_status(socket) do
+    config = wind_shift_source_status(socket.assigns.wind_shift, "wind_shift config")
+    live = wind_shift_source_status(socket.assigns.wind_shift_observer, "wind_shift observer")
+
+    %{
+      applied_version: Map.get(config, :applied_version),
+      regime: Map.get(live, :regime),
+      confidence: Map.get(live, :confidence),
+      oscillation_period_s: Map.get(live, :oscillation_period_s),
+      oscillation_amplitude_deg: Map.get(live, :oscillation_amplitude_deg),
+      trend_deg_per_hr: Map.get(live, :trend_deg_per_hr),
+      wind_phase_deg: Map.get(live, :wind_phase_deg),
+      wind_lift_deg: Map.get(live, :wind_lift_deg),
+      twd_range_deg: Map.get(live, :twd_range_deg),
+      wally_mode: Map.get(config, :wally_mode),
+      reported_at: DateTime.utc_now() |> DateTime.to_iso8601(),
+      status: Map.get(live, :status, Map.get(config, :status, "ok"))
+    }
+  end
+
+  defp wind_shift_source_status({module, server}, what) do
+    module.status(server)
+  rescue
+    error ->
+      Logger.warning("[ChannelClient] #{what} status read failed: #{inspect(error)}")
+      %{}
+  catch
+    :exit, _ -> %{}
   end
 
   # --- Computed-values collaborator (Phase 7 compute engine) ---
