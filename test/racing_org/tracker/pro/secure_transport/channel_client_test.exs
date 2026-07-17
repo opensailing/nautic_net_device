@@ -1250,6 +1250,144 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     end
   end
 
+  # --- wind-shift streamback: send_wind_shift_update/2 ---
+
+  describe "send_wind_shift_update (SocketTest)" do
+    defmodule WindShiftFakeWiFi do
+      use Agent
+
+      def start_link(_opts),
+        do: Agent.start_link(fn -> %{enabled: false, ssid: nil, connection: :disconnected, signal: nil} end)
+
+      def current_status(agent), do: Agent.get(agent, & &1)
+    end
+
+    defp connect_live_wind_shift(ctx) do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      {:ok, wifi} = start_supervised(WindShiftFakeWiFi)
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           wifi: {WindShiftFakeWiFi, wifi},
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+
+      {:ok, hello_wire, rstate} =
+        Handshake.responder_hello(
+          server_identity_private: ctx.srv_priv,
+          server_identity_public: ctx.srv_pub,
+          device_identity_public: ctx.identity.public_key,
+          epoch: 0
+        )
+
+      push(client, topic, "handshake_hello", %{"hello" => Base.encode64(hello_wire)})
+      assert_push(^topic, "handshake_init", %{"init" => init_b64})
+      {:ok, init_wire} = Base.decode64(init_b64)
+      {:ok, server_session} = Handshake.responder_finalize(rstate, init_wire)
+      push(client, topic, "handshake_ok", %{"session_id" => Base.encode64(server_session.session_id)})
+
+      assert_push(^topic, "wifi_status", _wifi)
+      assert eventually(fn -> SessionHolder.live?(holder) end)
+      {client, topic}
+    end
+
+    defp wind_shift_update(overrides \\ %{}) do
+      Map.merge(
+        %{
+          boat_identifier: "boat-42",
+          seq: 4,
+          session: %{
+            started_at_ms: 1_784_800_800_000,
+            centroid: %{lat: 41.0, lon: -71.0},
+            race_session_id: nil,
+            summary: %{
+              mean_twd_deg: 201.5,
+              trend_deg_per_hr: nil,
+              oscillation_period_s: 480.0,
+              oscillation_amplitude_deg: 9.5,
+              regime: "oscillating",
+              tws_mean_mps: 6.1
+            }
+          },
+          timeline: [
+            %{
+              t_ms: 1_784_800_860_000,
+              mean_twd_deg: 201.5,
+              phase_deg: 3.0,
+              amplitude_deg: 9.5,
+              period_s: 480.0,
+              trend_deg_per_hr: nil,
+              tws_mps: 6.1
+            }
+          ],
+          events: [
+            %{
+              t_ms: 1_784_800_870_000,
+              kind: "header_extreme",
+              twd_deg: 192.0,
+              magnitude_deg: 9.5,
+              detail: %{phase_deg: -9.5}
+            }
+          ]
+        },
+        overrides
+      )
+    end
+
+    test "pushes wind_shift_update over the channel when a session is live", ctx do
+      {client, topic} = connect_live_wind_shift(ctx)
+
+      assert :ok = ChannelClient.send_wind_shift_update(client, wind_shift_update())
+
+      assert_push(^topic, "wind_shift_update", payload)
+      assert payload.boat_identifier == "boat-42"
+      assert payload.seq == 4
+      assert payload.session.started_at_ms == 1_784_800_800_000
+      assert payload.session.summary.regime == "oscillating"
+      assert [%{mean_twd_deg: 201.5}] = payload.timeline
+      assert [%{kind: "header_extreme"}] = payload.events
+    end
+
+    test "a summary-only update (empty timeline/events, session present) still pushes", ctx do
+      {client, topic} = connect_live_wind_shift(ctx)
+
+      assert :ok = ChannelClient.send_wind_shift_update(client, wind_shift_update(%{timeline: [], events: []}))
+      assert_push(^topic, "wind_shift_update", payload)
+      assert payload.timeline == []
+      assert payload.events == []
+    end
+
+    test "a degenerate empty update (no session, nothing pending) is not pushed", ctx do
+      {client, _topic} = connect_live_wind_shift(ctx)
+
+      update = %{boat_identifier: "boat-42", seq: 1, session: nil, timeline: [], events: []}
+      assert :ok = ChannelClient.send_wind_shift_update(client, update)
+      refute_push("wind_shift_update", _payload, 50)
+    end
+
+    test "no-ops (no push) when there is no live session", ctx do
+      client =
+        start_supervised!({ChannelClient, name: nil, auto_connect?: false, keystore_opts: [base_path: ctx.base]})
+
+      assert :ok = ChannelClient.send_wind_shift_update(client, wind_shift_update())
+      refute_push("wind_shift_update", _payload, 50)
+      assert Process.alive?(client)
+    end
+
+    test "no-ops safely when the target process is not running" do
+      assert :ok = ChannelClient.send_wind_shift_update(:no_such_channel_client, wind_shift_update())
+    end
+  end
+
   defp eventually(fun, retries \\ 50) do
     cond do
       fun.() ->

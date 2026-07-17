@@ -190,6 +190,33 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   end
 
   @doc """
+  Stream a throttled WIND-SHIFT update back to the backend over the channel, as
+  the `"wind_shift_update"` event with payload `%{boat_identifier:, seq:,
+  session: %{started_at_ms:, centroid:, race_session_id:, summary:},
+  timeline: rows, events: events}` — the session-scoped batch the
+  `WindShift.Observer` assembles (60 s timeline rows + envelope/step/regime/
+  extrema events + the running session summary). `seq` is a per-device
+  monotonic sequence so the server can order batches.
+
+  Best-effort + session-gated, exactly like `send_calibration_update/2`: pushes
+  ONLY when a secure session is live; with no live session — or no running
+  client — the update is simply dropped (the Observer keeps its session summary
+  and re-syncs when it next changes). The Observer already skips no-op batches
+  (nothing new AND an unchanged summary); a degenerate update with no session
+  and empty timeline/events is dropped here too. Always returns `:ok` and never
+  raises (the Observer must never be coupled to channel state).
+  """
+  @spec send_wind_shift_update(GenServer.server(), map()) :: :ok
+  def send_wind_shift_update(server \\ __MODULE__, %{} = update) do
+    case GenServer.whereis(server) do
+      pid when is_pid(pid) -> send(pid, {:send_wind_shift_update, update})
+      _ -> :ok
+    end
+
+    :ok
+  end
+
+  @doc """
   Request a route recalc from the backend (P3), as the `"request_route_recalc"`
   event. `position` is `{lat, lon}` (the boat's exact position at the deviation) or
   `nil`; when present it is sent as `%{position: %{latitude: lat, longitude: lon}}`,
@@ -495,6 +522,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     {:noreply, push_calibration_update(socket, update)}
   end
 
+  def handle_info({:send_wind_shift_update, update}, socket) do
+    {:noreply, push_wind_shift_update(socket, update)}
+  end
+
   # The DeviationMonitor asks for a recalc when the boat deviates past the threshold.
   # Push it as "request_route_recalc" ONLY when a secure session is live; otherwise
   # drop it (best-effort, like telemetry).
@@ -555,6 +586,21 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   defp push_calibration_update(socket, update) do
     if session_live?(socket) do
       push(socket, socket.assigns.topic, "calibration_update", update)
+    end
+
+    socket
+  end
+
+  # Wind-shift updates follow the calibration rules exactly: no joined topic or a
+  # degenerate batch (no session + nothing pending) -> drop; push only over a live
+  # secure session. (A summary-only update with empty timeline/events is NOT
+  # degenerate — the Observer sends those when the session summary changed.)
+  defp push_wind_shift_update(%{assigns: %{topic: nil}} = socket, _update), do: socket
+  defp push_wind_shift_update(socket, %{timeline: [], events: [], session: nil}), do: socket
+
+  defp push_wind_shift_update(socket, update) do
+    if session_live?(socket) do
+      push(socket, socket.assigns.topic, "wind_shift_update", update)
     end
 
     socket
