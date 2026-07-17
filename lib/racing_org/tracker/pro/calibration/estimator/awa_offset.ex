@@ -31,6 +31,20 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffset do
   `g′` comes from a ±0.5° central finite difference through the wind triangle at
   the starboard operating point (guarded away from degenerate |g′| ≈ 0).
 
+  ### Upwash is TWS-banded (partial pooling)
+
+  Upwash is NOT one number for a boat: it scales with sail lift coefficient, so
+  it is largest powered-up in light/medium air and shrinks (typically crossing
+  zero around 12–15 kn) as the crew depowers in breeze. Each raw upwash estimate
+  is therefore fed, keyed by the pair's TWS (mean of the two legs' `tws_mean`,
+  falling back to the wind-triangle leg TWS when absent), into
+  `Estimator.UpwashBands`: per-band robust trackers + a linear-in-TWS backbone +
+  empirical-Bayes shrinkage, with a light-air (< 2 m/s) exclusion and a
+  shear-day screen — see that module for the physics and statistics. A GLOBAL
+  upwash tracker still runs on every band-accepted raw estimate as the flat,
+  TWS-agnostic fallback (and preserves the classic `snapshot.upwash` shape).
+  Rotation is never banded, excluded, or screened.
+
   ## Locked sign conventions (defined by the synthetic-recovery tests)
 
     * `rotation` is the correction ADDED to signed AWA: injected starboard-rotation
@@ -46,9 +60,10 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffset do
   """
 
   alias RacingOrg.Tracker.Pro.Calibration.Estimate
+  alias RacingOrg.Tracker.Pro.Calibration.Estimator.UpwashBands
   alias RacingOrg.Tracker.Pro.Calibration.Estimator.WindTriangle
 
-  defstruct rotation: nil, upwash: nil, pairs_seen: 0, pairs_skipped: 0
+  defstruct rotation: nil, upwash: nil, bands: nil, pairs_seen: 0, pairs_skipped: 0
 
   @type leg :: %{
           required(:heading_mean) => number(),
@@ -56,6 +71,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffset do
           required(:awa_mean_signed) => number(),
           required(:awa_abs_mean) => number(),
           required(:aws_mean) => number(),
+          optional(:tws_mean) => number() | nil,
           optional(atom()) => any()
         }
 
@@ -64,8 +80,19 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffset do
   @type t :: %__MODULE__{
           rotation: Estimate.Tracker.t(),
           upwash: Estimate.Tracker.t(),
+          bands: UpwashBands.t(),
           pairs_seen: non_neg_integer(),
           pairs_skipped: non_neg_integer()
+        }
+
+  @type snapshot :: %{
+          rotation: Estimate.t(),
+          upwash: Estimate.t(),
+          upwash_bands: %{optional(UpwashBands.center()) => Estimate.t()},
+          upwash_curve: [{UpwashBands.center(), float()}],
+          upwash_backbone: %{a: float(), b: float()} | nil,
+          screened: non_neg_integer(),
+          excluded_light: non_neg_integer()
         }
 
   # Estimator-specific Estimate defaults: corrections are a few degrees at most.
@@ -83,8 +110,10 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffset do
   @min_sensitivity 0.05
 
   @doc """
-  Build a fresh estimator. Options are forwarded to BOTH embedded `Estimate`
-  trackers, with estimator-specific defaults: `max_spread: 2.0` (degrees),
+  Build a fresh estimator. Options are forwarded to the embedded `Estimate`
+  trackers (rotation, global upwash, and — with the structural per-band
+  overrides described in `UpwashBands` — every band tracker), with
+  estimator-specific defaults: `max_spread: 2.0` (degrees),
   `clamp_min/clamp_max: ∓10.0`, `max_slew: 0.5`.
   """
   @spec new(keyword()) :: t()
@@ -98,13 +127,22 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffset do
 
     est_opts = Keyword.merge(defaults, opts)
 
-    %__MODULE__{rotation: Estimate.new(est_opts), upwash: Estimate.new(est_opts)}
+    %__MODULE__{
+      rotation: Estimate.new(est_opts),
+      upwash: Estimate.new(est_opts),
+      bands: UpwashBands.new(est_opts)
+    }
   end
 
   @doc """
-  Fold one matched tack pair into both trackers. Pairs that fail sanity checks
+  Fold one matched tack pair into the trackers. Pairs that fail sanity checks
   (missing fields, boat not moving, no apparent wind, or signed AWA inconsistent
   with the tack labels) are counted in `pairs_skipped` and otherwise ignored.
+
+  The rotation contrast is always fed. The upwash contrast is keyed by the
+  pair's TWS and offered to `UpwashBands` — a light-air (< 2 m/s) or
+  shear-screened raw feeds NOTHING (only its counter); an accepted raw feeds
+  its band AND the global fallback tracker.
   """
   @spec observe_pair(t(), tack_pair()) :: t()
   def observe_pair(%__MODULE__{} = t, %{starboard: stbd, port: port}) do
@@ -114,19 +152,57 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffset do
       t = %{t | rotation: Estimate.observe(t.rotation, rotation_raw), pairs_seen: t.pairs_seen + 1}
 
       case upwash_raw(stbd, port, rotation_raw) do
-        {:ok, raw} -> %{t | upwash: Estimate.observe(t.upwash, raw)}
-        :skip -> t
+        {:ok, raw, triangle_tws} ->
+          case UpwashBands.observe(t.bands, pair_tws(stbd, port, triangle_tws), raw) do
+            {:accepted, bands} -> %{t | bands: bands, upwash: Estimate.observe(t.upwash, raw)}
+            {_screened_or_light, bands} -> %{t | bands: bands}
+          end
+
+        :skip ->
+          t
       end
     else
       %{t | pairs_skipped: t.pairs_skipped + 1}
     end
   end
 
-  @doc "Snapshot of both corrections: `%{rotation: %Estimate{}, upwash: %Estimate{}}`."
-  @spec snapshot(t()) :: %{rotation: Estimate.t(), upwash: Estimate.t()}
+  @doc """
+  Snapshot of the fitted corrections:
+
+    * `rotation` — the global rotation tracker's `%Estimate{}`.
+    * `upwash` — the GLOBAL (TWS-agnostic) upwash tracker's `%Estimate{}`, the
+      flat fallback when TWS is unavailable at apply time.
+    * `upwash_bands` — `%{band_center_mps => %Estimate{}}`, the raw (unshrunk)
+      per-band trackers, for observability.
+    * `upwash_curve` — `[{band_center_mps, correction_deg}]`, ascending: the
+      PUBLISHED shrunk per-band corrections, clamped ±10°; unpublished bands
+      are omitted (consumers interpolate between and hold beyond points).
+    * `upwash_backbone` — `%{a: deg_at_6_17_mps, b: deg_per_mps}` linear fit
+      over populated bands, or `nil` when none are populated.
+    * `screened` / `excluded_light` — upwash raws rejected by the shear-day
+      screen / the light-air (TWS < 2 m/s) exclusion.
+  """
+  @spec snapshot(t()) :: snapshot()
   def snapshot(%__MODULE__{} = t) do
-    %{rotation: Estimate.snapshot(t.rotation), upwash: Estimate.snapshot(t.upwash)}
+    bands = UpwashBands.snapshot(t.bands)
+
+    %{
+      rotation: Estimate.snapshot(t.rotation),
+      upwash: Estimate.snapshot(t.upwash),
+      upwash_bands: bands.bands,
+      upwash_curve: bands.curve,
+      upwash_backbone: bands.backbone,
+      screened: bands.screened,
+      excluded_light: bands.excluded_light
+    }
   end
+
+  @doc """
+  Just the published upwash curve, `[{band_center_mps, correction_deg}]`
+  ascending (see `snapshot/1`'s `upwash_curve`).
+  """
+  @spec upwash_curve(t()) :: [{UpwashBands.center(), float()}]
+  def upwash_curve(%__MODULE__{} = t), do: UpwashBands.snapshot(t.bands).curve
 
   # --- internal ---
 
@@ -134,13 +210,15 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffset do
   # pair's own rotation estimate, keeping the two fits separable pair-by-pair),
   # push both through the wind triangle to a per-leg TWD, and convert the
   # starboard-vs-port TWD disagreement back to an AWA-scale correction via the
-  # local sensitivity g′ at the starboard operating point.
+  # local sensitivity g′ at the starboard operating point. Also returns the
+  # wind-triangle pair TWS (mean of the two leg fits) — the banding key when
+  # the detector supplied no `tws_mean`.
   defp upwash_raw(stbd, port, rotation_raw) do
     awa_stbd = stbd.awa_mean_signed + rotation_raw
     awa_port = port.awa_mean_signed + rotation_raw
 
-    {_tws_s, twa_stbd} = WindTriangle.true_wind(stbd.aws_mean, awa_stbd, stbd.stw_mean)
-    {_tws_p, twa_port} = WindTriangle.true_wind(port.aws_mean, awa_port, port.stw_mean)
+    {tws_s, twa_stbd} = WindTriangle.true_wind(stbd.aws_mean, awa_stbd, stbd.stw_mean)
+    {tws_p, twa_port} = WindTriangle.true_wind(port.aws_mean, awa_port, port.stw_mean)
 
     twd_stbd = WindTriangle.twd(stbd.heading_mean, twa_stbd)
     twd_port = WindTriangle.twd(port.heading_mean, twa_port)
@@ -151,7 +229,19 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffset do
     if abs(g) < @min_sensitivity do
       :skip
     else
-      {:ok, -(twd_delta / 2) / g}
+      {:ok, -(twd_delta / 2) / g, (tws_s + tws_p) / 2}
+    end
+  end
+
+  # The pair's banding TWS: the detector's per-leg `tws_mean` (guaranteed
+  # coherent within 1 m/s across the pair) when both legs carry it, else the
+  # wind-triangle fit already computed for the upwash contrast.
+  defp pair_tws(stbd, port, triangle_tws) do
+    with tws_s when is_number(tws_s) <- stbd[:tws_mean],
+         tws_p when is_number(tws_p) <- port[:tws_mean] do
+      (tws_s + tws_p) / 2
+    else
+      _missing -> triangle_tws
     end
   end
 

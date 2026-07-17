@@ -35,6 +35,12 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffsetTest do
     rotated + upwash * sign
   end
 
+  # Ockam-shaped truth CORRECTION curve for the banded tests: u(V) in degrees,
+  # V in m/s, anchored at 6.17 m/s (12 kn). The synthetic vane ERROR that the
+  # estimator maps to the correction u is `upwash: -u` (recovered = -injected),
+  # so pairs built with `upwash: -truth(v)` recover a curve equal to +truth(v).
+  defp truth(v), do: 3.0 - 0.5 * (v - 6.17)
+
   describe "pure rotation" do
     test "recovers δ_r = 3.0° as +3.0 rotation and ≈ 0 upwash over 10 pairs" do
       %{rotation: rotation, upwash: upwash} = recover([rotation: 3.0], 10)
@@ -125,6 +131,158 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffsetTest do
         end)
 
       assert Enum.all?(states, &(&1 == {:learning, :learning}))
+    end
+  end
+
+  describe "TWS-banded upwash: curve recovery" do
+    test "recovers the Ockam-shaped curve, backbone slope, and rotation simultaneously" do
+      :rand.seed(:exsss, {7, 77, 777})
+
+      # 12 pairs per band at TWS 4.5 / 7.0 / 10.5 m/s (bins 5 / 7 / 11),
+      # interleaved as rounds like a real day, σ = 0.5° AWA noise per leg mean,
+      # with a 2.0° rotation error injected simultaneously.
+      pairs =
+        for _round <- 1..12, tws <- [4.5, 7.0, 10.5] do
+          Synthetic.tack_pair(tws: tws, upwash: -truth(tws), rotation: 2.0, noise_sigma: 0.5)
+        end
+
+      snap = AwaOffset.new() |> observe_pairs(pairs) |> AwaOffset.snapshot()
+
+      assert Enum.map(snap.upwash_curve, &elem(&1, 0)) == [5, 7, 11]
+
+      for {center, value} <- snap.upwash_curve do
+        assert_in_delta value, truth(center), 0.5
+      end
+
+      assert_in_delta snap.upwash_backbone.b, -0.5, 0.15
+      assert_in_delta snap.rotation.value, 2.0, 0.2
+      assert snap.screened == 0
+    end
+  end
+
+  describe "TWS-banded upwash: sparse-band pooling" do
+    test "a 3-pair band consistent with the backbone publishes via pooling" do
+      pairs =
+        for _ <- 1..15, do: Synthetic.tack_pair(tws: 7.0, upwash: -truth(7.0))
+
+      sparse =
+        for _ <- 1..3, do: Synthetic.tack_pair(tws: 11.0, upwash: -truth(11.0))
+
+      snap = AwaOffset.new() |> observe_pairs(pairs ++ sparse) |> AwaOffset.snapshot()
+
+      # Far below the classic 8-pair gate, yet published through the backbone.
+      assert %Estimate{sample_count: 3} = snap.upwash_bands[11]
+      assert {11, v11} = List.keyfind(snap.upwash_curve, 11, 0)
+      assert_in_delta v11, truth(11.0), 0.7
+    end
+
+    test "an adversarial 3-pair band 4° off a published 2-band curve never gets in" do
+      base =
+        for _ <- 1..12, do: Synthetic.tack_pair(tws: 4.5, upwash: -truth(4.5))
+
+      base =
+        base ++ for _ <- 1..15, do: Synthetic.tack_pair(tws: 7.0, upwash: -truth(7.0))
+
+      bad =
+        for _ <- 1..3, do: Synthetic.tack_pair(tws: 11.0, upwash: -(truth(11.0) - 4.0))
+
+      snap = AwaOffset.new() |> observe_pairs(base ++ bad) |> AwaOffset.snapshot()
+
+      assert snap.screened == 3
+      refute Map.has_key?(snap.upwash_bands, 11)
+      assert Enum.map(snap.upwash_curve, &elem(&1, 0)) == [5, 7]
+      # The screened raws never reached the global fallback tracker either.
+      assert snap.upwash.sample_count == 27
+    end
+  end
+
+  describe "TWS-banded upwash: single band = legacy behavior" do
+    test "one populated band publishes only after the classic ≥ 8-pair gate" do
+      pairs = for _ <- 1..10, do: Synthetic.tack_pair(tws: 6.5, upwash: 2.0)
+
+      {_est, curves} =
+        Enum.reduce(pairs, {AwaOffset.new(), []}, fn pair, {est, acc} ->
+          est = AwaOffset.observe_pair(est, pair)
+          {est, [AwaOffset.snapshot(est).upwash_curve | acc]}
+        end)
+
+      curves = Enum.reverse(curves)
+
+      assert Enum.all?(Enum.take(curves, 7), &(&1 == []))
+      assert [{7, v}] = Enum.at(curves, 7)
+      assert_in_delta v, -2.0, 0.3
+    end
+
+    test "the single band's tracker matches the global fallback tracker" do
+      pairs = for _ <- 1..10, do: Synthetic.tack_pair(tws: 6.5, upwash: 2.0)
+
+      snap = AwaOffset.new() |> observe_pairs(pairs) |> AwaOffset.snapshot()
+
+      assert Map.keys(snap.upwash_bands) == [7]
+      assert snap.upwash_bands[7].sample_count == snap.upwash.sample_count
+      assert_in_delta snap.upwash_bands[7].value, snap.upwash.value, 1.0e-9
+
+      assert [{7, _v}] = snap.upwash_curve
+      assert snap.upwash_backbone.b == 0.0
+      assert_in_delta snap.upwash_backbone.a, -2.0, 0.3
+    end
+  end
+
+  describe "TWS-banded upwash: light-air exclusion (pair TWS < 2 m/s)" do
+    test "light-air pairs feed rotation but never the upwash bins or global tracker" do
+      pairs = for _ <- 1..5, do: Synthetic.tack_pair(tws: 1.5, rotation: 3.0)
+
+      snap = AwaOffset.new() |> observe_pairs(pairs) |> AwaOffset.snapshot()
+
+      assert snap.rotation.sample_count == 5
+      assert_in_delta snap.rotation.value, 3.0, 0.2
+      assert snap.upwash.sample_count == 0
+      assert snap.upwash_bands == %{}
+      assert snap.upwash_curve == []
+      assert snap.upwash_backbone == nil
+      assert snap.excluded_light == 5
+      assert snap.screened == 0
+    end
+  end
+
+  describe "TWS-banded upwash: shear-day screen" do
+    test "a freak pair 6° off a published 2-band curve is rejected everywhere" do
+      base =
+        for _ <- 1..12, tws <- [4.5, 7.0] do
+          Synthetic.tack_pair(tws: tws, upwash: -truth(tws))
+        end
+
+      est = observe_pairs(AwaOffset.new(), base)
+      before = AwaOffset.snapshot(est)
+
+      assert length(before.upwash_curve) == 2
+      assert before.screened == 0
+
+      freak = Synthetic.tack_pair(tws: 7.0, upwash: -(truth(7.0) - 6.0))
+      snap = est |> AwaOffset.observe_pair(freak) |> AwaOffset.snapshot()
+
+      assert snap.screened == 1
+      assert snap.upwash_curve == before.upwash_curve
+      assert snap.upwash.sample_count == before.upwash.sample_count
+      assert snap.upwash_bands[7].sample_count == before.upwash_bands[7].sample_count
+      # Rotation is never screened.
+      assert snap.rotation.sample_count == before.rotation.sample_count + 1
+    end
+  end
+
+  describe "TWS-banded upwash: pair-TWS fallback" do
+    test "nil tws_mean legs fall back to the wind-triangle leg TWS to pick the bin" do
+      pairs =
+        for _ <- 1..8 do
+          pair = Synthetic.tack_pair(tws: 7.0, upwash: 2.0)
+          %{pair | starboard: %{pair.starboard | tws_mean: nil}, port: %{pair.port | tws_mean: nil}}
+        end
+
+      snap = AwaOffset.new() |> observe_pairs(pairs) |> AwaOffset.snapshot()
+
+      assert Map.keys(snap.upwash_bands) == [7]
+      assert [{7, v}] = snap.upwash_curve
+      assert_in_delta v, -2.0, 0.3
     end
   end
 
