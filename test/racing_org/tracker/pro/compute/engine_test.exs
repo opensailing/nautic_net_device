@@ -406,6 +406,34 @@ defmodule RacingOrg.Tracker.Pro.Compute.EngineTest do
     end
   end
 
+  # --- batched signal injection (the WindShift.Observer's per-tick output) ---
+
+  describe "put_signals batch injection" do
+    test "a batch folds into the signal map in one message with a shared timestamp", %{dir: dir} do
+      pid = start(dir: dir)
+
+      assert :ok =
+               Engine.put_signals(pid, [{"average_twd", 202.5}, {"wind_phase_deg", 4.0}, {"wind_regime", 2}], 1_000)
+
+      assert eventually(fn ->
+               match?(
+                 %{"average_twd" => {202.5, 1_000}, "wind_phase_deg" => {4.0, 1_000}, "wind_regime" => {2, 1_000}},
+                 Engine.signals(pid)
+               )
+             end)
+    end
+
+    test "an empty batch is a no-op", %{dir: dir} do
+      pid = start(dir: dir)
+      assert :ok = Engine.put_signals(pid, [], 1_000)
+      assert Engine.signals(pid) == %{}
+    end
+
+    test "no-ops safely when the engine is not running" do
+      assert :ok = Engine.put_signals(:no_such_engine, [{"average_twd", 200.0}], 1_000)
+    end
+  end
+
   # --- status for the channel (applied_version + active_count) ---
 
   describe "status for the channel" do

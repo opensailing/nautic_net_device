@@ -256,6 +256,27 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
   end
 
   @doc """
+  Inject a BATCH of raw signals in one message (catalog units, a shared monotonic
+  timestamp) — the batched form of `put_signal/4`, for producers that emit several
+  signals per tick (notably `RacingOrg.Tracker.Pro.WindShift.Observer`, which
+  publishes the wind-shift signals at 1 Hz). One message per batch keeps the
+  engine's mailbox and the feedback pass at one traversal per tick instead of one
+  per signal. Same staleness rules as `put_signal/4`; an empty batch is a no-op.
+
+  Asynchronous; the values are visible on the next `current_values/1` read.
+  """
+  @spec put_signals(GenServer.server(), [{String.t(), number()}], integer()) :: :ok
+  def put_signals(server \\ __MODULE__, updates, mono_ms) when is_list(updates) and is_integer(mono_ms) do
+    case GenServer.whereis(server) do
+      nil -> :ok
+      _dest when updates == [] -> :ok
+      dest -> send(dest, {:signal_updates, updates, mono_ms})
+    end
+
+    :ok
+  end
+
+  @doc """
   Status for the channel: `%{applied_version: int | nil, active_count: int}` where
   `active_count` is the number of currently-VALID computed values.
   """
