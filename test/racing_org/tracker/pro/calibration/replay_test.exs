@@ -432,4 +432,186 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ReplayTest do
       assert_in_delta up, -1.5, 0.5
     end
   end
+
+  # ==================================================================
+  # Scenarios 7 & 8: TWS-banded upwash over a multi-band race day
+  # ==================================================================
+
+  # LOCKED SIGN CONVENTION (derived from Phase A, see the AwaOffset and
+  # ReplayScenarios moduledocs): the injected upwash ERROR makes |AWA| read
+  # HIGH by delta_u on both tacks; the recovered CORRECTION (applied as
+  # `awa + upwash * sign(awa)`) is its NEGATION. A TWS-dependent injected
+  # error delta_u(V) = a + b*(V - 6.17) therefore recovers the correction
+  # curve u(V) = -a - b*(V - 6.17): backbone intercept -a, slope -b.
+  #
+  # Injected here: {a, b} = {+2.5, -0.45} deg — error +3.25 @ 4.5 m/s,
+  # +1.90 @ 7.5, +0.55 @ 10.5; corrections -3.25 / -1.90 / -0.55; recovered
+  # backbone slope -b = +0.45 deg/(m/s).
+  @injected_upwash {2.5, -0.45}
+
+  defp upwash_truth_at(tws) do
+    {a, b} = @injected_upwash
+    -(a + b * (tws - 6.17))
+  end
+
+  # 2 h beat, scenario-1 tack cadence (220 s legs + 20 s tacks -> 240 s
+  # cycles), walking a TWS schedule of ~40 min per band. The 2400 s segments
+  # align exactly on the 240 s cycle, so no leg straddles a TWS step.
+  defp multi_band_samples(overrides \\ []) do
+    Scenarios.race_day_beat(
+      Keyword.merge(
+        [
+          rotation_error_deg: 2.0,
+          upwash_error_deg: @injected_upwash,
+          awa_sigma_deg: 0.8,
+          tws_schedule: [{2_400, 4.5}, {2_400, 7.5}, {2_400, 10.5}]
+        ],
+        overrides
+      )
+    )
+  end
+
+  describe "scenario 7: multi-band race day" do
+    test "bands 5/7/11 publish a curve, each band and the backbone slope recover, rotation stays separable" do
+      result = Replay.run(multi_band_samples(), @beat_tack_opts ++ [trace: true])
+
+      # 30 legs -> 15 pairs, 5 per band; nothing screened or light-excluded.
+      assert result.events.legs == 30
+      assert result.events.tack_pairs == 15
+      assert result.awa.screened == 0
+      assert result.awa.excluded_light == 0
+
+      # >= 2 bins publish (measured: all three sailed bins, nothing else).
+      curve = result.awa.upwash_curve
+      assert length(curve) >= 2
+      assert Enum.map(curve, &elem(&1, 0)) == [5, 7, 11]
+
+      # Each published u-hat within 0.6 deg of the injected truth AT ITS
+      # CENTER. Note the honest slack: the boat sailed each band at its
+      # segment TWS (4.5/7.5/10.5), not at the bin center (5/7/11), so even a
+      # perfect fit sits |b| * 0.5 = 0.225 deg from truth-at-center.
+      # Measured: u5 -3.468 vs -3.026 (err -0.44 — the center offset plus the
+      # band's breathing trough), u7 -2.110 vs -2.127 (+0.02), u11 -0.533 vs
+      # -0.326 (-0.21).
+      for {center, value} <- curve do
+        assert_in_delta value, upwash_truth_at(center), 0.6, "band #{center}"
+      end
+
+      # Backbone slope: recovered CORRECTION slope = -(injected error slope).
+      # Measured: %{a: -2.749, b: +0.476}.
+      assert %{a: intercept, b: slope} = result.awa.upwash_backbone
+      assert_in_delta slope, 0.45, 0.15
+      assert_in_delta intercept, -2.5, 0.6
+
+      # Banding did not break rotation separability under the TWS ramp.
+      # Measured: 1.958 (err 0.042, spread 0.285).
+      assert %Estimate{state: :validated, value: rot} = result.awa.rotation
+      assert_in_delta rot, 2.0, 0.5
+
+      # FINDING: the GLOBAL (flat) upwash fallback honestly refuses to
+      # validate under a genuinely TWS-dependent error — its raws span ~3 deg
+      # across the bands (measured spread 2.456 > the 2.0 gate), so the
+      # legacy scalar path never promotes a smeared average; the curve is the
+      # only published upwash truth here.
+      assert %Estimate{state: :learning, sample_count: 15} = result.awa.upwash
+
+      # Along the WHOLE trace the curve only ever contains published bins:
+      # bins the boat actually sailed, ascending, each backed by at least the
+      # pooled publication gate's 3 samples at that moment. Measured curve
+      # evolution: the 5 single-band pairs publish NOTHING (the k = 1 classic
+      # gate needs 8), then [5] once band 7 populates (k = 2 pooling), then
+      # [5, 7] at band 7's 3rd pair, then [5, 7, 11] at band 11's 3rd.
+      first_five = result.trace |> tack_pair_entries() |> Enum.take(5)
+      assert Enum.all?(first_five, &(&1.awa.upwash_curve == []))
+
+      for entry <- result.trace do
+        centers = Enum.map(entry.awa.upwash_curve, &elem(&1, 0))
+        assert centers == Enum.sort(centers)
+        assert Enum.all?(centers, &(&1 in [5, 7, 11]))
+
+        for center <- centers do
+          assert entry.awa.upwash_bands[center].sample_count >= 3
+        end
+      end
+    end
+  end
+
+  describe "scenario 8: sparse band + shear day (adversarial)" do
+    test "8a: three pairs in the top band still publish through the pooled gate, near truth" do
+      # Same ramp, but the breeze-on band gets only 1440 s (~24 min = 3 pairs
+      # at the 240 s cycle / disjoint pairing; 12 min would leave a single
+      # pair, below even the pooled gate's n >= 3).
+      samples =
+        multi_band_samples(
+          duration_s: 6_240,
+          tws_schedule: [{2_400, 4.5}, {2_400, 7.5}, {1_440, 10.5}]
+        )
+
+      result = Replay.run(samples, @beat_tack_opts)
+
+      assert result.events.legs == 26
+      assert result.events.tack_pairs == 13
+      assert result.awa.upwash_bands[11].sample_count == 3
+
+      # MEASURED BRANCH: the 11 bin PUBLISHES via pooling — 3 consistent
+      # pairs ride the backbone through the posterior gate (u11 -0.507 vs
+      # truth-at-center -0.326, err -0.18) even while its raw tracker is
+      # honestly still :learning. That is the point of partial pooling: the
+      # sparse band borrows strength from the backbone instead of starving.
+      assert result.awa.upwash_bands[11].state == :learning
+      assert [{5, _}, {7, _}, {11, v11}] = result.awa.upwash_curve
+      assert_in_delta v11, upwash_truth_at(11), 0.8
+    end
+
+    test "8b: a one-session +5 deg veer is screened and cannot drag the matured curve" do
+      {a, b} = @injected_upwash
+
+      # First build a genuine 2-band curve (bands 5 and 7)...
+      pre = multi_band_samples(duration_s: 4_800, tws_schedule: [{2_400, 4.5}, {2_400, 7.5}])
+
+      # ...then a later session (600 s of silence between them — no junction
+      # pair) on the same boat with the same physical upwash, but with a
+      # veer-like +5 deg riding on every |AWA| (1-arity injection fn).
+      shear =
+        Scenarios.race_day_beat(
+          duration_s: 2_400,
+          rotation_error_deg: 2.0,
+          upwash_error_deg: fn tws -> a + b * (tws - 6.17) + 5.0 end,
+          awa_sigma_deg: 0.8,
+          tws_mps: 7.5,
+          seed: {20_260, 716, 8}
+        )
+        |> Enum.map(&%{&1 | t_ms: &1.t_ms + 5_400_000})
+
+      pre_result = Replay.run(pre, @beat_tack_opts)
+      result = Replay.run(pre ++ shear, @beat_tack_opts)
+
+      # The 2-band curve existed before the deviant session arrived...
+      assert [{5, _}, {7, _}] = pre_result.awa.upwash_curve
+
+      # ...so the shear day's raws (~5 deg off the curve, beyond the 3 deg
+      # screen floor) are REJECTED: all 5 deviant pairs screened, and no band
+      # tracker grew past the pre-shear counts.
+      assert result.awa.screened == 5
+      assert result.events.tack_pairs == 15
+      assert result.awa.upwash_bands[5].sample_count == pre_result.awa.upwash_bands[5].sample_count
+      assert result.awa.upwash_bands[7].sample_count == pre_result.awa.upwash_bands[7].sample_count
+
+      # The final curve sits within 0.6 deg of its pre-shear values
+      # (measured: bit-identical — a screened raw feeds nothing).
+      pre_curve = Map.new(pre_result.awa.upwash_curve)
+      curve = Map.new(result.awa.upwash_curve)
+      assert Map.keys(curve) == Map.keys(pre_curve)
+
+      for {center, value} <- curve do
+        assert_in_delta value, pre_curve[center], 0.6, "band #{center}"
+      end
+
+      # Rotation keeps learning THROUGH the shear day (the veer-like error is
+      # tack-symmetric, invisible to the rotation contrast, never screened).
+      # Measured: 2.038 over all 15 pairs, spread 0.341.
+      assert %Estimate{state: :validated, value: rot} = result.awa.rotation
+      assert_in_delta rot, 2.0, 0.5
+    end
+  end
 end

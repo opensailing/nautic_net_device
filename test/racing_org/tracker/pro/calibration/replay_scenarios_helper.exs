@@ -22,7 +22,12 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ReplayScenarios do
       recover is `+δ_r`.
     * `upwash_error_deg` δ_u — |AWA| reads HIGH by δ_u on both tacks:
       `awa_meas = awa_true + δ_u · sign(awa_true)`. The recovered
-      correction is `−δ_u`.
+      correction is `−δ_u`. δ_u is a NUMBER (TWS-flat, unchanged), an
+      `{a, b}` tuple meaning `δ_u(V) = a + b·(V − 6.17)` at true TWS V
+      (m/s; 6.17 = 12 kn, `UpwashBands`' backbone anchor), or any 1-arity
+      fn of V — evaluated PER SAMPLE against the sample's true TWS (the
+      exact frame `apparent/3` sees). The recovered correction curve is
+      the pointwise negation: backbone intercept `−a`, slope `−b`.
     * `stw_gain_error` g — the speedo under-reads by the factor g:
       `stw_meas = stw_true / g`. The recovered correction is exactly `g`.
 
@@ -42,6 +47,10 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ReplayScenarios do
   @deg_per_rad 180.0 / :math.pi()
   @rad_per_deg :math.pi() / 180.0
 
+  # The TWS-dependent upwash injection's anchor (12 kn — matches
+  # Estimator.UpwashBands' backbone anchor).
+  @upwash_anchor_mps 6.17
+
   # Bounded per-sample noise amplitudes (see moduledoc).
   @helm_amp 0.4
   @stw_amp 0.02
@@ -56,18 +65,23 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ReplayScenarios do
   random-walks (per-second gaussian step `:twd_walk_sigma_deg`, clamped to
   `:twd0_deg ± :twd_bound_deg`) and may genuinely step once
   (`twd_step: {at_s, delta_deg}`). TWS breathes sinusoidally
-  (`:tws_amp_mps` over `:tws_period_s`). The helmsman sets each leg's compass
-  heading from the TWD at the moment the leg starts and then holds it, so
-  intra-leg wind wander shows up as AWA/TWD contrast noise — exactly what the
-  estimators must absorb.
+  (`:tws_amp_mps` over `:tws_period_s`) around a base that is either the
+  constant `:tws_mps` or, when `:tws_schedule` is given, a walked list of
+  `{duration_s, tws_mps}` segments (the last segment's TWS is held beyond
+  the schedule's end; the breathing rides on top either way). The helmsman
+  sets each leg's compass heading from the TWD at the moment the leg starts
+  and then holds it, so intra-leg wind wander shows up as AWA/TWD contrast
+  noise — exactly what the estimators must absorb.
 
   Options (defaults): `duration_s 7200`, `leg_s 220`, `turn_s 20`,
   `twd0_deg 20.0`, `twd_walk_sigma_deg 0.05`, `twd_bound_deg 5.0`,
-  `twd_step nil`, `tws_mps 6.17` (12 kn), `tws_amp_mps 0.51` (1 kn),
-  `tws_period_s 1500`, `stw_mps 3.2`, `twa_abs_deg 42.0`,
-  `wave nil` (`{amp_deg, period_s}`), `heel_deg 12.0` (may be nil),
-  `rotation_error_deg 0.0`, `upwash_error_deg 0.0`, `awa_sigma_deg 0.0`,
-  `stw_gain_error 1.0`, `seed {20_260, 716, 1}`.
+  `twd_step nil`, `tws_mps 6.17` (12 kn), `tws_schedule nil`,
+  `tws_amp_mps 0.51` (1 kn), `tws_period_s 1500`, `stw_mps 3.2`,
+  `twa_abs_deg 42.0`, `wave nil` (`{amp_deg, period_s}`), `heel_deg 12.0`
+  (may be nil), `rotation_error_deg 0.0`,
+  `upwash_error_deg 0.0` (number | `{a, b}` | 1-arity fn of true TWS — see
+  the moduledoc), `awa_sigma_deg 0.0`, `stw_gain_error 1.0`,
+  `seed {20_260, 716, 1}`.
   """
   def race_day_beat(opts \\ []) do
     duration_s = Keyword.get(opts, :duration_s, 7_200)
@@ -78,6 +92,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ReplayScenarios do
     twd_bound = Keyword.get(opts, :twd_bound_deg, 5.0)
     twd_step = Keyword.get(opts, :twd_step)
     tws0 = Keyword.get(opts, :tws_mps, 6.17)
+    tws_schedule = Keyword.get(opts, :tws_schedule)
     tws_amp = Keyword.get(opts, :tws_amp_mps, 0.51)
     tws_period_s = Keyword.get(opts, :tws_period_s, 1_500)
     stw = Keyword.get(opts, :stw_mps, 3.2)
@@ -112,7 +127,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ReplayScenarios do
             wrap360(leg_heading + wrapped_delta(leg_heading, target) * frac)
           end
 
-        tws_t = tws0 + tws_amp * :math.sin(2.0 * :math.pi() * t / tws_period_s)
+        tws_t = schedule_tws(tws_schedule, t, tws0) + tws_amp * :math.sin(2.0 * :math.pi() * t / tws_period_s)
 
         {sample(t, base_heading, twd_t, tws_t, stw, {0.0, 0.0}, wave, heel, inject), {walk, leg_heading}}
       end)
@@ -223,7 +238,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ReplayScenarios do
     {aws_true, awa_true} = apparent(tws_true, twa, stw_true)
 
     awa_meas =
-      wrap180(awa_true - inj.rotation + inj.upwash * sgn(awa_true) + gauss(inj.awa_sigma))
+      wrap180(awa_true - inj.rotation + upwash_error(inj.upwash, tws_true) * sgn(awa_true) + gauss(inj.awa_sigma))
 
     aws_meas = max(aws_true + ih(@aws_amp), 0.0)
     stw_meas = stw_true / inj.stw_gain
@@ -258,12 +273,31 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ReplayScenarios do
     }
   end
 
+  # The injected upwash ERROR at true TWS V (deg, |AWA|-reads-high positive):
+  # a number is TWS-flat (the classic scalar path, RNG-identical to before);
+  # `{a, b}` means `a + b·(V − 6.17)`; a 1-arity fn is evaluated at V. Always
+  # evaluated per-sample against the sample's TRUE TWS.
+  defp upwash_error(err, _tws) when is_number(err), do: err
+
+  defp upwash_error({a, b}, tws) when is_number(a) and is_number(b),
+    do: a + b * (tws - @upwash_anchor_mps)
+
+  defp upwash_error(fun, tws) when is_function(fun, 1), do: fun.(tws)
+
   # =====================================================================
   # Numeric plumbing
   # =====================================================================
 
   # Even cycles are starboard tack (heading = TWD − TWA), odd are port.
   defp tack_sign(k), do: if(rem(k, 2) == 0, do: 1.0, else: -1.0)
+
+  # The scheduled base TWS at second t: walk the {duration_s, tws_mps}
+  # segments in order, holding the LAST segment's TWS beyond the schedule's
+  # end. nil = the constant :tws_mps base (the classic behavior).
+  defp schedule_tws(nil, _t, tws0), do: tws0
+  defp schedule_tws([{_dur, tws}], _t, _tws0), do: tws
+  defp schedule_tws([{dur, tws} | _rest], t, _tws0) when t < dur, do: tws
+  defp schedule_tws([{dur, _tws} | rest], t, tws0), do: schedule_tws(rest, t - dur, tws0)
 
   defp step_offset({at_s, delta}, t) when t >= at_s, do: delta
   defp step_offset(_step, _t), do: 0.0

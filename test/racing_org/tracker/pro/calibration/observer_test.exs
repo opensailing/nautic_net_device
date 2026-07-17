@@ -412,7 +412,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverTest do
     test "a TWS-dependent upwash curve promotes into Config and the Engine applies the band value at the current TWS" do
       clock = start_clock()
       {:ok, config} = Config.start_link(name: nil, store_dir: nil)
-      pid = start_observer(clock, calibration: {Config, config})
+      pid = start_observer(clock, calibration: {Config, config}, sender: collecting_sender())
 
       # Two TWS regimes with DIFFERENT injected upwash errors: 9 legs -> 4 pairs
       # at TWS 4.5 (band 5) with error -3 (correction +3), then 9 legs -> 4
@@ -460,6 +460,32 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverTest do
       send(engine, {:signal_updates, [{"apparent_wind_angle", 30.0}], 0, @wind_name})
       assert {awa, _mono} = Engine.signals(engine)["apparent_wind_angle"]
       assert_in_delta awa, 30.0 + offset + (v5 + v9) / 2, 1.0e-9
+
+      # WIRE-LEVEL SANITY after the multi-band promotion. The status (pushed
+      # verbatim as "calibration_status") must survive JSON encoding with the
+      # curve rendered as [%{center:, value:}] maps...
+      assert {:ok, encoded} = Jason.encode(Config.status(config))
+
+      assert %{"parameter" => "awa_upwash", "state" => "applied", "value" => [point5, point9]} =
+               encoded |> Jason.decode!() |> Map.fetch!("sensors") |> Enum.find(&(&1["parameter"] == "awa_upwash"))
+
+      assert %{"center" => 5, "value" => wire5} = point5
+      assert %{"center" => 9, "value" => wire9} = point9
+      assert_in_delta wire5, v5, 1.0e-9
+      assert_in_delta wire9, v9, 1.0e-9
+
+      # ...and the "calibration_update" sync entry carries the same curve
+      # (value = the point nearest 6.17 m/s, i.e. band 5's).
+      :ok = Observer.sync_now(pid)
+      assert_received {:calibration_update, update}
+
+      assert %{state: "applied", value: rep, curve: sync_curve} =
+               Enum.find(update.entries, &(&1.parameter == "awa_upwash"))
+
+      assert [%{center: 5, value: sync5}, %{center: 9, value: sync9}] = sync_curve
+      assert_in_delta sync5, v5, 1.0e-9
+      assert_in_delta sync9, v9, 1.0e-9
+      assert rep == sync5
     end
   end
 

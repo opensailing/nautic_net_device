@@ -65,6 +65,17 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
   Sensor `hardware_identifier`s are canonicalized to the backend's uppercase-hex
   form via `RacingOrg.Tracker.Pro.NmeaIdentity.canonical_hardware_id/1`, the same
   identity the engine derives from each telemetry event's NMEA NAME.
+
+  ## Wire contract (device → server)
+
+  `status/1` is pushed verbatim as the `"calibration_status"` event and must
+  stay JSON-encodable: scalar learned/locked values pass through as numbers,
+  and curve-valued parameters render as maps — `stw_scale` as
+  `[%{center: band_center_mps, gain: g}]`, `awa_upwash` as
+  `[%{center: tws_center_mps, value: deg}]` (the key names the backend
+  expects). The Observer's throttled `"calibration_update"` entries carry the
+  SAME curve rendering under a `curve` key, alongside a scalar representative
+  `value` (see `RacingOrg.Tracker.Pro.Calibration.Observer`).
   """
 
   use GenServer

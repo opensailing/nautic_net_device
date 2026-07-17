@@ -39,12 +39,23 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Replay do
   ## Result
 
       %{
-        awa: %{rotation: %Estimate{}, upwash: %Estimate{}},
+        awa: %{rotation: %Estimate{}, upwash: %Estimate{},
+               upwash_bands: %{center => %Estimate{}},
+               upwash_curve: [{center_mps, deg}],
+               upwash_backbone: %{a: deg, b: deg_per_mps} | nil,
+               screened: n, excluded_light: n},
         stw: %{bands: %{center => %{rls: θ, estimate: %Estimate{}}}, gain_curve: [{center, gain}]},
         aws: %{downwind_over_upwind_ratio: %Estimate{}, regimes: %{...}},
         events: %{legs: n, tack_pairs: n, gybe_pairs: n, reciprocal_pairs: n},
         trace: [%{kind: kind, t_ms: t, awa: ..., stw: ..., aws: ...}]
       }
+
+  `awa` is the full `Estimator.AwaOffset.snapshot/1`: alongside the classic
+  `rotation`/`upwash` (global flat fallback) trackers it carries the
+  TWS-banded upwash state — the raw per-band trackers, the PUBLISHED
+  (shrunk + clamped) `upwash_curve`, the linear backbone fit, and the
+  shear-screen / light-air rejection counters — so replays can validate
+  multi-band convergence, not just the scalars (replay scenarios 7 & 8).
 
   The `events` counters make non-detection honest: a session with zero tack
   pairs SHOULD report estimators still `:learning` — silence, not invention.
@@ -53,7 +64,6 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Replay do
   alias RacingOrg.Tracker.Pro.Calibration.Detect.Leg
   alias RacingOrg.Tracker.Pro.Calibration.Detect.Legs
   alias RacingOrg.Tracker.Pro.Calibration.Detect.Tack
-  alias RacingOrg.Tracker.Pro.Calibration.Estimate
   alias RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffset
   alias RacingOrg.Tracker.Pro.Calibration.Estimator.AwsScale
   alias RacingOrg.Tracker.Pro.Calibration.Estimator.StwScale
@@ -70,13 +80,13 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Replay do
   @type trace_entry :: %{
           kind: event_kind(),
           t_ms: integer(),
-          awa: %{rotation: Estimate.t(), upwash: Estimate.t()},
+          awa: AwaOffset.snapshot(),
           stw: map(),
           aws: map()
         }
 
   @type result :: %{
-          awa: %{rotation: Estimate.t(), upwash: Estimate.t()},
+          awa: AwaOffset.snapshot(),
           stw: map(),
           aws: map(),
           events: event_counts(),
