@@ -50,6 +50,30 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
     assert {:error, :no_session} = SessionHolder.take_send_counter()
   end
 
+  test "the wind-shift Config + Observer are supervised, alive, and idle on host" do
+    alias RacingOrg.Tracker.Pro.WindShift
+
+    # The policy config runs in EVERY environment (the channel reads it); with no
+    # persisted/pushed config it reports the safe defaults.
+    assert {WindShift.Config, config_pid, :worker, [WindShift.Config]} = child(WindShift.Config)
+    assert Process.alive?(config_pid)
+    assert WindShift.Config.applied_version() == nil
+    assert %{wally_mode: "off", status: "ok"} = WindShift.Config.status()
+
+    # The Observer ticks off the compute engine; with no wind on host it stays
+    # idle (its stats are readable and its session is unstarted or in-memory only).
+    assert {WindShift.Observer, observer_pid, :worker, [WindShift.Observer]} = child(WindShift.Observer)
+    assert Process.alive?(observer_pid)
+    assert %{samples: _, accepted: _, rejected: _, reject_reasons: %{}} = WindShift.Observer.stats()
+
+    # Config starts BEFORE the Observer (the Observer subscribes/reads it in init).
+    ids = child_ids()
+    config_index = Enum.find_index(ids, &(&1 == WindShift.Config))
+    observer_index = Enum.find_index(ids, &(&1 == WindShift.Observer))
+    # which_children returns children in REVERSE start order.
+    assert observer_index < config_index
+  end
+
   test "the WSS ChannelClient is NOT started on host (target + pinned-key gated)" do
     refute ChannelClient in child_ids()
     refute Process.whereis(ChannelClient)

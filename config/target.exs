@@ -55,7 +55,8 @@ config :racing_org_tracker,
   tracking_directory: "/data/tracking",
   computed_values_directory: "/data/computed_values",
   clock_source_directory: "/data/clock_source",
-  calibration_directory: "/data/calibration"
+  calibration_directory: "/data/calibration",
+  wind_shift_directory: "/data/wind_shift"
 
 # NervesHub remote management (OTA firmware updates + remote console).
 #

@@ -67,9 +67,11 @@ defmodule RacingOrg.Tracker.Pro.Application do
       tracking_config_child(),
       clock_source_config_child(),
       calibration_config_child(),
+      wind_shift_config_child(),
       calibration_observer_child(),
       compute_engine_child(),
       polar_observer_child(),
+      wind_shift_observer_child(),
       {RacingOrg.Tracker.Pro.Sampling, name: RacingOrg.Tracker.Pro.Sampling},
       archive_child(),
       {RacingOrg.Tracker.Pro.Nav.Broadcaster, name: RacingOrg.Tracker.Pro.Nav.Broadcaster},
@@ -237,6 +239,32 @@ defmodule RacingOrg.Tracker.Pro.Application do
      name: RacingOrg.Tracker.Pro.Compute.Engine,
      store_dir: Application.get_env(:racing_org_tracker, :computed_values_directory),
      calibration: RacingOrg.Tracker.Pro.Calibration.Config}
+  end
+
+  # Wind-shift policy (server-pushed "set_wind_shift" config: predictor windows /
+  # envelope alarms / wally mode). It persists the config to /data (survives
+  # reboots) and notifies the WindShift.Observer, which rebuilds its cores on a
+  # change. Started in EVERY environment so the channel + Observer can read it;
+  # cheap + idle with no config (built-in defaults apply). Must start BEFORE
+  # WindShift.Observer (the Observer subscribes to / reads it in init).
+  defp wind_shift_config_child do
+    {RacingOrg.Tracker.Pro.WindShift.Config,
+     name: RacingOrg.Tracker.Pro.WindShift.Config,
+     store_dir: Application.get_env(:racing_org_tracker, :wind_shift_directory)}
+  end
+
+  # The wind-shift predictor Observer: on its own ~1 Hz timer it samples the
+  # compute engine's signals, drives the pure wind-shift cores (means / envelope /
+  # cycle / period / step / classifier), publishes the wind-shift signals back
+  # into the engine, broadcasts the B&G 130824 keys 336-338, and syncs a
+  # throttled session batch upstream over the WSS channel. Shares
+  # :wind_shift_directory with the Config (distinct filenames). Must start AFTER
+  # Compute.Engine (it reads its signals) and AFTER WindShift.Config.
+  defp wind_shift_observer_child do
+    {RacingOrg.Tracker.Pro.WindShift.Observer,
+     name: RacingOrg.Tracker.Pro.WindShift.Observer,
+     dir: Application.get_env(:racing_org_tracker, :wind_shift_directory),
+     boat_identifier: RacingOrg.Tracker.Pro.boat_identifier()}
   end
 
   # SECONDARY observational ("sailed") polar (Phase 4): on its own ~1 Hz timer it
