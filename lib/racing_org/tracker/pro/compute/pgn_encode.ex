@@ -329,14 +329,22 @@ defmodule RacingOrg.Tracker.Pro.Compute.PgnEncode do
   # HARDWARE-VALIDATION: these keys/resolutions are reverse-engineered (like Key 117) and
   # need a bench sniff against a real B&G display; the encode tests lock the wire layout.
   # {key, wire-type, resolution}. :u16 ×1/res unsigned; :i16 signed; :rad_i16 converts
-  # the catalog DEGREES to radians before quantizing.
+  # the catalog DEGREES to radians (wrapped to (-π, π]) before quantizing; :rad_u16
+  # converts a catalog 0..360 DIRECTION to radians wrapped to [0, 2π).
+  #
+  # Keys 336–338 carry the wind-shift predictor outputs the WindShift.Observer
+  # broadcasts at 1 Hz: the smoothed reference TWD (a direction -> :rad_u16) and the
+  # signed phase/lift deviations (-> :rad_i16). Same reverse-engineered caveat.
   @bandg_target_keys %{
     "target_boat_speed" => {125, :u16, 0.01},
     "target_twa" => {83, :rad_i16, 0.0001},
     "vmg" => {127, :u16, 0.01},
     "vmg_performance" => {285, :u16, 0.1},
     "next_leg_awa" => {111, :rad_i16, 0.0001},
-    "next_leg_aws" => {113, :u16, 0.01}
+    "next_leg_aws" => {113, :u16, 0.01},
+    "average_twd" => {336, :rad_u16, 0.0001},
+    "wind_phase_deg" => {337, :rad_i16, 0.0001},
+    "wind_lift_deg" => {338, :rad_i16, 0.0001}
   }
 
   defp do_encode(130_824, def, outputs) do
@@ -372,8 +380,11 @@ defmodule RacingOrg.Tracker.Pro.Compute.PgnEncode do
 
   # Quantize a catalog value to its 2-byte B&G wire integer. :rad_i16 first converts the
   # ANGLE from DEGREES to radians (wrapped to (-π, π]) — the wire unit for B&G angle keys;
-  # :u16 takes the (m/s or %) value as-is. Both clamp to range — never wrap/garble.
+  # :rad_u16 converts a 0..360 DIRECTION from degrees to radians wrapped to [0, 2π)
+  # (unsigned — wrapping keeps rad < 2π so the raw can never reach the u16 sentinel);
+  # :u16 takes the (m/s or %) value as-is. All clamp to range — never wrap/garble.
   defp quantize_bandg(:rad_i16, deg, resolution), do: clamp_i16(round(wrap_pi(deg * @rad_per_deg) / resolution))
+  defp quantize_bandg(:rad_u16, deg, resolution), do: clamp_u16(round(normalize_rad(deg * @rad_per_deg) / resolution))
   defp quantize_bandg(:u16, value, resolution), do: clamp_u16(round(value / resolution))
 
   # Best-effort proprietary frame: 2-byte manufacturer/industry header word, then the

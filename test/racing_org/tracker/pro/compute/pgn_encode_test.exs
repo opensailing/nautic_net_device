@@ -314,6 +314,70 @@ defmodule RacingOrg.Tracker.Pro.Compute.PgnEncodeTest do
     end
   end
 
+  # PGN 130824 "B&G: key-value data" carrying the wind-shift predictor outputs the
+  # WindShift.Observer broadcasts at 1 Hz: the smoothed reference TWD (Key 336, a
+  # 0..360 DIRECTION -> unsigned radians) and the signed phase/lift deviations
+  # (Keys 337/338 -> signed radians). Same reverse-engineered caveat as the other
+  # 130824 keys: needs a bench sniff against a real B&G display; these tests LOCK
+  # the exact byte layout we currently believe is correct.
+  describe "130824 B&G wind-shift key-value entries (336/337/338) — exact bytes" do
+    @bandg_header <<0x7D, 0x99>>
+
+    defp ws_descriptor2(key) do
+      import Bitwise
+      <<key &&& 0xFF, (key >>> 8 &&& 0x0F) ||| 2 <<< 4>>
+    end
+
+    defp ws_encode(field, value) do
+      d = def_for(130_824, %{output_field: field})
+      PgnEncode.encode(d, %{field => value})
+    end
+
+    test "average_twd -> Key 336, u16 radians ×10000 (deg→rad, wrapped to [0, 2π))" do
+      # 359.5 deg -> 6.2744586... rad -> round(/1e-4) = 62745 = 0xF519 -> LE 19 F5.
+      assert {:ok, payload} = ws_encode("average_twd", 359.5)
+      assert payload == @bandg_header <> ws_descriptor2(336) <> <<0x19, 0xF5>>
+    end
+
+    test "average_twd at 90 deg -> π/2 rad -> 15708 = 0x3D5C -> LE 5C 3D" do
+      assert {:ok, payload} = ws_encode("average_twd", 90.0)
+      assert payload == @bandg_header <> ws_descriptor2(336) <> <<0x5C, 0x3D>>
+    end
+
+    test "average_twd is UNSIGNED: -0.5 deg wraps to 359.5 deg (same bytes)" do
+      assert ws_encode("average_twd", -0.5) == ws_encode("average_twd", 359.5)
+    end
+
+    test "average_twd at 360 deg wraps to 0 (never the u16 unknown sentinel)" do
+      assert {:ok, payload} = ws_encode("average_twd", 360.0)
+      assert payload == @bandg_header <> ws_descriptor2(336) <> <<0x00, 0x00>>
+    end
+
+    test "wind_phase_deg -> Key 337, i16 radians ×10000: -12 deg -> -2094 -> LE D2 F7" do
+      # -12 deg -> -0.2094395... rad -> round(/1e-4) = -2094; i16 LE = 0xF7D2 bytes D2 F7.
+      assert {:ok, payload} = ws_encode("wind_phase_deg", -12.0)
+      assert payload == @bandg_header <> ws_descriptor2(337) <> <<0xD2, 0xF7>>
+    end
+
+    test "wind_lift_deg -> Key 338, i16 radians ×10000: +12 deg -> 2094 -> LE 2E 08" do
+      assert {:ok, payload} = ws_encode("wind_lift_deg", 12.0)
+      assert payload == @bandg_header <> ws_descriptor2(338) <> <<0x2E, 0x08>>
+    end
+
+    test "every wind-shift frame is exactly 6 bytes (2 header + 2 descriptor + 2 value)" do
+      for {field, v} <- [{"average_twd", 200.0}, {"wind_phase_deg", -5.0}, {"wind_lift_deg", 5.0}] do
+        assert {:ok, payload} = ws_encode(field, v)
+        assert byte_size(payload) == 6
+      end
+    end
+
+    test "a missing/invalid wind-shift output is :error (nothing to encode, no garbage)" do
+      d = def_for(130_824, %{output_field: "average_twd"})
+      assert :error = PgnEncode.encode(d, %{})
+      assert :error = PgnEncode.encode(d, %{"average_twd" => "nan"})
+    end
+  end
+
   # PGN 129284 "Navigation Data" — the bearing/distance/destination data-box that a
   # B&G/Zeus plotter renders for the active waypoint. 34-byte fast packet. Field order
   # and encodings per canboat + the ttlappalainen library (see PgnEncode.navigation_data_129284/1).
