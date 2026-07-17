@@ -50,7 +50,11 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   Batch per tick (a value that is currently `nil` is omitted): `average_twd`
   (slow mean), `wind_phase_deg`, `wind_lift_deg`, `twd_range_deg`,
   `twd_trend_deg_per_hr`, `oscillation_period_s`, `oscillation_amplitude_deg`,
-  `time_to_next_shift_s`, `shift_confidence` (0–100), `wind_regime` (code).
+  `time_to_next_shift_s`, `shift_confidence` (0–100), `wind_regime` (code),
+  and `wally_mode` (0 off / 1 shadow / 2 on — the cached `WindShift.Config`
+  policy as `RacingOrg.Tracker.Pro.WindShift.Wally.mode_code/1`, threading the
+  Wally mode into the pure `target_boat_speed`/`target_twa` calcs with zero
+  new plumbing).
 
   ## Session, timeline, events (the `"wind_shift_update"` batch)
 
@@ -81,11 +85,13 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   ## Config reaction
 
-  Subscribes to `WindShift.Config`; when a new policy lands the cores are
-  REBUILT with the new windows/alarm margin. This resets the predictor's
+  Subscribes to `WindShift.Config`; when a new policy lands with CHANGED
+  windows/alarm margin the cores are REBUILT. This resets the predictor's
   warmup (accepted — a window change redefines every mean, so carrying old
   filter state across would be dishonest); the session and sync sequence carry
-  over untouched.
+  over untouched. A WALLY-MODE-ONLY change does NOT rebuild (the mode shapes
+  no core): flipping Wally on/shadow/off mid-race keeps the live oscillation
+  verdict, so the target modulation engages/reverts on the very next tick.
 
   ## Step absorption
 
@@ -121,6 +127,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   alias RacingOrg.Tracker.Pro.WindShift.Observer.Store
   alias RacingOrg.Tracker.Pro.WindShift.Period
   alias RacingOrg.Tracker.Pro.WindShift.StepDetect
+  alias RacingOrg.Tracker.Pro.WindShift.Wally
 
   @default_sample_ms 1_000
   @default_persist_ms 60_000
@@ -278,6 +285,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
         # Policy (from WindShift.Config; safe defaults until readable).
         windows: @default_windows,
         alarms: @default_alarms,
+        wally_mode_code: 0,
         # Session identity + upstream sync bookkeeping (restored across reboots).
         session: Map.get(persisted, :session),
         seq: Map.get(persisted, :seq, 0),
@@ -320,11 +328,17 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     {:noreply, state}
   end
 
-  # The wind-shift policy changed -> refetch it and REBUILD the cores under the
-  # new windows/alarm margin. The warmup reset is accepted (a window change
-  # redefines every mean); session/seq/pending batches carry over.
+  # The wind-shift policy changed -> refetch it, and REBUILD the cores ONLY when
+  # the core-shaping half (windows / alarm margin) actually changed. The warmup
+  # reset is accepted for those (a window change redefines every mean), but a
+  # WALLY-MODE-ONLY flip must NOT rebuild: toggling Wally mid-race keeps the
+  # live oscillation verdict, so engagement/reversion is immediate and
+  # glitch-free. Session/seq/pending batches carry over either way.
   def handle_info({:racing_org_wind_shift, :updated}, state) do
-    {:noreply, state |> put_policy(fetch_policy(state.config)) |> build_cores()}
+    policy = fetch_policy(state.config)
+    rebuild? = policy.windows != state.windows or policy.alarms != state.alarms
+    state = put_policy(state, policy)
+    {:noreply, if(rebuild?, do: build_cores(state), else: state)}
   end
 
   def handle_info(_msg, state), do: {:noreply, state}
@@ -687,7 +701,8 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
         {"oscillation_amplitude_deg", osc && osc.amplitude_deg},
         {"time_to_next_shift_s", verdict.time_to_next_shift_s},
         {"shift_confidence", verdict.confidence * 100.0},
-        {"wind_regime", regime_code(verdict.regime)}
+        {"wind_regime", regime_code(verdict.regime)},
+        {"wally_mode", state.wally_mode_code}
       ]
       |> Enum.filter(fn {_name, value} -> is_number(value) end)
 
@@ -926,17 +941,24 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   # --- Policy (WindShift.Config collaborator) ---
 
-  defp put_policy(state, {windows, alarms}), do: %{state | windows: windows, alarms: alarms}
+  defp put_policy(state, %{windows: windows, alarms: alarms, wally_mode_code: code}),
+    do: %{state | windows: windows, alarms: alarms, wally_mode_code: code}
 
-  defp fetch_policy(nil), do: {@default_windows, @default_alarms}
+  # Wally.mode_code(nil) == 0 (off) — the fail-safe default policy.
+  @default_policy %{windows: @default_windows, alarms: @default_alarms, wally_mode_code: 0}
+
+  defp fetch_policy(nil), do: @default_policy
 
   defp fetch_policy({module, server}) do
     case module.current(server) do
-      %{windows: %{} = windows, alarms: %{} = alarms} -> {windows, alarms}
-      _ -> {@default_windows, @default_alarms}
+      %{windows: %{} = windows, alarms: %{} = alarms} = policy ->
+        %{windows: windows, alarms: alarms, wally_mode_code: Wally.mode_code(Map.get(policy, :wally_mode))}
+
+      _ ->
+        @default_policy
     end
   catch
-    :exit, _ -> {@default_windows, @default_alarms}
+    :exit, _ -> @default_policy
   end
 
   defp subscribe_config(nil), do: :ok

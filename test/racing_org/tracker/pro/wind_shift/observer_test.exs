@@ -425,6 +425,45 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     end
   end
 
+  # --- wally mode signal -----------------------------------------------------------------
+
+  test "wally_mode from the config policy publishes as an int signal each tick" do
+    ctx = new_script()
+    config = start_supervised!({Config, name: nil, store_dir: nil}, id: make_ref())
+    {:ok, _} = Config.apply_config(config, %{"version" => 1, "wally" => %{"mode" => "shadow"}})
+    observer = start_observer(ctx, config: {Config, config})
+
+    drive(observer, ctx, gen([%{dur_s: 5, base: 200.0}]))
+    assert last_batch(ctx)["wally_mode"] == 1
+    assert Observer.stats(observer).accepted == 5
+  end
+
+  test "with no config collaborator wally_mode publishes as 0 (off)" do
+    ctx = new_script()
+    observer = start_observer(ctx)
+
+    drive(observer, ctx, gen([%{dur_s: 5, base: 200.0}]))
+    assert last_batch(ctx)["wally_mode"] == 0
+  end
+
+  test "a wally-mode-only config change does NOT rebuild the cores (mode flips are glitch-free)" do
+    ctx = new_script()
+    config = start_supervised!({Config, name: nil, store_dir: nil}, id: make_ref())
+    {:ok, _} = Config.apply_config(config, %{"version" => 1, "wally" => %{"mode" => "shadow"}})
+    observer = start_observer(ctx, config: {Config, config})
+
+    drive(observer, ctx, gen([%{dur_s: 120, base: 200.0}], noise_sigma: 1.0))
+    assert is_number(Observer.status(observer).twd_range_deg)
+    assert last_batch(ctx)["wally_mode"] == 1
+
+    # Mode-only flip: the signal follows on the next tick; the envelope (a core)
+    # survives — unlike a window change, which rebuilds and empties it.
+    {:ok, _} = Config.apply_config(config, %{"version" => 2, "wally" => %{"mode" => "on"}})
+    drive(observer, ctx, [%{t_ms: 120_000, twd_deg: 200.0, tws_mps: 6.0}])
+    assert last_batch(ctx)["wally_mode"] == 2
+    assert is_number(Observer.status(observer).twd_range_deg)
+  end
+
   # --- config reaction -------------------------------------------------------------------
 
   test "a config change rebuilds the cores (warmup resets) but preserves the session" do

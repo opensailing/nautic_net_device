@@ -101,6 +101,46 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
       current leg, where `actual_vmg = boat_speed · |cos(twa)|` and `optimum_vmg` is
       `.beat.vmg` / `.run.vmg`. INVALID when the optimum VMG is ~0.
 
+  ## Wally — shift-phase modulation of `target_boat_speed` / `target_twa`
+
+  When the wind OSCILLATES, VMG should be maximized along the AVERAGE wind, not
+  the current wind (the Ockam/McCurdy doctrine): on the LIFTED tack sail lower
+  and faster than the polar optimum ("foot the lift"); on the HEADED tack sail
+  higher and slower ("pinch the header") — by roughly HALF the shift. The
+  doctrine, the delta rule (`clamp(lift/2, ±6°)`), and the activation gates
+  (oscillating regime code 2, `shift_confidence ≥ 50`, `|lift| ≥ 2°` deadband,
+  upwind `|twa| < 90°` — downwind Wally is a later refinement) live in
+  `RacingOrg.Tracker.Pro.WindShift.Wally`.
+
+  The two target calcs read four OPTIONAL signals — `wally_mode` (0 off /
+  1 shadow / 2 on, the `WindShift.Config` policy published per tick by the
+  WindShift Observer), `wind_lift_deg` (tack-resolved, positive = lifted),
+  `wind_regime`, `shift_confidence`:
+
+    * **mode 2 (on) + gates open** — the PRIMARY outputs become the modulated
+      targets: `target_twa = leg_twa + delta` (the signed delta WIDENS the
+      angle on a lift, NARROWS it on a header) and `target_boat_speed =
+      Lookup.boat_speed(leg_twa + delta, tws)` — the honest polar speed AT the
+      modulated angle (faster than the optimum bsp when footing on the polar's
+      rising side, slower when pinching), never a fabricated number.
+      `wally_delta_deg` and `wally_active => 1.0` ride along as extra outputs.
+    * **mode 1 (shadow) + gates open** — the primaries are UNTOUCHED
+      (bit-identical to mode off); `wally_target_twa` /
+      `wally_target_boat_speed` / `wally_delta_deg` / `wally_active => 1.0`
+      ride along for display and evaluation.
+    * **mode 0 / any gate closed / signals missing** — byte-identical outputs
+      to a build without Wally (no extra keys). A degenerate polar speed at the
+      modulated angle (the no-go epsilon) also deactivates rather than emitting
+      a useless target.
+
+  Because these calcs are PURE and re-evaluated per tick, reversion when any
+  gate fails (confidence drop, regime change, mode change) is immediate and
+  glitch-free at the source; the per-def output damping in
+  `RacingOrg.Tracker.Pro.Compute.Broadcaster` then smooths the step for the
+  NMEA bus consumers. `vmg_performance` deliberately keeps measuring against
+  the LEG OPTIMUM VMG — sailing Wally targets reads slightly below 100% on the
+  current wind by design (the gain is realized against the average wind).
+
   ## Next-leg predicted apparent wind (B&G "Next Leg AWA/AWS")
 
   Predicts the apparent wind you'd experience on the FOLLOWING leg of the course
@@ -127,6 +167,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
   """
 
   alias RacingOrg.Tracker.Pro.Polar.Lookup
+  alias RacingOrg.Tracker.Pro.WindShift.Wally
 
   @type signals :: %{optional(String.t()) => number()}
   @type outputs :: %{optional(String.t()) => number()}
@@ -275,18 +316,19 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
   end
 
   # The VMG-optimal target boat speed for the current leg (beat when twa < 90, else
-  # run).
+  # run), Wally-modulated when the mode + gates allow (see with_wally/5).
   defp target_boat_speed(signals, ctx) do
     case leg_optimum(signals, ctx) do
-      {:ok, leg} -> finite_map(%{"target_boat_speed" => leg.bsp})
+      {:ok, leg} -> finite_map(with_wally(%{"target_boat_speed" => leg.bsp}, :bsp, signals, ctx, leg))
       :error -> :invalid
     end
   end
 
-  # The matching optimum TWA for the current leg.
+  # The matching optimum TWA for the current leg, Wally-modulated when the mode +
+  # gates allow (see with_wally/5).
   defp target_twa(signals, ctx) do
     case leg_optimum(signals, ctx) do
-      {:ok, leg} -> finite_map(%{"target_twa" => leg.twa})
+      {:ok, leg} -> finite_map(with_wally(%{"target_twa" => leg.twa}, :twa, signals, ctx, leg))
       :error -> :invalid
     end
   end
@@ -303,6 +345,79 @@ defmodule RacingOrg.Tracker.Pro.Compute.Library do
       finite_map(%{"vmg_performance" => 100.0 * actual_vmg / leg.vmg})
     else
       _ -> :invalid
+    end
+  end
+
+  # --- Wally (shift-phase target modulation; see the module doc + WindShift.Wally) ---
+
+  # Overlay the Wally modulation onto a target calc's base outputs. `primary` is
+  # which primary this calc owns (:twa | :bsp); `leg` is the base leg optimum.
+  #
+  #   * inactive (mode off / a gate closed / signals missing / degenerate polar
+  #     speed at the modulated angle) -> the base outputs, BYTE-IDENTICAL to a
+  #     build without Wally (no extra keys). Because this is re-decided on every
+  #     evaluation from the live signals, reversion when a gate fails is
+  #     immediate and glitch-free.
+  #   * mode 2 (on) -> the PRIMARY becomes the modulated value; `wally_delta_deg`
+  #     + `wally_active => 1.0` ride along.
+  #   * mode 1 (shadow) -> the primary stays the base value; the modulated pair
+  #     rides along as `wally_target_twa` / `wally_target_boat_speed` (both, from
+  #     either calc, so one def suffices for display) plus `wally_delta_deg` +
+  #     `wally_active => 1.0`.
+  defp with_wally(base_outputs, primary, signals, ctx, leg) do
+    case wally_modulation(signals, ctx, leg) do
+      :inactive ->
+        base_outputs
+
+      {mode, mod} ->
+        primary_outputs =
+          case {mode, primary} do
+            {:on, :twa} -> %{"target_twa" => mod.twa}
+            {:on, :bsp} -> %{"target_boat_speed" => mod.bsp}
+            {:shadow, _} -> base_outputs
+          end
+
+        shadow_extras =
+          case mode do
+            :on -> %{}
+            :shadow -> %{"wally_target_twa" => mod.twa, "wally_target_boat_speed" => mod.bsp}
+          end
+
+        primary_outputs
+        |> Map.merge(shadow_extras)
+        |> Map.merge(%{"wally_delta_deg" => mod.delta, "wally_active" => 1.0})
+    end
+  end
+
+  # Decide + compute the Wally modulation from the OPTIONAL wind-shift signals
+  # (`wally_mode`, `wind_lift_deg`, `wind_regime`, `shift_confidence` — published
+  # per tick by the WindShift Observer) and the polar. Returns
+  # `{:on | :shadow, %{twa:, bsp:, delta:}}` or `:inactive`.
+  #
+  # The lift is tack-resolved (positive = lifted), so the signed half-shift delta
+  # applies directly to the |TWA| leg optimum: widen on a lift (FOOT — the polar
+  # speed at the footed angle is honestly FASTER on the rising side), narrow on a
+  # header (PINCH — honestly slower). The speed target is always the polar
+  # surface AT the modulated angle, never a fabricated number; a degenerate polar
+  # speed there (~0, the no-go zone) deactivates the modulation instead of
+  # emitting a useless target.
+  defp wally_modulation(signals, ctx, leg) do
+    with {:ok, mode} when mode == 1.0 or mode == 2.0 <- fetch(signals, "wally_mode"),
+         {:ok, lift} <- fetch(signals, "wind_lift_deg"),
+         {:ok, regime} <- fetch(signals, "wind_regime"),
+         {:ok, confidence} <- fetch(signals, "shift_confidence"),
+         {:ok, twa} <- resolve_twa(signals),
+         true <-
+           Wally.active?(%{wind_lift_deg: lift, wind_regime: regime, shift_confidence: confidence, twa_deg: twa}),
+         {:ok, lookup} <- polar_lookup(ctx),
+         {:ok, tws} <- fetch(signals, "true_wind_speed"),
+         delta = Wally.delta_deg(lift),
+         modulated_twa = leg.twa + delta,
+         {:ok, bsp} <- Lookup.boat_speed(lookup, modulated_twa, tws) |> ok_or_error(),
+         true <- bsp > @target_eps do
+      {if(mode == 2.0, do: :on, else: :shadow), %{twa: modulated_twa, bsp: bsp, delta: delta}}
+    else
+      _ -> :inactive
     end
   end
 
