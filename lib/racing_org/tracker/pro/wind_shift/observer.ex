@@ -37,8 +37,11 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   On starboard tack (signed TWA ≥ 0, wind over the starboard side —
   `Compute.Library.resolve_twa` semantics) a veer is a LIFT; on port tack a
   back is the lift. So `wind_lift_deg = phase_deg × tack_sign` with tack_sign
-  +1 starboard / −1 port from the sign of the live `true_wind_angle` signal.
-  With no fresh TWA the lift is simply omitted (the phase still flows).
+  +1 starboard / −1 port from the sign of the resolved TWA — the live
+  `true_wind_angle` signal when fresh, else `wrap180(true_wind_direction −
+  heading)` (the same fallback `Compute.Library.resolve_twa` uses, so boats
+  publishing direction + speed but no angle still get the lift). When neither
+  resolves the lift is simply omitted (the phase still flows).
 
   ## Engine signals (numeric only) and the regime code
 
@@ -62,7 +65,10 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   `:utc_now_fn`) of the first valid wind sample after boot/day-start, persisted
   via `Observer.Store` so a mid-day reboot keeps the same session (a snapshot
   from a PREVIOUS UTC day starts a fresh session; `seq` stays monotonic either
-  way). The session also carries a running position centroid and TWS mean, and
+  way). A device powered THROUGH midnight UTC rotates the same way mid-run:
+  the old session is flushed with a final sync under its own identity, then a
+  fresh session (fresh centroid/summary accumulators) starts on the next
+  accepted tick — `seq` continues monotonically across the rotation. The session also carries a running position centroid and TWS mean, and
   `race_session_id` is read from the active assignment once per sync (never on
   the tick hot path). Timeline rows accumulate every 60 s; events fire on
   envelope alarms (`new_high`/`new_low`, suppressed when the config disables
@@ -92,6 +98,8 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   over untouched. A WALLY-MODE-ONLY change does NOT rebuild (the mode shapes
   no core): flipping Wally on/shadow/off mid-race keeps the live oscillation
   verdict, so the target modulation engages/reverts on the very next tick.
+  `alarms.enabled` is live-only the same way — per-tick event suppression
+  reads it — so toggling alarms mid-run never costs the warmup either.
 
   ## Step absorption
 
@@ -333,10 +341,17 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   # reset is accepted for those (a window change redefines every mean), but a
   # WALLY-MODE-ONLY flip must NOT rebuild: toggling Wally mid-race keeps the
   # live oscillation verdict, so engagement/reversion is immediate and
-  # glitch-free. Session/seq/pending batches carry over either way.
+  # glitch-free. `alarms.enabled` is a LIVE-ONLY flag exactly the same way —
+  # per-tick event suppression reads it off the state, no core carries it — so
+  # toggling alarms mid-run must not cost the ~20 min warmup either.
+  # Session/seq/pending batches carry over either way.
   def handle_info({:racing_org_wind_shift, :updated}, state) do
     policy = fetch_policy(state.config)
-    rebuild? = policy.windows != state.windows or policy.alarms != state.alarms
+
+    rebuild? =
+      policy.windows != state.windows or
+        policy.alarms.new_extreme_margin_deg != state.alarms.new_extreme_margin_deg
+
     state = put_policy(state, policy)
     {:noreply, if(rebuild?, do: build_cores(state), else: state)}
   end
@@ -370,7 +385,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   defp accept(state, signals, twd, now) do
     tws = optional_fresh(signals, "true_wind_speed", now, state.staleness_ms)
-    twa = optional_fresh(signals, "true_wind_angle", now, state.staleness_ms)
+    twa = resolve_twa(signals, twd, now, state.staleness_ms)
     lat = optional_fresh(signals, "latitude", now, state.staleness_ms)
     lon = optional_fresh(signals, "longitude", now, state.staleness_ms)
     wall_ms = DateTime.to_unix(state.utc_now_fn.(), :millisecond)
@@ -474,7 +489,23 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   # --- Session (identity + running centroid / TWS mean) ---
 
-  defp ensure_session(%{session: nil} = state, wall_ms) do
+  defp ensure_session(%{session: nil} = state, wall_ms), do: start_session(state, wall_ms)
+
+  # A device powered through midnight UTC must not accumulate one multi-day
+  # session: once the wall clock's UTC date has advanced past the session's,
+  # the old session is ROTATED — flushed with a final sync under its own
+  # identity (throttle bypassed), then a fresh identity starts with fresh
+  # centroid/summary accumulators. `seq` continues monotonically across the
+  # rotation (the flush increments it; the backend orders per boat by seq).
+  defp ensure_session(%{session: %{started_at_ms: started_ms}} = state, wall_ms) do
+    if Date.compare(utc_date(wall_ms), utc_date(started_ms)) == :gt do
+      rotate_session(state, wall_ms)
+    else
+      state
+    end
+  end
+
+  defp start_session(state, wall_ms) do
     Logger.info("[WindShift.Observer] wind-shift session started (started_at_ms=#{wall_ms})")
 
     %{
@@ -484,7 +515,24 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     }
   end
 
-  defp ensure_session(state, _wall_ms), do: state
+  defp rotate_session(state, wall_ms) do
+    Logger.info("[WindShift.Observer] UTC day rollover: rotating the wind-shift session")
+    state = sync(state)
+
+    # The flush can only be skipped while no verdict exists yet (a batch
+    # restored at boot, rotated before the first classified tick). Old-day rows
+    # must never attach to the new session, so they are dropped — the same
+    # policy restore/2 applies to a previous-day snapshot at boot.
+    if state.pending_timeline != [] or state.pending_events != [] do
+      Logger.warning("[WindShift.Observer] dropping unsynced previous-day rows at UTC rollover")
+    end
+
+    # last_summary resets so the new session's FIRST sync always goes out.
+    %{state | session: nil, pending_timeline: [], pending_events: [], last_summary: nil}
+    |> start_session(wall_ms)
+  end
+
+  defp utc_date(ms), do: ms |> DateTime.from_unix!(:millisecond) |> DateTime.to_date()
 
   defp fold_session(state, lat, lon, tws) do
     session = state.session
@@ -1024,6 +1072,34 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   defp tack_sign(twa) when is_number(twa) and twa >= 0, do: 1.0
   defp tack_sign(twa) when is_number(twa), do: -1.0
   defp tack_sign(_twa), do: nil
+
+  # The Observer-side mirror of `Compute.Library.resolve_twa/1` (which reads the
+  # calc-signals map; the raw-signal freshness semantics here are the same
+  # names): the signed TWA is the live `true_wind_angle` signal when fresh,
+  # otherwise `wrap180(true_wind_direction - heading)` — the instrumented-boat
+  # case where the network true-wind PGN carries direction + speed but no
+  # angle. `twd` is the tick's already-validated fresh true_wind_direction.
+  # nil when neither resolves (the lift is then simply omitted).
+  defp resolve_twa(signals, twd, now, staleness_ms) do
+    case optional_fresh(signals, "true_wind_angle", now, staleness_ms) do
+      twa when is_number(twa) ->
+        twa
+
+      nil ->
+        case optional_fresh(signals, "heading", now, staleness_ms) do
+          heading when is_number(heading) -> wrap180(twd - heading)
+          nil -> nil
+        end
+    end
+  end
+
+  # Signed wrap to (-180, 180] — Compute.Library.wrap180 semantics, so the
+  # derived TWA resolves dead astern to starboard exactly like resolve_twa.
+  defp wrap180(deg) do
+    wrapped = :math.fmod(deg, 360.0)
+    wrapped = if wrapped < 0.0, do: wrapped + 360.0, else: wrapped
+    if wrapped > 180.0, do: wrapped - 360.0, else: wrapped
+  end
 
   defp safe_signals do
     Engine.signals()

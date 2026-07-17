@@ -20,7 +20,9 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
 
   defp new_script do
     {:ok, script} =
-      Agent.start_link(fn -> %{t_ms: 0, twd: nil, tws: nil, twa: nil, lat: nil, lon: nil, stale: false} end)
+      Agent.start_link(fn ->
+        %{t_ms: 0, twd: nil, tws: nil, twa: nil, heading: nil, lat: nil, lon: nil, stale: false}
+      end)
 
     {:ok, sink} = Agent.start_link(fn -> [] end)
     %{script: script, sink: sink}
@@ -38,6 +40,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
         {"true_wind_direction", s.twd},
         {"true_wind_speed", s.tws},
         {"true_wind_angle", s.twa},
+        {"heading", s.heading},
         {"latitude", s.lat},
         {"longitude", s.lon}
       ]
@@ -186,6 +189,40 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     assert is_number(batch["wind_phase_deg"])
     refute Map.has_key?(batch, "wind_lift_deg")
     assert Observer.status(observer).wind_lift_deg == nil
+  end
+
+  test "without a TWA signal the tack falls back to direction - heading (Library.resolve_twa parity)" do
+    # 5 min settled at 200, then a +12 deg veer for 60 s: phase_deg goes positive.
+    samples = gen([%{dur_s: 300, base: 200.0}, %{dur_s: 60, step: 12.0}])
+
+    # No true_wind_angle published; heading 160 -> wrap180(TWD - heading) stays
+    # positive (wind over the starboard side) -> the veer is a LIFT.
+    ctx = new_script()
+    observer = start_observer(ctx)
+    drive(observer, ctx, samples, %{heading: 160.0})
+    starboard = last_batch(ctx)
+    assert starboard["wind_phase_deg"] > 5.0
+    assert starboard["wind_lift_deg"] > 5.0
+    assert_in_delta starboard["wind_lift_deg"], starboard["wind_phase_deg"], 1.0e-9
+    assert is_number(Observer.status(observer).wind_lift_deg)
+
+    # Heading 240 -> derived TWA negative (port tack) -> the SAME veer is a HEADER.
+    ctx2 = new_script()
+    observer2 = start_observer(ctx2)
+    drive(observer2, ctx2, samples, %{heading: 240.0})
+    port = last_batch(ctx2)
+    assert port["wind_phase_deg"] > 5.0
+    assert port["wind_lift_deg"] < -5.0
+    assert_in_delta port["wind_lift_deg"], -port["wind_phase_deg"], 1.0e-9
+
+    # A fresh true_wind_angle signal stays the canonical source: it wins over
+    # the direction-heading derivation when both are available.
+    ctx3 = new_script()
+    observer3 = start_observer(ctx3)
+    drive(observer3, ctx3, samples, %{twa: -40.0, heading: 160.0})
+    canonical = last_batch(ctx3)
+    assert canonical["wind_phase_deg"] > 5.0
+    assert_in_delta canonical["wind_lift_deg"], -canonical["wind_phase_deg"], 1.0e-9
   end
 
   # --- timeline -------------------------------------------------------------------
@@ -425,6 +462,46 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     end
   end
 
+  # --- UTC-day rollover (mid-run session rotation) ------------------------------------------
+
+  test "a UTC-day rollover mid-run rotates the session: old one flushed, fresh accumulators, monotonic seq" do
+    ctx = new_script()
+    # Park the sync throttle out of the way so ONLY the rotation flush (throttle
+    # bypassed) and the explicit sync_now emit updates.
+    observer = start_observer(ctx, sync_ms: 3_600_000_000)
+
+    drive(observer, ctx, gen([%{dur_s: 70, base: 200.0}]), %{lat: 41.0, lon: -71.0})
+    assert Observer.session(observer).started_at_ms == @wall_base
+
+    # @utc_base is 10:00Z, so +14 h crosses midnight into the NEXT UTC day.
+    jump_ms = 14 * 60 * 60 * 1000
+    next_day = for i <- 0..69, do: %{t_ms: jump_ms + i * 1000, twd_deg: 200.0, tws_mps: 6.0}
+    drive(observer, ctx, next_day, %{lat: 42.0, lon: -72.0})
+
+    # The rotation flushed the OLD session first (final sync under its identity,
+    # carrying its pending timeline row).
+    assert_receive {:sync, %{seq: 1, session: %{started_at_ms: @wall_base}} = flush}
+    assert [%{t_ms: t_ms}] = flush.timeline
+    assert t_ms == @wall_base + 60_000
+    assert_in_delta flush.session.centroid.lat, 41.0, 1.0e-9
+
+    # The NEW session starts at the first accepted tick past midnight with FRESH
+    # accumulators (the centroid reflects only the new day's positions).
+    session = Observer.session(observer)
+    assert session.started_at_ms == @wall_base + jump_ms
+    assert_in_delta session.centroid.lat, 42.0, 1.0e-9
+    assert_in_delta session.centroid.lon, -72.0, 1.0e-9
+
+    # seq continues strictly monotonically across the rotation, and the new
+    # session's rows all belong to the new day.
+    :ok = Observer.sync_now(observer)
+    assert_receive {:sync, %{seq: 2, session: %{started_at_ms: started}} = update}
+    assert started == @wall_base + jump_ms
+    assert update.timeline != []
+    assert Enum.all?(update.timeline, &(&1.t_ms >= started))
+    refute_receive {:sync, _}, 20
+  end
+
   # --- wally mode signal -----------------------------------------------------------------
 
   test "wally_mode from the config policy publishes as an int signal each tick" do
@@ -465,6 +542,46 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
   end
 
   # --- config reaction -------------------------------------------------------------------
+
+  test "an alarms-enabled-only config change does NOT rebuild the cores (a live-only flag)" do
+    ctx = new_script()
+    config = start_supervised!({Config, name: nil, store_dir: nil}, id: make_ref())
+    observer = start_observer(ctx, config: {Config, config})
+
+    samples = gen([%{dur_s: 900, base: 200.0}, %{dur_s: 480, step: 30.0}], noise_sigma: 1.5)
+    {warmup, front} = Enum.split(samples, 900)
+
+    drive(observer, ctx, warmup, %{twa: 40.0})
+    status_before = Observer.status(observer)
+    assert is_number(status_before.twd_range_deg)
+
+    # Flip ONLY alarms.enabled mid-run: the cores retain their state (the
+    # envelope stays warm, the regime is unchanged on the next tick).
+    {:ok, _} = Config.apply_config(config, %{"version" => 1, "alarms" => %{"enabled" => false}})
+    assert is_number(Observer.status(observer).twd_range_deg)
+
+    drive(observer, ctx, Enum.take(front, 1), %{twa: 40.0})
+    status_after = Observer.status(observer)
+    assert is_number(status_after.twd_range_deg)
+    assert status_after.regime == status_before.regime
+
+    # Event suppression honors the new flag: the +30 deg front breaks out of the
+    # (warm) envelope, but no new_high/new_low is emitted while disabled...
+    drive(observer, ctx, Enum.drop(front, 1), %{twa: 40.0})
+    flip_wall_ms = @wall_base + 900_000
+    events = collect_syncs() |> Enum.flat_map(& &1.events)
+    refute Enum.any?(events, &(&1.kind in ["new_high", "new_low"] and &1.t_ms >= flip_wall_ms))
+
+    # ...and the warmup was preserved: 900 s + 480 s of history classify the
+    # front as a persistent step (a rebuild at the flip would still be warming up).
+    assert Observer.status(observer).regime == "persistent_step"
+
+    # A margin change still rebuilds (the envelope empties again).
+    {:ok, _} =
+      Config.apply_config(config, %{"version" => 2, "alarms" => %{"new_extreme_margin_deg" => 5.0}})
+
+    assert Observer.status(observer).twd_range_deg == nil
+  end
 
   test "a config change rebuilds the cores (warmup resets) but preserves the session" do
     ctx = new_script()
