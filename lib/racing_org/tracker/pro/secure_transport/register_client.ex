@@ -184,7 +184,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.RegisterClient do
   end
 
   defp configured_api_endpoint do
-    Application.get_env(:racing_org_tracker, :api_endpoint, "")
+    Application.get_env(:racing_org_tracker_pro, :api_endpoint, "")
   end
 
   defp parse_success(body) when is_map(body) do

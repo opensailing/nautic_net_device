@@ -1,7 +1,7 @@
 defmodule RacingOrg.Tracker.Pro.WebClients.HTTPClient do
   use Tesla
 
-  @api_endpoint Application.compile_env!(:racing_org_tracker, :api_endpoint)
+  @api_endpoint Application.compile_env!(:racing_org_tracker_pro, :api_endpoint)
 
   plug Tesla.Middleware.BaseUrl, @api_endpoint
   plug Tesla.Middleware.JSON

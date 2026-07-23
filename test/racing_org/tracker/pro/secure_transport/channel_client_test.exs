@@ -23,8 +23,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     {:ok, identity} = KeyStore.load_or_generate(base_path: base)
 
     {srv_pub, srv_priv} = identity(<<0xB2>>)
-    prev = Application.get_env(:racing_org_tracker, ServerIdentity)
-    Application.put_env(:racing_org_tracker, ServerIdentity, public_key: srv_pub)
+    prev = Application.get_env(:racing_org_tracker_pro, ServerIdentity)
+    Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: srv_pub)
     on_exit(fn -> restore_env(ServerIdentity, prev) end)
 
     %{base: base, identity: identity, srv_pub: srv_pub, srv_priv: srv_priv}
@@ -35,8 +35,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     {Primitives.ed25519_public_from_secret(seed), seed}
   end
 
-  defp restore_env(key, nil), do: Application.delete_env(:racing_org_tracker, key)
-  defp restore_env(key, prev), do: Application.put_env(:racing_org_tracker, key, prev)
+  defp restore_env(key, nil), do: Application.delete_env(:racing_org_tracker_pro, key)
+  defp restore_env(key, prev), do: Application.put_env(:racing_org_tracker_pro, key, prev)
 
   # --- gating: safe to start idle, never connects when not configured ---
 

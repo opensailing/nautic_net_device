@@ -9,7 +9,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ServerIdentityTest do
 
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
 
-  @app :racing_org_tracker
+  @app :racing_org_tracker_pro
 
   setup do
     prior = Application.get_env(@app, ServerIdentity)

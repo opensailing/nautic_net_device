@@ -20,7 +20,7 @@ defmodule RacingOrg.Tracker.Pro.DeviceCLI do
   def replay_log(log_filename, opts \\ []) do
     paths = [
       log_filename,
-      Path.join([:code.priv_dir(:racing_org_tracker), "replay_logs", log_filename])
+      Path.join([:code.priv_dir(:racing_org_tracker_pro), "replay_logs", log_filename])
     ]
 
     if path = Enum.find(paths, &File.exists?/1) do

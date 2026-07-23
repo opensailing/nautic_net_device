@@ -20,7 +20,7 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveBulkGateTest do
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
 
-  @app :racing_org_tracker
+  @app :racing_org_tracker_pro
 
   setup do
     base = Path.join(System.tmp_dir!(), "nn_arc_gate_#{System.unique_integer([:positive])}")

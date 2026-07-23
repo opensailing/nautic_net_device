@@ -25,7 +25,7 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.CreateGPSLog do
   end
 
   defp init_format(:gpx, _opts) do
-    # apps/racing_org_tracker/tmp/[timestamp].gpx
+    # apps/racing_org_tracker_pro/tmp/[timestamp].gpx
     path =
       Path.join([
         __DIR__,
@@ -42,7 +42,7 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.CreateGPSLog do
   end
 
   defp init_format(:csv, _opts) do
-    # apps/racing_org_tracker/tmp/[timestamp].csv
+    # apps/racing_org_tracker_pro/tmp/[timestamp].csv
     path =
       Path.join([
         __DIR__,

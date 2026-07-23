@@ -13,7 +13,7 @@ defmodule RacingOrg.Tracker.Pro do
   end
 
   def git_commit do
-    Application.get_env(:racing_org_tracker, :git_commit)
+    Application.get_env(:racing_org_tracker_pro, :git_commit)
   end
 
   @doc "The running NMEA 2000 VirtualDevice pid (set at boot), or `nil`."

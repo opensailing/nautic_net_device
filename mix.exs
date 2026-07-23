@@ -11,7 +11,7 @@ defmodule RacingOrg.Tracker.Pro.Device.MixProject do
       app: @app,
       # NervesHub product name. Nerves bakes `:name || :app` into the firmware's
       # `meta-product`, and NervesHub matches uploads against a Product of that exact
-      # name. The OTP app stays `:racing_org_tracker`; only the firmware product label
+      # name. The OTP app stays `:racing_org_tracker_pro`; only the firmware product label
       # changes. Must match the NervesHub Product name exactly.
       name: "tracker-pro",
       version: @version,

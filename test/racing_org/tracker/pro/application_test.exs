@@ -90,12 +90,12 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
 
   describe "secure_transport_configured?/1 gate predicate" do
     setup do
-      prev = Application.get_env(:racing_org_tracker, ServerIdentity)
+      prev = Application.get_env(:racing_org_tracker_pro, ServerIdentity)
 
       on_exit(fn ->
         case prev do
-          nil -> Application.delete_env(:racing_org_tracker, ServerIdentity)
-          value -> Application.put_env(:racing_org_tracker, ServerIdentity, value)
+          nil -> Application.delete_env(:racing_org_tracker_pro, ServerIdentity)
+          value -> Application.put_env(:racing_org_tracker_pro, ServerIdentity, value)
         end
       end)
 
@@ -103,7 +103,7 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
     end
 
     test "host target is never configured, even with a pinned key set" do
-      Application.put_env(:racing_org_tracker, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+      Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
 
       refute RacingOrg.Tracker.Pro.Application.secure_transport_configured?(:host)
       refute RacingOrg.Tracker.Pro.Application.secure_transport_configured?(:"")
@@ -111,12 +111,12 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
     end
 
     test "a real target with NO pinned key is not configured" do
-      Application.delete_env(:racing_org_tracker, ServerIdentity)
+      Application.delete_env(:racing_org_tracker_pro, ServerIdentity)
       refute RacingOrg.Tracker.Pro.Application.secure_transport_configured?(:racing_org_rpi3)
     end
 
     test "a real target WITH a pinned key is configured" do
-      Application.put_env(:racing_org_tracker, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+      Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
 
       assert RacingOrg.Tracker.Pro.Application.secure_transport_configured?(:racing_org_rpi3)
     end

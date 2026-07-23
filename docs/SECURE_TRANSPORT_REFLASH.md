@@ -17,7 +17,7 @@ This is the operational counterpart to the device wiring landed in P9-job-6
 the supervision tree, and the post-race `BulkUploader` trigger from
 `RacingOrg.Tracker.Pro.Race.Archive`).
 
-> Terminology: "device" = the Nerves firmware in `racing_org_tracker`; "server" =
+> Terminology: "device" = the Nerves firmware in `racing_org_tracker_pro`; "server" =
 > RacingOrg (`backend`, deployed on Fly). All crypto is Ed25519 + ChaCha20-Poly1305;
 > there is no PKI — the device PINS the server's public key and the server records
 > the device's self-registered public key (a `DeviceKey`).

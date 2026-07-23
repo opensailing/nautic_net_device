@@ -19,15 +19,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootProvisionerTest do
 
     # Pin a server public key so the provisioner has something to register against.
     srv_pub = RacingOrg.Tracker.Pro.SecureTransport.Primitives.ed25519_public_from_secret(:binary.copy(<<0xB2>>, 32))
-    prev = Application.get_env(:racing_org_tracker, ServerIdentity)
-    Application.put_env(:racing_org_tracker, ServerIdentity, public_key: srv_pub)
+    prev = Application.get_env(:racing_org_tracker_pro, ServerIdentity)
+    Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: srv_pub)
     on_exit(fn -> restore_env(ServerIdentity, prev) end)
 
     %{base: base}
   end
 
-  defp restore_env(key, nil), do: Application.delete_env(:racing_org_tracker, key)
-  defp restore_env(key, prev), do: Application.put_env(:racing_org_tracker, key, prev)
+  defp restore_env(key, nil), do: Application.delete_env(:racing_org_tracker_pro, key)
+  defp restore_env(key, prev), do: Application.put_env(:racing_org_tracker_pro, key, prev)
 
   defp ok_adapter(device_id \\ "dev-9") do
     fn %Tesla.Env{} = env ->
@@ -44,7 +44,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootProvisionerTest do
   end
 
   test "no-op (no crash) when the server is not pinned", %{base: base} do
-    Application.delete_env(:racing_org_tracker, ServerIdentity)
+    Application.delete_env(:racing_org_tracker_pro, ServerIdentity)
 
     adapter = fn %Tesla.Env{} -> flunk("should not hit the transport when unpinned") end
 

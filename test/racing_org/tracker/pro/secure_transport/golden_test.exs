@@ -13,7 +13,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.GoldenTest do
 
   alias RacingOrg.Tracker.Pro.SecureTransport.{Frame, Handshake}
 
-  @golden_path Application.app_dir(:racing_org_tracker, "priv/secure_transport/handshake_kat.json")
+  @golden_path Application.app_dir(:racing_org_tracker_pro, "priv/secure_transport/handshake_kat.json")
 
   setup_all do
     golden = @golden_path |> File.read!() |> Jason.decode!()

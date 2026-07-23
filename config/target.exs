@@ -5,7 +5,7 @@ import Config
 
 case System.get_env("CAN_DRIVER") do
   "canusb" ->
-    config :racing_org_tracker, RacingOrg.Tracker.Pro.CAN,
+    config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.CAN,
       driver: {RacingOrg.Tracker.Pro.CAN.CANUSB.Driver, start_logging?: true},
       handlers: [
         RacingOrg.Tracker.Pro.PacketHandler.DiscoverDevices,
@@ -34,20 +34,20 @@ case System.get_env("CAN_DRIVER") do
       certification_level: :level_a
 
   "fake" ->
-    config :racing_org_tracker, RacingOrg.Tracker.Pro.CAN, driver: RacingOrg.Tracker.Pro.CAN.Fake.Driver
+    config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.CAN, driver: RacingOrg.Tracker.Pro.CAN.Fake.Driver
 
   "disabled" ->
-    config :racing_org_tracker, RacingOrg.Tracker.Pro.CAN, false
+    config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.CAN, false
 
   _else ->
     raise "the CAN_DRIVER environment variable must be one of: canusb, pican-m, disabled"
 end
 
-config :racing_org_tracker, RacingOrg.Tracker.Pro.Serial,
+config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.Serial,
   driver: RacingOrg.Tracker.Pro.Serial.SixFab.Driver,
   handlers: [RacingOrg.Tracker.Pro.PacketHandler.SetTimeFromGPS]
 
-config :racing_org_tracker,
+config :racing_org_tracker_pro,
   data_set_directory: "/data/datasets",
   assignment_directory: "/data/assignment",
   polar_directory: "/data/polars",
@@ -161,7 +161,7 @@ wifi_ssid = System.get_env("VINTAGE_NET_WIFI_SSID")
 wifi_psk = System.get_env("VINTAGE_NET_WIFI_PSK")
 wifi_enabled? = is_binary(wifi_ssid) and wifi_ssid != "" and is_binary(wifi_psk) and wifi_psk != ""
 
-config :racing_org_tracker, :wifi_enabled, wifi_enabled?
+config :racing_org_tracker_pro, :wifi_enabled, wifi_enabled?
 
 wlan0_config =
   if wifi_enabled? do

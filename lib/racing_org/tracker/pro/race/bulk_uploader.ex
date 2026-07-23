@@ -487,7 +487,7 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploader do
   end
 
   defp base_url(opts) do
-    Keyword.get(opts, :base_url) || Application.get_env(:racing_org_tracker, :api_endpoint, "")
+    Keyword.get(opts, :base_url) || Application.get_env(:racing_org_tracker_pro, :api_endpoint, "")
   end
 
   defp now_unix(opts) do

@@ -26,6 +26,6 @@ config :nmea, NMEA.VirtualDevice,
   load_equivelency_number: 0,
   certification_level: :level_a
 
-config :racing_org_tracker, RacingOrg.Tracker.Pro.Serial,
+config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.Serial,
   driver: RacingOrg.Tracker.Pro.Serial.Fake.Driver,
   handlers: [RacingOrg.Tracker.Pro.PacketHandler.SetTimeFromGPS]

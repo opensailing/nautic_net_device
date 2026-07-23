@@ -25,7 +25,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.KeyStore do
   reboots/OTA): `/data/secure_transport/device_ed25519.key`. The base path is
   configurable via
 
-      config :racing_org_tracker, #{inspect(__MODULE__)}, base_path: "/some/dir"
+      config :racing_org_tracker_pro, #{inspect(__MODULE__)}, base_path: "/some/dir"
 
   (defaulting to `/data/secure_transport`), so the host/test target points at a
   temp dir. The seed file is written ATOMICALLY (write to a temp file in the
@@ -138,7 +138,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.KeyStore do
   end
 
   defp configured_base_path do
-    :racing_org_tracker
+    :racing_org_tracker_pro
     |> Application.get_env(__MODULE__, [])
     |> Keyword.get(:base_path)
   end

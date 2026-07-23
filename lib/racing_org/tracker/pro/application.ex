@@ -117,7 +117,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
     end
   end
 
-  defp wifi_enabled?, do: Application.get_env(:racing_org_tracker, :wifi_enabled, true) == true
+  defp wifi_enabled?, do: Application.get_env(:racing_org_tracker_pro, :wifi_enabled, true) == true
 
   # P9-job-6 secure-transport children, appended after the network/HTTP deps they
   # rely on. The SessionHolder is started inline above (it runs in EVERY environment:
@@ -174,8 +174,8 @@ defmodule RacingOrg.Tracker.Pro.Application do
     {RacingOrg.Tracker.Pro.Commands,
      name: RacingOrg.Tracker.Pro.Commands,
      device_id: RacingOrg.Tracker.Pro.boat_identifier(),
-     store_dir: Application.get_env(:racing_org_tracker, :assignment_directory),
-     polar_dir: Application.get_env(:racing_org_tracker, :polar_directory)}
+     store_dir: Application.get_env(:racing_org_tracker_pro, :assignment_directory),
+     polar_dir: Application.get_env(:racing_org_tracker_pro, :polar_directory)}
   end
 
   # Per-tracking-state damping + send-rate config pushed by the server over the WSS
@@ -187,7 +187,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
   defp tracking_config_child do
     {RacingOrg.Tracker.Pro.Tracking.Config,
      name: RacingOrg.Tracker.Pro.Tracking.Config,
-     store_dir: Application.get_env(:racing_org_tracker, :tracking_directory),
+     store_dir: Application.get_env(:racing_org_tracker_pro, :tracking_directory),
      on_apply: fn _config ->
        try do
          RacingOrg.Tracker.Pro.Sampling.reconfigure(RacingOrg.Tracker.Pro.Sampling)
@@ -209,7 +209,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
   defp clock_source_config_child do
     {RacingOrg.Tracker.Pro.ClockSource.Config,
      name: RacingOrg.Tracker.Pro.ClockSource.Config,
-     store_dir: Application.get_env(:racing_org_tracker, :clock_source_directory)}
+     store_dir: Application.get_env(:racing_org_tracker_pro, :clock_source_directory)}
   end
 
   # Sensor-calibration state (server-pushed "set_calibration" policy + on-device
@@ -221,7 +221,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
   defp calibration_config_child do
     {RacingOrg.Tracker.Pro.Calibration.Config,
      name: RacingOrg.Tracker.Pro.Calibration.Config,
-     store_dir: Application.get_env(:racing_org_tracker, :calibration_directory)}
+     store_dir: Application.get_env(:racing_org_tracker_pro, :calibration_directory)}
   end
 
   # The auto-calibration Observer: harvests steady legs / tack pairs / reciprocal
@@ -231,13 +231,13 @@ defmodule RacingOrg.Tracker.Pro.Application do
   defp calibration_observer_child do
     {RacingOrg.Tracker.Pro.Calibration.Observer,
      name: RacingOrg.Tracker.Pro.Calibration.Observer,
-     dir: Application.get_env(:racing_org_tracker, :calibration_directory)}
+     dir: Application.get_env(:racing_org_tracker_pro, :calibration_directory)}
   end
 
   defp compute_engine_child do
     {RacingOrg.Tracker.Pro.Compute.Engine,
      name: RacingOrg.Tracker.Pro.Compute.Engine,
-     store_dir: Application.get_env(:racing_org_tracker, :computed_values_directory),
+     store_dir: Application.get_env(:racing_org_tracker_pro, :computed_values_directory),
      calibration: RacingOrg.Tracker.Pro.Calibration.Config}
   end
 
@@ -250,7 +250,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
   defp wind_shift_config_child do
     {RacingOrg.Tracker.Pro.WindShift.Config,
      name: RacingOrg.Tracker.Pro.WindShift.Config,
-     store_dir: Application.get_env(:racing_org_tracker, :wind_shift_directory)}
+     store_dir: Application.get_env(:racing_org_tracker_pro, :wind_shift_directory)}
   end
 
   # The wind-shift predictor Observer: on its own ~1 Hz timer it samples the
@@ -263,7 +263,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
   defp wind_shift_observer_child do
     {RacingOrg.Tracker.Pro.WindShift.Observer,
      name: RacingOrg.Tracker.Pro.WindShift.Observer,
-     dir: Application.get_env(:racing_org_tracker, :wind_shift_directory),
+     dir: Application.get_env(:racing_org_tracker_pro, :wind_shift_directory),
      boat_identifier: RacingOrg.Tracker.Pro.boat_identifier()}
   end
 
@@ -279,7 +279,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
   defp polar_observer_child do
     {RacingOrg.Tracker.Pro.Polar.Observer,
      name: RacingOrg.Tracker.Pro.Polar.Observer,
-     dir: Application.get_env(:racing_org_tracker, :polar_directory),
+     dir: Application.get_env(:racing_org_tracker_pro, :polar_directory),
      boat_identifier: RacingOrg.Tracker.Pro.boat_identifier()}
   end
 
@@ -287,7 +287,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
   defp archive_child do
     {RacingOrg.Tracker.Pro.Race.Archive,
      name: RacingOrg.Tracker.Pro.Race.Archive,
-     base_dir: Application.get_env(:racing_org_tracker, :race_archive_directory),
+     base_dir: Application.get_env(:racing_org_tracker_pro, :race_archive_directory),
      sampling: RacingOrg.Tracker.Pro.Sampling,
      device_id: RacingOrg.Tracker.Pro.boat_identifier()}
   end
@@ -317,7 +317,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
   # AFTER Commands + Sampling + Tracking.Config (it subscribes to / reads them in init).
 
   defp product do
-    case Application.get_env(:racing_org_tracker, :product) do
+    case Application.get_env(:racing_org_tracker_pro, :product) do
       "logger" ->
         :logger
 
@@ -336,14 +336,14 @@ defmodule RacingOrg.Tracker.Pro.Application do
   end
 
   defp target do
-    Application.get_env(:racing_org_tracker, :target)
+    Application.get_env(:racing_org_tracker_pro, :target)
   end
 
   # Get the filtering configuration / settings for NMEA data being
   # set to the cloud.
   # FUTURETODO: Load the current fitters from disk
   defp emit_telemetry_config do
-    (Application.get_env(:racing_org_tracker, :data_filtering) || [])
+    (Application.get_env(:racing_org_tracker_pro, :data_filtering) || [])
     |> Keyword.put(:clock_source, RacingOrg.Tracker.Pro.ClockSource.Config)
   end
 
@@ -378,18 +378,18 @@ defmodule RacingOrg.Tracker.Pro.Application do
   end
 
   defp serial_config do
-    Application.get_env(:racing_org_tracker, RacingOrg.Tracker.Pro.Serial, [])
+    Application.get_env(:racing_org_tracker_pro, RacingOrg.Tracker.Pro.Serial, [])
   end
 
   defp udp_config do
-    endpoint = Application.get_env(:racing_org_tracker, :udp_endpoint, "localhost:4001")
+    endpoint = Application.get_env(:racing_org_tracker_pro, :udp_endpoint, "localhost:4001")
     [hostname, port] = String.split(endpoint, ":")
 
     [hostname: hostname, port: String.to_integer(port)]
   end
 
   def maybe_replay_log do
-    if filename = Application.get_env(:racing_org_tracker, :replay_log) do
+    if filename = Application.get_env(:racing_org_tracker_pro, :replay_log) do
       RacingOrg.Tracker.Pro.DeviceCLI.replay_log(filename, realtime?: true)
     end
   end

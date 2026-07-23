@@ -1033,7 +1033,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   end
 
   defp derive_from_api_endpoint do
-    case Application.get_env(:racing_org_tracker, :api_endpoint) do
+    case Application.get_env(:racing_org_tracker_pro, :api_endpoint) do
       endpoint when is_binary(endpoint) and endpoint != "" ->
         uri = URI.parse(endpoint)
         scheme = if uri.scheme in ["https", "wss"], do: "wss", else: "ws"
@@ -1102,7 +1102,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   defp auto_connect?(opts), do: Keyword.get_lazy(opts, :auto_connect?, fn -> connectable?(opts) end)
 
   defp device_target? do
-    case Application.get_env(:racing_org_tracker, :target) do
+    case Application.get_env(:racing_org_tracker_pro, :target) do
       nil -> false
       :host -> false
       :"" -> false

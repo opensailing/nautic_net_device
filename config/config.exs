@@ -18,7 +18,7 @@ target =
     Mix.target()
   end
 
-config :racing_org_tracker,
+config :racing_org_tracker_pro,
   target: target,
   api_endpoint: System.fetch_env!("API_ENDPOINT"),
   udp_endpoint: System.fetch_env!("UDP_ENDPOINT"),
@@ -55,14 +55,14 @@ config :racing_org_tracker,
 #       needs (no out-of-band claim token / nonce anymore — registration is tokenless
 #       and an admin associates the device to an account after it registers). It is
 #       the SINGLE enable for the secure-transport children.
-config :racing_org_tracker, RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity,
+config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity,
   public_key: System.get_env("SECURE_TRANSPORT_SERVER_PUBLIC_KEY")
 
 # Data upload filter modes:
 # :permissive - Allow data to be uploaded by any sensor for a data type
 # :strict - Only allow data to be uploaded if a sensor is selected -- via a filter -- for the data type
 # FUTURETODO: This should probably move to a runtime configuration value
-config :racing_org_tracker, :data_filtering, filter_mode: :permissive
+config :racing_org_tracker_pro, :data_filtering, filter_mode: :permissive
 
 # Customize non-Elixir parts of the firmware. See
 # https://hexdocs.pm/nerves/advanced-configuration.html for details.

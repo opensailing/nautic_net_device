@@ -9,7 +9,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.KATVectors do
   This module decodes the hex fields into binaries for the KAT test suite (OTP 28).
   """
 
-  @path Application.app_dir(:racing_org_tracker, "priv/secure_transport/kat_vectors.json")
+  @path Application.app_dir(:racing_org_tracker_pro, "priv/secure_transport/kat_vectors.json")
   @external_resource @path
 
   @doc "Path to the on-disk KAT JSON file."

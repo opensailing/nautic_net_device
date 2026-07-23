@@ -38,7 +38,7 @@ mix firmware && mix upload nerves.local
 If you need to work on the `racing_org_*` libraries locally, you can specify `RACING_ORG_DEPS_PATH='..'` and set up the
 dependencies as sibling directories to this repo.
 
-    racing_org_tracker/         <-- you are here
+    racing_org_tracker_pro/         <-- you are here
     racing_org_tracker_protobuf/
     racing_org_system_rpi3/
     nmea/

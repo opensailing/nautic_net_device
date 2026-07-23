@@ -14,7 +14,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity do
 
   The pinned public key is read at runtime from application env:
 
-      config :racing_org_tracker, #{inspect(__MODULE__)},
+      config :racing_org_tracker_pro, #{inspect(__MODULE__)},
         public_key: System.get_env("SECURE_TRANSPORT_SERVER_PUBLIC_KEY")
 
   The value is accepted as either a raw 32-byte binary or a 64-character hex string
@@ -38,7 +38,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity do
   server must never be silently trusted.
   """
 
-  @app :racing_org_tracker
+  @app :racing_org_tracker_pro
   @ed25519_pub_size 32
 
   @doc """
@@ -76,7 +76,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity do
         firmware-pinned Ed25519 public key. Set it to the SERVER's real public key
         at provisioning/reflash time (job-6):
 
-            config :racing_org_tracker, #{inspect(__MODULE__)},
+            config :racing_org_tracker_pro, #{inspect(__MODULE__)},
               public_key: System.get_env("SECURE_TRANSPORT_SERVER_PUBLIC_KEY")
 
         The value is 32 bytes, supplied as raw bytes or a 64-char hex string.

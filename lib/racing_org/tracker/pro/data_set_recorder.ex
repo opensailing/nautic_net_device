@@ -121,7 +121,7 @@ defmodule RacingOrg.Tracker.Pro.DataSetRecorder do
       :ok = File.mkdir_p!(tmp_dir)
       tmp_dir
     else
-      dir = Application.get_env(:racing_org_tracker, :data_set_directory, Path.join(System.tmp_dir!(), "datasets"))
+      dir = Application.get_env(:racing_org_tracker_pro, :data_set_directory, Path.join(System.tmp_dir!(), "datasets"))
       :ok = File.mkdir_p!(dir)
       dir
     end
