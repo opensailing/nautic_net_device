@@ -2,7 +2,8 @@ defmodule RacingOrg.Tracker.Pro.Device.MixProject do
   use Mix.Project
 
   @app :racing_org_tracker
-  @version "0.5.0"
+  # 0.7.0: first 64-bit (aarch64) firmware — racing_org_system_rpi3 v3.0.0
+  @version "0.7.0"
   @all_device_targets [:racing_org_rpi3]
 
   def project do

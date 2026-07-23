@@ -4,19 +4,20 @@ This is the parent/main repository for the "keelboat" tracker (aka "logger"). Th
 
 __TODO:__ This repository used to support 2 products and is now designed only to support the keelboat variant. There is still cruft in here surrounding the "upload" variant that needs to be removed to be more hygenic.
 
-__When this library is used in a project it must be compiled on a Linux machine (physical or VM). This is due to the dependency on the linux kernel header files required to compile the CAN C driver. See the Development section of this document for further information.__
+Firmware is 64-bit (AArch64): the target system (`racing_org_system_rpi3` v3.0.0+)
+runs the Pi 3's Cortex-A53 in 64-bit mode, which enables the Erlang/OTP JIT. The
+system is consumed as a PREBUILT artifact from its GitHub release, and the
+`aarch64-nerves-linux-gnu` cross toolchain ships macOS builds, so firmware
+builds work directly on macOS (the old "Linux only" requirement is gone —
+`:ng_can` cross-compiles against the Nerves system's kernel headers, not the
+host's).
 
 ## Initial setup
 
-This project requires that compiling is conducted on a Linux machine. This is due to the dependency on the linux kernel header files required to compile the CAN C driver in `:ng_can`.
-
-The step to setup the machine are:
-
-* Install Erlang otp 25
-* Install precompiled Elixir 1.16.1 -- download precompiled and link into path.
-* Install fwup via deb package found in fwup Github repo.
-* Install Nerves (and dependencies).
-* Create directories /Volumes/Nerves/dl and /Volumes/Nerves/artifacts with write permission for your user.
+* Install Erlang/OTP 28 and a matching Elixir (see `.tool-versions` /
+  CI: Elixir 1.19, OTP 28).
+* Install fwup (`brew install fwup` on macOS).
+* Install Nerves bootstrap: `mix archive.install hex nerves_bootstrap`.
 * Copy `.envrc-example` to `.envrc` and modify as needed. Then `direnv allow` to load the environment, answering the prompts.
 
 During development the following are the command you should need:
