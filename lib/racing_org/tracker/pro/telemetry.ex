@@ -7,7 +7,21 @@ defmodule RacingOrg.Tracker.Pro.Telemetry do
 
   alias RacingOrg.Tracker.Pro.DataSetRecorder
   alias RacingOrg.Tracker.Pro.DeviceInfo
+  alias RacingOrg.Tracker.Pro.Upstream
   alias RacingOrg.Tracker.Protobuf
+
+  # DataPoint sample tag -> the server's upstream signal name (the set_upstream
+  # wire contract / the backend's Device.upstream_signals/0). Tags NOT in this map
+  # (:position, :tracker, future sample types) always stream: position is how
+  # tracks and races exist, and device health is not a filterable signal.
+  @sample_tag_to_signal %{
+    heading: :heading,
+    speed: :speed,
+    velocity: :velocity,
+    wind_velocity: :wind,
+    water_depth: :water_depth,
+    attitude: :attitude
+  }
 
   def child_spec(_opts) do
     %{
@@ -49,7 +63,30 @@ defmodule RacingOrg.Tracker.Pro.Telemetry do
   def report_metric(metric_name, device_id, value) do
     metric_name
     |> to_proto_data_points(device_id, value)
+    |> upstream_filtered()
     |> DataSetRecorder.add_data_points()
+  end
+
+  @doc """
+  Drop data points whose sample type the owner switched off upstream (the
+  server-pushed `set_upstream` selection, read per-sample via
+  `RacingOrg.Tracker.Pro.Upstream.Config.stream_signal?/1` — a `:persistent_term`
+  read, free at sample rate). Points whose sample tag is outside the filterable
+  set (position, tracker health) always pass. Public so the mapping is unit-tested
+  without a recorder running.
+  """
+  @spec upstream_filtered([struct()]) :: [struct()]
+  def upstream_filtered(data_points) do
+    Enum.filter(data_points, fn
+      %{sample: {tag, _sample}} ->
+        case Map.fetch(@sample_tag_to_signal, tag) do
+          {:ok, signal} -> Upstream.Config.stream_signal?(signal)
+          :error -> true
+        end
+
+      _point ->
+        true
+    end)
   end
 
   ### Attitude

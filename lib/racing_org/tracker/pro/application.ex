@@ -63,6 +63,9 @@ defmodule RacingOrg.Tracker.Pro.Application do
   defp children(:logger, target) do
     [
       commands_child(),
+      # Upstream signal selection BEFORE Telemetry: Telemetry's report path reads
+      # the published selection per sample (fail-open all-on until this boots).
+      upstream_config_child(),
       RacingOrg.Tracker.Pro.Telemetry,
       tracking_config_child(),
       clock_source_config_child(),
@@ -184,6 +187,18 @@ defmodule RacingOrg.Tracker.Pro.Application do
   # EWMA damping for the active state). Started in EVERY environment so Sampling can
   # read it; cheap + idle with no config (Sampling falls back to safe defaults). Must
   # start BEFORE Sampling.
+  # Upstream signal selection pushed by the server over the WSS channel
+  # ("set_upstream"): WHICH telemetry sample types the tracker streams (position
+  # always streams). Persists to /data (survives reboots) and publishes the
+  # disabled-signal set to :persistent_term for Telemetry's per-sample read.
+  # Started in EVERY environment; cheap + idle with no config (everything streams
+  # until the server pushes a selection). Must start BEFORE Telemetry.
+  defp upstream_config_child do
+    {RacingOrg.Tracker.Pro.Upstream.Config,
+     name: RacingOrg.Tracker.Pro.Upstream.Config,
+     store_dir: Application.get_env(:racing_org_tracker_pro, :upstream_directory)}
+  end
+
   defp tracking_config_child do
     {RacingOrg.Tracker.Pro.Tracking.Config,
      name: RacingOrg.Tracker.Pro.Tracking.Config,

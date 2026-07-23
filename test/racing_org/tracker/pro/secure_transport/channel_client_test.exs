@@ -329,6 +329,96 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     end
   end
 
+  # --- upstream signal selection: set_upstream / upstream_status ---
+
+  describe "set_upstream / upstream_status (SocketTest)" do
+    # A fake Upstream collaborator mirroring the RacingOrg.Tracker.Pro.Upstream.Config
+    # API surface the channel uses: apply_config/2 (records the call) + upstream_status/1.
+    defmodule FakeUpstream do
+      use GenServer
+
+      def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+      @impl true
+      def init(opts) do
+        {:ok,
+         %{
+           parent: Keyword.fetch!(opts, :parent),
+           status: Keyword.get(opts, :status, %{applied_version: 0}),
+           apply_result: Keyword.get(opts, :apply_result, {:ok, %{version: 0}})
+         }}
+      end
+
+      def apply_config(server, config), do: GenServer.call(server, {:apply_config, config})
+      def upstream_status(server), do: GenServer.call(server, :upstream_status)
+
+      @impl true
+      def handle_call({:apply_config, config}, _from, state) do
+        send(state.parent, {:apply_upstream_called, config})
+        {:reply, state.apply_result, state}
+      end
+
+      def handle_call(:upstream_status, _from, state), do: {:reply, state.status, state}
+    end
+
+    defp connect_upstream_client(ctx, upstream_opts) do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      {:ok, upstream} = start_supervised({FakeUpstream, [parent: self()] ++ upstream_opts})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           upstream: {FakeUpstream, upstream},
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      {client, topic, upstream}
+    end
+
+    test "server set_upstream → apply_config called + upstream_status pushed", ctx do
+      {client, topic, _upstream} =
+        connect_upstream_client(ctx, apply_result: {:ok, %{version: 2}}, status: %{applied_version: 2})
+
+      push(client, topic, "set_upstream", %{
+        "version" => 2,
+        "signals" => %{
+          "heading" => true,
+          "speed" => true,
+          "velocity" => true,
+          "wind" => false,
+          "water_depth" => true,
+          "attitude" => false
+        }
+      })
+
+      assert_receive {:apply_upstream_called, config}
+      assert config["version"] == 2
+      assert config["signals"]["wind"] == false
+
+      assert_push(^topic, "upstream_status", status)
+      assert status.applied_version == 2
+      assert is_binary(status.reported_at)
+    end
+
+    test "an apply error still reports the current status (server never left stale)", ctx do
+      {client, topic, _upstream} =
+        connect_upstream_client(ctx, apply_result: {:error, :bad_payload}, status: %{applied_version: 1})
+
+      push(client, topic, "set_upstream", %{"version" => "garbage"})
+
+      assert_receive {:apply_upstream_called, _config}
+      assert_push(^topic, "upstream_status", status)
+      assert status.applied_version == 1
+    end
+  end
+
   # --- per-state tracking config (Phase 5): set_tracking / tracking_status ---
 
   describe "set_tracking / tracking_status (SocketTest)" do

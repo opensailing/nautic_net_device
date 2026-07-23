@@ -11,6 +11,12 @@ config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.CAN, false
 config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.Discovery, false
 config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.Serial, false
 
+# Upstream signal selection: never write to the target's /data path under test.
+# Tests pass explicit per-test temp store dirs; this is a defensive default for
+# the application-supervised instance on a CI/host machine.
+config :racing_org_tracker_pro,
+  upstream_directory: Path.join(System.tmp_dir!(), "racing_org_tracker_upstream_test")
+
 # Device-identity key store: never write to the target's /data path under test.
 # Tests pass an explicit per-test temp `:base_path`; this is a defensive default
 # so an unparameterized call cannot touch /data on a CI/host machine.
