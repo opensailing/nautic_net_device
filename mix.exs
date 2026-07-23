@@ -1,7 +1,7 @@
 defmodule RacingOrg.Tracker.Pro.Device.MixProject do
   use Mix.Project
 
-  @app :racing_org_tracker
+  @app :racing_org_tracker_pro
   # 0.7.0: first 64-bit (aarch64) firmware — racing_org_system_rpi3 v3.0.0
   @version "0.7.0"
   @all_device_targets [:racing_org_rpi3]
@@ -13,7 +13,7 @@ defmodule RacingOrg.Tracker.Pro.Device.MixProject do
       # `meta-product`, and NervesHub matches uploads against a Product of that exact
       # name. The OTP app stays `:racing_org_tracker`; only the firmware product label
       # changes. Must match the NervesHub Product name exactly.
-      name: "racing-org",
+      name: "tracker-pro",
       version: @version,
       elixir: "~> 1.17",
       archives: [nerves_bootstrap: "~> 1.13"],
