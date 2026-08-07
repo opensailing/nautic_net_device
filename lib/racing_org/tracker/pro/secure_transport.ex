@@ -59,6 +59,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport do
   @purpose_external_min 0x80
   # A SECOND consumer (e.g. a bulk HTTPS download key). Moved into the external range.
   @purpose_https_bulk 0x80
+  # Desired-state-only control_v1 AEAD envelope. This remains independent from both
+  # session data and HTTPS bulk counters/replay state.
+  @purpose_control_v1 0x81
 
   @dir_device_to_server 0x01
   @dir_server_to_device 0x02
@@ -101,6 +104,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport do
 
   def purpose_session, do: @purpose_session
   def purpose_https_bulk, do: @purpose_https_bulk
+  def purpose_control_v1, do: @purpose_control_v1
   def purpose_session_id, do: @purpose_session_id
   def purpose_external_min, do: @purpose_external_min
 
