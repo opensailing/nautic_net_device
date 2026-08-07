@@ -40,17 +40,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelHandler do
   @typedoc "Everything the handshake needs from the device's key material."
   @type handshake_inputs ::
           %{
-            device_identity: IdentityProvider.t(),
-            server_identity_public: binary(),
-            device_id: binary(),
-            epoch: non_neg_integer()
+            required(:device_identity) => IdentityProvider.t(),
+            required(:server_identity_public) => binary(),
+            required(:device_id) => binary(),
+            optional(:epoch) => non_neg_integer(),
+            optional(:credential_epoch) => non_neg_integer()
           }
           | %{
-              device_identity_private: binary(),
-              device_identity_public: binary(),
-              server_identity_public: binary(),
-              device_id: binary(),
-              epoch: non_neg_integer()
+              required(:device_identity_private) => binary(),
+              required(:device_identity_public) => binary(),
+              required(:server_identity_public) => binary(),
+              required(:device_id) => binary(),
+              optional(:epoch) => non_neg_integer(),
+              optional(:credential_epoch) => non_neg_integer()
             }
 
   @doc "The ack-format version the device emits (matches the server's `@ack_format_version`)."
@@ -63,7 +65,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelHandler do
   Consume the server `"handshake_hello"` payload and produce the device INIT.
 
   `hello_payload` is the raw channel payload map, e.g. `%{"hello" => base64}`.
-  `inputs` is a `t:handshake_inputs/0` (epoch defaults to 0 when absent).
+  `inputs` is a `t:handshake_inputs/0`. When `:epoch` is omitted, the signed
+  HELLO epoch is adopted; `:credential_epoch`, when present, is the downgrade floor.
 
   Returns `{:ok, init_payload, session}` where `init_payload` is the
   `%{"init" => base64}` map to push, or `{:error, reason}` (bad base64, missing
@@ -105,9 +108,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelHandler do
     opts = [
       server_identity_public: inputs.server_identity_public,
       device_id: inputs.device_id,
-      epoch: Map.get(inputs, :epoch, 0),
       timestamp_ms: System.system_time(:millisecond)
     ]
+
+    opts = maybe_put_opt(opts, inputs, :epoch)
+    opts = maybe_put_opt(opts, inputs, :credential_epoch)
 
     identity_opts =
       case Map.get(inputs, :device_identity) do
@@ -201,6 +206,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelHandler do
   end
 
   # --- shared helpers ---
+
+  defp maybe_put_opt(opts, inputs, key) do
+    case Map.fetch(inputs, key) do
+      {:ok, value} -> Keyword.put(opts, key, value)
+      :error -> opts
+    end
+  end
 
   defp fetch_field(payload, key) when is_map(payload) do
     case payload do

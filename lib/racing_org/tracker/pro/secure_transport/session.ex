@@ -35,6 +35,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Session do
     :role,
     :session_id,
     :epoch,
+    :credential_epoch,
+    :generation,
     :out_key,
     :in_key,
     :transcript_hash,
@@ -54,6 +56,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Session do
           role: role(),
           session_id: binary(),
           epoch: non_neg_integer(),
+          credential_epoch: non_neg_integer(),
+          generation: non_neg_integer() | nil,
           out_key: binary(),
           in_key: binary(),
           transcript_hash: binary() | nil,
@@ -67,6 +71,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Session do
   @doc "Build a session, initializing the inbound replay window."
   @spec new(keyword()) :: t()
   def new(fields) do
+    fields = Keyword.put_new(fields, :credential_epoch, Keyword.fetch!(fields, :epoch))
+
     struct!(__MODULE__, fields)
     |> Map.update!(:replay_window, fn
       nil -> ReplayWindow.new()

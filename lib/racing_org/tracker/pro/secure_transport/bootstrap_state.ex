@@ -45,10 +45,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapState do
   ]
   @allowed_reasons @remote_reasons ++ @local_reasons
 
-  @derive {Inspect, only: [:phase, :blocked_reason, :retry_count, :legacy_marker]}
+  @max_credential_epoch 0xFFFF_FFFF
+
+  @derive {Inspect, only: [:phase, :blocked_reason, :retry_count, :legacy_marker, :verified_credential_epoch]}
   defstruct phase: :uninitialized,
             hardware_identity_digest: nil,
             authority: nil,
+            verified_credential_epoch: nil,
             previous_authority: nil,
             recovery: nil,
             blocked_reason: nil,
@@ -72,6 +75,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapState do
           phase: phase(),
           hardware_identity_digest: binary() | nil,
           authority: map() | nil,
+          verified_credential_epoch: non_neg_integer() | nil,
           previous_authority: map() | nil,
           recovery: map() | nil,
           blocked_reason: atom() | nil,
@@ -92,12 +96,29 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapState do
   @spec allowed_reasons() :: [atom()]
   def allowed_reasons, do: @allowed_reasons
 
+  @doc "Return the monotonic credential epoch authorized by the receipt/session high-water mark."
+  @spec credential_epoch(t()) :: {:ok, non_neg_integer()} | {:error, :no_verified_authority}
+  def credential_epoch(%__MODULE__{authority: %{credential_epoch: authority_epoch}} = state)
+      when is_integer(authority_epoch) and authority_epoch >= 0 and authority_epoch <= @max_credential_epoch do
+    verified_epoch = Map.get(state, :verified_credential_epoch)
+
+    if is_integer(verified_epoch) and verified_epoch >= authority_epoch and
+         verified_epoch <= @max_credential_epoch do
+      {:ok, verified_epoch}
+    else
+      {:ok, authority_epoch}
+    end
+  end
+
+  def credential_epoch(%__MODULE__{}), do: {:error, :no_verified_authority}
+
   @doc "Structural validation used at the storage trust boundary."
   @spec valid?(term()) :: boolean()
   def valid?(%__MODULE__{} = state) do
     state.phase in @phases and
       optional_fixed_binary?(state.hardware_identity_digest, 32) and
       valid_authority?(state.authority) and
+      valid_verified_credential_epoch?(state) and
       valid_authority?(state.previous_authority) and
       valid_recovery?(state.recovery) and
       valid_reason?(state.blocked_reason) and
@@ -107,6 +128,22 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapState do
   end
 
   def valid?(_state), do: false
+
+  defp valid_verified_credential_epoch?(state) do
+    case Map.get(state, :verified_credential_epoch) do
+      nil ->
+        true
+
+      epoch when is_integer(epoch) and epoch >= 0 and epoch <= @max_credential_epoch ->
+        case state.authority do
+          %{credential_epoch: authority_epoch} when is_integer(authority_epoch) and epoch >= authority_epoch -> true
+          _other -> false
+        end
+
+      _other ->
+        false
+    end
+  end
 
   defp valid_authority?(nil), do: true
 

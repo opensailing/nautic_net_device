@@ -50,13 +50,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelHandlerTest do
   end
 
   # The "server" side, using the device's own crypto as the responder.
-  defp server_hello(ctx) do
+  defp server_hello(ctx, epoch \\ 0) do
     {:ok, hello_wire, rstate} =
       Handshake.responder_hello(
         server_identity_private: ctx.srv_priv,
         server_identity_public: ctx.srv_pub,
         device_identity_public: ctx.dev_pub,
-        epoch: 0
+        epoch: epoch
       )
 
     {%{"hello" => Base.encode64(hello_wire)}, rstate}
@@ -91,6 +91,53 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelHandlerTest do
       # The server mirrors whatever device_id we sent; finalize must still succeed
       # AND the session must match, proving the device_id bytes agreed.
       assert {:ok, _server_session} = Handshake.responder_finalize(rstate, init_wire)
+    end
+
+    test "verifies the signed HELLO, adopts its epoch, and signs INIT with that exact epoch", ctx do
+      {hello_payload, rstate} = server_hello(ctx, 4)
+
+      inputs =
+        ctx.inputs
+        |> Map.delete(:epoch)
+        |> Map.put(:credential_epoch, 3)
+
+      assert {:ok, %{"init" => init_b64}, device_session} =
+               ChannelHandler.handshake_init(hello_payload, inputs)
+
+      assert device_session.epoch == 4
+      assert device_session.credential_epoch == 4
+
+      {:ok, init_wire} = Base.decode64(init_b64)
+      assert {:ok, server_session} = Handshake.responder_finalize(rstate, init_wire)
+      assert server_session.epoch == 4
+    end
+
+    test "rejects a signed HELLO below the durable credential epoch", ctx do
+      {hello_payload, _rstate} = server_hello(ctx, 3)
+
+      inputs =
+        ctx.inputs
+        |> Map.delete(:epoch)
+        |> Map.put(:credential_epoch, 4)
+
+      assert {:error, :epoch_downgrade} =
+               ChannelHandler.handshake_init(hello_payload, inputs)
+    end
+
+    test "rejects a bad server signature before considering epoch adoption or downgrade", ctx do
+      {hello_payload, _rstate} = server_hello(ctx, 3)
+      {:ok, hello_wire} = Base.decode64(hello_payload["hello"])
+      prefix_size = byte_size(hello_wire) - 1
+      <<prefix::binary-size(prefix_size), last>> = hello_wire
+      tampered = prefix <> <<Bitwise.bxor(last, 1)>>
+
+      inputs =
+        ctx.inputs
+        |> Map.delete(:epoch)
+        |> Map.put(:credential_epoch, 4)
+
+      assert {:error, :bad_server_signature} =
+               ChannelHandler.handshake_init(%{"hello" => Base.encode64(tampered)}, inputs)
     end
 
     test "rejects a HELLO signed by the WRONG server key (pin mismatch)", ctx do

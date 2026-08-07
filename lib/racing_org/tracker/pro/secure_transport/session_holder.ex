@@ -61,13 +61,20 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   alias RacingOrg.Tracker.Pro.SecureTransport.Session
 
+  @type generation :: non_neg_integer()
+
   @type counter_grant :: %{
           session_id: binary(),
           out_key: binary(),
           epoch: non_neg_integer(),
+          credential_epoch: non_neg_integer(),
+          generation: generation(),
           counter: non_neg_integer(),
           role: Session.role()
         }
+
+  @type session_error :: :no_session | :stale_session
+  @type publication_error :: :stale_session | :epoch_downgrade | :session_reused
 
   # --- Client API ---
 
@@ -81,16 +88,65 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   Publish the current live session, replacing any previous one. The counter base
   is taken from the session's own `send_counter` (normally 0 for a fresh
   handshake).
+
+  This compatibility API discards the holder-assigned generation. New session
+  owners should use `publish/2` or fenced `publish/3` and retain the returned
+  session.
   """
-  @spec put(GenServer.server(), Session.t()) :: :ok
+  @spec put(GenServer.server(), Session.t()) ::
+          :ok | {:error, :epoch_downgrade | :session_reused}
   def put(server \\ __MODULE__, %Session{} = session) do
-    GenServer.call(server, {:put, session})
+    case publish(server, session) do
+      {:ok, %Session{}} -> :ok
+      {:error, reason} = error when reason in [:epoch_downgrade, :session_reused] -> error
+    end
   end
 
-  @doc "Drop the current session (no live session afterwards). Idempotent."
+  @doc "Publish a replacement session and return it with its new monotonic generation."
+  @spec publish(GenServer.server(), Session.t()) ::
+          {:ok, Session.t()} | {:error, :epoch_downgrade | :session_reused}
+  def publish(server \\ __MODULE__, %Session{} = session) do
+    GenServer.call(server, {:publish, session, :any})
+  end
+
+  @doc "Publish only if `expected_generation` is still the holder's current fence."
+  @spec publish(GenServer.server(), Session.t(), generation()) ::
+          {:ok, Session.t()} | {:error, publication_error()}
+  def publish(server, %Session{} = session, expected_generation)
+      when is_integer(expected_generation) and expected_generation >= 0 do
+    GenServer.call(server, {:publish, session, expected_generation})
+  end
+
+  @doc "Return the current monotonic generation fence, including while no session is live."
+  @spec generation(GenServer.server()) :: generation()
+  def generation(server \\ __MODULE__), do: GenServer.call(server, :generation)
+
+  @doc """
+  Return a publication fence for an authenticated credential epoch.
+
+  A higher epoch is retained as a high-water mark, atomically clears any live
+  lower-epoch session, and advances the generation even while idle. An equal
+  epoch reuses the current generation; a lower requested epoch is rejected.
+  """
+  @spec fence_for_credential_epoch(GenServer.server(), non_neg_integer()) ::
+          {:ok, generation(), :current | :evicted} | {:error, :epoch_downgrade}
+  def fence_for_credential_epoch(server \\ __MODULE__, credential_epoch)
+      when is_integer(credential_epoch) and credential_epoch >= 0 and
+             credential_epoch <= 0xFFFF_FFFF do
+    GenServer.call(server, {:fence_for_credential_epoch, credential_epoch})
+  end
+
+  @doc "Drop the current session and advance the generation fence."
   @spec clear(GenServer.server()) :: :ok
   def clear(server \\ __MODULE__) do
-    GenServer.call(server, :clear)
+    GenServer.call(server, {:clear, :any})
+  end
+
+  @doc "Drop the session only if it is still the expected generation."
+  @spec clear(GenServer.server(), generation()) :: :ok | {:error, :stale_session}
+  def clear(server, expected_generation)
+      when is_integer(expected_generation) and expected_generation >= 0 do
+    GenServer.call(server, {:clear, expected_generation})
   end
 
   @doc """
@@ -122,10 +178,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   @spec take_send_counter(GenServer.server()) ::
           {:ok, counter_grant()} | {:error, :no_session}
   def take_send_counter(server \\ __MODULE__) do
-    case take_send_counters(server, 1) do
-      {:ok, [grant]} -> {:ok, grant}
-      {:error, _} = err -> err
-    end
+    take_one_send_counter(server, :any)
+  end
+
+  @doc "Reserve one counter only if the expected generation is still current."
+  @spec take_send_counter(GenServer.server(), generation()) ::
+          {:ok, counter_grant()} | {:error, session_error()}
+  def take_send_counter(server, expected_generation)
+      when is_integer(expected_generation) and expected_generation >= 0 do
+    take_one_send_counter(server, expected_generation)
   end
 
   @doc """
@@ -135,23 +196,128 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   @spec take_send_counters(GenServer.server(), pos_integer()) ::
           {:ok, [counter_grant()]} | {:error, :no_session}
   def take_send_counters(server \\ __MODULE__, count) when is_integer(count) and count > 0 do
-    GenServer.call(server, {:take_send_counters, count})
+    GenServer.call(server, {:take_send_counters, count, :any})
+  end
+
+  @doc "Reserve a counter block only if the expected generation is still current."
+  @spec take_send_counters(GenServer.server(), pos_integer(), generation()) ::
+          {:ok, [counter_grant()]} | {:error, session_error()}
+  def take_send_counters(server, count, expected_generation)
+      when is_integer(count) and count > 0 and is_integer(expected_generation) and
+             expected_generation >= 0 do
+    GenServer.call(server, {:take_send_counters, count, expected_generation})
+  end
+
+  @doc "Run work against the current session while replacement/clear remains serialized."
+  @spec with_session(GenServer.server(), generation(), (Session.t() -> result)) ::
+          {:ok, result} | {:error, session_error() | :session_callback_failed}
+        when result: term()
+  def with_session(server, expected_generation, fun)
+      when is_integer(expected_generation) and expected_generation >= 0 and is_function(fun, 1) do
+    GenServer.call(server, {:with_session, expected_generation, fun})
+  end
+
+  @doc """
+  Reserve one counter and run `fun` while replacement/clear calls remain serialized
+  behind that send boundary. This prevents a granted old-session key from being
+  used after the holder has moved to another generation.
+  """
+  @spec with_send_counter(GenServer.server(), (counter_grant() -> result)) ::
+          {:ok, result} | {:error, :no_session | :send_failed}
+        when result: term()
+  def with_send_counter(server \\ __MODULE__, fun) when is_function(fun, 1) do
+    GenServer.call(server, {:with_send_counter, :any, fun})
+  end
+
+  @doc "Run fenced send work only if `expected_generation` is still current."
+  @spec with_send_counter(GenServer.server(), generation(), (counter_grant() -> result)) ::
+          {:ok, result} | {:error, session_error() | :send_failed}
+        when result: term()
+  def with_send_counter(server, expected_generation, fun)
+      when is_integer(expected_generation) and expected_generation >= 0 and is_function(fun, 1) do
+    GenServer.call(server, {:with_send_counter, expected_generation, fun})
+  end
+
+  defp take_one_send_counter(server, expected_generation) do
+    case GenServer.call(server, {:take_send_counters, 1, expected_generation}) do
+      {:ok, [grant]} -> {:ok, grant}
+      {:error, _} = error -> error
+    end
   end
 
   # --- Server ---
 
   @impl true
   def init(_opts) do
-    {:ok, %{session: nil}}
+    {:ok, %{session: nil, generation: 0, credential_epoch: nil}}
   end
 
   @impl true
-  def handle_call({:put, session}, _from, state) do
-    {:reply, :ok, %{state | session: session}}
+  def handle_call({:publish, session, expected_generation}, _from, state) do
+    with :ok <- check_generation(state, expected_generation),
+         :ok <- check_credential_epoch(state, session.credential_epoch),
+         :ok <- check_fresh_session(state, session) do
+      generation = state.generation + 1
+      published = %{session | generation: generation}
+
+      {:reply, {:ok, published},
+       %{
+         state
+         | session: published,
+           generation: generation,
+           credential_epoch: session.credential_epoch
+       }}
+    else
+      {:error, reason} = error when reason in [:stale_session, :epoch_downgrade, :session_reused] ->
+        {:reply, error, state}
+    end
   end
 
-  def handle_call(:clear, _from, state) do
-    {:reply, :ok, %{state | session: nil}}
+  def handle_call(:generation, _from, state) do
+    {:reply, state.generation, state}
+  end
+
+  def handle_call(
+        {:fence_for_credential_epoch, credential_epoch},
+        _from,
+        %{credential_epoch: nil} = state
+      ) do
+    {:reply, {:ok, state.generation, :current}, %{state | credential_epoch: credential_epoch}}
+  end
+
+  def handle_call(
+        {:fence_for_credential_epoch, credential_epoch},
+        _from,
+        %{credential_epoch: credential_epoch} = state
+      ) do
+    {:reply, {:ok, state.generation, :current}, state}
+  end
+
+  def handle_call(
+        {:fence_for_credential_epoch, credential_epoch},
+        _from,
+        %{credential_epoch: current_epoch} = state
+      )
+      when current_epoch < credential_epoch do
+    generation = state.generation + 1
+
+    {:reply, {:ok, generation, :evicted},
+     %{state | session: nil, generation: generation, credential_epoch: credential_epoch}}
+  end
+
+  def handle_call({:fence_for_credential_epoch, _credential_epoch}, _from, state) do
+    {:reply, {:error, :epoch_downgrade}, state}
+  end
+
+  def handle_call({:clear, expected_generation}, _from, state) do
+    case check_generation(state, expected_generation) do
+      :ok ->
+        generation = state.generation + 1
+        {:reply, :ok, %{state | session: nil, generation: generation}}
+
+      {:error, :stale_session} = error ->
+        {:reply, error, state}
+    end
   end
 
   def handle_call(:get_current_session, _from, %{session: nil} = state) do
@@ -166,25 +332,88 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     {:reply, not is_nil(state.session), state}
   end
 
-  def handle_call({:take_send_counters, _count}, _from, %{session: nil} = state) do
-    {:reply, {:error, :no_session}, state}
+  def handle_call({:take_send_counters, count, expected_generation}, _from, state) do
+    case reserve_counters(state, count, expected_generation) do
+      {:ok, grants, next_state} -> {:reply, {:ok, grants}, next_state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
-  def handle_call({:take_send_counters, count}, _from, %{session: %Session{} = session} = state) do
-    start = session.send_counter
+  def handle_call({:with_session, expected_generation, fun}, _from, state) do
+    with :ok <- check_generation(state, expected_generation),
+         %Session{} = session <- state.session do
+      {:reply, invoke_callback(fun, session, :session_callback_failed), state}
+    else
+      nil -> {:reply, {:error, :no_session}, state}
+      {:error, :stale_session} = error -> {:reply, error, state}
+    end
+  end
 
-    grants =
-      for counter <- start..(start + count - 1)//1 do
-        %{
-          session_id: session.session_id,
-          out_key: session.out_key,
-          epoch: session.epoch,
-          counter: counter,
-          role: session.role
-        }
-      end
+  def handle_call({:with_send_counter, expected_generation, fun}, _from, state) do
+    case reserve_counters(state, 1, expected_generation) do
+      {:ok, [grant], next_state} ->
+        {:reply, invoke_callback(fun, grant, :send_failed), next_state}
 
-    session = %{session | send_counter: start + count}
-    {:reply, {:ok, grants}, %{state | session: session}}
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  defp reserve_counters(state, count, expected_generation) do
+    with :ok <- check_generation(state, expected_generation),
+         %Session{} = session <- state.session do
+      start = session.send_counter
+
+      grants =
+        for counter <- start..(start + count - 1)//1 do
+          %{
+            session_id: session.session_id,
+            out_key: session.out_key,
+            epoch: session.epoch,
+            credential_epoch: session.credential_epoch,
+            generation: state.generation,
+            counter: counter,
+            role: session.role
+          }
+        end
+
+      session = %{session | send_counter: start + count}
+      {:ok, grants, %{state | session: session}}
+    else
+      nil -> {:error, :no_session}
+      {:error, :stale_session} = error -> error
+    end
+  end
+
+  defp check_generation(_state, :any), do: :ok
+
+  defp check_generation(%{generation: generation}, generation), do: :ok
+  defp check_generation(_state, _expected_generation), do: {:error, :stale_session}
+
+  # Reinstalling the same cryptographic session would reset its holder-owned
+  # counter and reuse AEAD nonces under the same key. A replacement handshake
+  # must always derive a distinct session_id.
+  defp check_fresh_session(
+         %{session: %Session{session_id: session_id}},
+         %Session{session_id: session_id}
+       ),
+       do: {:error, :session_reused}
+
+  defp check_fresh_session(_state, _session), do: :ok
+
+  defp check_credential_epoch(%{credential_epoch: nil}, _credential_epoch), do: :ok
+
+  defp check_credential_epoch(%{credential_epoch: current_epoch}, credential_epoch)
+       when current_epoch <= credential_epoch,
+       do: :ok
+
+  defp check_credential_epoch(_state, _credential_epoch), do: {:error, :epoch_downgrade}
+
+  defp invoke_callback(fun, value, failure_reason) do
+    {:ok, fun.(value)}
+  rescue
+    _exception -> {:error, failure_reason}
+  catch
+    _kind, _reason -> {:error, failure_reason}
   end
 end

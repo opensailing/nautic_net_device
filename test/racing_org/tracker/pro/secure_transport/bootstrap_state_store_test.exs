@@ -137,6 +137,36 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateStoreTest do
     assert loaded.previous_authority.receipt === registration_receipt
   end
 
+  test "loads a version-1 state written before the verified epoch high-water field existed", %{base: base} do
+    authority = %{
+      kind: :registration,
+      public_key: bytes(0x11, 32),
+      client_nonce: bytes(0x22, 32),
+      receipt: <<1, 2, 3>>,
+      logical_device_id: bytes(0x33, 16),
+      credential_epoch: 0
+    }
+
+    old_shape =
+      %BootstrapState{phase: :registered, authority: authority}
+      |> Map.from_struct()
+      |> Map.delete(:verified_credential_epoch)
+      |> Map.put(:__struct__, BootstrapState)
+
+    File.mkdir_p!(base)
+
+    File.write!(
+      BootstrapStateStore.path(base_path: base),
+      :erlang.term_to_binary({1, old_shape})
+    )
+
+    assert {:ok, loaded} = BootstrapStateStore.load(base_path: base)
+    assert loaded.phase == :registered
+    assert loaded.authority == authority
+    assert loaded.verified_credential_epoch == nil
+    assert {:ok, 0} = BootstrapState.credential_epoch(loaded)
+  end
+
   test "uses restrictive creation, file fsync, atomic rename, and directory fsync", %{base: base} do
     TracingFileSystem.attach(self())
     path = BootstrapStateStore.path(base_path: base)

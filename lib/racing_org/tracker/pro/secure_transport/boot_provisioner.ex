@@ -22,6 +22,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner do
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachine
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateStore
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
+  alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
 
   @default_retry_ms 10_000
   @max_retry_ms 60_000
@@ -117,6 +118,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner do
     end
   end
 
+  @doc "Return the verified durable/session credential epoch used as the handshake downgrade floor."
+  @spec credential_epoch(server()) :: {:ok, non_neg_integer()} | {:error, :no_verified_authority}
+  def credential_epoch(server \\ __MODULE__), do: GenServer.call(server, :credential_epoch)
+
+  @doc "Persist a signed-HELLO credential epoch as a monotonic high-water mark."
+  @spec adopt_credential_epoch(non_neg_integer(), server()) ::
+          {:ok, BootstrapState.t()} | {:error, atom()}
+  def adopt_credential_epoch(epoch, server \\ __MODULE__),
+    do: GenServer.call(server, {:adopt_credential_epoch, epoch})
+
   @doc "Callback for a successful secure-channel authentication."
   @spec authenticated(server()) :: {:ok, BootstrapState.t()} | {:error, atom()}
   def authenticated(server \\ __MODULE__), do: GenServer.call(server, :authenticated)
@@ -166,6 +177,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner do
   @impl true
   def handle_call(:current_state, _from, state), do: {:reply, state.bootstrap_state, state}
 
+  def handle_call(:credential_epoch, _from, state) do
+    {:reply, BootstrapState.credential_epoch(state.bootstrap_state), state}
+  end
+
+  def handle_call({:adopt_credential_epoch, epoch}, _from, state) do
+    callback_transition(&BootstrapStateMachine.adopt_credential_epoch(epoch, &1), state)
+  end
+
   def handle_call(:authenticated, _from, state) do
     callback_transition(&BootstrapStateMachine.mark_authenticated/1, state)
   end
@@ -206,6 +225,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner do
   end
 
   defp handle_reconcile_outcome({:ready, %BootstrapState{} = bootstrap_state}, state) do
+    bootstrap_state = fence_advanced_credential_epoch(bootstrap_state, state)
+
     {:noreply,
      %{
        state
@@ -229,6 +250,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner do
   end
 
   defp schedule_retry_outcome(bootstrap_state, reason, state) do
+    bootstrap_state = fence_advanced_credential_epoch(bootstrap_state, state)
     next_attempt = state.retry_attempt + 1
     delay = retry_delay(next_attempt, state.opts)
 
@@ -248,8 +270,52 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner do
   end
 
   defp callback_transition(fun, state) do
-    result = fun.(state.opts)
+    result = state.opts |> fun.() |> fence_advanced_credential_epoch(state)
     {:reply, result, refresh_state_after_callback(result, state)}
+  end
+
+  defp fence_advanced_credential_epoch({:ok, %BootstrapState{} = next_state}, state) do
+    {:ok, fence_advanced_credential_epoch(next_state, state)}
+  end
+
+  defp fence_advanced_credential_epoch(%BootstrapState{} = next_state, state) do
+    with {:ok, next_epoch} <- BootstrapState.credential_epoch(next_state) do
+      previous_epoch = credential_epoch_or_before_registration(state.bootstrap_state)
+      fence_result = fence_session_holder(state.opts, next_epoch)
+
+      if next_epoch > previous_epoch or match?({:ok, _generation, :evicted}, fence_result) do
+        clear_readiness_after_epoch_advance(next_state, state.opts)
+      else
+        next_state
+      end
+    else
+      _unavailable -> next_state
+    end
+  end
+
+  defp fence_advanced_credential_epoch(result, _state), do: result
+
+  defp fence_session_holder(opts, credential_epoch) do
+    holder = Keyword.get(opts, :session_holder, SessionHolder)
+    SessionHolder.fence_for_credential_epoch(holder, credential_epoch)
+  rescue
+    _exception -> {:error, :session_holder_unavailable}
+  catch
+    :exit, _reason -> {:error, :session_holder_unavailable}
+  end
+
+  defp clear_readiness_after_epoch_advance(next_state, opts) do
+    case BootstrapStateMachine.mark_session_lost(next_state, opts) do
+      {:ok, %BootstrapState{} = demoted} -> demoted
+      {:error, _reason} -> next_state
+    end
+  end
+
+  defp credential_epoch_or_before_registration(%BootstrapState{} = state) do
+    case BootstrapState.credential_epoch(state) do
+      {:ok, epoch} -> epoch
+      {:error, :no_verified_authority} -> -1
+    end
   end
 
   defp refresh_state_after_callback({:ok, %BootstrapState{} = bootstrap_state}, state) do

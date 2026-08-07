@@ -92,6 +92,28 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachine do
     end
   end
 
+  @doc "Persist a signed-HELLO credential epoch as a monotonic downgrade fence."
+  @spec adopt_credential_epoch(non_neg_integer(), keyword()) ::
+          {:ok, BootstrapState.t()} | {:error, atom()}
+  def adopt_credential_epoch(epoch, opts \\ [])
+
+  def adopt_credential_epoch(epoch, opts)
+      when is_integer(epoch) and epoch >= 0 and epoch <= 0xFFFF_FFFF do
+    with {:ok, %BootstrapState{} = state} <- BootstrapStateStore.load(state_store_opts(opts)),
+         {:ok, current_epoch} <- BootstrapState.credential_epoch(state),
+         :ok <- ensure(epoch >= current_epoch, :epoch_downgrade),
+         next = %{state | verified_credential_epoch: epoch},
+         :ok <- persist_if_changed(state, next, opts) do
+      {:ok, next}
+    else
+      {:error, :no_verified_authority} -> {:error, :no_verified_authority}
+      {:error, :epoch_downgrade} -> {:error, :epoch_downgrade}
+      {:error, _reason} -> {:error, :state_persistence_failed}
+    end
+  end
+
+  def adopt_credential_epoch(_epoch, _opts), do: {:error, :epoch_exhausted}
+
   @doc "Persist the post-handshake authenticated phase."
   @spec mark_authenticated(keyword()) :: {:ok, BootstrapState.t()} | {:error, atom()}
   def mark_authenticated(opts \\ []), do: transition([:registered, :committed], :authenticated, opts)
@@ -107,8 +129,18 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachine do
   @doc "Clear live-session readiness while retaining the verified durable authority."
   @spec mark_session_lost(keyword()) :: {:ok, BootstrapState.t()} | {:error, atom()}
   def mark_session_lost(opts \\ []) do
-    with {:ok, %BootstrapState{} = state} <- BootstrapStateStore.load(state_store_opts(opts)),
-         {:ok, next} <- session_lost_state(state),
+    with {:ok, %BootstrapState{} = state} <- BootstrapStateStore.load(state_store_opts(opts)) do
+      mark_session_lost(state, opts)
+    else
+      {:error, _reason} -> {:error, :state_persistence_failed}
+    end
+  end
+
+  @doc false
+  @spec mark_session_lost(BootstrapState.t(), keyword()) ::
+          {:ok, BootstrapState.t()} | {:error, atom()}
+  def mark_session_lost(%BootstrapState{} = state, opts) do
+    with {:ok, next} <- session_lost_state(state),
          :ok <- persist_if_changed(state, next, opts) do
       {:ok, next}
     else
@@ -595,6 +627,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachine do
     public_key = IdentityProvider.public_key(identity)
 
     with :ok <- validate_logical_device_binding(state, result.receipt.payload.logical_device_id),
+         :ok <- validate_credential_epoch_advance(state, result.receipt.payload.credential_epoch),
          {:ok, commit_assertion} <-
            Contract.recovery_commit_assertion(
              challenge_receipt.payload.attempt_id,
@@ -616,6 +649,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachine do
         state
         | phase: :committed,
           authority: authority,
+          verified_credential_epoch: authority.credential_epoch,
           previous_authority: state.authority || state.previous_authority,
           blocked_reason: nil,
           retry_count: 0
@@ -630,6 +664,21 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachine do
       end
     else
       {:error, _reason} -> persist_blocked(state, :limbo, :invalid_server_receipt, opts)
+    end
+  end
+
+  defp validate_credential_epoch_advance(%BootstrapState{} = state, credential_epoch) do
+    current_epoch =
+      case BootstrapState.credential_epoch(state) do
+        {:ok, epoch} -> epoch
+        {:error, :no_verified_authority} -> -1
+      end
+
+    if is_integer(credential_epoch) and credential_epoch >= 0 and
+         credential_epoch <= 0xFFFF_FFFF and credential_epoch >= current_epoch do
+      :ok
+    else
+      {:error, :credential_epoch_downgrade}
     end
   end
 

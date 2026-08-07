@@ -117,7 +117,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachineTest do
                  phase: :registered,
                  hardware_identity_digest:
                    BootstrapStateMachine.hardware_identity_digest("raspberry_pi_soc_serial_v1", @serial),
-                 authority: prior_authority
+                 authority: prior_authority,
+                 verified_credential_epoch: 6
                },
                base_path: ctx.base
              )
@@ -138,6 +139,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachineTest do
     assert state.authority.kind == :recovery
     assert state.authority.logical_device_id == prior_authority.logical_device_id
     assert state.authority.credential_epoch == 7
+    assert state.verified_credential_epoch == 7
     assert is_binary(state.authority.challenge_receipt)
     assert is_binary(state.authority.lifecycle_receipt)
     assert byte_size(state.authority.commit_signing_bytes_hash) == 32
@@ -145,6 +147,38 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachineTest do
     assert {:ok, active} = KeyStore.load(base_path: ctx.base)
     assert IdentityProvider.public_key(active) == state.authority.public_key
     assert {:error, :candidate_not_staged} = KeyStore.load_candidate(base_path: ctx.base)
+  end
+
+  test "recovery commit cannot lower a signed-HELLO credential epoch high-water mark", ctx do
+    old_identity = Support.identity(0x11)
+    {:ok, old_registration} = Support.registration_result(old_identity, @serial)
+    prior_authority = registration_authority(old_registration)
+
+    assert :ok =
+             BootstrapStateStore.save(
+               %BootstrapState{
+                 phase: :registered,
+                 hardware_identity_digest:
+                   BootstrapStateMachine.hardware_identity_digest("raspberry_pi_soc_serial_v1", @serial),
+                 authority: prior_authority,
+                 verified_credential_epoch: 6
+               },
+               base_path: ctx.base
+             )
+
+    assert {:blocked, :invalid_server_receipt, %BootstrapState{phase: :limbo}} =
+             BootstrapStateMachine.reconcile(
+               ctx.common ++
+                 [
+                   challenge_fun: fn identity, serial -> Support.challenge_result(identity, serial) end,
+                   commit_fun: fn identity, challenge_receipt ->
+                     Support.lifecycle_result(identity, challenge_receipt,
+                       device_id: prior_authority.logical_device_id,
+                       credential_epoch: 5
+                     )
+                   end
+                 ]
+             )
   end
 
   test "recovery commit for a different logical device enters limbo without promotion", ctx do
@@ -264,9 +298,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachineTest do
     end
 
     assert {:retry, :transport_unavailable, %BootstrapState{phase: :recovery_candidate}} =
-             BootstrapStateMachine.reconcile(
-               ctx.common ++ [challenge_fun: challenge_fun, register_fun: register_fun]
-             )
+             BootstrapStateMachine.reconcile(ctx.common ++ [challenge_fun: challenge_fun, register_fun: register_fun])
 
     assert Agent.get(calls, & &1) == %{challenge: 1, register: 1}
   end

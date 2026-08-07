@@ -19,6 +19,8 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveBulkGateTest do
   alias RacingOrg.Tracker.Pro.Race.BulkUploader
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
+  alias RacingOrg.Tracker.Pro.SecureTransport.Session
+  alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
 
   @app :racing_org_tracker_pro
 
@@ -29,6 +31,7 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveBulkGateTest do
 
     prev_si = Application.get_env(@app, ServerIdentity)
     prev_ks = Application.get_env(@app, KeyStore)
+    holder = start_supervised!({SessionHolder, name: nil})
 
     on_exit(fn ->
       File.rm_rf(base)
@@ -37,7 +40,7 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveBulkGateTest do
       restore(KeyStore, prev_ks)
     end)
 
-    %{base: base, keystore_dir: keystore_dir}
+    %{base: base, keystore_dir: keystore_dir, holder: holder}
   end
 
   defp restore(key, nil), do: Application.delete_env(@app, key)
@@ -47,11 +50,30 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveBulkGateTest do
   defp unpin_server, do: Application.delete_env(@app, ServerIdentity)
 
   defp configure_keystore(dir), do: Application.put_env(@app, KeyStore, base_path: dir)
-  defp provision_identity(dir), do: {:ok, _} = KeyStore.load_or_generate(base_path: dir)
+
+  defp provision_identity(dir) do
+    {:ok, identity} = KeyStore.load_or_generate(base_path: dir)
+    identity
+  end
+
+  defp publish_session(holder, identity) do
+    session =
+      Session.new(
+        role: :initiator,
+        session_id: :crypto.strong_rand_bytes(16),
+        epoch: 0,
+        credential_epoch: 0,
+        identity_fingerprint: Base.decode16!(identity.fingerprint, case: :mixed),
+        out_key: :crypto.strong_rand_bytes(32),
+        in_key: :crypto.strong_rand_bytes(32)
+      )
+
+    SessionHolder.publish(holder, session)
+  end
 
   # Start an Archive using its REAL default trigger (no injected bulk_upload_fn), plus
   # a probe BulkUploader whose actual upload is short-circuited by a capturing adapter.
-  defp start_archive(base) do
+  defp start_archive(base, holder) do
     test_pid = self()
     commands = start_supervised!({Commands, device_id: "dev"})
 
@@ -62,6 +84,8 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveBulkGateTest do
       start_supervised!(
         {BulkUploader,
          name: BulkUploader,
+         session_holder: holder,
+         credential_epoch_fun: fn -> {:ok, 0} end,
          adapter: fn %Tesla.Env{} = env ->
            send(test_pid, {:bulk_request, env.url})
            {:ok, %{env | status: 200, body: "{}"}}
@@ -109,12 +133,12 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveBulkGateTest do
     send(archive, {:sampling_phase, :finish, :complete})
   end
 
-  test "default trigger does NOT fire when the server is NOT pinned", %{base: base, keystore_dir: dir} do
+  test "default trigger does NOT fire when the server is NOT pinned", %{base: base, keystore_dir: dir, holder: holder} do
     unpin_server()
     configure_keystore(dir)
     provision_identity(dir)
 
-    %{commands: c, archive: a} = start_archive(base)
+    %{commands: c, archive: a} = start_archive(base, holder)
     run_race(a, c, base)
 
     # Legacy UDP manifest still flows; but no signed bulk request is dispatched.
@@ -123,25 +147,26 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveBulkGateTest do
   end
 
   test "default trigger does NOT fire when the server is pinned but identity is NOT provisioned",
-       %{base: base, keystore_dir: dir} do
+       %{base: base, keystore_dir: dir, holder: holder} do
     pin_server()
     configure_keystore(dir)
     # No provision_identity/1 -> KeyStore.load/0 returns {:error, :not_provisioned}.
 
-    %{commands: c, archive: a} = start_archive(base)
+    %{commands: c, archive: a} = start_archive(base, holder)
     run_race(a, c, base)
 
     assert_receive {:enqueued, _}
     refute_receive {:bulk_request, _}, 200
   end
 
-  test "default trigger FIRES when the server is pinned AND identity is provisioned",
-       %{base: base, keystore_dir: dir} do
+  test "default trigger reaches bulk transport when pin, identity, and live session are current",
+       %{base: base, keystore_dir: dir, holder: holder} do
     pin_server()
     configure_keystore(dir)
-    provision_identity(dir)
+    identity = provision_identity(dir)
+    assert {:ok, _session} = publish_session(holder, identity)
 
-    %{commands: c, archive: a} = start_archive(base)
+    %{commands: c, archive: a} = start_archive(base, holder)
     run_race(a, c, base)
 
     assert_receive {:enqueued, _}

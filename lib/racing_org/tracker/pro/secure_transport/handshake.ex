@@ -123,10 +123,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Handshake do
     * `:device_id` (required) — opaque device identifier bytes.
     * `:ephemeral` (optional) — `{pub, priv}` X25519 (tests).
     * `:timestamp_ms` (optional) — device clock, advisory; defaults to system time.
-    * `:epoch` (optional) — session epoch (default 0). Must match the epoch the server
-      bound into its HELLO; a mismatch is rejected with `:epoch_mismatch` (before key
-      agreement) and the epoch is also bound into the INIT signature + transcript. Must
-      be in `0..#{0xFFFF_FFFF}` (else `:epoch_exhausted`).
+    * `:epoch` (optional) — when supplied, pins the session epoch for deterministic
+      compatibility callers. The signed HELLO is authenticated first, then a mismatch is
+      rejected with `:epoch_mismatch`. When omitted, the authenticated HELLO epoch is
+      adopted and bound into the INIT signature + transcript.
+    * `:credential_epoch` (optional) — durable minimum credential epoch. A correctly
+      signed HELLO below it is rejected with `:epoch_downgrade`. Both values must remain
+      in `0..#{0xFFFF_FFFF}` (else `:epoch_exhausted`).
 
   Returns `{:ok, init_wire, session}` or `{:error, reason}`.
   """
@@ -137,10 +140,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Handshake do
          dev_pub = initiator_public_key(device_identity),
          {:ok, srv_pub} <- fetch(opts, :server_identity_public),
          {:ok, device_id} <- fetch(opts, :device_id),
-         {:ok, epoch} <- valid_epoch(Keyword.get(opts, :epoch, 0)),
          {:ok, hello} <- parse_hello(hello_wire),
-         :ok <- ensure(hello.epoch == epoch, :epoch_mismatch),
          :ok <- verify_server_hello(hello, srv_pub),
+         {:ok, epoch} <- initiator_epoch(hello.epoch, opts),
          {:ok, {eph_pub_d, eph_priv_d}} <- ephemeral(opts),
          {:ok, shared} <- Primitives.x25519_shared(hello.eph_pub_s, eph_priv_d),
          timestamp_ms = Keyword.get_lazy(opts, :timestamp_ms, &System.system_time/0) |> normalize_ts(),
@@ -316,8 +318,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Handshake do
   # ---- Canonical signed payloads (shared by produce + verify) ----
   #
   # epoch is bound into BOTH payloads (and the transcript, §4.5) so the two sides must
-  # agree on the epoch: a mismatch is caught explicitly (`:epoch_mismatch`) before any
-  # signature work, and any on-wire tamper of the epoch field breaks the signature.
+  # agree on the epoch. The initiator authenticates the HELLO before adopting/checking
+  # its epoch; any on-wire tamper of the epoch field therefore breaks the signature.
 
   defp resp_signed(server_nonce, eph_pub_s, server_id_fp, epoch) do
     lp(ST.magic()) <>
@@ -515,6 +517,40 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Handshake do
       nil -> {:ok, Primitives.generate_ephemeral_keypair()}
       {pub, priv} when is_binary(pub) and is_binary(priv) -> {:ok, {pub, priv}}
       _ -> {:error, :bad_ephemeral}
+    end
+  end
+
+  defp initiator_epoch(hello_epoch, opts) do
+    with {:ok, hello_epoch} <- valid_epoch(hello_epoch),
+         :ok <- ensure_pinned_epoch(hello_epoch, opts),
+         :ok <- ensure_minimum_credential_epoch(hello_epoch, opts) do
+      {:ok, hello_epoch}
+    end
+  end
+
+  defp ensure_pinned_epoch(hello_epoch, opts) do
+    case Keyword.fetch(opts, :epoch) do
+      :error ->
+        :ok
+
+      {:ok, pinned_epoch} ->
+        with {:ok, pinned_epoch} <- valid_epoch(pinned_epoch),
+             :ok <- ensure(hello_epoch == pinned_epoch, :epoch_mismatch) do
+          :ok
+        end
+    end
+  end
+
+  defp ensure_minimum_credential_epoch(hello_epoch, opts) do
+    case Keyword.fetch(opts, :credential_epoch) do
+      :error ->
+        :ok
+
+      {:ok, minimum_epoch} ->
+        with {:ok, minimum_epoch} <- valid_epoch(minimum_epoch),
+             :ok <- ensure(hello_epoch >= minimum_epoch, :epoch_downgrade) do
+          :ok
+        end
     end
   end
 

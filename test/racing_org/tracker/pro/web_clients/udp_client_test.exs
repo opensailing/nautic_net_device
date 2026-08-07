@@ -147,6 +147,60 @@ defmodule RacingOrg.Tracker.Pro.WebClients.UDPClientTest do
   end
 
   describe "robustness" do
+    test "queued work carrying a stale session generation is dropped before sealing" do
+      {first_device, _first_server} = loopback_sessions()
+      {second_device, _second_server} = loopback_sessions()
+      holder = start_holder(first_device)
+      {:ok, first} = SessionHolder.get_current_session(holder)
+      assert {:ok, _second} = SessionHolder.publish(holder, second_device, first.generation)
+
+      assert :ok =
+               UDPClient.send_data_set(@dataset_plaintext,
+                 session_holder: holder,
+                 session_generation: first.generation,
+                 send_fun: capture_fun(self())
+               )
+
+      refute_receive {:sent, _frame}
+    end
+
+    test "session replacement cannot overtake a delayed send using the old generation" do
+      parent = self()
+      {first_device, first_server} = loopback_sessions()
+      {second_device, _second_server} = loopback_sessions()
+      holder = start_holder(first_device)
+      {:ok, first} = SessionHolder.get_current_session(holder)
+
+      send_task =
+        Task.async(fn ->
+          UDPClient.send_data_set(@dataset_plaintext,
+            session_holder: holder,
+            send_fun: fn frame ->
+              send(parent, {:udp_send_started, self(), frame})
+
+              receive do
+                :finish_udp_send -> :ok
+              end
+            end
+          )
+        end)
+
+      assert_receive {:udp_send_started, send_process, frame}
+      assert send_process == holder
+      assert {:ok, @dataset_plaintext, _server_session} = Frame.open(first_server, frame)
+
+      replace_task =
+        Task.async(fn -> SessionHolder.publish(holder, second_device, first.generation) end)
+
+      assert Task.yield(replace_task, 20) == nil
+      send(holder, :finish_udp_send)
+
+      assert :ok = Task.await(send_task)
+      assert {:ok, replacement} = Task.await(replace_task)
+      assert replacement.session_id == second_device.session_id
+      assert replacement.generation > first.generation
+    end
+
     test "a seal error drops the one datagram and does not crash the sender" do
       # A short out_key forces Primitives.aead_seal -> {:error, :bad_key_length},
       # exercising the seal-error branch.

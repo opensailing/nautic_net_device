@@ -18,6 +18,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore
   alias RacingOrg.Tracker.Pro.SecureTransport.Primitives
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
+  alias RacingOrg.Tracker.Pro.SecureTransport.Session
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
 
   @serial "000000001234abcd"
@@ -57,6 +58,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     }
   end
 
+  defp recovery_authority(identity, challenge, lifecycle) do
+    %{
+      kind: :recovery,
+      public_key: IdentityProvider.public_key(identity),
+      challenge_client_nonce: challenge.request.client_nonce,
+      challenge_receipt: challenge.receipt.envelope,
+      commit_signing_bytes_hash: Primitives.sha256(lifecycle.request.assertion),
+      lifecycle_receipt: lifecycle.receipt.envelope,
+      logical_device_id: lifecycle.receipt.payload.logical_device_id,
+      credential_epoch: lifecycle.receipt.payload.credential_epoch
+    }
+  end
+
   defp bootstrap_opts(base, extra \\ []) do
     Keyword.merge(
       [
@@ -74,13 +88,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     start_supervised!({BootProvisioner, Keyword.put(opts, :name, nil)})
   end
 
-  defp complete_handshake(client, topic, ctx) do
+  defp complete_handshake(client, topic, ctx, epoch \\ 0) do
     {:ok, hello_wire, responder_state} =
       Handshake.responder_hello(
         server_identity_private: ctx.srv_priv,
         server_identity_public: ctx.srv_pub,
         device_identity_public: ctx.identity.public_key,
-        epoch: 0
+        epoch: epoch
       )
 
     push(client, topic, "handshake_hello", %{"hello" => Base.encode64(hello_wire)})
@@ -228,6 +242,567 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       {:ok, device_session} = SessionHolder.get_current_session(holder)
       assert device_session.session_id == server_session.session_id
       assert device_session.out_key == server_session.in_key
+      assert device_session.generation == 1
+    end
+
+    test "a duplicate handshake_ok cannot republish keys or reset the send counter", ctx do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           firmware_validator: fn -> :ok end,
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      server_session = complete_handshake(client, topic, ctx)
+      assert_push(^topic, "wifi_status", _status)
+      assert {:ok, published} = SessionHolder.get_current_session(holder)
+      assert {:ok, %{counter: 0}} = SessionHolder.take_send_counter(holder, published.generation)
+
+      push(client, topic, "handshake_ok", %{
+        "session_id" => Base.encode64(server_session.session_id)
+      })
+
+      Process.sleep(20)
+      assert SessionHolder.generation(holder) == published.generation
+      assert {:ok, %{counter: 1}} = SessionHolder.take_send_counter(holder, published.generation)
+    end
+
+    test "a delayed handshake_ok cannot replace a session published after its HELLO", ctx do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      first =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           firmware_validator: fn -> :ok end,
+           backoff: [base_ms: 60_000, cap_ms: 60_000, jitter: 0],
+           keystore_opts: [base_path: ctx.base]},
+          id: :first_fenced_channel_client
+        )
+
+      second =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           firmware_validator: fn -> :ok end,
+           backoff: [base_ms: 60_000, cap_ms: 60_000, jitter: 0],
+           keystore_opts: [base_path: ctx.base]},
+          id: :second_fenced_channel_client
+        )
+
+      connect_and_assert_join(first, ^topic, %{}, :ok)
+      connect_and_assert_join(second, ^topic, %{}, :ok)
+
+      {:ok, first_hello, first_responder} =
+        Handshake.responder_hello(
+          server_identity_private: ctx.srv_priv,
+          server_identity_public: ctx.srv_pub,
+          device_identity_public: ctx.identity.public_key,
+          epoch: 0
+        )
+
+      push(first, topic, "handshake_hello", %{"hello" => Base.encode64(first_hello)})
+      assert_push(^topic, "handshake_init", %{"init" => first_init_b64})
+      {:ok, first_init} = Base.decode64(first_init_b64)
+      {:ok, first_server_session} = Handshake.responder_finalize(first_responder, first_init)
+
+      {:ok, second_hello, second_responder} =
+        Handshake.responder_hello(
+          server_identity_private: ctx.srv_priv,
+          server_identity_public: ctx.srv_pub,
+          device_identity_public: ctx.identity.public_key,
+          epoch: 0
+        )
+
+      push(second, topic, "handshake_hello", %{"hello" => Base.encode64(second_hello)})
+      assert_push(^topic, "handshake_init", %{"init" => second_init_b64})
+      {:ok, second_init} = Base.decode64(second_init_b64)
+      {:ok, second_server_session} = Handshake.responder_finalize(second_responder, second_init)
+
+      push(second, topic, "handshake_ok", %{
+        "session_id" => Base.encode64(second_server_session.session_id)
+      })
+
+      assert eventually(fn ->
+               match?(
+                 {:ok, %{session_id: session_id}} when session_id == second_server_session.session_id,
+                 SessionHolder.get_current_session(holder)
+               )
+             end)
+
+      push(first, topic, "handshake_ok", %{
+        "session_id" => Base.encode64(first_server_session.session_id)
+      })
+
+      Process.sleep(20)
+      assert {:ok, current} = SessionHolder.get_current_session(holder)
+      assert current.session_id == second_server_session.session_id
+      assert current.generation == 1
+    end
+
+    test "a failed pending equal-epoch handshake cannot clear the live session or readiness", ctx do
+      {:ok, registration} = RecoverySupport.registration_result(ctx.identity, @serial)
+
+      BootstrapStateStore.save!(
+        %BootstrapState{
+          phase: :registered,
+          hardware_identity_digest:
+            BootstrapStateMachine.hardware_identity_digest("raspberry_pi_soc_serial_v1", @serial),
+          authority: registration_authority(registration)
+        },
+        base_path: ctx.base
+      )
+
+      boot_provisioner = start_boot_provisioner(ctx.base)
+      assert eventually(fn -> BootProvisioner.current_state(boot_provisioner).phase == :registered end)
+
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      live_client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           boot_provisioner: {BootProvisioner, boot_provisioner},
+           firmware_validator: fn -> :ok end,
+           backoff: [base_ms: 60_000, cap_ms: 60_000, jitter: 0],
+           keystore_opts: [base_path: ctx.base]},
+          id: :live_equal_epoch_channel_client
+        )
+
+      pending_client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           boot_provisioner: {BootProvisioner, boot_provisioner},
+           firmware_validator: fn -> :ok end,
+           backoff: [base_ms: 60_000, cap_ms: 60_000, jitter: 0],
+           keystore_opts: [base_path: ctx.base]},
+          id: :pending_equal_epoch_channel_client
+        )
+
+      connect_and_assert_join(live_client, ^topic, %{}, :ok)
+      live_server_session = complete_handshake(live_client, topic, ctx)
+      assert_push(^topic, "wifi_status", _status)
+      assert eventually(fn -> BootProvisioner.current_state(boot_provisioner).phase == :authenticated end)
+
+      assert {:ok, live_session} = SessionHolder.get_current_session(holder)
+      assert live_session.session_id == live_server_session.session_id
+
+      connect_and_assert_join(pending_client, ^topic, %{}, :ok)
+
+      {:ok, pending_hello, _pending_responder} =
+        Handshake.responder_hello(
+          server_identity_private: ctx.srv_priv,
+          server_identity_public: ctx.srv_pub,
+          device_identity_public: ctx.identity.public_key,
+          epoch: 0
+        )
+
+      push(pending_client, topic, "handshake_hello", %{"hello" => Base.encode64(pending_hello)})
+      assert_push(^topic, "handshake_init", %{"init" => _pending_init_b64})
+
+      push(pending_client, topic, "handshake_error", %{"reason" => "rejected"})
+      Process.sleep(20)
+
+      assert {:ok, current} = SessionHolder.get_current_session(holder)
+      assert current.session_id == live_session.session_id
+      assert current.generation == live_session.generation
+      assert BootProvisioner.current_state(boot_provisioner).phase == :authenticated
+    end
+
+    test "a failed rehandshake clears the live session owned by the same connection", ctx do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           firmware_validator: fn -> :ok end,
+           backoff: [base_ms: 60_000, cap_ms: 60_000, jitter: 0],
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      complete_handshake(client, topic, ctx)
+      assert_push(^topic, "wifi_status", _status)
+      assert {:ok, live_session} = SessionHolder.get_current_session(holder)
+
+      {:ok, replacement_hello, _replacement_responder} =
+        Handshake.responder_hello(
+          server_identity_private: ctx.srv_priv,
+          server_identity_public: ctx.srv_pub,
+          device_identity_public: ctx.identity.public_key,
+          epoch: 0
+        )
+
+      push(client, topic, "handshake_hello", %{"hello" => Base.encode64(replacement_hello)})
+      assert_push(^topic, "handshake_init", %{"init" => _replacement_init_b64})
+
+      push(client, topic, "handshake_error", %{"reason" => "rejected"})
+      Process.sleep(20)
+
+      assert {:error, :no_session} = SessionHolder.get_current_session(holder)
+      assert SessionHolder.generation(holder) == live_session.generation + 1
+    end
+
+    test "a stale client's disconnect and delayed callbacks cannot clear or use its replacement", ctx do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      first =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           firmware_validator: fn -> :ok end,
+           backoff: [base_ms: 60_000, cap_ms: 60_000, jitter: 0],
+           keystore_opts: [base_path: ctx.base]},
+          id: :first_replaced_channel_client
+        )
+
+      second =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           firmware_validator: fn -> :ok end,
+           backoff: [base_ms: 60_000, cap_ms: 60_000, jitter: 0],
+           keystore_opts: [base_path: ctx.base]},
+          id: :second_replacement_channel_client
+        )
+
+      connect_and_assert_join(first, ^topic, %{}, :ok)
+      first_server_session = complete_handshake(first, topic, ctx)
+      assert eventually(fn -> SessionHolder.live?(holder) end)
+      assert_push(^topic, "wifi_status", _first_status)
+
+      connect_and_assert_join(second, ^topic, %{}, :ok)
+      second_server_session = complete_handshake(second, topic, ctx)
+      assert_push(^topic, "wifi_status", _second_status)
+
+      assert eventually(fn ->
+               match?(
+                 {:ok, %{session_id: session_id}} when session_id == second_server_session.session_id,
+                 SessionHolder.get_current_session(holder)
+               )
+             end)
+
+      ChannelClient.send_computed_values_data(first, [%{name: "stale", value: 1}])
+      refute_push(^topic, "computed_values_data", _payload, 50)
+
+      send(first, {VintageNet, ["interface", "wlan0", "connection"], :internet, :lan, %{}})
+      refute_push(^topic, "wifi_status", _payload, 50)
+
+      disconnect(first, :network_lost)
+
+      assert {:ok, current} = SessionHolder.get_current_session(holder)
+      assert current.session_id == second_server_session.session_id
+      refute current.session_id == first_server_session.session_id
+      assert current.generation == 2
+    end
+
+    test "session eviction clears the owned session and invalidates its generation", ctx do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           firmware_validator: fn -> :ok end,
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      complete_handshake(client, topic, ctx)
+      assert_push(^topic, "wifi_status", _status)
+      assert {:ok, published} = SessionHolder.get_current_session(holder)
+
+      push(client, topic, "session_evicted", %{"reason" => "credential_recovered"})
+
+      assert eventually(fn -> not SessionHolder.live?(holder) end)
+      assert SessionHolder.generation(holder) == published.generation + 1
+
+      assert {:error, :stale_session} =
+               SessionHolder.take_send_counter(holder, published.generation)
+    end
+
+    test "uses the verified recovery epoch for the signed HELLO, INIT, and published session", ctx do
+      {:ok, challenge} = RecoverySupport.challenge_result(ctx.identity, @serial)
+      {:ok, lifecycle} = RecoverySupport.lifecycle_result(ctx.identity, challenge.receipt, credential_epoch: 4)
+
+      BootstrapStateStore.save!(
+        %BootstrapState{
+          phase: :committed,
+          hardware_identity_digest:
+            BootstrapStateMachine.hardware_identity_digest("raspberry_pi_soc_serial_v1", @serial),
+          authority: recovery_authority(ctx.identity, challenge, lifecycle)
+        },
+        base_path: ctx.base
+      )
+
+      boot_provisioner = start_boot_provisioner(ctx.base)
+      assert eventually(fn -> BootProvisioner.credential_epoch(boot_provisioner) == {:ok, 4} end)
+
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           boot_provisioner: {BootProvisioner, boot_provisioner},
+           firmware_validator: fn -> :ok end,
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      server_session = complete_handshake(client, topic, ctx, 4)
+
+      assert eventually(fn -> SessionHolder.live?(holder) end)
+      assert {:ok, device_session} = SessionHolder.get_current_session(holder)
+      assert device_session.session_id == server_session.session_id
+      assert device_session.epoch == 4
+      assert device_session.credential_epoch == 4
+      assert {:ok, 4} = BootProvisioner.credential_epoch(boot_provisioner)
+    end
+
+    test "an authenticated higher epoch evicts the old live session before INIT can complete", ctx do
+      {:ok, challenge} = RecoverySupport.challenge_result(ctx.identity, @serial)
+      {:ok, lifecycle} = RecoverySupport.lifecycle_result(ctx.identity, challenge.receipt, credential_epoch: 3)
+
+      BootstrapStateStore.save!(
+        %BootstrapState{
+          phase: :committed,
+          hardware_identity_digest:
+            BootstrapStateMachine.hardware_identity_digest("raspberry_pi_soc_serial_v1", @serial),
+          authority: recovery_authority(ctx.identity, challenge, lifecycle)
+        },
+        base_path: ctx.base
+      )
+
+      boot_provisioner = start_boot_provisioner(ctx.base)
+      assert eventually(fn -> BootProvisioner.credential_epoch(boot_provisioner) == {:ok, 3} end)
+
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+
+      old_session =
+        Session.new(
+          role: :initiator,
+          session_id: :crypto.strong_rand_bytes(16),
+          epoch: 3,
+          credential_epoch: 3,
+          identity_fingerprint: Base.decode16!(ctx.identity.fingerprint, case: :mixed),
+          out_key: :crypto.strong_rand_bytes(32),
+          in_key: :crypto.strong_rand_bytes(32)
+        )
+
+      assert {:ok, old_session} = SessionHolder.publish(holder, old_session)
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           boot_provisioner: {BootProvisioner, boot_provisioner},
+           firmware_validator: fn -> :ok end,
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+
+      {:ok, hello_wire, responder_state} =
+        Handshake.responder_hello(
+          server_identity_private: ctx.srv_priv,
+          server_identity_public: ctx.srv_pub,
+          device_identity_public: ctx.identity.public_key,
+          epoch: 4
+        )
+
+      push(client, topic, "handshake_hello", %{"hello" => Base.encode64(hello_wire)})
+      assert_push(^topic, "handshake_init", %{"init" => init_b64})
+
+      assert {:error, :no_session} = SessionHolder.get_current_session(holder)
+      assert SessionHolder.generation(holder) == old_session.generation + 1
+
+      assert {:error, :stale_session} =
+               SessionHolder.take_send_counter(holder, old_session.generation)
+
+      {:ok, init_wire} = Base.decode64(init_b64)
+      {:ok, server_session} = Handshake.responder_finalize(responder_state, init_wire)
+      push(client, topic, "handshake_ok", %{"session_id" => Base.encode64(server_session.session_id)})
+
+      assert eventually(fn ->
+               match?(
+                 {:ok, %{credential_epoch: 4, generation: 3}},
+                 SessionHolder.get_current_session(holder)
+               )
+             end)
+    end
+
+    test "a recovery epoch advance invalidates an older handshake awaiting confirmation", ctx do
+      {:ok, challenge} = RecoverySupport.challenge_result(ctx.identity, @serial)
+      {:ok, lifecycle} = RecoverySupport.lifecycle_result(ctx.identity, challenge.receipt, credential_epoch: 3)
+
+      BootstrapStateStore.save!(
+        %BootstrapState{
+          phase: :committed,
+          hardware_identity_digest:
+            BootstrapStateMachine.hardware_identity_digest("raspberry_pi_soc_serial_v1", @serial),
+          authority: recovery_authority(ctx.identity, challenge, lifecycle)
+        },
+        base_path: ctx.base
+      )
+
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      boot_provisioner = start_boot_provisioner(ctx.base, session_holder: holder)
+      assert eventually(fn -> BootProvisioner.credential_epoch(boot_provisioner) == {:ok, 3} end)
+
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           boot_provisioner: {BootProvisioner, boot_provisioner},
+           firmware_validator: fn -> :ok end,
+           backoff: [base_ms: 60_000, cap_ms: 60_000, jitter: 0],
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+
+      {:ok, hello_wire, responder_state} =
+        Handshake.responder_hello(
+          server_identity_private: ctx.srv_priv,
+          server_identity_public: ctx.srv_pub,
+          device_identity_public: ctx.identity.public_key,
+          epoch: 3
+        )
+
+      push(client, topic, "handshake_hello", %{"hello" => Base.encode64(hello_wire)})
+      assert_push(^topic, "handshake_init", %{"init" => init_b64})
+      {:ok, init_wire} = Base.decode64(init_b64)
+      {:ok, old_server_session} = Handshake.responder_finalize(responder_state, init_wire)
+
+      pending_generation = SessionHolder.generation(holder)
+      refute SessionHolder.live?(holder)
+
+      assert {:ok, %BootstrapState{verified_credential_epoch: 4}} =
+               BootProvisioner.adopt_credential_epoch(4, boot_provisioner)
+
+      assert SessionHolder.generation(holder) == pending_generation + 1
+
+      push(client, topic, "handshake_ok", %{
+        "session_id" => Base.encode64(old_server_session.session_id)
+      })
+
+      refute eventually(fn -> SessionHolder.live?(holder) end, 100)
+      assert {:ok, 4} = BootProvisioner.credential_epoch(boot_provisioner)
+    end
+
+    test "rejects a signed HELLO below the verified recovery epoch and publishes no session", ctx do
+      {:ok, challenge} = RecoverySupport.challenge_result(ctx.identity, @serial)
+      {:ok, lifecycle} = RecoverySupport.lifecycle_result(ctx.identity, challenge.receipt, credential_epoch: 4)
+
+      BootstrapStateStore.save!(
+        %BootstrapState{
+          phase: :committed,
+          hardware_identity_digest:
+            BootstrapStateMachine.hardware_identity_digest("raspberry_pi_soc_serial_v1", @serial),
+          authority: recovery_authority(ctx.identity, challenge, lifecycle)
+        },
+        base_path: ctx.base
+      )
+
+      boot_provisioner = start_boot_provisioner(ctx.base)
+      assert eventually(fn -> BootProvisioner.credential_epoch(boot_provisioner) == {:ok, 4} end)
+
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           boot_provisioner: {BootProvisioner, boot_provisioner},
+           backoff: [base_ms: 60_000, cap_ms: 60_000, jitter: 0],
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+
+      {:ok, hello_wire, _responder_state} =
+        Handshake.responder_hello(
+          server_identity_private: ctx.srv_priv,
+          server_identity_public: ctx.srv_pub,
+          device_identity_public: ctx.identity.public_key,
+          epoch: 0
+        )
+
+      push(client, topic, "handshake_hello", %{"hello" => Base.encode64(hello_wire)})
+
+      refute_push(^topic, "handshake_init", _payload, 100)
+      refute SessionHolder.live?(holder)
+      assert {:ok, 4} = BootProvisioner.credential_epoch(boot_provisioner)
     end
 
     test "validates the running firmware once the RacingOrg session is live", ctx do
@@ -307,10 +882,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       assert eventually(fn -> SessionHolder.live?(holder) end)
       assert eventually(fn -> BootProvisioner.current_state(boot_provisioner).phase == :authenticated end)
       assert_push(^topic, "wifi_status", _status)
+      assert {:ok, published} = SessionHolder.get_current_session(holder)
 
       disconnect(client, :network_lost)
 
       assert eventually(fn -> not SessionHolder.live?(holder) end)
+      assert SessionHolder.generation(holder) == published.generation + 1
+
+      assert {:error, :stale_session} =
+               SessionHolder.take_send_counter(holder, published.generation)
+
       assert eventually(fn -> BootProvisioner.current_state(boot_provisioner).phase == :registered end)
     end
 
@@ -555,9 +1136,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       assert Process.alive?(client)
     end
 
-    test "a simulated wlan0 connection-change pushes a fresh wifi_status", ctx do
+    test "an authenticated simulated wlan0 connection-change pushes a fresh wifi_status", ctx do
       {client, topic, _wifi} =
         connect_client(ctx, status: %{enabled: true, ssid: "boat-net", connection: :lan, signal: -60})
+
+      complete_handshake(client, topic, ctx)
+      assert_push(^topic, "wifi_status", _initial_status)
 
       # Drive the VintageNet property-change handler directly (the real subscription
       # is a no-op in test_mode, so we simulate the message it would deliver).
@@ -567,6 +1151,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       assert status.connection == :lan
       assert status.enabled == true
       refute Map.has_key?(status, :psk)
+    end
+
+    test "drops delayed wifi_status callbacks after the authenticated session disconnects", ctx do
+      {client, topic, _wifi} =
+        connect_client(ctx, status: %{enabled: true, ssid: "boat-net", connection: :lan, signal: -60})
+
+      complete_handshake(client, topic, ctx)
+      assert_push(^topic, "wifi_status", _initial_status)
+
+      disconnect(client, :network_lost)
+      send(client, {VintageNet, ["interface", "wlan0", "connection"], :internet, :lan, %{}})
+
+      refute_push(^topic, "wifi_status", _status, 100)
     end
 
     test "pushes an initial wifi_status shortly after a successful handshake", ctx do

@@ -72,7 +72,10 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploader do
   alias RacingOrg.Tracker.Protobuf.RaceManifest
   alias RacingOrg.Tracker.Pro.Race.Recording
   alias RacingOrg.Tracker.Pro.SecureTransport.Backoff
+  alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
+  alias RacingOrg.Tracker.Pro.SecureTransport.IdentityProvider
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore
+  alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
   alias RacingOrg.Tracker.Pro.SecureTransport.SignedRequest
 
   @manifests_path "/api/bulk/race_manifests"
@@ -171,9 +174,11 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploader do
          {:ok, recording_id} <- require_opt(opts, :recording_id),
          {:ok, race_session_id} <- require_opt(opts, :race_session_id),
          {:ok, identity} <- resolve_identity(opts),
-         {:ok, recording} <- load_recording(base_dir, recording_id) do
+         {:ok, recording} <- load_recording(base_dir, recording_id),
+         {:ok, secure_session} <- secure_session_context(identity, opts) do
       plans = chunk_plans(recording)
       manifest_blob = build_manifest_blob(recording, race_session_id, plans, opts)
+      opts = Keyword.put(opts, :secure_session, secure_session)
 
       Logger.info("Bulk upload starting: recording=#{recording_id} chunks=#{length(plans)} session=#{race_session_id}")
 
@@ -420,6 +425,9 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploader do
       {:ok, %Tesla.Env{status: status, body: resp_body}} ->
         maybe_retry(path, body, identity, opts, attempt, max_attempts, {:ok, status, decode_resp(resp_body)})
 
+      {:error, {:security_gate, _reason} = reason} ->
+        {:error, reason}
+
       {:error, reason} ->
         maybe_retry(path, body, identity, opts, attempt, max_attempts, {:error, reason})
     end
@@ -448,10 +456,129 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploader do
       end
 
     url = base_url(opts) <> path
-    Tesla.post(client, url, json_body, headers: headers)
+
+    with {:ok, secure_session} <- Keyword.fetch(opts, :secure_session),
+         :ok <- recheck_durable_epoch(secure_session, opts) do
+      fenced_post(secure_session, fn -> Tesla.post(client, url, json_body, headers: headers) end)
+    else
+      :error -> {:error, {:security_gate, :no_live_secure_session}}
+      {:error, reason} -> {:error, {:security_gate, reason}}
+    end
+  end
+
+  defp recheck_durable_epoch(secure_session, opts) do
+    case credential_epoch(opts) do
+      {:ok, epoch} when epoch == secure_session.credential_epoch -> :ok
+      {:ok, _advanced_epoch} -> {:error, :stale_credential_epoch}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp fenced_post(secure_session, post_fun) do
+    result =
+      SessionHolder.with_session(
+        secure_session.holder,
+        secure_session.generation,
+        fn current ->
+          cond do
+            current.session_id != secure_session.session_id ->
+              {:error, {:security_gate, :stale_secure_session}}
+
+            current.credential_epoch != secure_session.credential_epoch ->
+              {:error, {:security_gate, :stale_credential_epoch}}
+
+            session_identity_fingerprint(current) != secure_session.identity_fingerprint ->
+              {:error, {:security_gate, :session_identity_mismatch}}
+
+            true ->
+              post_fun.()
+          end
+        end
+      )
+
+    case result do
+      {:ok, post_result} -> post_result
+      {:error, :stale_session} -> {:error, {:security_gate, :stale_secure_session}}
+      {:error, :no_session} -> {:error, {:security_gate, :no_live_secure_session}}
+      {:error, _reason} -> {:error, {:security_gate, :secure_request_failed}}
+    end
+  rescue
+    _ -> {:error, {:security_gate, :secure_request_failed}}
+  catch
+    :exit, _ -> {:error, {:security_gate, :secure_request_failed}}
   end
 
   ## --- helpers -------------------------------------------------------------
+
+  defp secure_session_context(identity, opts) do
+    holder = Keyword.get(opts, :session_holder, SessionHolder)
+
+    with {:ok, durable_epoch} <- credential_epoch(opts),
+         {:ok, session} <- current_session(holder),
+         :ok <- ensure_session_epoch(session, durable_epoch),
+         :ok <- ensure_session_identity(session, identity) do
+      {:ok,
+       %{
+         holder: holder,
+         generation: session.generation,
+         session_id: session.session_id,
+         credential_epoch: durable_epoch,
+         identity_fingerprint: identity_fingerprint(identity)
+       }}
+    end
+  end
+
+  defp current_session(holder) do
+    case SessionHolder.get_current_session(holder) do
+      {:ok, %{generation: generation} = session} when is_integer(generation) -> {:ok, session}
+      _ -> {:error, :no_live_secure_session}
+    end
+  rescue
+    _ -> {:error, :no_live_secure_session}
+  catch
+    :exit, _ -> {:error, :no_live_secure_session}
+  end
+
+  defp credential_epoch(opts) do
+    case Keyword.get(opts, :credential_epoch_fun) do
+      fun when is_function(fun, 0) ->
+        normalize_credential_epoch(fun.())
+
+      _ ->
+        server = Keyword.get(opts, :boot_provisioner, BootProvisioner)
+        normalize_credential_epoch(BootProvisioner.credential_epoch(server))
+    end
+  rescue
+    _ -> {:error, :credential_epoch_unavailable}
+  catch
+    :exit, _ -> {:error, :credential_epoch_unavailable}
+  end
+
+  defp normalize_credential_epoch({:ok, epoch})
+       when is_integer(epoch) and epoch >= 0 and epoch <= 0xFFFF_FFFF,
+       do: {:ok, epoch}
+
+  defp normalize_credential_epoch(_), do: {:error, :credential_epoch_unavailable}
+
+  defp ensure_session_epoch(%{credential_epoch: epoch}, epoch), do: :ok
+  defp ensure_session_epoch(_session, _durable_epoch), do: {:error, :stale_credential_epoch}
+
+  defp ensure_session_identity(session, identity) do
+    if session_identity_fingerprint(session) == identity_fingerprint(identity) do
+      :ok
+    else
+      {:error, :session_identity_mismatch}
+    end
+  end
+
+  defp session_identity_fingerprint(%{identity_fingerprint: fingerprint}) when is_binary(fingerprint) do
+    Base.encode16(fingerprint, case: :lower)
+  end
+
+  defp session_identity_fingerprint(_), do: nil
+
+  defp identity_fingerprint(%IdentityProvider{} = identity), do: IdentityProvider.fingerprint(identity)
+  defp identity_fingerprint(%{fingerprint: fingerprint}) when is_binary(fingerprint), do: fingerprint
 
   defp chunks_path(recording_id) do
     String.replace(@chunks_path_template, ":recording_id", to_string(recording_id))
@@ -459,6 +586,9 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploader do
 
   defp resolve_identity(opts) do
     case Keyword.fetch(opts, :identity) do
+      {:ok, %IdentityProvider{} = identity} ->
+        {:ok, identity}
+
       {:ok, %{private_key: _, fingerprint: _} = identity} ->
         {:ok, identity}
 

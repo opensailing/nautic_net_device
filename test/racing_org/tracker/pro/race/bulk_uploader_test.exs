@@ -29,6 +29,8 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploaderTest do
   alias RacingOrg.Tracker.Pro.Race.Recording
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore
   alias RacingOrg.Tracker.Pro.SecureTransport.Primitives
+  alias RacingOrg.Tracker.Pro.SecureTransport.Session
+  alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
 
   @recording_id "2026-06-03-1"
   @session_id "session-abc"
@@ -39,6 +41,20 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploaderTest do
     on_exit(fn -> File.rm_rf(base) end)
 
     {:ok, identity} = KeyStore.load_or_generate(base_path: key_base)
+    holder = start_supervised!({SessionHolder, name: nil})
+
+    session =
+      Session.new(
+        role: :initiator,
+        session_id: :crypto.strong_rand_bytes(16),
+        epoch: 0,
+        credential_epoch: 0,
+        identity_fingerprint: Base.decode16!(identity.fingerprint, case: :mixed),
+        out_key: :crypto.strong_rand_bytes(32),
+        in_key: :crypto.strong_rand_bytes(32)
+      )
+
+    assert {:ok, _published} = SessionHolder.publish(holder, session)
 
     # A recording with a tiny chunk threshold so we get several sealed chunks.
     recording =
@@ -59,7 +75,7 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploaderTest do
       end)
       |> Recording.finalize(device_status: "complete")
 
-    %{base: base, identity: identity, recording: recording}
+    %{base: base, identity: identity, recording: recording, holder: holder}
   end
 
   # --- helpers: parse + verify a signed request the uploader produced -------
@@ -196,6 +212,8 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploaderTest do
         recording_id: @recording_id,
         race_session_id: @session_id,
         identity: ctx.identity,
+        session_holder: ctx.holder,
+        credential_epoch_fun: fn -> {:ok, 0} end,
         adapter: adapter,
         base_url: "http://localhost:4000",
         sleep_fn: fn _ -> :ok end
@@ -317,6 +335,103 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploaderTest do
     chunk_count = length(ctx.recording.sealed_chunks)
     verified = Agent.get(agent, & &1.verified)
     assert MapSet.equal?(verified, MapSet.new(0..(chunk_count - 1)))
+  end
+
+  test "no live secure session blocks signed bulk requests", ctx do
+    assert :ok = SessionHolder.clear(ctx.holder)
+
+    assert {:error, :no_live_secure_session} =
+             BulkUploader.upload(
+               upload_opts(ctx, {nil, fn _ -> flunk("must not hit transport without a live session") end})
+             )
+  end
+
+  test "an unavailable durable credential epoch blocks signed bulk requests", ctx do
+    assert {:error, :credential_epoch_unavailable} =
+             BulkUploader.upload(
+               upload_opts(
+                 ctx,
+                 {nil, fn _ -> flunk("must not hit transport without a verified credential epoch") end},
+                 credential_epoch_fun: fn -> {:error, :no_verified_authority} end
+               )
+             )
+  end
+
+  test "a live session below the durable credential epoch blocks signed bulk requests", ctx do
+    assert {:error, :stale_credential_epoch} =
+             BulkUploader.upload(
+               upload_opts(
+                 ctx,
+                 {nil, fn _ -> flunk("must not hit transport with a stale credential epoch") end},
+                 credential_epoch_fun: fn -> {:ok, 1} end
+               )
+             )
+  end
+
+  test "a session for a replaced signing identity blocks signed bulk requests", ctx do
+    other_identity_fingerprint = :crypto.strong_rand_bytes(32)
+
+    stale_session =
+      Session.new(
+        role: :initiator,
+        session_id: :crypto.strong_rand_bytes(16),
+        epoch: 0,
+        credential_epoch: 0,
+        identity_fingerprint: other_identity_fingerprint,
+        out_key: :crypto.strong_rand_bytes(32),
+        in_key: :crypto.strong_rand_bytes(32)
+      )
+
+    assert {:ok, _replacement} = SessionHolder.publish(ctx.holder, stale_session)
+
+    assert {:error, :session_identity_mismatch} =
+             BulkUploader.upload(
+               upload_opts(ctx, {nil, fn _ -> flunk("must not hit transport with a stale signer") end})
+             )
+  end
+
+  test "session replacement cannot overtake an in-flight signed request", ctx do
+    parent = self()
+
+    adapter = fn %Tesla.Env{} = env ->
+      send(parent, {:bulk_request_started, self(), env})
+
+      receive do
+        :finish_bulk_request ->
+          {:ok,
+           %Tesla.Env{
+             env
+             | status: 200,
+               body: %{"verification_status" => "complete", "missing_chunk_indexes" => []}
+           }}
+      end
+    end
+
+    {:ok, current} = SessionHolder.get_current_session(ctx.holder)
+    upload_task = Task.async(fn -> BulkUploader.upload(upload_opts(ctx, {nil, adapter})) end)
+    assert_receive {:bulk_request_started, request_process, _env}
+    assert request_process == ctx.holder
+
+    replacement =
+      Session.new(
+        role: :initiator,
+        session_id: :crypto.strong_rand_bytes(16),
+        epoch: 0,
+        credential_epoch: 0,
+        identity_fingerprint: Base.decode16!(ctx.identity.fingerprint, case: :mixed),
+        out_key: :crypto.strong_rand_bytes(32),
+        in_key: :crypto.strong_rand_bytes(32)
+      )
+
+    replace_task =
+      Task.async(fn -> SessionHolder.publish(ctx.holder, replacement, current.generation) end)
+
+    assert Task.yield(replace_task, 20) == nil
+    send(ctx.holder, :finish_bulk_request)
+
+    assert {:ok, :complete} = Task.await(upload_task)
+    assert {:ok, published_replacement} = Task.await(replace_task)
+    assert published_replacement.generation > current.generation
   end
 
   test "no provisioned identity is a clean no-op", ctx do

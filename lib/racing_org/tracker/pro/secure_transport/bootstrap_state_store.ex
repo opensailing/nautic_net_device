@@ -97,6 +97,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateStore do
   defp decode(binary) do
     case :erlang.binary_to_term(binary, [:safe]) do
       {@format_version, %BootstrapState{} = state} ->
+        state = normalize_state(state)
         if BootstrapState.valid?(state), do: {:ok, state}, else: {:error, :invalid_state}
 
       {version, %BootstrapState{}} when is_integer(version) ->
@@ -109,6 +110,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateStore do
     _exception -> {:error, :corrupt_state}
   catch
     _kind, _reason -> {:error, :corrupt_state}
+  end
+
+  defp normalize_state(%BootstrapState{} = state) do
+    state
+    |> Map.from_struct()
+    |> then(&struct(BootstrapState, &1))
   end
 
   defp durable_write(destination, contents, opts) do

@@ -59,14 +59,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   alias RacingOrg.Tracker.Pro.SecureTransport.Backoff
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
+  alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapState
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelHandler
   alias RacingOrg.Tracker.Pro.SecureTransport.IdentityProvider
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
+  alias RacingOrg.Tracker.Pro.SecureTransport.Session
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
 
   @device_socket_path "/device_socket"
-  @handshake_epoch 0
 
   # --- Public API / child spec ---
 
@@ -298,6 +299,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       backoff_opts: Keyword.get(opts, :backoff, Backoff.defaults()),
       attempt: 0,
       session: nil,
+      session_fence: nil,
+      owned_session_generation: nil,
       enrollment_ref: nil,
       topic: nil
     }
@@ -353,12 +356,17 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   # Server pushes "handshake_hello" -> produce + push INIT, hold the session.
   @impl Slipstream
   def handle_message(_topic, "handshake_hello", payload, socket) do
-    case ChannelHandler.handshake_init(payload, handshake_inputs(socket.assigns.opts)) do
-      {:ok, init_payload, session} ->
-        socket = assign(socket, :session, session)
-        push(socket, socket.assigns.topic, "handshake_init", init_payload)
-        {:ok, socket}
+    with {:ok, init_payload, session} <- ChannelHandler.handshake_init(payload, handshake_inputs(socket)),
+         :ok <- persist_handshake_epoch(socket, session.credential_epoch),
+         {:ok, session_fence} <- handshake_session_fence(socket, session.credential_epoch) do
+      socket =
+        socket
+        |> assign(:session, session)
+        |> assign(:session_fence, session_fence)
 
+      push(socket, socket.assigns.topic, "handshake_init", init_payload)
+      {:ok, socket}
+    else
       {:error, reason} ->
         Logger.error("[ChannelClient] handshake_init failed: #{inspect(reason)}")
         {:ok, fail_handshake(socket)}
@@ -368,32 +376,44 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   # Server confirms with "handshake_ok" -> verify, publish the live session.
   def handle_message(_topic, "handshake_ok", payload, socket) do
     case socket.assigns.session do
+      %Session{generation: generation} = session when is_integer(generation) ->
+        case ChannelHandler.verify_handshake_ok(payload, session) do
+          :ok ->
+            Logger.debug("[ChannelClient] ignoring duplicate handshake_ok for the live session")
+            {:ok, socket}
+
+          {:error, reason} ->
+            Logger.error("[ChannelClient] duplicate handshake_ok rejected: #{inspect(reason)}")
+            {:ok, fail_handshake(socket)}
+        end
+
       nil ->
         Logger.error("[ChannelClient] handshake_ok before a derived session")
         {:ok, fail_handshake(socket)}
 
       session ->
-        case ChannelHandler.verify_handshake_ok(payload, session) do
-          :ok ->
-            :ok = SessionHolder.put(socket.assigns.session_holder, session)
-            Logger.info("[ChannelClient] secure session established")
+        with :ok <- ChannelHandler.verify_handshake_ok(payload, session),
+             {:ok, published_session} <- publish_session(socket, session) do
+          Logger.info("[ChannelClient] secure session established")
 
-            # Durable authenticated readiness is reported only after the holder has
-            # published the verified live session. A matching v1 authority cannot
-            # take that transition yet; it instead starts authenticated enrollment.
-            socket = report_authenticated(socket)
+          socket =
+            socket
+            |> assign(:session, published_session)
+            |> assign(:session_fence, published_session.generation)
+            |> assign(:owned_session_generation, published_session.generation)
+            |> report_authenticated()
 
-            # The device has connected to RacingOrg correctly -> mark the running
-            # firmware VALID (idempotent, best-effort). A bad OTA that never reaches
-            # this point stays unvalidated and auto-reverts on the next reboot.
-            _ = socket.assigns.firmware_validator.()
-            # Report current WiFi status once the session is live so the server
-            # reflects the device's actual state on (re)connect.
-            send(self(), :report_wifi_status)
-            {:ok, assign(socket, :attempt, 0)}
-
+          # The device has connected to RacingOrg correctly -> mark the running
+          # firmware VALID (idempotent, best-effort). A bad OTA that never reaches
+          # this point stays unvalidated and auto-reverts on the next reboot.
+          _ = socket.assigns.firmware_validator.()
+          # Report current WiFi status once the session is live so the server
+          # reflects the device's actual state on (re)connect.
+          send(self(), :report_wifi_status)
+          {:ok, assign(socket, :attempt, 0)}
+        else
           {:error, reason} ->
-            Logger.error("[ChannelClient] handshake_ok mismatch: #{inspect(reason)}")
+            Logger.error("[ChannelClient] handshake_ok rejected: #{inspect(reason)}")
             {:ok, fail_handshake(socket)}
         end
     end
@@ -603,14 +623,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   # --- internal ---
 
-  # Push the current WiFi status (no applied_version known) to the server. A no-op
-  # when there is no joined topic yet (e.g. a change before the channel is up).
+  # Push the current WiFi status (no applied_version known) only while this
+  # connection still owns the live secure session. Delayed VintageNet/report
+  # callbacks from a replaced or disconnected client are dropped.
   defp push_wifi_status(%{assigns: %{topic: nil}} = socket), do: socket
 
   defp push_wifi_status(socket) do
-    status = wifi_status(socket, nil)
-    push(socket, socket.assigns.topic, "wifi_status", status)
-    socket
+    push_if_session_live(socket, "wifi_status", wifi_status(socket, nil))
   end
 
   # Push a batch of streamed computed values as "computed_values_data". Gated on a
@@ -622,11 +641,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   defp push_computed_values_data(socket, []), do: socket
 
   defp push_computed_values_data(socket, values) do
-    if session_live?(socket) do
-      push(socket, socket.assigns.topic, "computed_values_data", %{values: values})
-    end
-
-    socket
+    push_if_session_live(socket, "computed_values_data", %{values: values})
   end
 
   # Push an incremental "sailed_polar_update". Gated on a LIVE secure session (joined
@@ -637,11 +652,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   defp push_sailed_polar_update(socket, %{cells: []}), do: socket
 
   defp push_sailed_polar_update(socket, update) do
-    if session_live?(socket) do
-      push(socket, socket.assigns.topic, "sailed_polar_update", update)
-    end
-
-    socket
+    push_if_session_live(socket, "sailed_polar_update", update)
   end
 
   # Calibration updates follow the sailed-polar rules exactly: no joined topic or
@@ -650,11 +661,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   defp push_calibration_update(socket, %{entries: []}), do: socket
 
   defp push_calibration_update(socket, update) do
-    if session_live?(socket) do
-      push(socket, socket.assigns.topic, "calibration_update", update)
-    end
-
-    socket
+    push_if_session_live(socket, "calibration_update", update)
   end
 
   # Wind-shift updates follow the calibration rules exactly: no joined topic or a
@@ -665,11 +672,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   defp push_wind_shift_update(socket, %{timeline: [], events: [], session: nil}), do: socket
 
   defp push_wind_shift_update(socket, update) do
-    if session_live?(socket) do
-      push(socket, socket.assigns.topic, "wind_shift_update", update)
-    end
-
-    socket
+    push_if_session_live(socket, "wind_shift_update", update)
   end
 
   # Push a "request_route_recalc". Gated on a LIVE secure session (joined topic +
@@ -679,11 +682,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   defp push_request_route_recalc(%{assigns: %{topic: nil}} = socket, _position), do: socket
 
   defp push_request_route_recalc(socket, position) do
-    if session_live?(socket) do
-      push(socket, socket.assigns.topic, "request_route_recalc", recalc_payload(position))
-    end
-
-    socket
+    push_if_session_live(socket, "request_route_recalc", recalc_payload(position))
   end
 
   defp recalc_payload({lat, lon}) when is_number(lat) and is_number(lon),
@@ -691,17 +690,69 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   defp recalc_payload(_), do: %{}
 
-  # The session is live once the handshake has completed and published it to the
-  # holder (and not since been evicted/disconnected). Defaults to false if the holder
-  # is unavailable, so streamback is never sent over a half-open channel.
-  defp session_live?(%{assigns: %{session: nil}}), do: false
+  # Execute the final push while the holder serializes replacement/clear behind
+  # this session generation. A stale client therefore cannot emit over a session
+  # published by another connection, and a clear cannot overtake an approved push.
+  defp push_if_session_live(%{assigns: %{session: nil}} = socket, _event, _payload), do: socket
 
-  defp session_live?(socket) do
-    SessionHolder.live?(socket.assigns.session_holder)
+  defp push_if_session_live(socket, event, payload) do
+    session = socket.assigns.session
+
+    if is_integer(session.generation) do
+      _ =
+        SessionHolder.with_session(
+          socket.assigns.session_holder,
+          session.generation,
+          fn current ->
+            if current.session_id == session.session_id do
+              push(socket, socket.assigns.topic, event, payload)
+            else
+              {:error, :stale_session}
+            end
+          end
+        )
+    end
+
+    socket
   rescue
-    _ -> false
+    _ -> socket
   catch
-    :exit, _ -> false
+    :exit, _ -> socket
+  end
+
+  defp handshake_session_fence(socket, credential_epoch) do
+    case SessionHolder.fence_for_credential_epoch(
+           socket.assigns.session_holder,
+           credential_epoch
+         ) do
+      {:ok, generation, :current} ->
+        {:ok, generation}
+
+      {:ok, generation, :evicted} ->
+        _ = bootstrap_call(socket, :session_lost)
+        {:ok, generation}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  rescue
+    _ -> {:error, :session_holder_unavailable}
+  catch
+    :exit, _ -> {:error, :session_holder_unavailable}
+  end
+
+  defp publish_session(socket, session) do
+    case socket.assigns.session_fence do
+      generation when is_integer(generation) and generation >= 0 ->
+        SessionHolder.publish(socket.assigns.session_holder, session, generation)
+
+      _missing_fence ->
+        {:error, :stale_session}
+    end
+  rescue
+    _ -> {:error, :session_holder_unavailable}
+  catch
+    :exit, _ -> {:error, :session_holder_unavailable}
   end
 
   # --- WiFi collaborator (injectable like :commands) ---
@@ -1093,12 +1144,31 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   end
 
   defp clear_session(socket) do
-    _ = SessionHolder.clear(socket.assigns.session_holder)
-    _ = bootstrap_call(socket, :session_lost)
+    case socket.assigns.owned_session_generation do
+      generation when is_integer(generation) ->
+        case clear_owned_session(socket, generation) do
+          :ok -> _ = bootstrap_call(socket, :session_lost)
+          {:error, :stale_session} -> :ok
+          {:error, :session_holder_unavailable} -> _ = bootstrap_call(socket, :session_lost)
+        end
+
+      nil ->
+        :ok
+    end
 
     socket
     |> assign(:session, nil)
+    |> assign(:session_fence, nil)
+    |> assign(:owned_session_generation, nil)
     |> assign(:enrollment_ref, nil)
+  end
+
+  defp clear_owned_session(socket, generation) do
+    SessionHolder.clear(socket.assigns.session_holder, generation)
+  rescue
+    _ -> {:error, :session_holder_unavailable}
+  catch
+    :exit, _ -> {:error, :session_holder_unavailable}
   end
 
   defp schedule_reconnect(socket) do
@@ -1209,19 +1279,33 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     end
   end
 
-  defp handshake_inputs(opts) do
+  defp handshake_inputs(socket) do
+    opts = socket.assigns.opts
     {:ok, identity} = KeyStore.load(keystore_opts(opts))
     server_pub = ServerIdentity.public_key()
 
-    %{
+    inputs = %{
       device_identity: identity,
       server_identity_public: server_pub,
       # The server does not validate device_id; it binds whatever we send into the
       # transcript. We send the active identity fingerprint (the routing id) — the
       # same identifier used at connect + as the topic.
-      device_id: IdentityProvider.fingerprint(identity),
-      epoch: @handshake_epoch
+      device_id: IdentityProvider.fingerprint(identity)
     }
+
+    case bootstrap_call(socket, :credential_epoch) do
+      {:ok, credential_epoch} -> Map.put(inputs, :credential_epoch, credential_epoch)
+      _legacy_or_unavailable -> inputs
+    end
+  end
+
+  defp persist_handshake_epoch(socket, credential_epoch) do
+    case bootstrap_call(socket, :adopt_credential_epoch, [credential_epoch]) do
+      {:ok, %BootstrapState{}} -> :ok
+      {:error, reason} when credential_epoch == 0 and reason in [:no_verified_authority, :bootstrap_unavailable] -> :ok
+      {:error, reason} -> {:error, reason}
+      _invalid -> {:error, :bootstrap_unavailable}
+    end
   end
 
   defp fingerprint(opts) do

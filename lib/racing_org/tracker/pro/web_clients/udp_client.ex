@@ -27,9 +27,11 @@ defmodule RacingOrg.Tracker.Pro.WebClients.UDPClient do
   crashes the telemetry pipeline: the one datagram is dropped (UDP is lossy and the
   device re-sends on the next sample).
 
-  The existing UDP RECEIVE handling on the device-initiated socket
-  (`RacingOrg.Tracker.Pro.WebClients.UDPClient.Server`) is unchanged for legacy command
-  coexistence; secure command delivery is the P4 channel.
+  Legacy UDP replies on the device-initiated socket remain temporarily supported,
+  but `RacingOrg.Tracker.Pro.WebClients.UDPClient.Server` forwards them only while a
+  live session at the durable credential epoch is current. Full authenticated
+  `control_v1` command framing remains out of scope; secure command delivery normally
+  uses the WSS channel.
   """
 
   require Logger
@@ -52,25 +54,44 @@ defmodule RacingOrg.Tracker.Pro.WebClients.UDPClient do
     * `:send_fun` — 1-arity fun invoked with the FINAL (sealed) bytes to put on the
       wire (default `&Server.send/1`), so tests can capture the bytes without a
       socket.
+    * `:session_generation` — optional generation captured when work was queued.
+      If that generation has been replaced, the datagram is dropped before sealing.
   """
   @spec send_data_set(binary(), keyword()) :: :ok
   def send_data_set(proto_binary, opts \\ []) when is_binary(proto_binary) do
     holder = Keyword.get(opts, :session_holder, SessionHolder)
     send_fun = Keyword.get(opts, :send_fun, &Server.send/1)
+    expected_generation = Keyword.get(opts, :session_generation, :current)
 
-    case secure_grant(holder) do
-      {:ok, grant} -> send_secure(proto_binary, grant, send_fun)
+    case secure_send(holder, expected_generation, proto_binary, send_fun) do
+      :ok -> :ok
       :no_session -> drop_without_session()
+      :send_failed -> drop_failed_send()
     end
   end
 
-  # Reserve a counter from the holder iff a session is live. Treat a not-running /
-  # crashed holder, or a session cleared between the live? check and the take (race),
-  # as "no session" so we never crash the telemetry pipeline.
-  defp secure_grant(holder) do
-    case SessionHolder.take_send_counter(holder) do
-      {:ok, grant} -> {:ok, grant}
+  # Reserve, seal, and cross the final send boundary while the holder serializes
+  # replacement/clear calls. A counter grant and old key can therefore never be
+  # used after another session generation has become current.
+  defp secure_send(holder, expected_generation, proto_binary, send_fun) do
+    send_boundary = fn grant -> send_secure(proto_binary, grant, send_fun) end
+
+    result =
+      case expected_generation do
+        :current ->
+          SessionHolder.with_send_counter(holder, send_boundary)
+
+        generation when is_integer(generation) and generation >= 0 ->
+          SessionHolder.with_send_counter(holder, generation, send_boundary)
+
+        _invalid ->
+          {:error, :stale_session}
+      end
+
+    case result do
+      {:ok, :ok} -> :ok
       {:error, :no_session} -> :no_session
+      {:error, _reason} -> :send_failed
     end
   catch
     :exit, _ -> :no_session
@@ -94,6 +115,11 @@ defmodule RacingOrg.Tracker.Pro.WebClients.UDPClient do
   defp drop_without_session do
     # No live session: drop the datagram. Telemetry is AEAD-only — never leak plaintext.
     Logger.debug("Dropping telemetry datagram; no live secure transport session")
+    :ok
+  end
+
+  defp drop_failed_send do
+    Logger.warning("Dropping telemetry datagram; secure send boundary failed")
     :ok
   end
 end
