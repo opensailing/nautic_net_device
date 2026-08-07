@@ -25,7 +25,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Handshake do
   import Bitwise, only: [&&&: 2]
 
   alias RacingOrg.Tracker.Pro.SecureTransport, as: ST
-  alias RacingOrg.Tracker.Pro.SecureTransport.{HKDF, Primitives, Session}
+  alias RacingOrg.Tracker.Pro.SecureTransport.{HKDF, IdentityProvider, Primitives, Session}
 
   # ---- Wire (de)serialization helpers ----
 
@@ -116,8 +116,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Handshake do
 
   Options:
 
-    * `:device_identity_private` (required) — device long-term Ed25519 private.
-    * `:device_identity_public` (required) — device long-term Ed25519 public.
+    * `:device_identity` — operational `IdentityProvider` handle used by production callers.
+    * `:device_identity_private` / `:device_identity_public` — deterministic raw-seed
+      compatibility path for pure KAT/interoperability tests when `:device_identity` is absent.
     * `:server_identity_public` (required) — the FIRMWARE-PINNED server Ed25519 pub.
     * `:device_id` (required) — opaque device identifier bytes.
     * `:ephemeral` (optional) — `{pub, priv}` X25519 (tests).
@@ -130,10 +131,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Handshake do
   Returns `{:ok, init_wire, session}` or `{:error, reason}`.
   """
   @spec initiator_init(binary(), keyword()) ::
-          {:ok, binary(), Session.t()} | {:error, atom()}
+          {:ok, binary(), Session.t()} | {:error, term()}
   def initiator_init(hello_wire, opts) do
-    with {:ok, dev_priv} <- fetch(opts, :device_identity_private),
-         {:ok, dev_pub} <- fetch(opts, :device_identity_public),
+    with {:ok, device_identity} <- initiator_identity(opts),
+         dev_pub = initiator_public_key(device_identity),
          {:ok, srv_pub} <- fetch(opts, :server_identity_public),
          {:ok, device_id} <- fetch(opts, :device_id),
          {:ok, epoch} <- valid_epoch(Keyword.get(opts, :epoch, 0)),
@@ -141,14 +142,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Handshake do
          :ok <- ensure(hello.epoch == epoch, :epoch_mismatch),
          :ok <- verify_server_hello(hello, srv_pub),
          {:ok, {eph_pub_d, eph_priv_d}} <- ephemeral(opts),
-         {:ok, shared} <- Primitives.x25519_shared(hello.eph_pub_s, eph_priv_d) do
-      timestamp_ms = Keyword.get_lazy(opts, :timestamp_ms, &System.system_time/0) |> normalize_ts()
-
-      init_signed =
-        init_signed(device_id, eph_pub_d, hello.eph_pub_s, hello.server_nonce, epoch, timestamp_ms)
-
-      sig_d = Primitives.ed25519_sign(dev_priv, init_signed)
-
+         {:ok, shared} <- Primitives.x25519_shared(hello.eph_pub_s, eph_priv_d),
+         timestamp_ms = Keyword.get_lazy(opts, :timestamp_ms, &System.system_time/0) |> normalize_ts(),
+         init_signed =
+           init_signed(device_id, eph_pub_d, hello.eph_pub_s, hello.server_nonce, epoch, timestamp_ms),
+         {:ok, sig_d} <- sign_initiator_identity(device_identity, init_signed) do
       init_wire =
         <<ST.magic()::binary, ST.protocol_version(), ST.type_handshake_init(), ST.aead_chacha20_poly1305()>> <>
           lp(device_id) <>
@@ -479,6 +477,31 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Handshake do
   end
 
   # ---- small helpers ----
+
+  defp initiator_identity(opts) do
+    case Keyword.fetch(opts, :device_identity) do
+      {:ok, %IdentityProvider{} = identity} ->
+        {:ok, {:provider, identity}}
+
+      {:ok, _other} ->
+        {:error, :bad_device_identity}
+
+      :error ->
+        with {:ok, private_key} <- fetch(opts, :device_identity_private),
+             {:ok, public_key} <- fetch(opts, :device_identity_public) do
+          {:ok, {:raw_seed, private_key, public_key}}
+        end
+    end
+  end
+
+  defp initiator_public_key({:provider, identity}), do: IdentityProvider.public_key(identity)
+  defp initiator_public_key({:raw_seed, _private_key, public_key}), do: public_key
+
+  defp sign_initiator_identity({:provider, identity}, message), do: IdentityProvider.sign(identity, message)
+
+  defp sign_initiator_identity({:raw_seed, private_key, _public_key}, message) do
+    {:ok, Primitives.ed25519_sign(private_key, message)}
+  end
 
   defp fetch(opts, key) do
     case Keyword.fetch(opts, key) do

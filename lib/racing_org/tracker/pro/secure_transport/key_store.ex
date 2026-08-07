@@ -1,137 +1,152 @@
 defmodule RacingOrg.Tracker.Pro.SecureTransport.KeyStore do
   @moduledoc """
-  The device's long-term Ed25519 IDENTITY key store.
+  Durable storage for the device's active and staged Ed25519 identity seeds.
 
-  This is the device side of the Phase 2 device-identity model. The device's
-  cryptographic identity-of-record is a long-term Ed25519 keypair whose PUBLIC key
-  the server records (after a proof-of-possession-verified claim) as a
-  `RacingOrg.Devices.DeviceKey`. This module owns the device's STABLE PRIVATE
-  identity: it is generated exactly once (on first use), persisted to a writable
-  path, and reloaded unchanged on every subsequent boot.
+  Operational callers use an `IdentityProvider` handle for public key, fingerprint,
+  and signing operations. The handle contains only a non-secret seed-file path and the
+  expected public identity; private seed bytes are read only inside a signing call.
+  The active seed remains at
+  `device_ed25519.key`; recovery candidates are durably staged in a separate file and
+  never replace the last active seed until `promote_candidate/1` is explicitly called
+  after the server receipt has been verified.
 
-  ## What is persisted
-
-  Only the 32-byte Ed25519 PRIVATE SEED is written to disk. The public key is
-  DERIVED deterministically from the seed via
-  `Primitives.ed25519_public_from_secret/1` (verified on OTP 28:
-  `:crypto.generate_key(:eddsa, :ed25519, seed)` reproduces the matching public
-  half, and signatures made with the seed verify under it). Storing only the seed
-  keeps the on-disk footprint minimal and avoids any chance of a stored public key
-  disagreeing with the stored private key.
-
-  ## File location + permissions
-
-  On the device target the seed lives under `/data` (persistent + writable across
-  reboots/OTA): `/data/secure_transport/device_ed25519.key`. The base path is
-  configurable via
-
-      config :racing_org_tracker_pro, #{inspect(__MODULE__)}, base_path: "/some/dir"
-
-  (defaulting to `/data/secure_transport`), so the host/test target points at a
-  temp dir. The seed file is written ATOMICALLY (write to a temp file in the
-  same dir, `chmod 0600`, then rename) and the containing directory is created with
-  restrictive (`0700`) perms.
-
-  ## Identity struct
-
-  `load_or_generate/1` returns `{:ok, %{private_key:, public_key:, fingerprint:}}`
-  where `fingerprint` is the canonical lowercase hex `SHA-256(public_key)` (64
-  chars) — IDENTICAL to the server's `RacingOrg.Devices.DeviceKey.fingerprint/1`.
-
-  ## Hardware-backed keys (future)
-
-  NervesKey / ATECC608 secure-element storage is a future option. The seam is the
-  `t:backend/0` indirection: today only the `:file` backend (this module) is
-  implemented; a `:nerves_key` backend would generate/sign inside the secure
-  element without the private seed ever touching the filesystem. Callers depend on
-  the `load_or_generate/1` / `fingerprint/1` surface, not on the file layout.
+  Every seed write uses a same-directory exclusive temporary file, applies `0600`
+  before writing secret bytes, fsyncs the file, closes it, atomically renames it, and
+  fsyncs the parent directory. Filesystem operations and durability-boundary fault
+  injection are configurable for host tests.
   """
 
+  alias RacingOrg.Tracker.Pro.SecureTransport.IdentityProvider
+  alias RacingOrg.Tracker.Pro.SecureTransport.IdentityProvider.FileSeed
+  alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
   alias RacingOrg.Tracker.Pro.SecureTransport.Primitives
 
-  @type identity :: %{
-          private_key: binary(),
-          public_key: binary(),
-          fingerprint: String.t()
-        }
-
-  @typedoc "The storage backend. Only `:file` is implemented today (NervesKey is a future seam)."
-  @type backend :: :file
+  @type identity :: IdentityProvider.t()
+  @type fault_stage ::
+          :temp_opened
+          | :temp_chmodded
+          | :temp_written
+          | :temp_synced
+          | :temp_closed
+          | :before_rename
+          | :renamed
+          | :parent_synced
+          | :candidate_removed
 
   @default_base_path "/data/secure_transport"
   @key_filename "device_ed25519.key"
+  @candidate_key_filename "device_ed25519.candidate.key"
   @seed_size 32
   @dir_mode 0o700
   @file_mode 0o600
 
-  @doc "The default base path for the identity seed file (`/data/...` on target)."
+  @doc "The default base path for device identity seed files."
   @spec default_base_path() :: String.t()
   def default_base_path, do: @default_base_path
 
-  @doc """
-  Loads the device's long-term identity, generating + persisting it on first use.
-
-  On the FIRST call (no seed file present) a fresh Ed25519 keypair is generated via
-  `Primitives.generate_identity_keypair/0`, the 32-byte private seed is written
-  atomically with `0600` perms, and the identity is returned. On EVERY subsequent
-  call the existing seed is read back and the SAME identity is returned (the device
-  never regenerates its stable identity).
-
-  Options:
-
-    * `:base_path` — override the directory holding the seed file (defaults to the
-      configured `:base_path`, then `#{inspect(@default_base_path)}`). Tests/host
-      pass a temp dir.
-
-  Returns `{:ok, identity}` or `{:error, reason}` (e.g. `{:error, {:read, posix}}`,
-  `{:error, {:write, posix}}`, `{:error, :corrupt_seed}` for a wrong-sized file).
-  """
+  @doc "Load the active identity, generating and durably persisting it on first use."
   @spec load_or_generate(keyword()) :: {:ok, identity()} | {:error, term()}
   def load_or_generate(opts \\ []) do
     path = key_path(opts)
 
-    case read_seed(path) do
-      {:ok, seed} -> {:ok, identity_from_seed(seed)}
-      {:error, :enoent} -> generate_and_persist(path)
-      {:error, _} = err -> err
+    case read_seed(path, opts) do
+      {:ok, seed} -> identity_from_seed(path, seed, opts)
+      {:error, :enoent} -> generate_and_persist(path, opts)
+      {:error, _reason} = error -> error
     end
   end
 
-  @doc """
-  Loads the existing identity WITHOUT generating one.
-
-  Returns `{:ok, identity}` or `{:error, :not_provisioned}` when no seed file
-  exists yet. Useful for consumers (handshake/claim wiring) that must not silently
-  mint an identity.
-  """
+  @doc "Load the existing active identity without generating one."
   @spec load(keyword()) :: {:ok, identity()} | {:error, term()}
   def load(opts \\ []) do
-    case read_seed(key_path(opts)) do
-      {:ok, seed} -> {:ok, identity_from_seed(seed)}
+    path = key_path(opts)
+
+    case read_seed(path, opts) do
+      {:ok, seed} -> identity_from_seed(path, seed, opts)
       {:error, :enoent} -> {:error, :not_provisioned}
-      {:error, _} = err -> err
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc "Load the staged recovery candidate without changing the active identity."
+  @spec load_candidate(keyword()) :: {:ok, identity()} | {:error, term()}
+  def load_candidate(opts \\ []) do
+    path = candidate_key_path(opts)
+
+    case read_seed(path, opts) do
+      {:ok, seed} -> identity_from_seed(path, seed, opts)
+      {:error, :enoent} -> {:error, :candidate_not_staged}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc "Generate and durably stage a recovery candidate, reusing one already staged."
+  @spec stage_candidate(keyword()) :: {:ok, identity()} | {:error, term()}
+  def stage_candidate(opts \\ []) do
+    path = candidate_key_path(opts)
+
+    case read_seed(path, opts) do
+      {:ok, seed} -> identity_from_seed(path, seed, opts)
+      {:error, :enoent} -> generate_and_persist(path, opts)
+      {:error, _reason} = error -> error
     end
   end
 
   @doc """
-  Canonical fingerprint of a raw 32-byte Ed25519 public key: lowercase hex
-  `SHA-256(public_key)` (64 chars).
+  Atomically promote the staged candidate to the active identity.
 
-  IDENTICAL to the server's `RacingOrg.Devices.DeviceKey.fingerprint/1`. Uses
-  `Primitives.sha256/1` (the crypto core) — never hand-rolls hashing.
+  This is the sole operation that replaces the active seed. Recovery orchestration
+  must call it only after verifying the committed server receipt for this candidate.
   """
-  @spec fingerprint(binary()) :: String.t()
-  def fingerprint(public_key) when is_binary(public_key) do
-    public_key
-    |> Primitives.sha256()
-    |> Base.encode16(case: :lower)
+  @spec promote_candidate(keyword()) :: {:ok, identity()} | {:error, term()}
+  def promote_candidate(opts \\ []) do
+    candidate_path = candidate_key_path(opts)
+
+    active_path = key_path(opts)
+
+    with {:ok, seed} <- read_candidate_seed(candidate_path, opts),
+         :ok <- durable_rename(candidate_path, active_path, opts),
+         {:ok, identity} <- identity_from_seed(active_path, seed, opts) do
+      {:ok, identity}
+    end
   end
 
-  @doc "Absolute path of the identity seed file for the given/configured base path."
+  @doc "Durably discard a staged candidate without changing the active identity."
+  @spec discard_candidate(keyword()) :: :ok | {:error, term()}
+  def discard_candidate(opts \\ []) do
+    path = candidate_key_path(opts)
+    file_system = file_system(opts)
+
+    case file_system.remove(path) do
+      :ok ->
+        with :ok <- inject_fault(:candidate_removed, opts),
+             :ok <- sync_parent_directory(path, opts),
+             :ok <- inject_fault(:parent_synced, opts) do
+          :ok
+        end
+
+      {:error, :enoent} ->
+        :ok
+
+      {:error, reason} ->
+        {:error, {:remove, reason}}
+
+      other ->
+        {:error, {:remove, other}}
+    end
+  end
+
+  @doc "Canonical lowercase hexadecimal SHA-256 fingerprint of a raw Ed25519 public key."
+  @spec fingerprint(binary()) :: String.t()
+  def fingerprint(public_key), do: IdentityProvider.fingerprint_for_public_key(public_key)
+
+  @doc "Absolute path of the active identity seed file."
   @spec key_path(keyword()) :: String.t()
   def key_path(opts \\ []), do: Path.join(base_path(opts), @key_filename)
 
-  ## --- internal ------------------------------------------------------------
+  @doc "Absolute path of the staged recovery-candidate seed file."
+  @spec candidate_key_path(keyword()) :: String.t()
+  def candidate_key_path(opts \\ []), do: Path.join(base_path(opts), @candidate_key_filename)
 
   defp base_path(opts) do
     Keyword.get(opts, :base_path) || configured_base_path() || @default_base_path
@@ -143,88 +158,194 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.KeyStore do
     |> Keyword.get(:base_path)
   end
 
-  defp identity_from_seed(<<seed::binary-size(@seed_size)>>) do
-    public_key = Primitives.ed25519_public_from_secret(seed)
+  defp file_system(opts), do: Keyword.get(opts, :file_system, FileSystem)
 
-    %{
-      private_key: seed,
-      public_key: public_key,
-      fingerprint: fingerprint(public_key)
-    }
+  defp read_candidate_seed(path, opts) do
+    case read_seed(path, opts) do
+      {:error, :enoent} -> {:error, :candidate_not_staged}
+      result -> result
+    end
   end
 
-  defp read_seed(path) do
-    case File.read(path) do
+  defp read_seed(path, opts) do
+    case file_system(opts).read(path) do
       {:ok, <<seed::binary-size(@seed_size)>>} -> {:ok, seed}
       {:ok, _other} -> {:error, :corrupt_seed}
       {:error, :enoent} -> {:error, :enoent}
       {:error, reason} -> {:error, {:read, reason}}
+      other -> {:error, {:read, other}}
     end
   end
 
-  defp generate_and_persist(path) do
-    {public_key, private_seed} = Primitives.generate_identity_keypair()
-
-    with :ok <- ensure_dir(Path.dirname(path)),
-         :ok <- atomic_write(path, private_seed) do
-      {:ok,
-       %{
-         private_key: private_seed,
-         public_key: public_key,
-         fingerprint: fingerprint(public_key)
-       }}
+  defp generate_and_persist(path, opts) do
+    with {:ok, seed} <- generate_seed(opts),
+         :ok <- durable_write(path, seed, opts),
+         {:ok, identity} <- identity_from_seed(path, seed, opts) do
+      {:ok, identity}
     end
   end
 
-  defp ensure_dir(dir) do
-    case File.mkdir_p(dir) do
-      :ok ->
-        # Best-effort restrictive perms on the containing dir (a no-op surprise on
-        # exotic filesystems must not fail provisioning).
-        _ = File.chmod(dir, @dir_mode)
+  defp identity_from_seed(path, seed, opts) do
+    public_key = Primitives.ed25519_public_from_secret(seed)
+    FileSeed.from_path(path, public_key, file_system: file_system(opts))
+  end
+
+  defp generate_seed(opts) do
+    generator = Keyword.get(opts, :seed_generator, &default_seed_generator/0)
+
+    case generator.() do
+      <<seed::binary-size(@seed_size)>> ->
+        {:ok, seed}
+
+      {<<public_key::binary-size(@seed_size)>>, <<seed::binary-size(@seed_size)>>} ->
+        if Primitives.secure_compare(public_key, Primitives.ed25519_public_from_secret(seed)) do
+          {:ok, seed}
+        else
+          {:error, :generated_keypair_mismatch}
+        end
+
+      _other ->
+        {:error, :invalid_generated_seed}
+    end
+  rescue
+    exception -> {:error, {:seed_generation_failed, exception}}
+  catch
+    kind, reason -> {:error, {:seed_generation_failed, kind, reason}}
+  end
+
+  defp default_seed_generator do
+    {_public_key, seed} = Primitives.generate_identity_keypair()
+    seed
+  end
+
+  defp durable_write(path, contents, opts) do
+    temp_path = temporary_path(path)
+
+    result =
+      with :ok <- ensure_directory(Path.dirname(path), opts),
+           :ok <- write_and_sync_temp(temp_path, contents, opts),
+           :ok <- inject_fault(:before_rename, opts),
+           :ok <- rename(temp_path, path, opts),
+           :ok <- inject_fault(:renamed, opts),
+           :ok <- sync_parent_directory(path, opts),
+           :ok <- inject_fault(:parent_synced, opts) do
         :ok
+      end
+
+    if result != :ok do
+      _ = file_system(opts).remove(temp_path)
+    end
+
+    result
+  end
+
+  defp durable_rename(source, destination, opts) do
+    with :ok <- inject_fault(:before_rename, opts),
+         :ok <- rename(source, destination, opts),
+         :ok <- inject_fault(:renamed, opts),
+         :ok <- sync_parent_directory(destination, opts),
+         :ok <- inject_fault(:parent_synced, opts) do
+      :ok
+    end
+  end
+
+  defp write_and_sync_temp(temp_path, contents, opts) do
+    file_system = file_system(opts)
+
+    case file_system.open(temp_path, [:write, :binary, :raw, :exclusive]) do
+      {:ok, device} ->
+        operation_result =
+          with :ok <- inject_fault(:temp_opened, opts),
+               :ok <- fs_result(file_system.chmod(temp_path, @file_mode), :chmod),
+               :ok <- inject_fault(:temp_chmodded, opts),
+               :ok <- fs_result(file_system.write(device, contents), :write),
+               :ok <- inject_fault(:temp_written, opts),
+               :ok <- fs_result(file_system.sync(device), :file_sync),
+               :ok <- inject_fault(:temp_synced, opts) do
+            :ok
+          end
+
+        close_result = fs_result(file_system.close(device), :close)
+
+        case {operation_result, close_result} do
+          {:ok, :ok} -> inject_fault(:temp_closed, opts)
+          {{:error, _reason} = error, _close_result} -> error
+          {:ok, {:error, _reason} = error} -> error
+        end
 
       {:error, reason} ->
-        {:error, {:mkdir, reason}}
+        {:error, {:open, reason}}
+
+      other ->
+        {:error, {:open, other}}
     end
   end
 
-  # Atomic, 0600 write: write to a unique temp file in the SAME directory, chmod it
-  # 0600 BEFORE it carries the seed under its final name, then rename over the
-  # target (rename within a dir is atomic on the device's filesystem). A crash
-  # mid-write leaves either the old seed or nothing — never a partial seed.
-  defp atomic_write(path, contents) do
-    tmp = path <> ".tmp." <> Integer.to_string(System.unique_integer([:positive]))
+  defp ensure_directory(directory, opts) do
+    file_system = file_system(opts)
 
-    with :ok <- write_file(tmp, contents),
-         :ok <- chmod_file(tmp, @file_mode),
-         :ok <- rename_file(tmp, path) do
+    with :ok <- fs_result(file_system.mkdir_p(directory), :mkdir),
+         :ok <- fs_result(file_system.chmod(directory, @dir_mode), :chmod_directory) do
       :ok
-    else
-      {:error, _} = err ->
-        _ = File.rm(tmp)
-        err
     end
   end
 
-  defp write_file(path, contents) do
-    case File.write(path, contents) do
-      :ok -> :ok
-      {:error, reason} -> {:error, {:write, reason}}
+  defp rename(source, destination, opts) do
+    opts
+    |> file_system()
+    |> then(&fs_result(&1.rename(source, destination), :rename))
+  end
+
+  defp sync_parent_directory(path, opts) do
+    directory = Path.dirname(path)
+    file_system = file_system(opts)
+
+    case file_system.open(directory, [:read, :raw, :directory]) do
+      {:ok, device} ->
+        sync_result = fs_result(file_system.sync(device), :directory_sync)
+        close_result = fs_result(file_system.close(device), :directory_close)
+
+        case {sync_result, close_result} do
+          {:ok, :ok} -> :ok
+          {{:error, _reason} = error, _close_result} -> error
+          {:ok, {:error, _reason} = error} -> error
+        end
+
+      {:error, reason} ->
+        {:error, {:directory_open, reason}}
+
+      other ->
+        {:error, {:directory_open, other}}
     end
   end
 
-  defp chmod_file(path, mode) do
-    case File.chmod(path, mode) do
-      :ok -> :ok
-      {:error, reason} -> {:error, {:chmod, reason}}
+  defp inject_fault(stage, opts) do
+    case Keyword.get(opts, :fault_injector) do
+      nil ->
+        :ok
+
+      injector when is_function(injector, 1) ->
+        case injector.(stage) do
+          :ok -> :ok
+          {:error, reason} -> {:error, {:fault_injected, stage, reason}}
+          other -> {:error, {:fault_injected, stage, {:invalid_response, other}}}
+        end
+
+      _other ->
+        {:error, {:fault_injected, stage, :invalid_injector}}
     end
+  rescue
+    exception -> {:error, {:fault_injected, stage, {:exception, exception}}}
+  catch
+    kind, reason -> {:error, {:fault_injected, stage, {kind, reason}}}
   end
 
-  defp rename_file(src, dst) do
-    case File.rename(src, dst) do
-      :ok -> :ok
-      {:error, reason} -> {:error, {:rename, reason}}
-    end
+  defp fs_result(:ok, _operation), do: :ok
+  defp fs_result({:error, reason}, operation), do: {:error, {operation, reason}}
+  defp fs_result(other, operation), do: {:error, {operation, other}}
+
+  defp temporary_path(path) do
+    suffix = 12 |> :crypto.strong_rand_bytes() |> Base.url_encode64(padding: false)
+    path <> ".tmp." <> suffix
   end
 end

@@ -39,10 +39,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SignedRequest do
   into the assertion MUST equal the one sent in the header (this module guarantees
   that by building both from the same value).
 
-  This module is PURE: it builds the canonical bytes, signs them with the device's
-  identity private key (via `Primitives`), and returns the header set. No I/O.
+  This module builds the canonical bytes, signs them through the operational identity
+  provider, and returns the header set. The canonical builder and raw-seed compatibility
+  path remain pure for deterministic contract tests.
   """
 
+  alias RacingOrg.Tracker.Pro.SecureTransport.IdentityProvider
   alias RacingOrg.Tracker.Pro.SecureTransport.Primitives
 
   @domain_tag "racingorg-bulk-v1"
@@ -105,12 +107,22 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SignedRequest do
   end
 
   @doc """
-  Sign the canonical assertion with the device's Ed25519 identity private key.
+  Sign the canonical assertion through an operational identity provider.
 
-  Returns the raw 64-byte Ed25519 signature. Pure.
+  A raw 32-byte seed remains accepted only as a deterministic compatibility path for
+  pure contract tests and legacy callers.
   """
-  @spec sign(binary(), String.t(), String.t(), binary(), integer() | String.t(), String.t()) ::
+  @spec sign(IdentityProvider.t() | binary(), String.t(), String.t(), binary(), integer() | String.t(), String.t()) ::
           binary()
+  def sign(%IdentityProvider{} = identity, method, path, body, timestamp, fingerprint) do
+    if IdentityProvider.fingerprint(identity) != fingerprint do
+      raise ArgumentError, "identity fingerprint does not match signed request"
+    end
+
+    message = canonical(method, path, body, timestamp, fingerprint)
+    IdentityProvider.sign!(identity, message)
+  end
+
   def sign(private_key, method, path, body, timestamp, fingerprint)
       when is_binary(private_key) do
     message = canonical(method, path, body, timestamp, fingerprint)
@@ -133,16 +145,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SignedRequest do
   The timestamp baked into the SIGNED assertion is the SAME value placed in the
   header, so the server's window check + verify agree.
   """
-  @spec headers(map(), String.t(), String.t(), binary(), integer()) :: headers()
+  @spec headers(IdentityProvider.t() | map(), String.t(), String.t(), binary(), integer()) :: headers()
+  def headers(%IdentityProvider{} = identity, method, path, body, timestamp)
+      when is_binary(method) and is_binary(path) and is_binary(body) and is_integer(timestamp) do
+    fingerprint = IdentityProvider.fingerprint(identity)
+    signature = sign(identity, method, path, body, timestamp, fingerprint)
+
+    build_headers(fingerprint, timestamp, signature)
+  end
+
   def headers(%{private_key: private_key, fingerprint: fingerprint}, method, path, body, timestamp)
       when is_binary(method) and is_binary(path) and is_binary(body) and is_integer(timestamp) do
     signature = sign(private_key, method, path, body, timestamp, fingerprint)
-
-    %{
-      @fingerprint_header => fingerprint,
-      @timestamp_header => Integer.to_string(timestamp),
-      @signature_header => Base.encode64(signature)
-    }
+    build_headers(fingerprint, timestamp, signature)
   end
 
   @doc "Header set as a Tesla-style list of `{name, value}` tuples."
@@ -151,5 +166,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SignedRequest do
     identity
     |> headers(method, path, body, timestamp)
     |> Map.to_list()
+  end
+
+  defp build_headers(fingerprint, timestamp, signature) do
+    %{
+      @fingerprint_header => fingerprint,
+      @timestamp_header => Integer.to_string(timestamp),
+      @signature_header => Base.encode64(signature)
+    }
   end
 end

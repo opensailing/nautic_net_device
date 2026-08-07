@@ -78,7 +78,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SignedRequestTest do
       ts = 1_750_000_123
       path = "/api/bulk/race_manifests"
 
-      sig = SignedRequest.sign(id.private_key, "POST", path, body, ts, id.fingerprint)
+      sig = SignedRequest.sign(id, "POST", path, body, ts, id.fingerprint)
       message = server_canonical("POST", path, body, ts, id.fingerprint)
 
       assert byte_size(sig) == 64

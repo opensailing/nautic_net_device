@@ -17,6 +17,8 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
   """
   use ExUnit.Case, async: false
 
+  alias RacingOrg.Tracker.Pro.Race.BulkUploader
+  alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
@@ -33,6 +35,10 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
     @supervisor
     |> Supervisor.which_children()
     |> Enum.find(fn {child_id, _pid, _type, _modules} -> child_id == id end)
+  end
+
+  defp spec_ids(children) do
+    Enum.map(children, fn child -> Supervisor.child_spec(child, []).id end)
   end
 
   test "the application is running and its top supervisor is alive" do
@@ -120,6 +126,24 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
 
       assert RacingOrg.Tracker.Pro.Application.secure_transport_configured?(:racing_org_rpi3)
     end
+
+    test "secure transport starts deterministically after SessionHolder and bootstrap precedes the channel" do
+      Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+
+      ids =
+        :logger
+        |> RacingOrg.Tracker.Pro.Application.child_specs(:racing_org_rpi3)
+        |> spec_ids()
+
+      session_holder_index = Enum.find_index(ids, &(&1 == SessionHolder))
+      boot_provisioner_index = Enum.find_index(ids, &(&1 == BootProvisioner))
+      channel_client_index = Enum.find_index(ids, &(&1 == ChannelClient))
+      bulk_uploader_index = Enum.find_index(ids, &(&1 == BulkUploader))
+
+      assert session_holder_index < boot_provisioner_index
+      assert boot_provisioner_index < channel_client_index
+      assert channel_client_index < bulk_uploader_index
+    end
   end
 
   test "ChannelClient is not connectable on host (so it would stay idle if started)" do
@@ -155,7 +179,7 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
     assert cc_spec.restart == :permanent
     assert {ChannelClient, :start_link, [[]]} = cc_spec.start
 
-    # BootProvisioner is a transient one-shot worker (runs once then stops).
+    # BootProvisioner is a transient coordinator (normal terminal stop is not restarted).
     bp_spec = RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner.child_spec([])
     assert bp_spec.id == RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
     assert bp_spec.restart == :transient

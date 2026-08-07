@@ -6,6 +6,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.HandshakeTest do
   """
   use ExUnit.Case, async: true
 
+  alias RacingOrg.Tracker.Pro.IdentityProviderTestSupport
   alias RacingOrg.Tracker.Pro.SecureTransport.{Frame, Handshake, Primitives}
 
   setup do
@@ -105,6 +106,45 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.HandshakeTest do
       {d2, _} = full_handshake(ctx)
       assert d1.out_key != d2.out_key
       assert d1.session_id != d2.session_id
+    end
+
+    test "operational signer and deterministic raw-seed paths produce byte-identical INIT", ctx do
+      assert {:ok, identity} = IdentityProviderTestSupport.identity_from_seed(ctx.dev_priv)
+      {server_ephemeral_public, server_ephemeral_private} = Primitives.generate_ephemeral_keypair()
+      {device_ephemeral_public, device_ephemeral_private} = Primitives.generate_ephemeral_keypair()
+      server_nonce = :binary.copy(<<0x77>>, 32)
+
+      assert {:ok, hello, responder_state} =
+               Handshake.responder_hello(
+                 server_identity_private: ctx.srv_priv,
+                 server_identity_public: ctx.srv_pub,
+                 device_identity_public: ctx.dev_pub,
+                 ephemeral: {server_ephemeral_public, server_ephemeral_private},
+                 server_nonce: server_nonce,
+                 epoch: 5
+               )
+
+      common = [
+        server_identity_public: ctx.srv_pub,
+        device_id: ctx.device_id,
+        ephemeral: {device_ephemeral_public, device_ephemeral_private},
+        timestamp_ms: 1_700_000_000_123,
+        epoch: 5
+      ]
+
+      assert {:ok, raw_init, raw_session} =
+               Handshake.initiator_init(
+                 hello,
+                 [device_identity_private: ctx.dev_priv, device_identity_public: ctx.dev_pub] ++ common
+               )
+
+      assert {:ok, provider_init, provider_session} =
+               Handshake.initiator_init(hello, [device_identity: identity] ++ common)
+
+      assert provider_init == raw_init
+      assert provider_session == raw_session
+      assert {:ok, server_session} = Handshake.responder_finalize(responder_state, provider_init)
+      assert server_session.session_id == provider_session.session_id
     end
   end
 

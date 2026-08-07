@@ -49,8 +49,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   `start_link/1` always succeeds and the process is safe to run "not configured":
   if the device is not on a real target, is unregistered, has no identity, or has no
   pinned server key, the client stays IDLE (it never attempts to connect and never
-  crash-loops). It only connects when `connectable?/1` is true. The child spec is
-  exposed but NOT added to `application.ex` here.
+  crash-loops). It only connects when `connectable?/1` is true and starts after the
+  supervised bootstrap coordinator in `application.ex`.
   """
 
   use Slipstream
@@ -58,7 +58,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   require Logger
 
   alias RacingOrg.Tracker.Pro.SecureTransport.Backoff
+  alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelHandler
+  alias RacingOrg.Tracker.Pro.SecureTransport.IdentityProvider
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
@@ -77,6 +79,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     * `:name` — registered name (default `__MODULE__`).
     * `:commands` — the `RacingOrg.Tracker.Pro.Commands` server (default `RacingOrg.Tracker.Pro.Commands`).
     * `:session_holder` — the `SessionHolder` server (default `SessionHolder`).
+    * `:boot_provisioner` — coordinator collaborator as a module or `{module, server}`.
+    * `:bootstrap_opts` — full authority-validation options used by `connectable?/1`.
     * `:wifi` — the WiFi collaborator that applies config + reports status. Either a
       module (used as both module and GenServer name, default `RacingOrg.Tracker.Pro.WiFiManager`)
       or a `{module, server}` tuple so tests can inject a fake module + pid.
@@ -96,7 +100,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   @spec child_spec(keyword()) :: Supervisor.child_spec()
   def child_spec(opts) do
     %{
-      id: Keyword.get(opts, :name, __MODULE__),
+      id: Keyword.get(opts, :name) || __MODULE__,
       start: {__MODULE__, :start_link, [opts]},
       type: :worker,
       restart: :permanent,
@@ -246,6 +250,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       opts: opts,
       commands: Keyword.get(opts, :commands, RacingOrg.Tracker.Pro.Commands),
       session_holder: Keyword.get(opts, :session_holder, SessionHolder),
+      boot_provisioner: normalize_collaborator(Keyword.get(opts, :boot_provisioner, BootProvisioner)),
       wifi: normalize_wifi(Keyword.get(opts, :wifi, RacingOrg.Tracker.Pro.WiFiManager)),
       # The per-state tracking config (damping + send-rate). `tracking` applies the
       # server-pushed config (default RacingOrg.Tracker.Pro.Tracking.Config); `tracking_status`
@@ -293,6 +298,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       backoff_opts: Keyword.get(opts, :backoff, Backoff.defaults()),
       attempt: 0,
       session: nil,
+      enrollment_ref: nil,
       topic: nil
     }
 
@@ -371,6 +377,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
           :ok ->
             :ok = SessionHolder.put(socket.assigns.session_holder, session)
             Logger.info("[ChannelClient] secure session established")
+
+            # Durable authenticated readiness is reported only after the holder has
+            # published the verified live session. A matching v1 authority cannot
+            # take that transition yet; it instead starts authenticated enrollment.
+            socket = report_authenticated(socket)
+
             # The device has connected to RacingOrg correctly -> mark the running
             # firmware VALID (idempotent, best-effort). A bad OTA that never reaches
             # this point stays unvalidated and auto-reverts on the next reboot.
@@ -487,8 +499,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   # Server killed the session (key revoke / device revoke / transfer).
   def handle_message(_topic, "session_evicted", payload, socket) do
     Logger.warning("[ChannelClient] session evicted: #{inspect(payload)}")
-    clear_session(socket)
-    {:stop, :normal, socket}
+    {:stop, :normal, clear_session(socket)}
   end
 
   def handle_message(_topic, event, _payload, socket) do
@@ -497,17 +508,33 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   end
 
   @impl Slipstream
+  def handle_reply(ref, reply, socket), do: handle_channel_reply(ref, reply, socket)
+
+  defp handle_channel_reply(ref, reply, %{assigns: %{enrollment_ref: ref}} = socket) when not is_nil(ref) do
+    socket = assign(socket, :enrollment_ref, nil)
+
+    case reply do
+      {:ok, %{"receipt" => receipt} = response} when is_binary(receipt) and map_size(response) == 1 ->
+        complete_legacy_enrollment(response, socket)
+
+      _unsupported_or_invalid ->
+        Logger.info("[ChannelClient] authenticated legacy enrollment was not accepted")
+        {:ok, socket}
+    end
+  end
+
+  defp handle_channel_reply(_ref, _reply, socket), do: {:ok, socket}
+
+  @impl Slipstream
   def handle_disconnect(reason, socket) do
     Logger.warning("[ChannelClient] disconnected: #{inspect(reason)}")
-    clear_session(socket)
-    {:ok, schedule_reconnect(socket)}
+    {:ok, socket |> clear_session() |> schedule_reconnect()}
   end
 
   @impl Slipstream
   def handle_topic_close(_topic, reason, socket) do
     Logger.warning("[ChannelClient] topic closed: #{inspect(reason)}")
-    clear_session(socket)
-    {:ok, schedule_reconnect(disconnect(socket))}
+    {:ok, socket |> clear_session() |> disconnect() |> schedule_reconnect()}
   end
 
   # Our own jittered-backoff reconnect timer.
@@ -710,6 +737,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       rescue
         error ->
           Logger.warning("[ChannelClient] WiFi current_status failed: #{inspect(error)}")
+          %{enabled: false, ssid: nil, connection: :disconnected, signal: nil}
+      catch
+        :exit, reason ->
+          Logger.warning("[ChannelClient] WiFi current_status unavailable: #{inspect(reason)}")
           %{enabled: false, ssid: nil, connection: :disconnected, signal: nil}
       end
 
@@ -1003,17 +1034,71 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     not Keyword.get(opts, :test_mode?, false) and device_target?()
   end
 
+  defp report_authenticated(socket) do
+    case bootstrap_call(socket, :authenticated) do
+      {:ok, _state} -> socket
+      {:error, :invalid_transition} -> start_legacy_enrollment(socket)
+      _unavailable_or_failed -> socket
+    end
+  end
+
+  defp start_legacy_enrollment(socket) do
+    case bootstrap_call(socket, :legacy_enrollment_request) do
+      {:ok, %{body: body}} when is_map(body) ->
+        case push(socket, socket.assigns.topic, "enroll_hardware_identity", body) do
+          {:ok, ref} -> assign(socket, :enrollment_ref, ref)
+          {:error, _reason} -> socket
+        end
+
+      _not_a_legacy_migration ->
+        socket
+    end
+  end
+
+  defp complete_legacy_enrollment(response, socket) do
+    case bootstrap_call(socket, :accept_legacy_enrollment, [response]) do
+      {:ok, _registered_state} ->
+        case bootstrap_call(socket, :authenticated) do
+          {:ok, _authenticated_state} ->
+            Logger.info("[ChannelClient] authenticated legacy enrollment completed")
+
+          _failed ->
+            Logger.warning("[ChannelClient] legacy enrollment persisted but readiness update failed")
+        end
+
+      _invalid_receipt_or_state ->
+        Logger.warning("[ChannelClient] authenticated legacy enrollment receipt was rejected")
+    end
+
+    {:ok, socket}
+  end
+
+  defp bootstrap_call(socket, callback, args \\ []) do
+    {module, server} = socket.assigns.boot_provisioner
+    apply(module, callback, args ++ [server])
+  rescue
+    _exception -> {:error, :bootstrap_unavailable}
+  catch
+    :exit, _reason -> {:error, :bootstrap_unavailable}
+  end
+
   # A handshake failure (bad signature, mismatch, server error) is NOT a clean
   # session: clear the holder and reconnect on backoff (which re-runs the
   # handshake fresh). We disconnect the socket so a full reconnect happens.
   defp fail_handshake(socket) do
-    clear_session(socket)
-    schedule_reconnect(disconnect(socket))
+    socket
+    |> clear_session()
+    |> disconnect()
+    |> schedule_reconnect()
   end
 
   defp clear_session(socket) do
     _ = SessionHolder.clear(socket.assigns.session_holder)
-    assign(socket, :session, nil)
+    _ = bootstrap_call(socket, :session_lost)
+
+    socket
+    |> assign(:session, nil)
+    |> assign(:enrollment_ref, nil)
   end
 
   defp schedule_reconnect(socket) do
@@ -1129,20 +1214,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     server_pub = ServerIdentity.public_key()
 
     %{
-      device_identity_private: identity.private_key,
-      device_identity_public: identity.public_key,
+      device_identity: identity,
       server_identity_public: server_pub,
       # The server does not validate device_id; it binds whatever we send into the
-      # transcript. We send the fingerprint (the routing id) — deterministic, the
-      # same id used at connect + as the topic.
-      device_id: identity.fingerprint,
+      # transcript. We send the active identity fingerprint (the routing id) — the
+      # same identifier used at connect + as the topic.
+      device_id: IdentityProvider.fingerprint(identity),
       epoch: @handshake_epoch
     }
   end
 
   defp fingerprint(opts) do
     case KeyStore.load(keystore_opts(opts)) do
-      {:ok, %{fingerprint: fp}} -> {:ok, fp}
+      {:ok, identity} -> {:ok, IdentityProvider.fingerprint(identity)}
       {:error, _} = err -> err
     end
   end
@@ -1160,12 +1244,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     end
   end
 
-  defp registered?(opts) do
-    RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner.registered?(keystore_opts(opts))
-  end
+  defp registered?(opts), do: BootProvisioner.registered?(bootstrap_opts(opts))
 
   defp has_identity?(opts) do
     match?({:ok, _}, KeyStore.load(keystore_opts(opts)))
+  end
+
+  defp bootstrap_opts(opts) do
+    Keyword.get_lazy(opts, :bootstrap_opts, fn ->
+      [keystore_opts: keystore_opts(opts)]
+    end)
   end
 
   defp keystore_opts(opts), do: Keyword.get(opts, :keystore_opts, [])

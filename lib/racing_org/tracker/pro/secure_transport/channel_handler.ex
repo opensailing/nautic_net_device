@@ -32,18 +32,26 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelHandler do
 
   alias RacingOrg.Tracker.Pro.Commands
   alias RacingOrg.Tracker.Pro.SecureTransport.Handshake
+  alias RacingOrg.Tracker.Pro.SecureTransport.IdentityProvider
   alias RacingOrg.Tracker.Pro.SecureTransport.Session
 
   @ack_format_version 1
 
   @typedoc "Everything the handshake needs from the device's key material."
-  @type handshake_inputs :: %{
-          device_identity_private: binary(),
-          device_identity_public: binary(),
-          server_identity_public: binary(),
-          device_id: binary(),
-          epoch: non_neg_integer()
-        }
+  @type handshake_inputs ::
+          %{
+            device_identity: IdentityProvider.t(),
+            server_identity_public: binary(),
+            device_id: binary(),
+            epoch: non_neg_integer()
+          }
+          | %{
+              device_identity_private: binary(),
+              device_identity_public: binary(),
+              server_identity_public: binary(),
+              device_id: binary(),
+              epoch: non_neg_integer()
+            }
 
   @doc "The ack-format version the device emits (matches the server's `@ack_format_version`)."
   @spec ack_format_version() :: pos_integer()
@@ -94,14 +102,26 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelHandler do
   end
 
   defp initiator_init(hello_wire, inputs) do
-    Handshake.initiator_init(hello_wire,
-      device_identity_private: inputs.device_identity_private,
-      device_identity_public: inputs.device_identity_public,
+    opts = [
       server_identity_public: inputs.server_identity_public,
       device_id: inputs.device_id,
       epoch: Map.get(inputs, :epoch, 0),
       timestamp_ms: System.system_time(:millisecond)
-    )
+    ]
+
+    identity_opts =
+      case Map.get(inputs, :device_identity) do
+        %IdentityProvider{} = identity ->
+          [device_identity: identity]
+
+        nil ->
+          [
+            device_identity_private: inputs.device_identity_private,
+            device_identity_public: inputs.device_identity_public
+          ]
+      end
+
+    Handshake.initiator_init(hello_wire, identity_opts ++ opts)
   end
 
   # --- Commands ---

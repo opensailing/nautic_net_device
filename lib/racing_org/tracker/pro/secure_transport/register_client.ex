@@ -55,6 +55,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.RegisterClient do
     * 400 — malformed request.
   """
 
+  alias RacingOrg.Tracker.Pro.SecureTransport.IdentityProvider
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore
   alias RacingOrg.Tracker.Pro.SecureTransport.Primitives
 
@@ -88,10 +89,18 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.RegisterClient do
   end
 
   @doc """
-  Signs the proof-of-possession over `timestamp` with the device's identity private
-  key. Returns the raw 64-byte Ed25519 signature.
+  Signs the proof-of-possession over `timestamp` through the device's operational
+  identity provider. Returns the raw 64-byte Ed25519 signature. The raw-seed map
+  clause exists only for deterministic v1 compatibility tests.
   """
-  @spec sign_register_pop(identity(), integer()) :: binary()
+  @spec sign_register_pop(identity() | map(), integer()) :: binary()
+  def sign_register_pop(%IdentityProvider{} = identity, timestamp) do
+    message = build_register_pop_message(IdentityProvider.public_key(identity), timestamp)
+    IdentityProvider.sign!(identity, message)
+  end
+
+  # Deterministic raw-seed compatibility path retained for v1 KATs and pure interop
+  # tests. Operational callers use the IdentityProvider clause above.
   def sign_register_pop(%{private_key: private_key, public_key: public_key}, timestamp) do
     message = build_register_pop_message(public_key, timestamp)
     Primitives.ed25519_sign(private_key, message)
@@ -104,16 +113,20 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.RegisterClient do
   unix seconds; `boat_identifier` is included only when a non-empty value is given.
   Pure.
   """
-  @spec build_register_request(identity(), integer(), String.t() | nil) :: map()
-  def build_register_request(%{public_key: public_key} = identity, timestamp, boat_identifier \\ nil) do
-    signature = sign_register_pop(identity, timestamp)
+  @spec build_register_request(identity() | map(), integer(), String.t() | nil) :: map()
+  def build_register_request(identity, timestamp, boat_identifier \\ nil)
 
-    %{
-      "public_key" => Base.encode64(public_key),
-      "signature" => Base.encode64(signature),
-      "timestamp" => timestamp
-    }
-    |> maybe_put_boat_identifier(boat_identifier)
+  def build_register_request(%IdentityProvider{} = identity, timestamp, boat_identifier) do
+    build_register_request_with_public_key(
+      identity,
+      IdentityProvider.public_key(identity),
+      timestamp,
+      boat_identifier
+    )
+  end
+
+  def build_register_request(%{public_key: public_key} = identity, timestamp, boat_identifier) do
+    build_register_request_with_public_key(identity, public_key, timestamp, boat_identifier)
   end
 
   ## --- Registration flow ---------------------------------------------------
@@ -169,6 +182,17 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.RegisterClient do
   end
 
   ## --- internal ------------------------------------------------------------
+
+  defp build_register_request_with_public_key(identity, public_key, timestamp, boat_identifier) do
+    signature = sign_register_pop(identity, timestamp)
+
+    %{
+      "public_key" => Base.encode64(public_key),
+      "signature" => Base.encode64(signature),
+      "timestamp" => timestamp
+    }
+    |> maybe_put_boat_identifier(boat_identifier)
+  end
 
   defp post_register(path, body, opts) do
     middleware = [Tesla.Middleware.JSON]

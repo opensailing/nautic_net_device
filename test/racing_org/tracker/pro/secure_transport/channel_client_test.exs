@@ -7,12 +7,20 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
   """
   use Slipstream.SocketTest
 
+  alias RacingOrg.Tracker.Pro.RecoveryV2TestSupport, as: RecoverySupport
+  alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
+  alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapState
+  alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachine
+  alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateStore
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
   alias RacingOrg.Tracker.Pro.SecureTransport.Handshake
+  alias RacingOrg.Tracker.Pro.SecureTransport.IdentityProvider
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore
   alias RacingOrg.Tracker.Pro.SecureTransport.Primitives
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
+
+  @serial "000000001234abcd"
 
   # A per-test KeyStore in a temp dir + a pinned server keypair.
   setup do
@@ -37,6 +45,52 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:racing_org_tracker_pro, key)
   defp restore_env(key, prev), do: Application.put_env(:racing_org_tracker_pro, key, prev)
+
+  defp registration_authority(%{request: request, receipt: receipt}) do
+    %{
+      kind: :registration,
+      public_key: request.candidate_public_key,
+      client_nonce: request.client_nonce,
+      receipt: receipt.envelope,
+      logical_device_id: receipt.payload.logical_device_id,
+      credential_epoch: receipt.payload.credential_epoch
+    }
+  end
+
+  defp bootstrap_opts(base, extra \\ []) do
+    Keyword.merge(
+      [
+        keystore_opts: [base_path: base],
+        state_store_opts: [base_path: base],
+        hardware_identity_fun: fn -> {:ok, @serial} end,
+        server_public_key: RecoverySupport.server_public_key()
+      ],
+      extra
+    )
+  end
+
+  defp start_boot_provisioner(base, extra \\ []) do
+    opts = bootstrap_opts(base, extra)
+    start_supervised!({BootProvisioner, Keyword.put(opts, :name, nil)})
+  end
+
+  defp complete_handshake(client, topic, ctx) do
+    {:ok, hello_wire, responder_state} =
+      Handshake.responder_hello(
+        server_identity_private: ctx.srv_priv,
+        server_identity_public: ctx.srv_pub,
+        device_identity_public: ctx.identity.public_key,
+        epoch: 0
+      )
+
+    push(client, topic, "handshake_hello", %{"hello" => Base.encode64(hello_wire)})
+    assert_push(^topic, "handshake_init", %{"init" => init_b64})
+    {:ok, init_wire} = Base.decode64(init_b64)
+    {:ok, server_session} = Handshake.responder_finalize(responder_state, init_wire)
+
+    push(client, topic, "handshake_ok", %{"session_id" => Base.encode64(server_session.session_id)})
+    server_session
+  end
 
   # --- gating: safe to start idle, never connects when not configured ---
 
@@ -68,6 +122,59 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
 
       Process.sleep(80)
       assert Process.alive?(pid)
+    end
+
+    test "only the active key with verified authority is connectable; a staged candidate is never used", ctx do
+      previous_target = Application.get_env(:racing_org_tracker_pro, :target)
+      Application.put_env(:racing_org_tracker_pro, :target, :racing_org_rpi3)
+      on_exit(fn -> Application.put_env(:racing_org_tracker_pro, :target, previous_target) end)
+
+      {:ok, active_registration} = RecoverySupport.registration_result(ctx.identity, @serial)
+
+      BootstrapStateStore.save!(
+        %BootstrapState{
+          phase: :registered,
+          hardware_identity_digest:
+            BootstrapStateMachine.hardware_identity_digest("raspberry_pi_soc_serial_v1", @serial),
+          authority: registration_authority(active_registration)
+        },
+        base_path: ctx.base
+      )
+
+      channel_opts = [
+        keystore_opts: [base_path: ctx.base],
+        bootstrap_opts: bootstrap_opts(ctx.base)
+      ]
+
+      assert ChannelClient.connectable?(channel_opts)
+
+      {:ok, candidate} =
+        KeyStore.stage_candidate(
+          base_path: ctx.base,
+          seed_generator: fn -> :binary.copy(<<0xC4>>, 32) end
+        )
+
+      {:ok, candidate_registration} = RecoverySupport.registration_result(candidate, @serial)
+
+      BootstrapStateStore.save!(
+        %BootstrapState{
+          phase: :registered,
+          hardware_identity_digest:
+            BootstrapStateMachine.hardware_identity_digest("raspberry_pi_soc_serial_v1", @serial),
+          authority: registration_authority(candidate_registration),
+          recovery: %{
+            public_key: IdentityProvider.public_key(candidate),
+            source: :staged,
+            challenge_client_nonce: nil,
+            challenge_receipt: nil,
+            classification_receipt: nil,
+            commit_uncertain: false
+          }
+        },
+        base_path: ctx.base
+      )
+
+      refute ChannelClient.connectable?(channel_opts)
     end
   end
 
@@ -159,6 +266,167 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
 
       # The firmware is validated exactly when the device connects to RacingOrg correctly.
       assert_receive :firmware_validated
+    end
+
+    test "reports authenticated readiness and clears it with the live session on disconnect", ctx do
+      {:ok, registration} = RecoverySupport.registration_result(ctx.identity, @serial)
+
+      BootstrapStateStore.save!(
+        %BootstrapState{
+          phase: :registered,
+          hardware_identity_digest:
+            BootstrapStateMachine.hardware_identity_digest("raspberry_pi_soc_serial_v1", @serial),
+          authority: registration_authority(registration)
+        },
+        base_path: ctx.base
+      )
+
+      boot_provisioner = start_boot_provisioner(ctx.base)
+      assert eventually(fn -> BootProvisioner.current_state(boot_provisioner).phase == :registered end)
+
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           boot_provisioner: {BootProvisioner, boot_provisioner},
+           firmware_validator: fn -> :ok end,
+           backoff: [base_ms: 60_000, cap_ms: 60_000, jitter: 0],
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      complete_handshake(client, topic, ctx)
+
+      assert eventually(fn -> SessionHolder.live?(holder) end)
+      assert eventually(fn -> BootProvisioner.current_state(boot_provisioner).phase == :authenticated end)
+      assert_push(^topic, "wifi_status", _status)
+
+      disconnect(client, :network_lost)
+
+      assert eventually(fn -> not SessionHolder.live?(holder) end)
+      assert eventually(fn -> BootProvisioner.current_state(boot_provisioner).phase == :registered end)
+    end
+
+    test "a matching v1 device enrolls hardware only after authentication and adopts the signed receipt", ctx do
+      marker_path = Path.join(ctx.base, "register_marker.json")
+
+      File.write!(
+        marker_path,
+        Jason.encode!(%{
+          "device_id" => "legacy-device",
+          "fingerprint" => IdentityProvider.fingerprint(ctx.identity),
+          "status" => "assigned"
+        })
+      )
+
+      nonce = :binary.copy(<<0x45>>, 32)
+      boot_provisioner = start_boot_provisioner(ctx.base, client_nonce: nonce)
+
+      assert eventually(fn ->
+               match?(
+                 %BootstrapState{phase: :limbo, blocked_reason: :legacy_enrollment_required},
+                 BootProvisioner.current_state(boot_provisioner)
+               )
+             end)
+
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           boot_provisioner: {BootProvisioner, boot_provisioner},
+           firmware_validator: fn -> :ok end,
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      refute_push(^topic, "enroll_hardware_identity", %{}, 50)
+
+      complete_handshake(client, topic, ctx)
+
+      assert_push(^topic, "enroll_hardware_identity", request_body, request_ref)
+      assert request_body["provider"] == "raspberry_pi_soc_serial_v1"
+      assert request_body["serial"] == @serial
+      assert request_body["client_nonce"] == Base.encode64(nonce)
+      assert SessionHolder.live?(holder)
+      assert_push(^topic, "wifi_status", _status)
+
+      {:ok, enrollment} =
+        RecoverySupport.registration_result(ctx.identity, @serial, client_nonce: nonce)
+
+      reply(
+        client,
+        request_ref,
+        {:ok, RecoverySupport.receipt_response(enrollment.receipt)}
+      )
+
+      assert eventually(fn -> BootProvisioner.current_state(boot_provisioner).phase == :authenticated end)
+      refute File.exists?(marker_path)
+    end
+
+    test "a v1 device stays authenticated when an older backend rejects the enrollment event", ctx do
+      marker_path = Path.join(ctx.base, "register_marker.json")
+
+      File.write!(
+        marker_path,
+        Jason.encode!(%{
+          "device_id" => "legacy-device",
+          "fingerprint" => IdentityProvider.fingerprint(ctx.identity),
+          "status" => "assigned"
+        })
+      )
+
+      boot_provisioner = start_boot_provisioner(ctx.base, client_nonce: :binary.copy(<<0x46>>, 32))
+
+      assert eventually(fn ->
+               match?(
+                 %BootstrapState{phase: :limbo, blocked_reason: :legacy_enrollment_required},
+                 BootProvisioner.current_state(boot_provisioner)
+               )
+             end)
+
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           boot_provisioner: {BootProvisioner, boot_provisioner},
+           firmware_validator: fn -> :ok end,
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      complete_handshake(client, topic, ctx)
+      assert_push(^topic, "enroll_hardware_identity", _request_body, request_ref)
+      assert_push(^topic, "wifi_status", _status)
+
+      reply(client, request_ref, {:error, %{"reason" => "unsupported_event"}})
+
+      assert eventually(fn -> SessionHolder.live?(holder) end)
+      assert Process.alive?(client)
+      assert File.exists?(marker_path)
+
+      assert %BootstrapState{phase: :limbo, blocked_reason: :legacy_enrollment_required} =
+               BootProvisioner.current_state(boot_provisioner)
     end
   end
 

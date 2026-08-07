@@ -21,6 +21,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.RegisterClientTest do
   """
   use ExUnit.Case, async: true
 
+  alias RacingOrg.Tracker.Pro.IdentityProviderTestSupport
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore
   alias RacingOrg.Tracker.Pro.SecureTransport.Primitives
   alias RacingOrg.Tracker.Pro.SecureTransport.RegisterClient
@@ -82,6 +83,21 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.RegisterClientTest do
       # A signature is bound to the exact message: a different timestamp won't verify.
       other = server_pop_message(ctx.identity.public_key, ts + 1)
       refute Primitives.ed25519_verify(ctx.identity.public_key, other, sig)
+    end
+
+    test "operational signer and deterministic raw-seed paths remain byte-identical" do
+      seed = :binary.copy(<<0x5A>>, 32)
+      public_key = Primitives.ed25519_public_from_secret(seed)
+      timestamp = 1_700_000_000
+      assert {:ok, provider} = IdentityProviderTestSupport.identity_from_seed(seed)
+
+      legacy_identity = %{private_key: seed, public_key: public_key}
+
+      assert RegisterClient.sign_register_pop(provider, timestamp) ==
+               RegisterClient.sign_register_pop(legacy_identity, timestamp)
+
+      assert RegisterClient.build_register_request(provider, timestamp, "boat-7") ==
+               RegisterClient.build_register_request(legacy_identity, timestamp, "boat-7")
     end
   end
 

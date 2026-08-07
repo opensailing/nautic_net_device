@@ -11,7 +11,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
   def start(_type, _args) do
     opts = [strategy: :one_for_one, name: RacingOrg.Tracker.Pro.Supervisor]
 
-    children = children(product(), target())
+    children = child_specs(product(), target())
 
     with {:ok, sup} <- Supervisor.start_link(children, opts) do
       {:ok, vd_pid} = start_virtual_device_and_handlers(sup)
@@ -58,6 +58,10 @@ defmodule RacingOrg.Tracker.Pro.Application do
     {:ok, _discovery_pid} =
       Supervisor.start_child(supervisor, {RacingOrg.Tracker.Pro.Discovery, %{virtual_device_pid: virtual_device_pid}})
   end
+
+  @doc false
+  @spec child_specs(:logger | :uplink, atom() | nil) :: [Supervisor.child_spec() | module() | {module(), term()}]
+  def child_specs(product, target), do: children(product, target)
 
   # Product: NMEA 2000 standalone, on-board device
   defp children(:logger, target) do
@@ -129,12 +133,10 @@ defmodule RacingOrg.Tracker.Pro.Application do
   # device target AND the pinned server public key being configured (there is no
   # separate enable flag; the pinned key IS the enable):
   #
-  #   * BootProvisioner — one-shot boot self-registration. It generates the device
-  #     identity and tokenlessly registers it with the server, which (once an admin
-  #     associates it) makes the ChannelClient connectable.
+  #   * BootProvisioner — supervised receipt/state reconciliation coordinator. It
+  #     remains available for authenticated readiness and legacy-enrollment callbacks.
   #   * ChannelClient — outbound WSS command channel. It additionally SELF-GATES in
-  #     init (idle unless claimed + identity provisioned + server pinned), so it is
-  #     safe even if started before provisioning.
+  #     init (idle unless verified authority + an active identity + server pin exist).
   #   * BulkUploader — thin GenServer giving `upload_async/2` a named server for the
   #     Archive's post-race trigger. Cheap + idle.
   #
