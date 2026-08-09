@@ -324,11 +324,87 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
     assert {:ok, pointer} = Store.active(ctx.store)
 
     assert pointer == %{
+             device_id: DS.device_id(),
              credential_epoch: 4,
              storage_epoch: DS.storage_epoch(),
              generation: 1,
              manifest_hash: fixture.manifest_hash
            }
+  end
+
+  test "generation references are scoped by logical device and credential epoch", ctx do
+    next_epoch =
+      DS.generation_fixture(
+        generation: 1,
+        credential_epoch: 5,
+        contents: %{tracking: put_in(DS.default_contents().tracking["version"], 2)}
+      )
+
+    foreign_device =
+      DS.generation_fixture(
+        device_id: <<0x77::128>>,
+        generation: 1,
+        credential_epoch: 4,
+        contents: %{tracking: put_in(DS.default_contents().tracking["version"], 3)}
+      )
+
+    fixtures = [DS.generation_fixture(), next_epoch, foreign_device]
+
+    Enum.each(fixtures, fn fixture ->
+      assert {:ok, :staged} = Store.stage_manifest(ctx.store, fixture.delivery)
+
+      path =
+        generation_reference_path(
+          ctx.base,
+          fixture.binding.device_id,
+          fixture.binding.credential_epoch,
+          fixture.binding.generation
+        )
+
+      assert {2, :generation_reference, reference} = path |> File.read!() |> :erlang.binary_to_term()
+
+      assert reference == %{
+               device_id: fixture.binding.device_id,
+               credential_epoch: fixture.binding.credential_epoch,
+               storage_epoch: DS.storage_epoch(),
+               generation: fixture.binding.generation,
+               manifest_hash: fixture.manifest_hash
+             }
+    end)
+  end
+
+  test "legacy unscoped activation authority fails closed and is replaced by rehydration", ctx do
+    fixture = fully_stage(ctx.store, DS.generation_fixture())
+
+    legacy_pointer = %{
+      credential_epoch: fixture.binding.credential_epoch,
+      storage_epoch: DS.storage_epoch(),
+      generation: fixture.binding.generation,
+      manifest_hash: fixture.manifest_hash
+    }
+
+    write_term_record(Store.active_pointer_path(ctx.store), :active_pointer, legacy_pointer)
+
+    write_term_record(Store.activation_journal_path(ctx.store), :activation_journal, %{
+      storage_epoch: DS.storage_epoch(),
+      prior: nil,
+      candidate: legacy_pointer,
+      decision: nil,
+      terminal_ack: nil
+    })
+
+    assert :empty = Store.active(ctx.store)
+    assert :empty = Store.activation_journal(ctx.store)
+
+    assert {:ok, nil} = Store.activate(ctx.store, 1, fixture.manifest_hash)
+    assert {:ok, %{device_id: device_id}} = Store.active(ctx.store)
+    assert device_id == DS.device_id()
+
+    assert {2, :active_pointer, %{device_id: ^device_id}} =
+             ctx.store
+             |> Store.active_pointer_path()
+             |> File.read!()
+             |> :erlang.binary_to_term()
   end
 
   test "activation is idempotent and rejects credential or generation downgrade", ctx do
@@ -587,7 +663,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
     assert {:ok, decided} = Store.activation_journal(ctx.store)
 
     tampered = %{decided | terminal_ack: Map.put(rejected, :device_id, <<0x77::128>>)}
-    write_term_record(Store.activation_journal_path(ctx.store), :activation_journal, tampered)
+    write_term_record(Store.activation_journal_path(ctx.store), :activation_journal, tampered, 2)
     File.rm_rf!(Store.generation_directory(ctx.store, 2, candidate.manifest_hash))
 
     assert {:error, :corrupt_activation_journal} = Store.activation_journal(ctx.store)
@@ -867,11 +943,17 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
     assert {:error, :corrupt_generation_state} =
              Store.generation_state(ctx.store, 1, fixture.manifest_hash)
 
-    write_term_record(Store.active_pointer_path(ctx.store), :active_pointer, %{
-      storage_epoch: DS.storage_epoch(),
-      credential_epoch: 4,
-      generation: 1
-    })
+    write_term_record(
+      Store.active_pointer_path(ctx.store),
+      :active_pointer,
+      %{
+        device_id: DS.device_id(),
+        storage_epoch: DS.storage_epoch(),
+        credential_epoch: 4,
+        generation: 1
+      },
+      2
+    )
 
     assert {:error, :corrupt_active_pointer} = Store.active(ctx.store)
   end
@@ -880,13 +962,14 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
     fixture = DS.generation_fixture()
 
     pointer = %{
+      device_id: DS.device_id(),
       storage_epoch: DS.storage_epoch(),
       credential_epoch: 4,
       generation: 1,
       manifest_hash: fixture.manifest_hash
     }
 
-    write_term_record(Store.active_pointer_path(ctx.store), :active_pointer, pointer)
+    write_term_record(Store.active_pointer_path(ctx.store), :active_pointer, pointer, 2)
     assert {:error, :active_generation_missing} = Store.active(ctx.store)
 
     assert {:ok, :staged} = Store.stage_manifest(ctx.store, fixture.delivery)
@@ -939,9 +1022,19 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
     }
   end
 
-  defp write_term_record(path, type, value) do
+  defp generation_reference_path(base, device_id, credential_epoch, generation) do
+    Path.join([
+      base,
+      "generation_refs",
+      Base.encode16(device_id, case: :lower),
+      Integer.to_string(credential_epoch),
+      Integer.to_string(generation) <> ".term"
+    ])
+  end
+
+  defp write_term_record(path, type, value, version \\ 1) do
     File.mkdir_p!(Path.dirname(path))
-    File.write!(path, :erlang.term_to_binary({1, type, value}))
+    File.write!(path, :erlang.term_to_binary({version, type, value}))
   end
 
   defp fully_stage(store, fixture) do

@@ -32,6 +32,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
   @zero_identifier <<0::128>>
 
   @type pointer :: %{
+          required(:device_id) => binary(),
           required(:storage_epoch) => binary(),
           required(:credential_epoch) => non_neg_integer(),
           required(:generation) => pos_integer(),
@@ -2233,7 +2234,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
   defp positive_milliseconds(_value, default), do: default
 
   defp pointer_matches_identity?(pointer, identity) do
-    Map.get(pointer, :credential_epoch) == Map.get(identity, :credential_epoch) and
+    Map.get(pointer, :device_id) == Map.get(identity, :device_id) and
+      Map.get(pointer, :credential_epoch) == Map.get(identity, :credential_epoch) and
       Map.get(pointer, :storage_epoch) == Map.get(identity, :storage_epoch)
   end
 
@@ -2564,6 +2566,9 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
       :empty ->
         :ok
 
+      {:ok, %{device_id: device_id}} when device_id != manifest.device_id ->
+        :ok
+
       {:ok, %{credential_epoch: epoch, generation: generation, manifest_hash: hash}}
       when epoch == manifest.credential_epoch and generation == manifest.generation ->
         if secure_equal(hash, manifest.hash), do: :ok, else: {:error, :generation_hash_conflict}
@@ -2585,6 +2590,9 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
 
   defp validate_generation_payload(store, payload) do
     case Store.active(store) do
+      {:ok, %{device_id: device_id}} when device_id != payload.device_id ->
+        :ok
+
       {:ok, %{credential_epoch: epoch, generation: generation}}
       when epoch == payload.credential_epoch and generation > payload.generation ->
         {:error, :stale_generation}
@@ -2716,6 +2724,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
 
   defp pointer_from(binding) do
     %{
+      device_id: binding.device_id,
       storage_epoch: binding.storage_epoch,
       credential_epoch: binding.credential_epoch,
       generation: binding.generation,

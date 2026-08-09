@@ -6,6 +6,11 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
   mutable record (receipt state, activation journal, active pointer, and pending
   ACK replay state) is replaced through `DesiredState.AtomicFile`, so the only
   authoritative effective-generation switch is one atomic pointer file.
+
+  Active pointers, activation journals, and generation references use the
+  runtime-identity-scoped version 2 envelope. Version 1 authority records lacked
+  a logical device ID; they are ignored fail-closed so authenticated rehydration
+  can replace them without reopening ambiguous local authority.
   """
 
   alias RacingOrg.Tracker.Pro.DesiredState.AtomicFile
@@ -14,7 +19,9 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
 
   @format_version 1
+  @identity_format_version 2
   @active_filename "active_generation"
+  @zero_identifier <<0::128>>
   @pending_acks_filename "pending_acks"
   @activation_filename "activation_journal"
 
@@ -41,7 +48,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
          {:ok, manifest} <- Manifest.decode(manifest_bytes),
          :ok <- validate_manifest_delivery(store, delivery, manifest),
          :ok <- validate_wifi_descriptor(manifest),
-         :ok <- claim_generation(store, manifest.generation, manifest.hash),
+         :ok <- claim_generation(store, manifest),
          {:ok, disposition} <- persist_manifest_and_state(store, manifest) do
       {:ok, disposition}
     end
@@ -168,7 +175,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
   @spec activate(t(), pos_integer(), binary()) :: {:ok, map() | nil} | {:error, term()}
   def activate(%__MODULE__{} = store, generation, manifest_hash) do
     with {:ok, candidate} <- candidate_pointer(store, generation, manifest_hash),
-         {:ok, previous} <- active_or_nil(store),
+         {:ok, active} <- active_or_nil(store),
+         previous = prior_for_candidate(active, candidate),
          :ok <- validate_activation_transition(previous, candidate) do
       if previous == candidate do
         {:ok, previous}
@@ -202,7 +210,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
   end
 
   defp create_activation_journal(store, candidate) do
-    with {:ok, previous} <- active_or_nil(store),
+    with {:ok, active} <- active_or_nil(store),
+         previous = prior_for_candidate(active, candidate),
          :ok <- validate_activation_transition(previous, candidate),
          journal = %{
            storage_epoch: store.storage_epoch,
@@ -212,7 +221,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
            terminal_ack: nil
          },
          :ok <-
-           write_record_authoritative(
+           write_identity_record_authoritative(
              store,
              activation_journal_path(store),
              :activation_journal,
@@ -224,9 +233,9 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
 
   @spec activation_journal(t()) :: {:ok, map()} | :empty | {:error, term()}
   def activation_journal(%__MODULE__{} = store) do
-    case read_record(store, activation_journal_path(store), :activation_journal) do
+    case read_identity_record(store, activation_journal_path(store), :activation_journal) do
       {:ok, journal} -> validate_activation_journal(journal, store)
-      :empty -> :empty
+      status when status in [:empty, :legacy] -> :empty
       {:error, :corrupt_record} -> {:error, :corrupt_activation_journal}
       {:error, _reason} = error -> error
     end
@@ -236,7 +245,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
   def commit_activation(%__MODULE__{} = store) do
     with {:ok, %{prior: prior, candidate: candidate} = journal} <- activation_journal(store),
          :ok <- ensure_undecided_activation(journal),
-         {:ok, current} <- active_or_nil(store),
+         {:ok, active} <- active_or_nil(store),
+         current = prior_for_candidate(active, candidate),
          :ok <- validate_commit_position(current, prior, candidate),
          :ok <- write_active_pointer_authoritative(store, candidate) do
       {:ok, prior}
@@ -251,7 +261,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
   def restore_activation_prior(%__MODULE__{} = store) do
     with {:ok, %{prior: prior, candidate: candidate} = journal} <- activation_journal(store),
          :ok <- ensure_undecided_activation(journal),
-         {:ok, current} <- activation_position_or_nil(store),
+         {:ok, active} <- activation_position_or_nil(store),
+         current = prior_for_candidate(active, candidate),
          :ok <- validate_commit_position(current, prior, candidate),
          :ok <- recover_pointer(store, prior) do
       :ok
@@ -303,7 +314,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
   defp persist_activation_decision(store, journal, decision, terminal_ack) do
     decided = %{journal | decision: decision, terminal_ack: terminal_ack}
 
-    write_record_authoritative(
+    write_identity_record_authoritative(
       store,
       activation_journal_path(store),
       :activation_journal,
@@ -322,7 +333,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
     with {:ok, %{decision: decision, terminal_ack: terminal_ack} = journal}
          when decision in [:candidate, :prior] and is_map(terminal_ack) <-
            activation_journal(store),
-         {:ok, current} <- activation_position_or_nil(store),
+         {:ok, active} <- activation_position_or_nil(store),
+         current = prior_for_candidate(active, journal.candidate),
          :ok <- validate_commit_position(current, journal.prior, journal.candidate),
          :ok <- recover_pointer(store, Map.fetch!(journal, decision)) do
       {:ok, journal}
@@ -353,9 +365,9 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
 
   @spec active(t()) :: {:ok, map()} | :empty | {:error, term()}
   def active(%__MODULE__{} = store) do
-    case read_record(store, active_pointer_path(store), :active_pointer) do
+    case read_identity_record(store, active_pointer_path(store), :active_pointer) do
       {:ok, pointer} -> validate_active_pointer(pointer, store)
-      :empty -> :empty
+      status when status in [:empty, :legacy] -> :empty
       {:error, :corrupt_record} -> {:error, :corrupt_active_pointer}
       {:error, _reason} = error -> error
     end
@@ -495,30 +507,63 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
     end
   end
 
-  defp claim_generation(store, generation, manifest_hash) do
-    path = generation_reference_path(store, generation)
+  defp claim_generation(store, manifest) do
+    reference = %{
+      device_id: manifest.device_id,
+      credential_epoch: manifest.credential_epoch,
+      storage_epoch: store.storage_epoch,
+      generation: manifest.generation,
+      manifest_hash: manifest.hash
+    }
 
-    case read_record(store, path, :generation_reference) do
+    path =
+      generation_reference_path(
+        store,
+        manifest.device_id,
+        manifest.credential_epoch,
+        manifest.generation
+      )
+
+    case read_identity_record(store, path, :generation_reference) do
       :empty ->
-        write_record(store, path, :generation_reference, %{
-          storage_epoch: store.storage_epoch,
-          generation: generation,
-          manifest_hash: manifest_hash
-        })
+        write_identity_record(store, path, :generation_reference, reference)
 
-      {:ok, %{storage_epoch: epoch}} when epoch != store.storage_epoch ->
-        {:error, :storage_epoch_mismatch}
+      {:ok, existing} ->
+        validate_generation_claim(existing, reference, store)
 
-      {:ok, %{generation: ^generation, manifest_hash: existing}} ->
-        if secure_equal(existing, manifest_hash), do: :ok, else: {:error, :generation_hash_conflict}
-
-      {:ok, _other} ->
-        {:error, :generation_hash_conflict}
+      :legacy ->
+        {:error, :corrupt_generation_reference}
 
       {:error, _reason} ->
         {:error, :corrupt_generation_reference}
     end
   end
+
+  defp validate_generation_claim(
+         %{
+           device_id: device_id,
+           credential_epoch: credential_epoch,
+           storage_epoch: storage_epoch,
+           generation: generation,
+           manifest_hash: manifest_hash
+         },
+         expected,
+         store
+       ) do
+    with :ok <- ensure_epoch(%{storage_epoch: storage_epoch}, store),
+         true <- secure_equal(device_id, expected.device_id),
+         true <- credential_epoch == expected.credential_epoch,
+         true <- generation == expected.generation,
+         true <- secure_equal(manifest_hash, expected.manifest_hash) do
+      :ok
+    else
+      {:error, :storage_epoch_mismatch} = error -> error
+      _other -> {:error, :generation_hash_conflict}
+    end
+  end
+
+  defp validate_generation_claim(_existing, _expected, _store),
+    do: {:error, :generation_hash_conflict}
 
   defp persist_manifest_and_state(store, manifest) do
     case generation_state(store, manifest.generation, manifest.hash) do
@@ -922,8 +967,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
   end
 
   defp activation_position_or_nil(store) do
-    case read_record(store, active_pointer_path(store), :active_pointer) do
-      :empty ->
+    case read_identity_record(store, active_pointer_path(store), :active_pointer) do
+      status when status in [:empty, :legacy] ->
         {:ok, nil}
 
       {:ok, pointer} ->
@@ -944,14 +989,21 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
   defp candidate_pointer(store, generation, manifest_hash) do
     case fetch_generation_state(store, generation, manifest_hash) do
       {:ok, %{status: :staged, credential_epoch: credential_epoch}} ->
-        pointer = %{
-          credential_epoch: credential_epoch,
-          storage_epoch: store.storage_epoch,
-          generation: generation,
-          manifest_hash: manifest_hash
-        }
-
-        with :ok <- validate_pointer_target(pointer, store), do: {:ok, pointer}
+        with {:ok, manifest} <- load_manifest(store, generation, manifest_hash),
+             true <- manifest.credential_epoch == credential_epoch || {:error, :active_generation_mismatch},
+             pointer = %{
+               device_id: manifest.device_id,
+               credential_epoch: credential_epoch,
+               storage_epoch: store.storage_epoch,
+               generation: generation,
+               manifest_hash: manifest_hash
+             },
+             :ok <- validate_pointer_target(pointer, store) do
+          {:ok, pointer}
+        else
+          false -> {:error, :active_generation_mismatch}
+          {:error, _reason} = error -> error
+        end
 
       {:ok, _state} ->
         {:error, :generation_not_staged}
@@ -961,11 +1013,20 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
     end
   end
 
+  defp prior_for_candidate(nil, _candidate), do: nil
+
+  defp prior_for_candidate(previous, candidate) do
+    if secure_equal(previous.device_id, candidate.device_id), do: previous, else: nil
+  end
+
   defp validate_activation_transition(nil, _candidate), do: :ok
   defp validate_activation_transition(pointer, pointer), do: :ok
 
   defp validate_activation_transition(previous, candidate) do
     cond do
+      not secure_equal(candidate.device_id, previous.device_id) ->
+        {:error, :device_mismatch}
+
       candidate.credential_epoch < previous.credential_epoch ->
         {:error, :credential_epoch_downgrade}
 
@@ -1005,6 +1066,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
 
   defp validate_pointer_shape(
          %{
+           device_id: device_id,
            storage_epoch: storage_epoch,
            credential_epoch: credential_epoch,
            generation: generation,
@@ -1013,11 +1075,13 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
          store
        ) do
     with :ok <- ensure_epoch(%{storage_epoch: storage_epoch}, store),
+         true <- valid_device_id?(device_id),
          true <- is_integer(credential_epoch) and credential_epoch >= 0,
          true <- is_integer(generation) and generation > 0,
          true <- is_binary(manifest_hash) and byte_size(manifest_hash) == 32 do
       {:ok,
        %{
+         device_id: device_id,
          storage_epoch: storage_epoch,
          credential_epoch: credential_epoch,
          generation: generation,
@@ -1041,7 +1105,11 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
 
       {:ok, %{status: :staged, credential_epoch: credential_epoch}}
       when credential_epoch == pointer.credential_epoch ->
-        validate_persisted_sections(store, pointer)
+        with {:ok, manifest} <- load_pointer_manifest(store, pointer),
+             :ok <- validate_pointer_manifest(pointer, manifest),
+             :ok <- validate_generation_reference(store, pointer) do
+          validate_persisted_sections(store, pointer, manifest)
+        end
 
       {:ok, _state} ->
         {:error, :active_generation_mismatch}
@@ -1051,17 +1119,50 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
     end
   end
 
-  defp validate_persisted_sections(store, pointer) do
-    with {:ok, manifest} <- load_manifest(store, pointer.generation, pointer.manifest_hash) do
-      Enum.reduce_while(manifest.sections, :ok, fn descriptor, :ok ->
-        case read_section(store, pointer.generation, pointer.manifest_hash, descriptor.name) do
-          {:ok, _bytes} -> {:cont, :ok}
-          {:error, _reason} -> {:halt, {:error, :active_generation_missing}}
-        end
-      end)
-    else
+  defp load_pointer_manifest(store, pointer) do
+    case load_manifest(store, pointer.generation, pointer.manifest_hash) do
+      {:ok, manifest} -> {:ok, manifest}
       {:error, _reason} -> {:error, :active_generation_missing}
     end
+  end
+
+  defp validate_pointer_manifest(pointer, manifest) do
+    cond do
+      not secure_equal(pointer.device_id, manifest.device_id) ->
+        {:error, :active_generation_mismatch}
+
+      pointer.credential_epoch != manifest.credential_epoch ->
+        {:error, :active_generation_mismatch}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_generation_reference(store, pointer) do
+    path =
+      generation_reference_path(
+        store,
+        pointer.device_id,
+        pointer.credential_epoch,
+        pointer.generation
+      )
+
+    case read_identity_record(store, path, :generation_reference) do
+      {:ok, reference} -> validate_generation_claim(reference, pointer, store)
+      :empty -> {:error, :active_generation_missing}
+      :legacy -> {:error, :corrupt_generation_reference}
+      {:error, _reason} -> {:error, :corrupt_generation_reference}
+    end
+  end
+
+  defp validate_persisted_sections(store, pointer, manifest) do
+    Enum.reduce_while(manifest.sections, :ok, fn descriptor, :ok ->
+      case read_section(store, pointer.generation, pointer.manifest_hash, descriptor.name) do
+        {:ok, _bytes} -> {:cont, :ok}
+        {:error, _reason} -> {:halt, {:error, :active_generation_missing}}
+      end
+    end)
   end
 
   defp validate_activation_journal(
@@ -1236,7 +1337,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
     do: {:error, :activation_decision_already_recorded}
 
   defp write_active_pointer_authoritative(store, pointer) do
-    write_record_authoritative(store, active_pointer_path(store), :active_pointer, pointer)
+    write_identity_record_authoritative(store, active_pointer_path(store), :active_pointer, pointer)
   end
 
   defp recover_pointer(store, nil) do
@@ -1283,8 +1384,32 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
   defp ensure_epoch(%{storage_epoch: _other}, _store), do: {:error, :storage_epoch_mismatch}
   defp ensure_epoch(_record, _store), do: {:error, :corrupt_record}
 
-  defp generation_reference_path(store, generation),
-    do: Path.join([store.base_dir, "generation_refs", Integer.to_string(generation) <> ".term"])
+  defp generation_reference_path(store, device_id, credential_epoch, generation) do
+    Path.join([
+      store.base_dir,
+      "generation_refs",
+      Base.encode16(device_id, case: :lower),
+      Integer.to_string(credential_epoch),
+      Integer.to_string(generation) <> ".term"
+    ])
+  end
+
+  defp write_identity_record(store, path, type, value) do
+    write_file(store, path, :erlang.term_to_binary({@identity_format_version, type, value}))
+  end
+
+  defp write_identity_record_authoritative(store, path, type, value) do
+    case write_identity_record(store, path, type, value) do
+      :ok ->
+        :ok
+
+      {:error, _reason} = error ->
+        case read_identity_record(store, path, type) do
+          {:ok, ^value} -> :ok
+          _other -> error
+        end
+    end
+  end
 
   defp write_record(store, path, type, value) do
     write_file(store, path, :erlang.term_to_binary({@format_version, type, value}))
@@ -1316,12 +1441,30 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
     end
   end
 
+  defp read_identity_record(store, path, type) do
+    case read_file(store, path) do
+      {:ok, bytes} -> decode_identity_record(bytes, type)
+      {:error, :enoent} -> :empty
+      {:error, reason} -> {:error, {:read, reason}}
+    end
+  end
+
   defp read_record(store, path, type) do
     case read_file(store, path) do
       {:ok, bytes} -> decode_record(bytes, type)
       {:error, :enoent} -> :empty
       {:error, reason} -> {:error, {:read, reason}}
     end
+  end
+
+  defp decode_identity_record(bytes, type) do
+    case :erlang.binary_to_term(bytes, [:safe]) do
+      {@identity_format_version, ^type, value} -> {:ok, value}
+      {@format_version, ^type, _value} -> :legacy
+      _other -> {:error, :corrupt_record}
+    end
+  rescue
+    _exception -> {:error, :corrupt_record}
   end
 
   defp decode_record(bytes, type) do
@@ -1351,6 +1494,10 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
       value when is_binary(value) -> {:ok, value}
       _other -> {:error, reason}
     end
+  end
+
+  defp valid_device_id?(device_id) do
+    is_binary(device_id) and byte_size(device_id) == 16 and device_id != @zero_identifier
   end
 
   defp secure_equal(left, right) when is_binary(left) and is_binary(right) do

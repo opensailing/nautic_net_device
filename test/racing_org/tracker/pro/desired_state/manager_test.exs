@@ -556,6 +556,73 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     assert active == pointer(prior)
   end
 
+  test "foreign active state never opens and current device can rehydrate generation one", ctx do
+    foreign_device_id = <<0x77::128>>
+
+    foreign =
+      fully_stage(
+        ctx.store,
+        DS.generation_fixture(device_id: foreign_device_id, generation: 1, credential_epoch: 4)
+      )
+
+    assert {:ok, nil} = Store.activate(ctx.store, 1, foreign.manifest_hash)
+    pid = start_manager(ctx)
+
+    refute_receive {:applier, :reconcile, _reconcile}
+    assert OperationalGate.status(ctx.gate) == :closed
+
+    current =
+      DS.generation_fixture(
+        generation: 1,
+        credential_epoch: 4,
+        contents: %{tracking: put_in(DS.default_contents().tracking["version"], 2)}
+      )
+
+    deliver_generation(pid, current, ctx.session_generation)
+
+    assert_receive {:ack, %{status: :staged, device_id: device_id}, _meta}
+    assert device_id == DS.device_id()
+    assert_receive {:ack, %{status: :effective, device_id: ^device_id}, _meta}
+
+    eventually(fn ->
+      assert {:ok, active} = Store.active(ctx.store)
+      assert active.device_id == DS.device_id()
+      assert active.credential_epoch == 4
+      assert active.generation == 1
+      assert active.manifest_hash == current.manifest_hash
+      assert OperationalGate.status(ctx.gate) == {:open, gate_binding(current)}
+    end)
+  end
+
+  test "generation numbering may restart after credential epoch advancement", ctx do
+    prior = fully_stage(ctx.store, DS.generation_fixture(generation: 1, credential_epoch: 4))
+    assert {:ok, nil} = Store.activate(ctx.store, 1, prior.manifest_hash)
+
+    {:ok, current_session} = SessionHolder.publish(ctx.holder, session(<<2::128>>, 5))
+    current_identity = Map.put(identity(), :credential_epoch, 5)
+    pid = start_manager(ctx, identity: current_identity)
+
+    refute_receive {:applier, :reconcile, _reconcile}
+    assert OperationalGate.status(ctx.gate) == :closed
+
+    current =
+      DS.generation_fixture(
+        generation: 1,
+        credential_epoch: 5,
+        contents: %{tracking: put_in(DS.default_contents().tracking["version"], 2)}
+      )
+
+    deliver_generation(pid, current, current_session.generation)
+
+    assert_receive {:ack, %{status: :staged, credential_epoch: 5}, _meta}
+    assert_receive {:ack, %{status: :effective, credential_epoch: 5}, _meta}
+
+    eventually(fn ->
+      assert Store.active(ctx.store) == {:ok, pointer(current)}
+      assert OperationalGate.status(ctx.gate) == {:open, gate_binding(current)}
+    end)
+  end
+
   test "a deferred authority provider opens only after exact identity resolves and closes on epoch advance", ctx do
     prior = fully_stage(ctx.store, DS.generation_fixture(generation: 1))
     assert {:ok, nil} = Store.activate(ctx.store, 1, prior.manifest_hash)
@@ -1318,7 +1385,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
 
     File.write!(
       Store.activation_journal_path(ctx.store),
-      :erlang.term_to_binary({1, :activation_journal, tampered})
+      :erlang.term_to_binary({2, :activation_journal, tampered})
     )
 
     File.rm_rf!(Store.generation_directory(ctx.store, 2, candidate.manifest_hash))
@@ -3311,6 +3378,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
 
   defp pointer(fixture) do
     %{
+      device_id: fixture.binding.device_id,
       storage_epoch: DS.storage_epoch(),
       credential_epoch: fixture.binding.credential_epoch,
       generation: fixture.binding.generation,
