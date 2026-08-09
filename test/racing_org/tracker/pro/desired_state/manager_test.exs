@@ -206,42 +206,27 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     assert Manager.status(pid).active == pointer(prior)
   end
 
-  test "startup rolls an interrupted activation back when the Wi-Fi owner did not commit the candidate", ctx do
+  test "startup rolls an undecided committed pointer back without probing candidate authority", ctx do
     prior = fully_stage(ctx.store, DS.generation_fixture(generation: 1))
     candidate = fully_stage(ctx.store, DS.generation_fixture(generation: 2))
     assert {:ok, nil} = Store.activate(ctx.store, 1, prior.manifest_hash)
     assert {:ok, _journal} = Store.prepare_activation(ctx.store, 2, candidate.manifest_hash)
     assert {:ok, _prior} = Store.commit_activation(ctx.store)
 
-    test_pid = self()
-    candidate_pointer = pointer(candidate)
-
-    recovering_applier =
-      ctx
-      |> applier()
-      |> Map.put(:reconcile, fn pointer, _owner_pid_map ->
-        send(test_pid, {:applier, :reconcile, snapshot(ctx, pointer, nil, nil)})
-
-        if pointer == candidate_pointer,
-          do: {:error, {:apply_failed, :wifi, :wifi_activation_mismatch}},
-          else: :ok
-      end)
-
-    start_manager(ctx, applier: recovering_applier)
-
-    assert_receive {:applier, :reconcile, candidate_probe}
-    assert candidate_probe.pointer == candidate_pointer
+    start_manager(ctx)
 
     assert_receive {:applier, :reconcile, prior_reconcile}
     assert prior_reconcile.pointer == pointer(prior)
     assert prior_reconcile.active == pointer(prior)
+    candidate_pointer = pointer(candidate)
+    refute_receive {:applier, :reconcile, %{pointer: ^candidate_pointer}}
 
     rejected =
       rejected_ack(candidate,
-        phase: :wifi_trial,
-        error_code: :wifi_trial_failed,
+        phase: :activation,
+        error_code: :activation_failed,
         retryable: true,
-        section: section_identity(candidate, :wifi)
+        section: nil
       )
 
     assert_receive {:ack, ^rejected, rejected_meta}
@@ -250,26 +235,29 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     assert OperationalGate.status(ctx.gate) == {:open, gate_binding(prior)}
   end
 
-  test "startup finalizes an interrupted activation after the Wi-Fi owner committed the candidate", ctx do
+  test "startup finalizes a candidate whose terminal decision was durably recorded", ctx do
     prior = fully_stage(ctx.store, DS.generation_fixture(generation: 1))
     candidate = fully_stage(ctx.store, DS.generation_fixture(generation: 2))
     assert {:ok, nil} = Store.activate(ctx.store, 1, prior.manifest_hash)
     assert {:ok, _journal} = Store.prepare_activation(ctx.store, 2, candidate.manifest_hash)
     assert {:ok, _prior} = Store.commit_activation(ctx.store)
 
+    effective = effective_ack(candidate)
+    assert :ok = Store.record_activation_decision(ctx.store, :candidate, effective)
+
     start_manager(ctx)
 
-    assert_receive {:applier, :reconcile, candidate_probe}
-    assert candidate_probe.pointer == pointer(candidate)
+    assert_receive {:applier, :reconcile, candidate_reconcile}
+    assert candidate_reconcile.pointer == pointer(candidate)
 
-    assert_receive {:ack, %{status: :effective}, effective_meta}
+    assert_receive {:ack, ^effective, effective_meta}
     assert effective_meta.active == pointer(candidate)
     refute_receive {:applier, :reconcile, _duplicate_reconcile}
     assert Store.activation_journal(ctx.store) == :empty
     assert OperationalGate.status(ctx.gate) == {:open, gate_binding(candidate)}
   end
 
-  test "startup makes the candidate pointer authoritative before reporting interrupted recovery effective", ctx do
+  test "startup rejects an undecided prepared activation and preserves prior authority", ctx do
     prior = fully_stage(ctx.store, DS.generation_fixture(generation: 1))
     candidate = fully_stage(ctx.store, DS.generation_fixture(generation: 2))
     assert {:ok, nil} = Store.activate(ctx.store, 1, prior.manifest_hash)
@@ -277,16 +265,25 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
 
     start_manager(ctx)
 
-    assert_receive {:applier, :reconcile, candidate_probe}
-    assert candidate_probe.pointer == pointer(candidate)
+    assert_receive {:applier, :reconcile, prior_reconcile}
+    assert prior_reconcile.pointer == pointer(prior)
+    assert prior_reconcile.active == pointer(prior)
 
-    assert_receive {:ack, %{status: :effective}, effective_meta}
-    assert effective_meta.active == pointer(candidate)
+    rejected =
+      rejected_ack(candidate,
+        phase: :activation,
+        error_code: :activation_failed,
+        retryable: true,
+        section: nil
+      )
+
+    assert_receive {:ack, ^rejected, rejected_meta}
+    assert rejected_meta.active == pointer(prior)
 
     eventually(fn ->
       assert Store.activation_journal(ctx.store) == :empty
-      assert Store.active(ctx.store) == {:ok, pointer(candidate)}
-      assert OperationalGate.status(ctx.gate) == {:open, gate_binding(candidate)}
+      assert Store.active(ctx.store) == {:ok, pointer(prior)}
+      assert OperationalGate.status(ctx.gate) == {:open, gate_binding(prior)}
     end)
   end
 
@@ -646,6 +643,187 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     assert received == %{}
   end
 
+  test "session replacement stays responsive and fences activation before the pointer commit", ctx do
+    prior = fully_stage(ctx.store, DS.generation_fixture(generation: 1))
+    assert {:ok, nil} = Store.activate(ctx.store, 1, prior.manifest_hash)
+    test_pid = self()
+
+    blocking_applier =
+      ctx
+      |> applier()
+      |> Map.put(:apply_non_network, fn pointer, sections, _owner_pid_map ->
+        send(
+          test_pid,
+          {:non_network_activation_blocked, self(), snapshot(ctx, pointer, sections, nil)}
+        )
+
+        receive do
+          :continue_activation -> :ok
+        end
+      end)
+
+    pid = start_manager(ctx, applier: blocking_applier, owner_retry_base_ms: 10)
+    assert_receive {:applier, :reconcile, _startup}
+
+    candidate = DS.generation_fixture(generation: 2)
+    final_chunk = deliver_until_final_chunk(pid, candidate, ctx.session_generation)
+
+    activation_task =
+      Task.async(fn ->
+        Manager.deliver_chunk(pid, ctx.session_generation, final_chunk)
+      end)
+
+    assert_receive {:ack, %{status: :staged}, _meta}, 1_000
+    assert_receive {:non_network_activation_blocked, manager_pid, blocked}, 1_000
+    assert blocked.active == pointer(prior)
+
+    generation_task = Task.async(fn -> SessionHolder.generation(ctx.holder) end)
+    generation_result = Task.yield(generation_task, 100)
+
+    replacement_task =
+      Task.async(fn ->
+        :ok = SessionHolder.clear(ctx.holder)
+        SessionHolder.publish(ctx.holder, session(<<2::128>>))
+      end)
+
+    replacement_result = Task.yield(replacement_task, 100)
+    send(manager_pid, :continue_activation)
+
+    assert {:ok, :stored} = Task.await(activation_task, 1_000)
+
+    generation_result = complete_yielded_task(generation_task, generation_result)
+    replacement_result = complete_yielded_task(replacement_task, replacement_result)
+
+    assert {:ok, ctx.session_generation} == generation_result
+    assert {:ok, {:ok, %Session{generation: replacement_generation}}} = replacement_result
+    assert replacement_generation > ctx.session_generation
+
+    rejected =
+      rejected_ack(candidate,
+        phase: :activation,
+        error_code: :activation_failed,
+        retryable: true,
+        section: nil
+      )
+
+    assert_receive {:ack, ^rejected, _meta}, 1_000
+    refute_receive {:ack, %{status: :effective, generation: 2}, _meta}
+
+    eventually(fn ->
+      assert Store.activation_journal(ctx.store) == :empty
+      assert Store.active(ctx.store) == {:ok, pointer(prior)}
+      assert OperationalGate.status(ctx.gate) == {:open, gate_binding(prior)}
+    end)
+  end
+
+  test "session replacement after the provisional pointer commit cannot authorize effective state", ctx do
+    prior = fully_stage(ctx.store, DS.generation_fixture(generation: 1))
+    assert {:ok, nil} = Store.activate(ctx.store, 1, prior.manifest_hash)
+    test_pid = self()
+
+    blocking_applier =
+      ctx
+      |> applier()
+      |> Map.put(:apply_wifi, fn pointer, secret, _owner_pid_map ->
+        send(test_pid, {:wifi_activation_blocked, self(), snapshot(ctx, pointer, [:wifi], secret)})
+
+        receive do
+          :continue_activation -> :ok
+        end
+      end)
+
+    pid = start_manager(ctx, applier: blocking_applier, owner_retry_base_ms: 10)
+    assert_receive {:applier, :reconcile, _startup}
+
+    candidate = DS.generation_fixture(generation: 2)
+    final_chunk = deliver_until_final_chunk(pid, candidate, ctx.session_generation)
+
+    activation_task =
+      Task.async(fn ->
+        Manager.deliver_chunk(pid, ctx.session_generation, final_chunk)
+      end)
+
+    assert_receive {:ack, %{status: :staged}, _meta}, 1_000
+    assert_receive {:wifi_activation_blocked, manager_pid, blocked}, 1_000
+    assert blocked.active == pointer(candidate)
+    assert Store.active(ctx.store) == {:ok, pointer(candidate)}
+
+    replacement_task =
+      Task.async(fn ->
+        :ok = SessionHolder.clear(ctx.holder)
+        SessionHolder.publish(ctx.holder, session(<<3::128>>))
+      end)
+
+    replacement_result = Task.yield(replacement_task, 100)
+    send(manager_pid, :continue_activation)
+
+    assert {:ok, :stored} = Task.await(activation_task, 1_000)
+    replacement_result = complete_yielded_task(replacement_task, replacement_result)
+
+    assert {:ok, {:ok, %Session{generation: replacement_generation}}} = replacement_result
+    assert replacement_generation > ctx.session_generation
+
+    rejected =
+      rejected_ack(candidate,
+        phase: :activation,
+        error_code: :activation_failed,
+        retryable: true,
+        section: nil
+      )
+
+    assert_receive {:ack, ^rejected, _meta}, 1_000
+    refute_receive {:ack, %{status: :effective, generation: 2}, _meta}
+
+    eventually(fn ->
+      assert Store.activation_journal(ctx.store) == :empty
+      assert Store.active(ctx.store) == {:ok, pointer(prior)}
+      assert OperationalGate.status(ctx.gate) == {:open, gate_binding(prior)}
+    end)
+  end
+
+  test "an ACK sink may consult SessionHolder without deadlocking delivery", ctx do
+    test_pid = self()
+
+    ack_sink = fn ack ->
+      generation = SessionHolder.generation(ctx.holder)
+      send(test_pid, {:reentrant_ack, ack, generation})
+      :ok
+    end
+
+    pid = start_manager(ctx, ack_sink: ack_sink)
+    fixture = DS.generation_fixture()
+    session_generation = ctx.session_generation
+
+    caller =
+      spawn(fn ->
+        manifest_result =
+          Manager.deliver_manifest(pid, ctx.session_generation, fixture.delivery)
+
+        chunk_results =
+          Enum.map(DS.chunks(fixture), fn chunk ->
+            Manager.deliver_chunk(pid, ctx.session_generation, chunk)
+          end)
+
+        send(test_pid, {:reentrant_delivery_complete, manifest_result, chunk_results})
+      end)
+
+    caller_ref = Process.monitor(caller)
+
+    receive do
+      {:reentrant_delivery_complete, manifest_result, chunk_results} ->
+        Process.demonitor(caller_ref, [:flush])
+        assert {:ok, :staged} = manifest_result
+        assert Enum.all?(chunk_results, &match?({:ok, _disposition}, &1))
+    after
+      1_000 ->
+        Process.exit(pid, :kill)
+        flunk("desired-state delivery deadlocked while the ACK sink consulted SessionHolder")
+    end
+
+    assert_receive {:reentrant_ack, %{status: :staged}, ^session_generation}, 1_000
+    assert_receive {:reentrant_ack, %{status: :effective}, ^session_generation}, 1_000
+  end
+
   test "a transient chunk read failure stays retryable and emits no rejected transfer ACK", ctx do
     store =
       Store.new(
@@ -780,7 +958,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     assert {:ok, [^staged, ^effective]} = Store.pending_acks(ctx.store)
   end
 
-  test "an effective ACK storage failure keeps the decided candidate recoverable", ctx do
+  test "a decided candidate stays recoverable across session replacement", ctx do
     store =
       Store.new(
         base_dir: ctx.base,
@@ -810,15 +988,24 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     refute_receive {:ack, %{status: :effective}, _meta}
     refute_receive {:ack, %{status: :rejected}, _meta}
 
+    effective = effective_ack(fixture)
     assert {:ok, journal} = Store.activation_journal(store)
     assert journal.candidate == pointer(fixture)
+    assert journal.decision == :candidate
+    assert journal.terminal_ack == effective
     assert {:ok, active} = Store.active(store)
     assert active == pointer(fixture)
     assert OperationalGate.status(ctx.gate) == :closed
 
+    :ok = SessionHolder.clear(ctx.holder)
+
+    assert {:ok, %Session{generation: replacement_generation}} =
+             SessionHolder.publish(ctx.holder, session(<<4::128>>))
+
+    assert replacement_generation > ctx.session_generation
     PathFaultFileSystem.clear(:rename, pending_acks_path)
 
-    assert_receive {:ack, %{status: :effective}, effective_meta}, 1_000
+    assert_receive {:ack, ^effective, effective_meta}, 1_000
     assert effective_meta.active == pointer(fixture)
 
     eventually(fn ->
@@ -827,7 +1014,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     end)
   end
 
-  test "an effective decision write failure keeps the undecided journal recoverable", ctx do
+  test "an effective decision write failure cannot promote an undecided candidate during recovery", ctx do
     store =
       Store.new(
         base_dir: ctx.base,
@@ -866,12 +1053,22 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
 
     PathFaultFileSystem.clear(:rename, activation_path)
 
-    assert_receive {:ack, %{status: :effective}, effective_meta}, 1_000
-    assert effective_meta.active == pointer(fixture)
+    rejected =
+      rejected_ack(fixture,
+        phase: :activation,
+        error_code: :activation_failed,
+        retryable: true,
+        section: nil
+      )
+
+    assert_receive {:ack, ^rejected, rejected_meta}, 1_000
+    assert rejected_meta.active == nil
+    refute_receive {:ack, %{status: :effective}, _meta}
 
     eventually(fn ->
       assert Store.activation_journal(store) == :empty
-      assert OperationalGate.status(ctx.gate) == {:open, gate_binding(fixture)}
+      assert Store.active(store) == :empty
+      assert OperationalGate.status(ctx.gate) == :closed
     end)
   end
 
@@ -1439,8 +1636,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     assert OperationalGate.status(ctx.gate) == :closed
   end
 
-  test "indeterminate Wi-Fi authority keeps the activation journal until owner reconciliation decides", ctx do
-    {:ok, reconcile_result} = Agent.start_link(fn -> {:error, :owner_unavailable} end)
+  test "indeterminate Wi-Fi authority rejects an undecided candidate without probing it", ctx do
     test_pid = self()
 
     applier =
@@ -1451,9 +1647,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
         {:error, {:apply_failed, :wifi, :wifi_authority_indeterminate}}
       end)
       |> Map.put(:reconcile, fn pointer, _owner_pid_map ->
-        result = Agent.get(reconcile_result, & &1)
-        send(test_pid, {:wifi_reconcile_attempt, pointer, result})
-        result
+        send(test_pid, {:unexpected_candidate_reconcile, pointer})
+        :ok
       end)
 
     pid = start_manager(ctx, applier: applier)
@@ -1461,29 +1656,27 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     deliver_generation(pid, fixture, ctx.session_generation)
 
     staged = staged_ack(fixture)
-    effective = effective_ack(fixture)
+
+    rejected =
+      rejected_ack(fixture,
+        phase: :activation,
+        error_code: :activation_failed,
+        retryable: true,
+        section: nil
+      )
+
     assert_receive {:ack, ^staged, _staged_meta}
     assert_receive {:applier, :apply_wifi, wifi}
     assert wifi.active == pointer(fixture)
-    refute_receive {:ack, %{status: :rejected}, _meta}
-    refute_receive {:ack, ^effective, _meta}
-
-    assert {:ok, %{candidate: candidate}} = Store.activation_journal(ctx.store)
-    assert candidate == pointer(fixture)
-    assert {:ok, active} = Store.active(ctx.store)
-    assert active == pointer(fixture)
-    assert OperationalGate.status(ctx.gate) == :closed
-
-    assert_receive {:wifi_reconcile_attempt, ^candidate, {:error, :owner_unavailable}}, 1_000
-    Agent.update(reconcile_result, fn _current -> :ok end)
-
-    assert_receive {:wifi_reconcile_attempt, ^candidate, :ok}, 1_000
-    assert_receive {:ack, ^effective, _meta}, 1_000
-    refute_receive {:wifi_reconcile_attempt, ^candidate, :ok}
+    assert_receive {:ack, ^rejected, rejected_meta}, 1_000
+    assert rejected_meta.active == nil
+    refute_receive {:ack, %{status: :effective}, _meta}
+    refute_receive {:unexpected_candidate_reconcile, _pointer}
 
     eventually(fn ->
       assert Store.activation_journal(ctx.store) == :empty
-      assert OperationalGate.status(ctx.gate) == {:open, gate_binding(fixture)}
+      assert Store.active(ctx.store) == :empty
+      assert OperationalGate.status(ctx.gate) == :closed
     end)
   end
 
@@ -3082,6 +3275,22 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
 
     fixture
   end
+
+  defp deliver_until_final_chunk(pid, fixture, session_generation) do
+    assert {:ok, _disposition} = Manager.deliver_manifest(pid, session_generation, fixture.delivery)
+    chunks = DS.chunks(fixture)
+
+    chunks
+    |> Enum.drop(-1)
+    |> Enum.each(fn chunk ->
+      assert {:ok, _disposition} = Manager.deliver_chunk(pid, session_generation, chunk)
+    end)
+
+    List.last(chunks)
+  end
+
+  defp complete_yielded_task(task, nil), do: {:blocked, Task.await(task, 1_000)}
+  defp complete_yielded_task(_task, result), do: result
 
   defp fully_stage(store, fixture) do
     assert {:ok, _disposition} = Store.stage_manifest(store, fixture.delivery)

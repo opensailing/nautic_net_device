@@ -2,9 +2,11 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
   @moduledoc """
   Coordinates authenticated Desired State delivery and atomic generation activation.
 
-  Every network-triggered durable mutation runs behind the caller's
-  `SessionHolder` generation fence. The logical racing.org device identity is
-  injected separately from the operational session key identity.
+  Every network-triggered call captures a secret-free `SessionHolder`
+  authorization. Long staging and owner work runs outside the holder; durable
+  authority transitions revalidate the exact session generation, session ID,
+  credential epoch, and runtime identity. The logical racing.org device
+  identity is injected separately from the operational session key identity.
   """
 
   use GenServer
@@ -188,14 +190,14 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
   end
 
   def handle_call({:deliver_manifest, session_generation, delivery}, _from, state) do
-    handle_fenced_call(state, session_generation, delivery, fn ->
+    handle_fenced_call(state, session_generation, delivery, fn _authorization ->
       deliver_manifest_fenced(state, delivery)
     end)
   end
 
   def handle_call({:deliver_chunk, session_generation, payload}, _from, state) do
-    handle_fenced_call(state, session_generation, payload, fn ->
-      deliver_chunk_fenced(state, payload)
+    handle_fenced_call(state, session_generation, payload, fn authorization ->
+      deliver_chunk_fenced(state, payload, authorization)
     end)
   end
 
@@ -204,8 +206,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
         _from,
         state
       ) do
-    handle_fenced_call(state, session_generation, metadata, fn ->
-      deliver_secret_fenced(state, metadata, secret)
+    handle_fenced_call(state, session_generation, metadata, fn authorization ->
+      deliver_secret_fenced(state, metadata, secret, authorization)
     end)
   end
 
@@ -214,7 +216,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
   end
 
   def handle_call({:replay, session_generation}, _from, state) do
-    case with_current_session(state, session_generation, fn ->
+    case with_current_session(state, session_generation, fn _authorization ->
            replay_current_acks(state)
            {:ok, :none}
          end) do
@@ -391,23 +393,71 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     end
   end
 
-  defp with_current_session(state, session_generation, fun) do
+  defp with_current_session(state, session_generation, fun) when is_function(fun, 1) do
+    with {:ok, authorization} <- authorize_current_session(state, session_generation),
+         {:ok, result} <- invoke_authorized_callback(fun, authorization) do
+      {:ok, result}
+    end
+  end
+
+  defp authorize_current_session(state, session_generation) do
     callback = fn session ->
       if session.credential_epoch == state.identity.credential_epoch do
-        fun.()
+        {:ok,
+         %{
+           session_generation: session.generation,
+           session_id: session.session_id,
+           credential_epoch: session.credential_epoch,
+           runtime_identity: state.identity
+         }}
       else
-        {{:error, :credential_epoch_mismatch}, :none}
+        {:error, :credential_epoch_mismatch}
+      end
+    end
+
+    case SessionHolder.with_session(state.session_holder, session_generation, callback) do
+      {:ok, {:ok, authorization}} -> {:ok, authorization}
+      {:ok, {:error, reason}} -> {:error, reason}
+      {:error, reason} when reason in [:no_session, :stale_session] -> {:error, :stale_session}
+      {:error, :session_callback_failed} -> {:error, :internal_failure}
+    end
+  end
+
+  defp invoke_authorized_callback(fun, authorization) do
+    {:ok, fun.(authorization)}
+  rescue
+    _exception -> {:error, :internal_failure}
+  catch
+    _kind, _reason -> {:error, :internal_failure}
+  end
+
+  defp with_authorized_session_transition(state, authorization, fun)
+       when is_map(authorization) and is_function(fun, 0) do
+    callback = fn session ->
+      with :ok <- validate_session_authorization(session, authorization, state.identity) do
+        fun.()
       end
     end
 
     case with_session_in_manager(
            state.session_holder,
-           session_generation,
+           authorization.session_generation,
            callback
          ) do
-      {:ok, result} -> {:ok, result}
+      {:ok, result} -> result
       {:error, reason} when reason in [:no_session, :stale_session] -> {:error, :stale_session}
       {:error, :session_callback_failed} -> {:error, :internal_failure}
+    end
+  end
+
+  defp validate_session_authorization(session, authorization, current_identity) do
+    if session.generation == authorization.session_generation and
+         session.session_id == authorization.session_id and
+         session.credential_epoch == authorization.credential_epoch and
+         current_identity == authorization.runtime_identity do
+      :ok
+    else
+      {:error, :stale_session}
     end
   end
 
@@ -607,16 +657,16 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     end
   end
 
-  defp deliver_chunk_fenced(state, payload) do
+  defp deliver_chunk_fenced(state, payload, authorization) do
     with :ok <- validate_generation_payload(state.store, payload),
          {:ok, disposition} <- Store.put_chunk(state.store, payload) do
-      complete_generation_after_chunk(state, payload, disposition)
+      complete_generation_after_chunk(state, payload, disposition, authorization)
     else
       {:error, reason} -> {{:error, storage_or_protocol_error(reason)}, :none}
     end
   end
 
-  defp complete_generation_after_chunk(state, payload, disposition) do
+  defp complete_generation_after_chunk(state, payload, disposition, authorization) do
     pointer = pointer_from(payload)
 
     case Store.active(state.store) do
@@ -624,17 +674,17 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
         {{:ok, disposition}, :none}
 
       {:ok, _other} ->
-        verify_and_activate_generation(state, payload, disposition, pointer)
+        verify_and_activate_generation(state, payload, disposition, pointer, authorization)
 
       :empty ->
-        verify_and_activate_generation(state, payload, disposition, pointer)
+        verify_and_activate_generation(state, payload, disposition, pointer, authorization)
 
       {:error, reason} ->
         {{:error, storage_or_protocol_error(reason)}, :none}
     end
   end
 
-  defp verify_and_activate_generation(state, payload, disposition, pointer) do
+  defp verify_and_activate_generation(state, payload, disposition, pointer, authorization) do
     case Store.verify_and_stage(state.store, payload.generation, payload.manifest_hash) do
       {:error, :transfer_incomplete, _section} ->
         {{:ok, disposition}, :none}
@@ -647,7 +697,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
           if secret_required?(generation) do
             {{:ok, disposition}, :none}
           else
-            action = activate_candidate(state, pointer, generation, nil)
+            action = activate_candidate(state, pointer, generation, nil, authorization)
             {{:ok, disposition}, action}
           end
         else
@@ -666,7 +716,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     end
   end
 
-  defp deliver_secret_fenced(state, metadata, %Secret{} = secret) do
+  defp deliver_secret_fenced(state, metadata, %Secret{} = secret, authorization) do
     pointer = pointer_from(metadata)
 
     with {:ok, generation} <-
@@ -677,10 +727,10 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
           {{:ok, :accepted}, :none}
 
         {:ok, _other} ->
-          {{:ok, :accepted}, activate_candidate(state, pointer, generation, secret)}
+          {{:ok, :accepted}, activate_candidate(state, pointer, generation, secret, authorization)}
 
         :empty ->
-          {{:ok, :accepted}, activate_candidate(state, pointer, generation, secret)}
+          {{:ok, :accepted}, activate_candidate(state, pointer, generation, secret, authorization)}
 
         {:error, reason} ->
           {{:error, storage_or_protocol_error(reason)}, :none}
@@ -690,7 +740,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     end
   end
 
-  defp activate_candidate(state, pointer, generation, secret) do
+  defp activate_candidate(state, pointer, generation, secret, authorization) do
     :ok = invalidate_lease_sentinel(state)
 
     case gate_close(state) do
@@ -701,7 +751,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
             pointer,
             generation,
             secret,
-            transition
+            transition,
+            authorization
           )
         end)
 
@@ -715,7 +766,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
          pointer,
          generation,
          secret,
-         transition
+         transition,
+         authorization
        ) do
     with :ok <- require_current_transition(state, transition),
          :ok <-
@@ -728,7 +780,14 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
          :ok <- require_current_transition(state, transition) do
       case Store.prepare_activation(state.store, pointer.generation, pointer.manifest_hash) do
         {:ok, %{decision: nil}} ->
-          activate_prepared_candidate(state, pointer, generation, secret, transition)
+          activate_prepared_candidate(
+            state,
+            pointer,
+            generation,
+            secret,
+            transition,
+            authorization
+          )
 
         {:ok, %{decision: decision}} when decision in [:candidate, :prior] ->
           :reconcile_pending
@@ -753,7 +812,14 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     end
   end
 
-  defp activate_prepared_candidate(state, pointer, generation, secret, transition) do
+  defp activate_prepared_candidate(
+         state,
+         pointer,
+         generation,
+         secret,
+         transition,
+         authorization
+       ) do
     with :ok <- require_current_transition(state, transition),
          :ok <-
            call_applier(state.applier, :apply_non_network, [
@@ -762,9 +828,16 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
              transition.owner_pid_map
            ]),
          :ok <- require_current_transition(state, transition) do
-      case Store.commit_activation(state.store) do
+      case commit_activation_with_authorization(state, authorization) do
         {:ok, _prior} ->
-          activate_committed_candidate(state, pointer, generation, secret, transition)
+          activate_committed_candidate(
+            state,
+            pointer,
+            generation,
+            secret,
+            transition,
+            authorization
+          )
 
         {:error, {:apply_failed, section, _reason}} ->
           finalize_rejected_action(
@@ -824,7 +897,20 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     end
   end
 
-  defp activate_committed_candidate(state, pointer, generation, secret, transition) do
+  defp commit_activation_with_authorization(state, authorization) do
+    with_authorized_session_transition(state, authorization, fn ->
+      Store.commit_activation(state.store)
+    end)
+  end
+
+  defp activate_committed_candidate(
+         state,
+         pointer,
+         generation,
+         secret,
+         transition,
+         authorization
+       ) do
     with :ok <- require_current_transition(state, transition),
          :ok <-
            call_applier(state.applier, :apply_wifi, [
@@ -833,7 +919,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
              transition.owner_pid_map
            ]),
          :ok <- require_current_transition(state, transition) do
-      finalize_candidate_action(state, pointer, transition)
+      finalize_candidate_action(state, pointer, generation, transition, authorization)
     else
       {:error, {:gate_transition_changed, reason}} ->
         restore_prior_after_transition_change(state, reason)
@@ -932,7 +1018,13 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     :reconcile_pending
   end
 
-  defp finalize_candidate_action(state, pointer, transition) do
+  defp finalize_candidate_action(
+         state,
+         pointer,
+         generation,
+         transition,
+         authorization
+       ) do
     effective = effective_ack(state.identity, pointer)
 
     case record_and_finalize_activation(
@@ -940,11 +1032,29 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
            :candidate,
            effective,
            false,
-           transition
+           transition,
+           {:session, authorization}
          ) do
-      :ok -> {:open_prepared, transition}
-      {:error, {:gate_transition_changed, reason}} -> transition_pending_action(reason)
-      {:error, _reason} -> :reconcile_pending
+      :ok ->
+        {:open_prepared, transition}
+
+      {:error, :stale_session} ->
+        finalize_rejected_action(
+          state,
+          pointer,
+          generation,
+          :activation,
+          :activation_failed,
+          true,
+          nil,
+          transition
+        )
+
+      {:error, {:gate_transition_changed, reason}} ->
+        transition_pending_action(reason)
+
+      {:error, _reason} ->
+        :reconcile_pending
     end
   end
 
@@ -961,7 +1071,16 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     section_identity = if section, do: section_identity(generation, section), else: nil
     rejected = rejected_ack(state.identity, pointer, phase, code, retryable, section_identity)
 
-    _result = record_and_finalize_activation(state, :prior, rejected, true, transition)
+    _result =
+      record_and_finalize_activation(
+        state,
+        :prior,
+        rejected,
+        true,
+        transition,
+        :safety
+      )
+
     :reconcile_pending
   end
 
@@ -985,10 +1104,11 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
          decision,
          terminal_ack,
          reconcile_owners?,
-         transition
+         transition,
+         authority
        ) do
     with :ok <- require_current_transition(state, transition),
-         :ok <- Store.record_activation_decision(state.store, decision, terminal_ack),
+         :ok <- record_activation_decision(state, decision, terminal_ack, authority),
          :ok <- require_current_transition(state, transition),
          :ok <-
            finalize_recorded_activation(
@@ -1001,6 +1121,33 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
       :ok
     end
   end
+
+  defp record_activation_decision(
+         state,
+         :candidate,
+         terminal_ack,
+         {:session, authorization}
+       ) do
+    with_authorized_session_transition(state, authorization, fn ->
+      Store.record_activation_decision(state.store, :candidate, terminal_ack)
+    end)
+  end
+
+  defp record_activation_decision(state, :candidate, terminal_ack, :recovery) do
+    with {:ok, %{decision: :candidate}} <- Store.activation_journal(state.store) do
+      Store.record_activation_decision(state.store, :candidate, terminal_ack)
+    else
+      _other -> {:error, :candidate_authority_missing}
+    end
+  end
+
+  defp record_activation_decision(state, :prior, terminal_ack, authority)
+       when authority in [:recovery, :safety] do
+    Store.record_activation_decision(state.store, :prior, terminal_ack)
+  end
+
+  defp record_activation_decision(_state, _decision, _terminal_ack, _authority),
+    do: {:error, :activation_decision_authority_invalid}
 
   defp finalize_recorded_activation(
          state,
@@ -1299,7 +1446,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
                  decision,
                  current_ack,
                  true,
-                 transition
+                 transition,
+                 :recovery
                ) do
             :ok ->
               finish_recovery_transition(state, transition)
@@ -1341,25 +1489,35 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
   end
 
   defp recover_activation_journal(state, %{decision: nil, candidate: candidate}) do
+    rejected =
+      rejected_ack(
+        state.identity,
+        candidate,
+        :activation,
+        :activation_failed,
+        true,
+        nil
+      )
+
     with_recovery_transition(state, fn transition ->
-      with :ok <- require_current_transition(state, transition),
-           reconcile_result <-
-             call_applier(state.applier, :reconcile, [
-               candidate,
-               transition.owner_pid_map
-             ]),
-           :ok <- require_current_transition(state, transition) do
-        recover_undecided_reconcile_result(
-          state,
-          candidate,
-          reconcile_result,
-          transition
-        )
-      else
+      case record_and_finalize_activation(
+             state,
+             :prior,
+             rejected,
+             true,
+             transition,
+             :safety
+           ) do
+        :ok ->
+          finish_recovery_transition(state, transition)
+
         {:error, {:gate_transition_changed, reason}} ->
-          restore_prior_recovery_after_transition_change(
-            state,
-            reason
+          transition_recovery_failed(state, reason)
+
+        {:error, reason} ->
+          schedule_owner_reconcile(
+            close_runtime(state),
+            {:activation_recovery_failed, reason}
           )
       end
     end)
@@ -1369,84 +1527,6 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     schedule_owner_reconcile(
       close_runtime(state),
       {:activation_recovery_failed, :invalid_activation_journal}
-    )
-  end
-
-  defp recover_undecided_reconcile_result(
-         state,
-         candidate,
-         :ok,
-         transition
-       ) do
-    effective = effective_ack(state.identity, candidate)
-
-    case record_and_finalize_activation(
-           state,
-           :candidate,
-           effective,
-           false,
-           transition
-         ) do
-      :ok ->
-        finish_recovery_transition(state, transition)
-
-      {:error, {:gate_transition_changed, reason}} ->
-        transition_recovery_failed(state, reason)
-
-      {:error, reason} ->
-        schedule_owner_reconcile(
-          close_runtime(state),
-          {:activation_recovery_failed, reason}
-        )
-    end
-  end
-
-  defp recover_undecided_reconcile_result(
-         state,
-         candidate,
-         {:error, {:apply_failed, :wifi, :wifi_activation_mismatch}},
-         transition
-       ) do
-    rejected =
-      rejected_ack(
-        state.identity,
-        candidate,
-        :wifi_trial,
-        :wifi_trial_failed,
-        true,
-        recovery_section_identity(state.store, candidate, :wifi)
-      )
-
-    case record_and_finalize_activation(
-           state,
-           :prior,
-           rejected,
-           true,
-           transition
-         ) do
-      :ok ->
-        finish_recovery_transition(state, transition)
-
-      {:error, {:gate_transition_changed, reason}} ->
-        transition_recovery_failed(state, reason)
-
-      {:error, reason} ->
-        schedule_owner_reconcile(
-          close_runtime(state),
-          {:activation_recovery_failed, reason}
-        )
-    end
-  end
-
-  defp recover_undecided_reconcile_result(
-         state,
-         _candidate,
-         {:error, reason},
-         _transition
-       ) do
-    schedule_owner_reconcile(
-      close_runtime(state),
-      {:activation_recovery_failed, reason}
     )
   end
 
@@ -1470,13 +1550,6 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
       false -> {:error, :activation_decision_mismatch}
       {:error, _reason} = error -> error
       _other -> {:error, :activation_decision_mismatch}
-    end
-  end
-
-  defp recovery_section_identity(store, pointer, section) do
-    case Store.load_generation(store, pointer.generation, pointer.manifest_hash) do
-      {:ok, generation} -> section_identity(generation, section)
-      {:error, _reason} -> nil
     end
   end
 
@@ -2218,19 +2291,6 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
 
   defp transition_recovery_failed(state, reason) do
     apply_runtime_action(state, transition_pending_action(reason))
-  end
-
-  defp restore_prior_recovery_after_transition_change(state, reason) do
-    case Store.restore_activation_prior(state.store) do
-      :ok ->
-        transition_recovery_failed(state, reason)
-
-      {:error, restore_reason} ->
-        schedule_owner_reconcile(
-          close_runtime(state),
-          {:activation_authority_restore_failed, restore_reason}
-        )
-    end
   end
 
   defp require_current_transition(
