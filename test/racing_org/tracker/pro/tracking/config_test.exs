@@ -22,6 +22,10 @@ defmodule RacingOrg.Tracker.Pro.Tracking.ConfigTest do
     }
   end
 
+  defp desired_payload(version) do
+    Map.put(payload(version), "deviation_threshold_meters", 50.0)
+  end
+
   defp start(opts) do
     parent = self()
 
@@ -134,6 +138,98 @@ defmodule RacingOrg.Tracker.Pro.Tracking.ConfigTest do
       status = Config.status(pid)
       assert status.applied_version == 0
       assert status.states.race == %{damping_seconds: 0.5, send_rate_hz: 10.0}
+    end
+  end
+
+  describe "authoritative side effects" do
+    test "legacy apply does not publish owner state when its side effect fails", %{dir: dir} do
+      {:ok, callback_result} = Agent.start_link(fn -> {:error, :sampling_unavailable} end)
+
+      pid =
+        start_supervised!(
+          {Config, name: nil, store_dir: dir, on_apply: fn _config -> Agent.get(callback_result, & &1) end}
+        )
+
+      assert {:error, {:on_apply_failed, :sampling_unavailable}} =
+               Config.apply_config(pid, payload(1))
+
+      assert {:ok, %{version: 1}} = Store.load(dir)
+      assert Config.applied_version(pid) == nil
+      assert Config.get_state(pid, :race) == %{damping_seconds: 0.0, send_rate_hz: 1.0}
+
+      Agent.update(callback_result, fn _result -> :ok end)
+      assert {:ok, %{version: 1}} = Config.apply_config(pid, payload(1))
+    end
+
+    test "legacy apply does not publish or run side effects when persistence fails", %{dir: dir} do
+      File.mkdir_p!(dir)
+      blocked_dir = Path.join(dir, "not_a_directory")
+      File.write!(blocked_dir, "blocked")
+      parent = self()
+
+      pid =
+        start_supervised!(
+          {Config, name: nil, store_dir: blocked_dir, on_apply: fn config -> send(parent, {:on_apply, config}) end}
+        )
+
+      assert {:error, _reason} = Config.apply_config(pid, payload(1))
+      assert Config.applied_version(pid) == nil
+      refute_receive {:on_apply, _config}
+    end
+
+    test "reconcile sanitizes a raised side-effect failure", %{dir: dir} do
+      pid =
+        start_supervised!(
+          {Config, name: nil, store_dir: dir, on_apply: fn _config -> raise "sensitive callback detail" end}
+        )
+
+      assert {:error, {:on_apply_failed, :exception}} =
+               Config.reconcile_config(pid, desired_payload(1))
+
+      assert Process.alive?(pid)
+      assert Config.applied_version(pid) == nil
+    end
+
+    test "reset reports a side-effect failure after durably returning to defaults", %{dir: dir} do
+      pid =
+        start_supervised!(
+          {Config,
+           name: nil,
+           store_dir: dir,
+           on_apply: fn
+             %{version: nil} -> {:error, :sampling_unavailable}
+             _config -> :ok
+           end}
+        )
+
+      assert {:ok, %{version: 1}} = Config.reconcile_config(pid, desired_payload(1))
+
+      assert {:error, {:on_apply_failed, :sampling_unavailable}} =
+               Config.reset_config(pid)
+
+      assert Store.load(dir) == :empty
+      assert Config.applied_version(pid) == nil
+      assert Config.get_state(pid, :race) == %{damping_seconds: 0.0, send_rate_hz: 1.0}
+    end
+
+    test "reconcile does not publish owner state when its side effect fails", %{dir: dir} do
+      {:ok, callback_result} = Agent.start_link(fn -> {:error, :sampling_unavailable} end)
+
+      pid =
+        start_supervised!(
+          {Config, name: nil, store_dir: dir, on_apply: fn _config -> Agent.get(callback_result, & &1) end}
+        )
+
+      assert {:error, {:on_apply_failed, :sampling_unavailable}} =
+               Config.reconcile_config(pid, desired_payload(1))
+
+      assert {:ok, %{version: 1}} = Store.load(dir)
+      assert Config.applied_version(pid) == nil
+      assert Config.get_state(pid, :race) == %{damping_seconds: 0.0, send_rate_hz: 1.0}
+
+      Agent.update(callback_result, fn _result -> :ok end)
+      assert {:ok, %{version: 1}} = Config.reconcile_config(pid, desired_payload(1))
+      assert Config.get_state(pid, :race) == %{damping_seconds: 0.5, send_rate_hz: 10.0}
     end
   end
 

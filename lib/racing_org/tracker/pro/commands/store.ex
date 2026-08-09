@@ -43,8 +43,11 @@ defmodule RacingOrg.Tracker.Pro.Commands.Store do
 
   @doc "Remove any persisted assignment under `dir`."
   def clear(dir) do
-    _ = File.rm(path(dir))
-    :ok
+    case File.rm(path(dir)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp decode(binary, dir) do

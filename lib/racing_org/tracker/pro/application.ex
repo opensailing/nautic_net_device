@@ -65,6 +65,8 @@ defmodule RacingOrg.Tracker.Pro.Application do
 
   # Product: NMEA 2000 standalone, on-board device
   defp children(:logger, target) do
+    controller_capability = make_ref()
+
     [
       commands_child(),
       # Upstream signal selection BEFORE Telemetry: Telemetry's report path reads
@@ -93,7 +95,10 @@ defmodule RacingOrg.Tracker.Pro.Application do
       {RacingOrg.Tracker.Pro.WebClients.UDPClient, udp_config()},
       {RacingOrg.Tracker.Pro.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
       {RacingOrg.Tracker.Pro.DataSetUploader, via: :udp}
-    ] ++ wifi_manager_children(target) ++ secure_transport_children(target)
+    ] ++
+      wifi_manager_children(target) ++
+      desired_state_children(target, controller_capability) ++
+      secure_transport_children(:logger, target, controller_capability)
   end
 
   # Product: Base station receiver node for racing_org_tracker_mini
@@ -105,7 +110,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
       {RacingOrg.Tracker.Pro.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
       {RacingOrg.Tracker.Pro.DataSetUploader, via: :udp},
       RacingOrg.Tracker.Pro.BaseStation
-    ] ++ wifi_manager_children(target) ++ secure_transport_children(target)
+    ] ++ wifi_manager_children(target) ++ secure_transport_children(:uplink, target, nil)
   end
 
   # Wi-Fi: on a real device target, `RacingOrg.Tracker.Pro.WiFiManager` OWNS wlan0 at runtime.
@@ -126,6 +131,24 @@ defmodule RacingOrg.Tracker.Pro.Application do
 
   defp wifi_enabled?, do: Application.get_env(:racing_org_tracker_pro, :wifi_enabled, true) == true
 
+  # Logger-only Desired State foundations. RuntimeIdentity owns the boot/storage
+  # incarnation, and the Applier starts only after all authoritative section owners
+  # (including WiFiManager) are available. BootProvisioner, Manager, and the gate are
+  # ordered separately below so the gate can pin the exact live Manager PID at claim.
+  defp desired_state_children(target, controller_capability) do
+    if secure_transport_configured?(target) do
+      [
+        RacingOrg.Tracker.Pro.DesiredState.RuntimeIdentity,
+        RacingOrg.Tracker.Pro.DesiredState.OperationalGate.AuthorityRegistry.Root,
+        RacingOrg.Tracker.Pro.DesiredState.OperationalGate.AuthorityRegistry.Store,
+        RacingOrg.Tracker.Pro.DesiredState.OperationalGate.AuthorityRegistry,
+        RacingOrg.Tracker.Pro.DesiredState.Runtime.applier_child_spec(controller_capability: controller_capability)
+      ]
+    else
+      []
+    end
+  end
+
   # P9-job-6 secure-transport children, appended after the network/HTTP deps they
   # rely on. The SessionHolder is started inline above (it runs in EVERY environment:
   # the UDP send path + tests read it, and it is idle/cheap with no session). These
@@ -143,19 +166,40 @@ defmodule RacingOrg.Tracker.Pro.Application do
   # Each child also self-gates at runtime, so this is belt-and-suspenders. On
   # host/test (`real_target?` false) they never start.
   #
-  # Ordering: BootProvisioner (registers) → ChannelClient (connects/handshakes) →
-  # BulkUploader, all AFTER SessionHolder.
-  defp secure_transport_children(target) do
+  # Ordering on logger: BootProvisioner (signed authority) → DesiredState.Manager →
+  # OperationalGate (pins the live Manager PID) → ChannelClient (connects/handshakes)
+  # → BulkUploader, all AFTER SessionHolder and the Desired State foundations. Uplink
+  # preserves the legacy three-child order and
+  # does not start the logger-only generation runtime.
+  defp secure_transport_children(product, target, controller_capability) do
     if secure_transport_configured?(target) do
-      [
-        RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner,
-        RacingOrg.Tracker.Pro.SecureTransport.ChannelClient,
-        RacingOrg.Tracker.Pro.Race.BulkUploader
-      ]
+      [RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner] ++
+        desired_state_manager_children(product, controller_capability) ++
+        operational_gate_children(product, controller_capability) ++
+        [
+          RacingOrg.Tracker.Pro.SecureTransport.ChannelClient,
+          RacingOrg.Tracker.Pro.Race.BulkUploader
+        ]
     else
       []
     end
   end
+
+  defp desired_state_manager_children(:logger, controller_capability) do
+    [
+      RacingOrg.Tracker.Pro.DesiredState.Runtime.manager_child_spec(controller_capability: controller_capability)
+    ]
+  end
+
+  defp desired_state_manager_children(:uplink, _controller_capability), do: []
+
+  defp operational_gate_children(:logger, controller_capability) do
+    [
+      {RacingOrg.Tracker.Pro.DesiredState.OperationalGate, controller_capability: controller_capability}
+    ]
+  end
+
+  defp operational_gate_children(:uplink, _controller_capability), do: []
 
   @doc """
   Whether the secure-transport children should start: a real device target AND the
@@ -197,7 +241,12 @@ defmodule RacingOrg.Tracker.Pro.Application do
   # until the server pushes a selection). Must start BEFORE Telemetry.
   defp upstream_config_child do
     {RacingOrg.Tracker.Pro.Upstream.Config,
-     name: RacingOrg.Tracker.Pro.Upstream.Config,
+     name:
+       Application.get_env(
+         :racing_org_tracker_pro,
+         :upstream_config_name,
+         RacingOrg.Tracker.Pro.Upstream.Config
+       ),
      store_dir: Application.get_env(:racing_org_tracker_pro, :upstream_directory)}
   end
 
@@ -205,12 +254,8 @@ defmodule RacingOrg.Tracker.Pro.Application do
     {RacingOrg.Tracker.Pro.Tracking.Config,
      name: RacingOrg.Tracker.Pro.Tracking.Config,
      store_dir: Application.get_env(:racing_org_tracker_pro, :tracking_directory),
-     on_apply: fn _config ->
-       try do
-         RacingOrg.Tracker.Pro.Sampling.reconfigure(RacingOrg.Tracker.Pro.Sampling)
-       catch
-         :exit, _ -> :ok
-       end
+     on_apply: fn config ->
+       RacingOrg.Tracker.Pro.Sampling.reconfigure(RacingOrg.Tracker.Pro.Sampling, config)
      end}
   end
 

@@ -209,6 +209,22 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
     GenServer.call(server, {:apply_config, config})
   end
 
+  @doc "Purely validate and normalize a desired computed-values config."
+  @spec validate_config(term()) :: {:ok, map()} | {:error, term()}
+  def validate_config(config), do: strict_normalize(config)
+
+  @doc "Durably reconcile authoritative desired state, regardless of legacy version order."
+  @spec reconcile_config(GenServer.server(), map()) :: {:ok, map()} | {:error, term()}
+  def reconcile_config(server \\ __MODULE__, config) when is_map(config) do
+    GenServer.call(server, {:reconcile_config, config})
+  end
+
+  @doc "Durably clear desired computed-value authority and restore no definitions."
+  @spec reset_config(GenServer.server()) :: :ok | {:error, term()}
+  def reset_config(server \\ __MODULE__) do
+    GenServer.call(server, :reset_config)
+  end
+
   @doc "The currently-applied config version (`nil` if none applied yet)."
   @spec applied_version(GenServer.server()) :: integer() | nil
   def applied_version(server \\ __MODULE__) do
@@ -293,6 +309,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
 
     state = %{
       store_dir: Keyword.get(opts, :store_dir, @default_store_dir),
+      store_opts: Keyword.take(opts, [:file_system, :fault_injector]),
       max_age_ms: Keyword.get(opts, :max_age_ms, @default_max_age_ms),
       now_fn: Keyword.get(opts, :now_fn, fn -> System.monotonic_time(:millisecond) end),
       handler_id: handler_id,
@@ -335,6 +352,18 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
   def handle_call({:apply_config, config}, _from, state) do
     {result, state} = do_apply(config, state)
     {:reply, result, state}
+  end
+
+  def handle_call({:reconcile_config, config}, _from, state) do
+    {result, state} = do_reconcile(config, state)
+    {:reply, result, state}
+  end
+
+  def handle_call(:reset_config, _from, state) do
+    case clear_persisted(state) do
+      :ok -> {:reply, :ok, %{state | applied_version: nil, defs: []}}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call(:applied_version, _from, state) do
@@ -887,10 +916,169 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
     end
   end
 
+  defp do_reconcile(raw, state) do
+    with {:ok, config} <- strict_normalize(raw),
+         :ok <- maybe_persist(state.store_dir, config) do
+      state = %{state | defs: config.values, applied_version: config.version}
+      {{:ok, config}, state}
+    else
+      {:error, reason} -> {{:error, reason}, state}
+    end
+  end
+
+  defp clear_persisted(%{store_dir: nil}), do: :ok
+  defp clear_persisted(state), do: Store.clear(state.store_dir, state.store_opts)
+
   defp maybe_persist(nil, _config), do: :ok
   defp maybe_persist(dir, config), do: Store.save(dir, config)
 
-  # --- normalization (string OR atom keys -> canonical defs) ---
+  @library_keys ~w(true_wind vmg vmc polar_performance target_boat_speed target_twa vmg_performance
+                   next_leg_twa next_leg_aws next_leg_awa)
+
+  # --- Strict Desired State normalization ---
+  #
+  # The backend projection is COMPLETE and canonical, so unlike the legacy
+  # `set_computed_values` channel path below nothing is coerced or defaulted: a
+  # field present with the wrong shape (an `input_bindings` LIST instead of the
+  # canonical map, a string `version`, a non-numeric damping) rejects the whole
+  # generation rather than silently making a half-understood config effective.
+
+  defp strict_normalize(%{} = raw) do
+    with {:ok, version} <- strict_version(fetch(raw, :version, "version")),
+         {:ok, values} <- strict_values(fetch(raw, :values, "values")) do
+      {:ok, %{version: version, values: values}}
+    end
+  end
+
+  defp strict_normalize(_raw), do: {:error, :malformed}
+
+  defp strict_version(version) when is_integer(version) and version >= 0, do: {:ok, version}
+  defp strict_version(_version), do: {:error, :bad_version}
+
+  defp strict_values(values) when is_list(values) do
+    values
+    |> Enum.reduce_while({:ok, [], MapSet.new()}, fn raw, {:ok, acc, ids} ->
+      case strict_value(raw) do
+        {:ok, def} ->
+          if MapSet.member?(ids, def.id) do
+            {:halt, {:error, :duplicate_value_id}}
+          else
+            {:cont, {:ok, [def | acc], MapSet.put(ids, def.id)}}
+          end
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, defs, _ids} -> {:ok, Enum.reverse(defs)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp strict_values(_values), do: {:error, :bad_values}
+
+  defp strict_value(%{} = raw) do
+    with {:ok, id} <- fetch_id(raw),
+         {:ok, type} <- fetch_type(raw),
+         {:ok, signals} <- fetch_signals(raw),
+         {:ok, type_fields} <- strict_type_fields(type, raw),
+         {:ok, name} <- strict_name(fetch(raw, :name, "name")),
+         {:ok, bindings} <- strict_bindings(fetch(raw, :input_bindings, "input_bindings")),
+         {:ok, output_pgn} <- strict_optional_integer(fetch(raw, :output_pgn, "output_pgn")),
+         {:ok, output_field} <- strict_optional_string(fetch(raw, :output_field, "output_field")),
+         {:ok, output_reference} <-
+           strict_optional_string(fetch(raw, :output_reference, "output_reference")),
+         {:ok, output_unit} <- strict_optional_string(fetch(raw, :output_unit, "output_unit")),
+         {:ok, output_instance} <-
+           strict_optional_integer(fetch(raw, :output_instance, "output_instance")),
+         {:ok, damping} <-
+           strict_nonnegative_number(fetch(raw, :damping_seconds, "damping_seconds")),
+         {:ok, rate} <- strict_positive_number(fetch(raw, :broadcast_rate_hz, "broadcast_rate_hz")),
+         {:ok, broadcast?} <-
+           strict_boolean(fetch(raw, :broadcast_enabled, "broadcast_enabled")),
+         {:ok, stream?} <- strict_boolean(fetch(raw, :stream_to_backend, "stream_to_backend")) do
+      {:ok,
+       Map.merge(
+         %{
+           id: id,
+           name: name,
+           definition_type: type,
+           signals: signals,
+           input_bindings: bindings,
+           output_pgn: output_pgn,
+           output_field: output_field,
+           output_reference: output_reference,
+           output_unit: output_unit,
+           output_instance: output_instance,
+           damping_seconds: damping,
+           broadcast_rate_hz: rate,
+           broadcast_enabled: broadcast?,
+           stream_to_backend: stream?
+         },
+         type_fields
+       )}
+    end
+  end
+
+  defp strict_value(_raw), do: {:error, :bad_value}
+
+  # An expression def carries an rpn list AND a nil library_key; a library def is
+  # the exact mirror. A projection setting both (or neither) is not canonical.
+  defp strict_type_fields(:expression, raw) do
+    with rpn when is_list(rpn) <- fetch(raw, :rpn, "rpn"),
+         nil <- fetch(raw, :library_key, "library_key") do
+      {:ok, %{rpn: rpn, library_key: nil}}
+    else
+      _other -> {:error, :bad_rpn}
+    end
+  end
+
+  defp strict_type_fields(:library, raw) do
+    with key when is_binary(key) <- fetch(raw, :library_key, "library_key"),
+         true <- key in @library_keys,
+         nil <- fetch(raw, :rpn, "rpn") do
+      {:ok, %{library_key: key, rpn: nil}}
+    else
+      _other -> {:error, :bad_library_key}
+    end
+  end
+
+  defp strict_name(name) when is_binary(name), do: {:ok, name}
+  defp strict_name(_name), do: {:error, :bad_name}
+
+  defp strict_bindings(nil), do: {:ok, %{}}
+
+  defp strict_bindings(%{} = bindings) do
+    if Enum.all?(bindings, fn {k, v} -> is_binary(k) and is_binary(v) end) do
+      {:ok, Map.new(bindings)}
+    else
+      {:error, :bad_input_bindings}
+    end
+  end
+
+  defp strict_bindings(_bindings), do: {:error, :bad_input_bindings}
+
+  defp strict_optional_string(nil), do: {:ok, nil}
+  defp strict_optional_string(value) when is_binary(value), do: {:ok, value}
+  defp strict_optional_string(_value), do: {:error, :bad_output_field}
+
+  defp strict_optional_integer(nil), do: {:ok, nil}
+
+  defp strict_optional_integer(value) when is_integer(value) and value >= 0, do: {:ok, value}
+
+  defp strict_optional_integer(_value), do: {:error, :bad_output_field}
+
+  defp strict_nonnegative_number(value) when is_number(value) and value >= 0, do: {:ok, value / 1}
+  defp strict_nonnegative_number(_value), do: {:error, :bad_damping_seconds}
+
+  defp strict_positive_number(value) when is_number(value) and value > 0, do: {:ok, value / 1}
+  defp strict_positive_number(_value), do: {:error, :bad_broadcast_rate_hz}
+
+  defp strict_boolean(value) when is_boolean(value), do: {:ok, value}
+  defp strict_boolean(_value), do: {:error, :bad_boolean_flag}
+
+  # --- Legacy normalization (string OR atom keys -> canonical defs) ---
 
   defp normalize(%{} = raw) do
     with {:ok, version} <- fetch_version(raw),
@@ -994,9 +1182,6 @@ defmodule RacingOrg.Tracker.Pro.Compute.Engine do
       _ -> {:error, :bad_rpn}
     end
   end
-
-  @library_keys ~w(true_wind vmg vmc polar_performance target_boat_speed target_twa vmg_performance
-                   next_leg_twa next_leg_aws next_leg_awa)
 
   defp fetch_type_fields(:library, raw) do
     case fetch(raw, :library_key, "library_key") do

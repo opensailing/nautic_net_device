@@ -24,6 +24,8 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Store do
 
   require Logger
 
+  alias RacingOrg.Tracker.Pro.DesiredState.AtomicFile
+
   @type state_config :: %{damping_seconds: float(), send_rate_hz: float()}
   @type config :: %{version: integer(), states: %{atom() => state_config()}}
 
@@ -57,11 +59,10 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Store do
     end
   end
 
-  @doc "Remove any persisted tracking config under `dir`."
-  @spec clear(Path.t()) :: :ok
-  def clear(dir) do
-    _ = File.rm(path(dir))
-    :ok
+  @doc "Durably remove any persisted tracking config under `dir`."
+  @spec clear(Path.t(), keyword()) :: :ok | {:error, term()}
+  def clear(dir, opts \\ []) do
+    AtomicFile.remove(path(dir), Keyword.put_new(opts, :directory_root, dir))
   end
 
   defp decode(binary, dir) do

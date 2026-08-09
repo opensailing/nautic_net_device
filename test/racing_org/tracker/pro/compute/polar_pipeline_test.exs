@@ -119,7 +119,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.PolarPipelineTest do
   defp emit_wind(reference, angle_rad, speed_m_s, ts) do
     :telemetry.execute(
       [:racing_org, :wind, reference],
-      %{vector: %{timestamp: nil, angle: angle_rad, magnitude: speed_m_s}},
+      %{vector: %{timestamp: DateTime.utc_now(), angle: angle_rad, magnitude: speed_m_s}},
       %{device_id: <<1, 2, 3, 4, 5, 6, 7, 8>>, timestamp_monotonic_ms: ts}
     )
   end
@@ -127,7 +127,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.PolarPipelineTest do
   defp emit_water_speed(m_s, ts) do
     :telemetry.execute(
       [:racing_org, :speed, :water],
-      %{speed_m_s: %{timestamp: nil, value: m_s}},
+      %{speed_m_s: %{timestamp: DateTime.utc_now(), value: m_s}},
       %{device_id: <<1, 2, 3, 4, 5, 6, 7, 8>>, timestamp_monotonic_ms: ts}
     )
   end
@@ -135,7 +135,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.PolarPipelineTest do
   defp emit_heading(rad, ts) do
     :telemetry.execute(
       [:racing_org, :heading],
-      %{rad: %{timestamp: nil, value: rad}},
+      %{rad: %{timestamp: DateTime.utc_now(), value: rad}},
       %{device_id: <<1, 2, 3, 4, 5, 6, 7, 8>>, timestamp_monotonic_ms: ts}
     )
   end
@@ -143,7 +143,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.PolarPipelineTest do
   defp emit_attitude(pitch_rad, roll_rad, ts) do
     :telemetry.execute(
       [:racing_org, :attitude],
-      %{rad: %{timestamp: nil, yaw: 0.0, pitch: pitch_rad, roll: roll_rad}},
+      %{rad: %{timestamp: DateTime.utc_now(), yaw: 0.0, pitch: pitch_rad, roll: roll_rad}},
       %{device_id: <<1, 2, 3, 4, 5, 6, 7, 8>>, timestamp_monotonic_ms: ts}
     )
   end

@@ -267,6 +267,11 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverTest do
   describe "persistence" do
     setup do
       dir = Path.join(System.tmp_dir!(), "nn_observer_#{System.unique_integer([:positive])}")
+      # The Observer's terminate flush is asynchronous (linked + trap_exit) and
+      # can land AFTER on_exit's cleanup; unique_integer sequences repeat across
+      # BEAM runs, so a later run can inherit that leftover file. Pre-clean so
+      # every test starts from a genuinely empty dir.
+      File.rm_rf(dir)
       on_exit(fn -> File.rm_rf(dir) end)
       %{dir: dir}
     end

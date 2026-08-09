@@ -1120,7 +1120,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       refute Map.has_key?(status, :psk)
     end
 
-    test "set_wifi apply error → still pushes status (no crash) and never leaks psk", ctx do
+    test "set_wifi apply error → still pushes status without falsely acknowledging the version", ctx do
       {client, topic, _wifi} =
         connect_client(ctx,
           apply_result: {:error, :ssid_required},
@@ -1132,8 +1132,50 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       assert_receive {:apply_config_called, _config}
       assert_push(^topic, "wifi_status", status)
       assert Map.has_key?(status, :enabled)
+      refute Map.has_key?(status, :applied_version)
       refute Map.has_key?(status, :psk)
       assert Process.alive?(client)
+    end
+
+    test "indeterminate WiFi authority never reports the incoming version as applied", ctx do
+      {client, topic, _wifi} =
+        connect_client(ctx,
+          apply_result: {:error, :wifi_authority_indeterminate},
+          status: %{enabled: true, ssid: "candidate", connection: :lan, signal: -61}
+        )
+
+      push(client, topic, "set_wifi", %{
+        "enabled" => true,
+        "ssid" => "candidate",
+        "psk" => "candidate-secret",
+        "version" => 7
+      })
+
+      assert_receive {:apply_config_called, _config}
+      assert_push(^topic, "wifi_status", status)
+      refute Map.has_key?(status, :applied_version)
+      refute Map.has_key?(status, :psk)
+      assert Process.alive?(client)
+    end
+
+    test "set_wifi unchanged replay acknowledges the requested durable version", ctx do
+      {client, topic, _wifi} =
+        connect_client(ctx,
+          apply_result: {:ok, :unchanged},
+          status: %{enabled: true, ssid: "boat-net", connection: :internet, signal: -55}
+        )
+
+      push(client, topic, "set_wifi", %{
+        "enabled" => true,
+        "ssid" => "boat-net",
+        "psk" => "secret",
+        "version" => 5
+      })
+
+      assert_receive {:apply_config_called, _config}
+      assert_push(^topic, "wifi_status", status)
+      assert status.applied_version == 5
+      refute Map.has_key?(status, :psk)
     end
 
     test "an authenticated simulated wlan0 connection-change pushes a fresh wifi_status", ctx do

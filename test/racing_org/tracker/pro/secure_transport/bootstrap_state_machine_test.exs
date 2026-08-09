@@ -25,6 +25,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachineTest do
 
   setup do
     base = Path.join(System.tmp_dir!(), "bootstrap_machine_#{System.unique_integer([:positive])}")
+
+    # Fresh or concurrent BEAMs can reuse this suffix in the shared OS temp
+    # directory, so remove interrupted-run artifacts before each test.
+    File.rm_rf!(base)
     on_exit(fn -> File.rm_rf(base) end)
 
     common = [

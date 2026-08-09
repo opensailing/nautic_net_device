@@ -24,6 +24,8 @@ defmodule RacingOrg.Tracker.Pro.Upstream.Store do
 
   require Logger
 
+  alias RacingOrg.Tracker.Pro.DesiredState.AtomicFile
+
   @type config :: %{version: integer(), signals: %{atom() => boolean()}}
 
   @filename "current.upstream"
@@ -65,11 +67,10 @@ defmodule RacingOrg.Tracker.Pro.Upstream.Store do
     end
   end
 
-  @doc "Remove the persisted upstream config. Best-effort; never raises."
-  @spec clear(Path.t()) :: :ok
-  def clear(dir) do
-    _ = File.rm(path(dir))
-    :ok
+  @doc "Durably remove the persisted upstream config."
+  @spec clear(Path.t(), keyword()) :: :ok | {:error, term()}
+  def clear(dir, opts \\ []) do
+    AtomicFile.remove(path(dir), Keyword.put_new(opts, :directory_root, dir))
   end
 
   defp path(dir), do: Path.join(dir, @filename)

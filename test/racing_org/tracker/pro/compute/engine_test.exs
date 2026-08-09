@@ -454,7 +454,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.EngineTest do
   defp emit_wind(reference, angle_rad, speed_m_s, ts_ms) do
     :telemetry.execute(
       [:racing_org, :wind, reference],
-      %{vector: %{timestamp: nil, angle: angle_rad, magnitude: speed_m_s}},
+      %{vector: %{timestamp: DateTime.utc_now(), angle: angle_rad, magnitude: speed_m_s}},
       %{device_id: <<1, 2, 3, 4, 5, 6, 7, 8>>, timestamp_monotonic_ms: ts_ms}
     )
   end
@@ -462,7 +462,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.EngineTest do
   defp emit_heading(rad, ts_ms) do
     :telemetry.execute(
       [:racing_org, :heading],
-      %{rad: %{timestamp: nil, value: rad}},
+      %{rad: %{timestamp: DateTime.utc_now(), value: rad}},
       %{device_id: <<1, 2, 3, 4, 5, 6, 7, 8>>, timestamp_monotonic_ms: ts_ms}
     )
   end
@@ -470,7 +470,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.EngineTest do
   defp emit_velocity_ground(cog_rad, sog_m_s, ts_ms) do
     :telemetry.execute(
       [:racing_org, :velocity, :ground],
-      %{vector: %{timestamp: nil, angle: cog_rad, magnitude: sog_m_s}},
+      %{vector: %{timestamp: DateTime.utc_now(), angle: cog_rad, magnitude: sog_m_s}},
       %{device_id: <<1, 2, 3, 4, 5, 6, 7, 8>>, timestamp_monotonic_ms: ts_ms}
     )
   end
@@ -478,7 +478,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.EngineTest do
   defp emit_water_speed(m_s, ts_ms) do
     :telemetry.execute(
       [:racing_org, :speed, :water],
-      %{speed_m_s: %{timestamp: nil, value: m_s}},
+      %{speed_m_s: %{timestamp: DateTime.utc_now(), value: m_s}},
       %{device_id: <<1, 2, 3, 4, 5, 6, 7, 8>>, timestamp_monotonic_ms: ts_ms}
     )
   end
@@ -486,7 +486,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.EngineTest do
   defp emit_attitude(yaw, pitch, roll, ts_ms) do
     :telemetry.execute(
       [:racing_org, :attitude],
-      %{rad: %{timestamp: nil, yaw: yaw, pitch: pitch, roll: roll}},
+      %{rad: %{timestamp: DateTime.utc_now(), yaw: yaw, pitch: pitch, roll: roll}},
       %{device_id: <<1, 2, 3, 4, 5, 6, 7, 8>>, timestamp_monotonic_ms: ts_ms}
     )
   end
@@ -494,7 +494,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.EngineTest do
   defp emit_depth(m, ts_ms) do
     :telemetry.execute(
       [:racing_org, :water_depth],
-      %{depth_m: %{timestamp: nil, value: m}},
+      %{depth_m: %{timestamp: DateTime.utc_now(), value: m}},
       %{device_id: <<1, 2, 3, 4, 5, 6, 7, 8>>, timestamp_monotonic_ms: ts_ms}
     )
   end
@@ -502,7 +502,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.EngineTest do
   defp emit_gps(lat, lon, ts_ms) do
     :telemetry.execute(
       [:racing_org, :gps],
-      %{position: %{timestamp: nil, lat: lat, lon: lon}},
+      %{position: %{timestamp: DateTime.utc_now(), lat: lat, lon: lon}},
       %{device_id: <<1, 2, 3, 4, 5, 6, 7, 8>>, timestamp_monotonic_ms: ts_ms}
     )
   end

@@ -15,8 +15,9 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
       defaults) is always applied.
     * `apply_config/2` is idempotent on `version`: a `version` already applied (`<=`
       the last-applied) is a no-op returning `{:ok, :unchanged}`. Otherwise it
-      persists the new config, records the version, invokes the injected `on_apply`
-      side effect (which re-drives `RacingOrg.Tracker.Pro.Sampling`), and returns `{:ok, config}`.
+      persists the new config, invokes the injected `on_apply` side effect (which
+      re-drives `RacingOrg.Tracker.Pro.Sampling`), and only then publishes the version
+      in memory and returns `{:ok, config}`.
 
   ## The wire contract (server → device, Slipstream event `"set_tracking"`)
 
@@ -77,13 +78,30 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
   Idempotent on `version`: if `version <= last-applied version`, this is a no-op
   returning `{:ok, :unchanged}`. The first config is always applied because the
   last-applied version starts at `nil` (so even `version: 0` is newer). Returns
-  `{:ok, applied_config}` on apply, or `{:error, reason}` if the payload is
-  malformed (missing/invalid states); on error nothing is persisted/applied.
+  `{:ok, applied_config}` on apply, or `{:error, reason}` if validation,
+  persistence, or the required side effect fails. A durably persisted candidate is
+  retained for an idempotent retry when only the side effect fails.
   """
   @spec apply_config(GenServer.server(), map()) ::
-          {:ok, config()} | {:ok, :unchanged} | {:error, atom()}
+          {:ok, config()} | {:ok, :unchanged} | {:error, term()}
   def apply_config(server \\ __MODULE__, config) when is_map(config) do
     GenServer.call(server, {:apply_config, config})
+  end
+
+  @doc "Purely validate and normalize a desired tracking config."
+  @spec validate_config(term()) :: {:ok, config()} | {:error, term()}
+  def validate_config(config), do: strict_normalize(config)
+
+  @doc "Durably reconcile authoritative desired state, regardless of legacy version order."
+  @spec reconcile_config(GenServer.server(), map()) :: {:ok, config()} | {:error, term()}
+  def reconcile_config(server \\ __MODULE__, config) when is_map(config) do
+    GenServer.call(server, {:reconcile_config, config})
+  end
+
+  @doc "Durably clear desired tracking authority and restore compile-time defaults."
+  @spec reset_config(GenServer.server()) :: :ok | {:error, term()}
+  def reset_config(server \\ __MODULE__) do
+    GenServer.call(server, :reset_config)
   end
 
   @doc "The `{damping_seconds, send_rate_hz}` config for one tracking state."
@@ -121,6 +139,7 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
   def init(opts) do
     state = %{
       store_dir: Keyword.get(opts, :store_dir, @default_store_dir),
+      store_opts: Keyword.take(opts, [:file_system, :fault_injector]),
       on_apply: Keyword.get(opts, :on_apply, fn _config -> :ok end),
       # nil = nothing applied yet, so any incoming version (incl. 0) is newer.
       applied_version: nil,
@@ -135,6 +154,32 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
   def handle_call({:apply_config, config}, _from, state) do
     {result, state} = do_apply(config, state)
     {:reply, result, state}
+  end
+
+  def handle_call({:reconcile_config, config}, _from, state) do
+    {result, state} = do_reconcile(config, state)
+    {:reply, result, state}
+  end
+
+  def handle_call(:reset_config, _from, state) do
+    case clear_persisted(state) do
+      :ok ->
+        config = %{
+          version: nil,
+          states: default_states(),
+          deviation_threshold_meters: @default_deviation_threshold_m
+        }
+
+        state = apply_config_to_state(state, config)
+
+        case safe_on_apply(state.on_apply, config) do
+          :ok -> {:reply, :ok, state}
+          {:error, reason} -> {:reply, {:error, {:on_apply_failed, reason}}, state}
+        end
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:get_state, state_name}, _from, state) do
@@ -181,7 +226,10 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
             Logger.info("[Tracking.Config] reconciling persisted config (version=#{config.version})")
             # A config persisted by an older build has no threshold key; fall back to
             # the default so the in-memory value is always a real float.
-            apply_config_to_state(state, Map.put_new(config, :deviation_threshold_meters, @default_deviation_threshold_m))
+            apply_config_to_state(
+              state,
+              Map.put_new(config, :deviation_threshold_meters, @default_deviation_threshold_m)
+            )
 
           :empty ->
             state
@@ -196,8 +244,7 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
       state
       | states: config.states,
         applied_version: config.version,
-        deviation_threshold_meters:
-          Map.get(config, :deviation_threshold_meters, state.deviation_threshold_meters)
+        deviation_threshold_meters: Map.get(config, :deviation_threshold_meters, state.deviation_threshold_meters)
     }
   end
 
@@ -213,22 +260,77 @@ defmodule RacingOrg.Tracker.Pro.Tracking.Config do
         {{:ok, :unchanged}, state}
 
       {:ok, config} ->
-        _ = maybe_persist(state.store_dir, config)
-        state = apply_config_to_state(state, config)
-        _ = safe_on_apply(state.on_apply, config)
-        {{:ok, config}, state}
+        with :ok <- maybe_persist(state.store_dir, config) do
+          case safe_on_apply(state.on_apply, config) do
+            :ok ->
+              {{:ok, config}, apply_config_to_state(state, config)}
+
+            {:error, reason} ->
+              {{:error, {:on_apply_failed, reason}}, state}
+          end
+        else
+          {:error, reason} -> {{:error, reason}, state}
+        end
     end
   end
+
+  defp do_reconcile(raw, state) do
+    with {:ok, config} <- strict_normalize(raw),
+         :ok <- maybe_persist(state.store_dir, config) do
+      case safe_on_apply(state.on_apply, config) do
+        :ok ->
+          {{:ok, config}, apply_config_to_state(state, config)}
+
+        {:error, reason} ->
+          {{:error, {:on_apply_failed, reason}}, state}
+      end
+    else
+      {:error, reason} -> {{:error, reason}, state}
+    end
+  end
+
+  # --- Strict Desired State normalization ---
+  #
+  # The backend projection is COMPLETE, so the route-deviation threshold is
+  # REQUIRED and must be a positive number here — unlike the legacy channel path
+  # below, where an older server legitimately omits it and the safe default
+  # applies. `version` is likewise an integer only: no string coercion.
+  defp strict_normalize(%{} = raw) do
+    with {:ok, version} <- strict_version(fetch(raw, :version, "version")),
+         {:ok, states_map} <- fetch_states(raw),
+         {:ok, states} <- normalize_states(states_map),
+         {:ok, threshold} <-
+           strict_threshold(fetch(raw, :deviation_threshold_meters, "deviation_threshold_meters")) do
+      {:ok, %{version: version, states: states, deviation_threshold_meters: threshold}}
+    end
+  end
+
+  defp strict_normalize(_raw), do: {:error, :malformed}
+
+  defp strict_version(version) when is_integer(version) and version >= 0, do: {:ok, version}
+  defp strict_version(_version), do: {:error, :bad_version}
+
+  defp strict_threshold(value) when is_number(value) and value > 0, do: {:ok, value / 1}
+  defp strict_threshold(_value), do: {:error, :bad_deviation_threshold}
+
+  defp clear_persisted(%{store_dir: nil}), do: :ok
+  defp clear_persisted(state), do: Store.clear(state.store_dir, state.store_opts)
 
   defp maybe_persist(nil, _config), do: :ok
   defp maybe_persist(dir, config), do: Store.save(dir, config)
 
   defp safe_on_apply(fun, config) do
-    fun.(config)
+    case fun.(config) do
+      {:error, reason} -> {:error, reason}
+      _other -> :ok
+    end
   rescue
-    error -> Logger.warning("[Tracking.Config] on_apply failed: #{inspect(error)}")
+    _error ->
+      Logger.warning("[Tracking.Config] on_apply raised")
+      {:error, :exception}
   catch
-    :exit, _ -> :ok
+    :exit, _reason -> {:error, :exit}
+    _kind, _reason -> {:error, :failure}
   end
 
   # --- Normalization (string OR atom keys -> canonical) ---

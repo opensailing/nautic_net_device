@@ -103,6 +103,22 @@ defmodule RacingOrg.Tracker.Pro.ClockSource.Config do
     GenServer.call(server, {:apply_config, config})
   end
 
+  @doc "Purely validate and normalize a desired clock-source config."
+  @spec validate_config(term()) :: {:ok, config()} | {:error, term()}
+  def validate_config(config), do: strict_normalize(config)
+
+  @doc "Durably reconcile authoritative desired state, regardless of legacy version order."
+  @spec reconcile_config(GenServer.server(), map()) :: {:ok, config()} | {:error, term()}
+  def reconcile_config(server \\ __MODULE__, config) when is_map(config) do
+    GenServer.call(server, {:reconcile_config, config})
+  end
+
+  @doc "Durably clear desired clock-source authority and restore compile-time defaults."
+  @spec reset_config(GenServer.server()) :: :ok | {:error, term()}
+  def reset_config(server \\ __MODULE__) do
+    GenServer.call(server, :reset_config)
+  end
+
   @doc """
   Resolve the boat-clock timestamp for a telemetry frame, given the frame's own
   receive timestamp (`fallback_ts`) and its monotonic timestamp. Returns a
@@ -140,6 +156,7 @@ defmodule RacingOrg.Tracker.Pro.ClockSource.Config do
   def init(opts) do
     state = %{
       store_dir: Keyword.get(opts, :store_dir, @default_store_dir),
+      store_opts: Keyword.take(opts, [:file_system, :fault_injector]),
       stale_ms: Keyword.get(opts, :stale_ms, @default_stale_ms),
       now_fn: Keyword.get(opts, :now_fn, fn -> System.monotonic_time(:millisecond) end),
       # nil = nothing applied yet, so any incoming version (incl. 0) is newer.
@@ -157,6 +174,30 @@ defmodule RacingOrg.Tracker.Pro.ClockSource.Config do
   def handle_call({:apply_config, config}, _from, state) do
     {result, state} = do_apply(config, state)
     {:reply, result, state}
+  end
+
+  def handle_call({:reconcile_config, config}, _from, state) do
+    {result, state} = do_reconcile(config, state)
+    {:reply, result, state}
+  end
+
+  def handle_call(:reset_config, _from, state) do
+    case clear_persisted(state) do
+      :ok ->
+        state = %{
+          state
+          | applied_version: nil,
+            mode: :tracker_receive_time,
+            fallback: :tracker_receive_time,
+            sources: [],
+            timebase: nil
+        }
+
+        {:reply, :ok, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:resolve_timestamp, fallback_ts, monotonic_ms}, _from, state) do
@@ -239,6 +280,18 @@ defmodule RacingOrg.Tracker.Pro.ClockSource.Config do
         {{:ok, config}, apply_config_to_state(state, config)}
     end
   end
+
+  defp do_reconcile(raw, state) do
+    with {:ok, config} <- strict_normalize(raw),
+         :ok <- maybe_persist(state.store_dir, config) do
+      {{:ok, config}, apply_config_to_state(state, config)}
+    else
+      {:error, reason} -> {{:error, reason}, state}
+    end
+  end
+
+  defp clear_persisted(%{store_dir: nil}), do: :ok
+  defp clear_persisted(state), do: Store.clear(state.store_dir, state.store_opts)
 
   defp maybe_persist(nil, _config), do: :ok
   defp maybe_persist(dir, config), do: Store.save(dir, config)
@@ -389,6 +442,93 @@ defmodule RacingOrg.Tracker.Pro.ClockSource.Config do
   defp last_gps_iso(_), do: nil
 
   # --- Normalization (string OR atom keys -> canonical) ---
+
+  # Desired-state reconciliation is intentionally stricter than the legacy channel
+  # path below. The backend projection is complete and canonical, so silently
+  # defaulting malformed policy fields could make an invalid generation effective.
+  defp strict_normalize(%{} = raw) do
+    with {:ok, version} <- strict_version(fetch(raw, :version, "version")),
+         {:ok, mode} <- strict_mode(fetch(raw, :mode, "mode")),
+         {:ok, fallback} <- strict_fallback(fetch(raw, :fallback, "fallback")),
+         {:ok, sources} <- strict_sources(fetch(raw, :sources, "sources")) do
+      {:ok, %{version: version, mode: mode, fallback: fallback, sources: sources}}
+    end
+  end
+
+  defp strict_normalize(_), do: {:error, :malformed}
+
+  defp strict_version(version) when is_integer(version) and version >= 0, do: {:ok, version}
+  defp strict_version(_version), do: {:error, :bad_version}
+
+  defp strict_mode(mode) when mode in [:tracker_receive_time, "tracker_receive_time"],
+    do: {:ok, :tracker_receive_time}
+
+  defp strict_mode(mode) when mode in [:sensor_priority, "sensor_priority"],
+    do: {:ok, :sensor_priority}
+
+  defp strict_mode(_mode), do: {:error, :bad_mode}
+
+  defp strict_fallback(fallback)
+       when fallback in [:tracker_receive_time, "tracker_receive_time"],
+       do: {:ok, :tracker_receive_time}
+
+  defp strict_fallback(_fallback), do: {:error, :bad_fallback}
+
+  defp strict_sources(sources) when is_list(sources) do
+    sources
+    |> Enum.reduce_while({:ok, []}, fn source, {:ok, acc} ->
+      case strict_source(source) do
+        {:ok, normalized} -> {:cont, {:ok, [normalized | acc]}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+    |> case do
+      {:ok, normalized} -> {:ok, Enum.sort_by(normalized, & &1.priority)}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp strict_sources(_sources), do: {:error, :bad_sources}
+
+  defp strict_source(%{} = source) do
+    with {:ok, priority} <- strict_priority(fetch(source, :priority, "priority")),
+         {:ok, sensor_id} <- strict_optional_string(fetch(source, :sensor_id, "sensor_id")),
+         {:ok, sensor_uid} <- strict_optional_string(fetch(source, :sensor_uid, "sensor_uid")),
+         {:ok, hardware_identifier} <-
+           strict_optional_string(fetch(source, :hardware_identifier, "hardware_identifier")),
+         {:ok, source_bus} <- strict_optional_string(fetch(source, :source_bus, "source_bus")),
+         {:ok, source_address} <-
+           strict_optional_string(fetch(source, :source_address, "source_address")),
+         {:ok, sensor_type} <- strict_optional_string(fetch(source, :sensor_type, "sensor_type")),
+         {:ok, label} <- strict_optional_string(fetch(source, :label, "label")),
+         {:ok, metadata} <- strict_metadata(fetch(source, :metadata, "metadata")) do
+      {:ok,
+       %{
+         priority: priority,
+         sensor_id: sensor_id,
+         sensor_uid: sensor_uid,
+         hardware_identifier: hardware_identifier,
+         source_bus: source_bus,
+         source_address: source_address,
+         sensor_type: sensor_type,
+         label: label,
+         metadata: metadata
+       }}
+    end
+  end
+
+  defp strict_source(_source), do: {:error, :bad_source}
+
+  defp strict_priority(priority) when is_integer(priority), do: {:ok, priority}
+  defp strict_priority(_priority), do: {:error, :bad_priority}
+
+  defp strict_optional_string(nil), do: {:ok, nil}
+  defp strict_optional_string(value) when is_binary(value), do: {:ok, value}
+  defp strict_optional_string(_value), do: {:error, :bad_source_field}
+
+  defp strict_metadata(nil), do: {:ok, %{}}
+  defp strict_metadata(%{} = metadata), do: {:ok, metadata}
+  defp strict_metadata(_metadata), do: {:error, :bad_metadata}
 
   defp normalize(%{} = raw) do
     with {:ok, version} <- fetch_version(raw) do

@@ -75,7 +75,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.CalibrationEngineTest do
   defp emit_wind(angle_deg, speed_m_s, device_id) do
     :telemetry.execute(
       [:racing_org, :wind, :apparent],
-      %{vector: %{timestamp: nil, angle: angle_deg * @rad_per_deg, magnitude: speed_m_s}},
+      %{vector: %{timestamp: DateTime.utc_now(), angle: angle_deg * @rad_per_deg, magnitude: speed_m_s}},
       %{device_id: device_id, timestamp_monotonic_ms: 1_000}
     )
   end
@@ -83,7 +83,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.CalibrationEngineTest do
   defp emit_water_speed(m_s, device_id) do
     :telemetry.execute(
       [:racing_org, :speed, :water],
-      %{speed_m_s: %{timestamp: nil, value: m_s}},
+      %{speed_m_s: %{timestamp: DateTime.utc_now(), value: m_s}},
       %{device_id: device_id, timestamp_monotonic_ms: 1_000}
     )
   end
@@ -91,7 +91,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.CalibrationEngineTest do
   defp emit_heading(rad, device_id) do
     :telemetry.execute(
       [:racing_org, :heading],
-      %{rad: %{timestamp: nil, value: rad}},
+      %{rad: %{timestamp: DateTime.utc_now(), value: rad}},
       %{device_id: device_id, timestamp_monotonic_ms: 1_000}
     )
   end
@@ -99,7 +99,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.CalibrationEngineTest do
   defp emit_attitude(yaw, pitch, roll, device_id) do
     :telemetry.execute(
       [:racing_org, :attitude],
-      %{rad: %{timestamp: nil, yaw: yaw, pitch: pitch, roll: roll}},
+      %{rad: %{timestamp: DateTime.utc_now(), yaw: yaw, pitch: pitch, roll: roll}},
       %{device_id: device_id, timestamp_monotonic_ms: 1_000}
     )
   end
@@ -207,7 +207,16 @@ defmodule RacingOrg.Tracker.Pro.Compute.CalibrationEngineTest do
     test "an integer NMEA NAME device_id canonicalizes to the same hex identity" do
       %{engine: pid} = start_engine(corrections: %{"1A2B" => %{awa_offset_deg: 10.0}})
 
-      emit_wind(10.0, 8.0, 0x1A2B)
+      # Exercise the Engine callback boundary directly: production racing.org
+      # telemetry carries the on-bus 8-byte NAME and is also consumed by the
+      # application Reporter, whose wire contract intentionally requires that shape.
+      Engine.handle_event(
+        [:racing_org, :wind, :apparent],
+        %{vector: %{timestamp: DateTime.utc_now(), angle: 10.0 * @rad_per_deg, magnitude: 8.0}},
+        %{device_id: 0x1A2B, timestamp_monotonic_ms: 1_000},
+        %{target: pid}
+      )
+
       assert_in_delta await_signal(pid, "apparent_wind_angle"), 20.0, 1.0e-9
     end
   end

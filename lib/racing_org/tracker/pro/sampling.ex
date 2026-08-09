@@ -23,8 +23,8 @@ defmodule RacingOrg.Tracker.Pro.Sampling do
   tagged the same way; the actual rate/damping now come from `Tracking.Config`.
 
   Re-evaluation is triggered on the periodic tick, on a `RacingOrg.Tracker.Pro.Commands` change,
-  and on a `RacingOrg.Tracker.Pro.Tracking.Config` change (via `reconfigure/1`, wired as the
-  Config's `on_apply`).
+  and on a `RacingOrg.Tracker.Pro.Tracking.Config` change. Authoritative config application uses
+  `reconfigure/2` so the Config callback never synchronously calls back into its own GenServer.
   """
   use GenServer
 
@@ -57,10 +57,23 @@ defmodule RacingOrg.Tracker.Pro.Sampling do
   def reevaluate(server \\ __MODULE__), do: GenServer.call(server, :reevaluate)
 
   @doc """
-  Re-apply the rate + damping for the current state (call when the tracking config
-  changes). Returns `:ok`. Wired as `RacingOrg.Tracker.Pro.Tracking.Config`'s `on_apply`.
+  Re-read and apply the rate + damping for the current state.
+
+  This fail-safe compatibility path is intended for callers outside
+  `RacingOrg.Tracker.Pro.Tracking.Config`.
   """
+  @spec reconfigure(GenServer.server()) :: :ok
   def reconfigure(server \\ __MODULE__), do: GenServer.call(server, :reconfigure)
+
+  @doc """
+  Authoritatively apply a normalized tracking config without calling back into
+  `RacingOrg.Tracker.Pro.Tracking.Config`.
+  """
+  @spec reconfigure(GenServer.server(), map()) ::
+          :ok | {:error, :invalid_tracking_config | :reporter_unavailable}
+  def reconfigure(server, config) when is_map(config) do
+    GenServer.call(server, {:reconfigure, config})
+  end
 
   @doc """
   The tracking status the device reports to the server: the applied config version
@@ -132,6 +145,13 @@ defmodule RacingOrg.Tracker.Pro.Sampling do
     {:reply, :ok, apply_state(state, state.tracking_state)}
   end
 
+  def handle_call({:reconfigure, config}, _from, state) do
+    case apply_supplied_state(state, state.tracking_state, config) do
+      {:ok, state} -> {:reply, :ok, state}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
   def handle_call(:tracking_status, _from, state) do
     {:reply, build_status(state), state}
   end
@@ -193,6 +213,27 @@ defmodule RacingOrg.Tracker.Pro.Sampling do
     %{state | tracking_state: tracking_state, applied: cfg}
   end
 
+  defp apply_supplied_state(state, tracking_state, config) do
+    with {:ok, cfg} <- supplied_state(config, tracking_state),
+         :ok <- set_flush_interval_authoritative(state, rate_to_interval_ms(cfg.send_rate_hz)),
+         :ok <- set_damping_authoritative(state, cfg.damping_seconds) do
+      {:ok, %{state | tracking_state: tracking_state, applied: cfg}}
+    end
+  end
+
+  defp supplied_state(%{states: states}, tracking_state) when is_map(states) do
+    case Map.get(states, tracking_state) do
+      %{damping_seconds: damping, send_rate_hz: rate} = config
+      when is_number(damping) and damping >= 0 and is_number(rate) and rate > 0 ->
+        {:ok, config}
+
+      _other ->
+        {:error, :invalid_tracking_config}
+    end
+  end
+
+  defp supplied_state(_config, _tracking_state), do: {:error, :invalid_tracking_config}
+
   defp rate_to_interval_ms(hz) when is_number(hz) and hz > 0, do: max(1, round(1000 / hz))
   defp rate_to_interval_ms(_), do: 1000
 
@@ -217,6 +258,25 @@ defmodule RacingOrg.Tracker.Pro.Sampling do
     Reporter.set_damping(state.reporter, tau)
   catch
     :exit, _ -> :ok
+  end
+
+  defp set_flush_interval_authoritative(state, ms) do
+    reporter_call(fn -> Reporter.set_flush_interval(state.reporter, ms) end)
+  end
+
+  defp set_damping_authoritative(state, tau) do
+    reporter_call(fn -> Reporter.set_damping(state.reporter, tau) end)
+  end
+
+  defp reporter_call(fun) do
+    case fun.() do
+      :ok -> :ok
+      _other -> {:error, :reporter_unavailable}
+    end
+  rescue
+    _error -> {:error, :reporter_unavailable}
+  catch
+    _kind, _reason -> {:error, :reporter_unavailable}
   end
 
   defp safe_get_state(config, tracking_state) do

@@ -24,6 +24,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Assignment do
     :active_mark_code,
     :route_geometry,
     :route_hash,
+    :desired_state,
     cancelled: false
   ]
 

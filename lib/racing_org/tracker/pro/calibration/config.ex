@@ -139,6 +139,22 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
     GenServer.call(server, {:apply_config, config})
   end
 
+  @doc "Purely validate and normalize a complete desired calibration policy."
+  @spec validate_config(term()) :: {:ok, map()} | {:error, term()}
+  def validate_config(config), do: strict_normalize(config)
+
+  @doc "Durably reconcile desired policy while preserving owner-learned calibration state."
+  @spec reconcile_config(GenServer.server(), map()) :: {:ok, map()} | {:error, term()}
+  def reconcile_config(server \\ __MODULE__, config) when is_map(config) do
+    GenServer.call(server, {:reconcile_config, config})
+  end
+
+  @doc "Durably clear desired calibration authority and restore compile-time defaults."
+  @spec reset_config(GenServer.server()) :: :ok | {:error, term()}
+  def reset_config(server \\ __MODULE__) do
+    GenServer.call(server, :reset_config)
+  end
+
   @doc """
   Record a learned calibration estimate for `(sensor, parameter)` — called by the
   on-device estimation layer. `entry` is `%{value: v, confidence: f,
@@ -197,6 +213,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
   def init(opts) do
     state = %{
       store_dir: Keyword.get(opts, :store_dir, @default_store_dir),
+      store_opts: Keyword.take(opts, [:file_system, :fault_injector]),
       # nil = nothing applied yet, so any incoming version (incl. 0) is newer.
       applied_version: nil,
       modes: @default_modes,
@@ -212,6 +229,30 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
   def handle_call({:apply_config, config}, _from, state) do
     {result, state} = do_apply(config, state)
     {:reply, result, state}
+  end
+
+  def handle_call({:reconcile_config, config}, _from, state) do
+    {result, state} = do_reconcile(config, state)
+    {:reply, result, state}
+  end
+
+  def handle_call(:reset_config, _from, state) do
+    case clear_persisted(state) do
+      :ok ->
+        state = %{
+          state
+          | applied_version: nil,
+            modes: @default_modes,
+            locks: %{},
+            learned: %{}
+        }
+
+        notify(state)
+        {:reply, :ok, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call({:put_learned, sensor_id, parameter, entry}, _from, state) do
@@ -280,6 +321,28 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
     end
   end
 
+  defp do_reconcile(raw, state) do
+    with {:ok, config} <- strict_normalize(raw) do
+      candidate = %{
+        state
+        | applied_version: config.version,
+          modes: config.modes,
+          locks: config.locks
+      }
+
+      case maybe_persist(candidate) do
+        :ok ->
+          notify(candidate)
+          {{:ok, config}, candidate}
+
+        {:error, reason} ->
+          {{:error, reason}, state}
+      end
+    else
+      {:error, reason} -> {{:error, reason}, state}
+    end
+  end
+
   defp do_put_learned(sensor_id, parameter, entry, state) do
     with {:ok, parameter} <- validate_parameter(parameter),
          {:ok, entry} <- validate_entry(parameter, entry) do
@@ -334,6 +397,9 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
       {:error, :bad_entry}
     end
   end
+
+  defp clear_persisted(%{store_dir: nil}), do: :ok
+  defp clear_persisted(state), do: Store.clear(state.store_dir, state.store_opts)
 
   defp maybe_persist(%{store_dir: nil}), do: :ok
 
@@ -481,7 +547,89 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
 
   defp status_value(_parameter, value), do: value
 
-  # --- Normalization (string OR atom keys -> canonical) ---
+  # --- Strict Desired State normalization ---
+
+  defp strict_normalize(%{} = raw) do
+    with {:ok, version} <- strict_version(raw),
+         {:ok, modes} <- strict_parameters(fetch(raw, :parameters, "parameters")),
+         {:ok, locks} <- strict_sensors(fetch(raw, :sensors, "sensors")) do
+      {:ok, %{version: version, modes: modes, locks: locks}}
+    end
+  end
+
+  defp strict_normalize(_raw), do: {:error, :malformed}
+
+  defp strict_version(raw) do
+    case fetch(raw, :version, "version") do
+      version when is_integer(version) and version >= 0 -> {:ok, version}
+      _other -> {:error, :bad_version}
+    end
+  end
+
+  defp strict_parameters(%{} = parameters) do
+    if map_size(parameters) == length(@parameters) do
+      Enum.reduce_while(@parameters, {:ok, %{}}, fn parameter, {:ok, acc} ->
+        case fetch(parameters, String.to_atom(parameter), parameter) do
+          %{} = entry ->
+            mode = fetch(entry, :mode, "mode")
+
+            if is_binary(mode) and mode in allowed_modes(parameter) do
+              {:cont, {:ok, Map.put(acc, parameter, mode)}}
+            else
+              {:halt, {:error, {:invalid_parameter_mode, parameter}}}
+            end
+
+          _other ->
+            {:halt, {:error, {:invalid_parameter, parameter}}}
+        end
+      end)
+    else
+      {:error, :invalid_parameters}
+    end
+  end
+
+  defp strict_parameters(_parameters), do: {:error, :invalid_parameters}
+
+  defp strict_sensors(sensors) when is_list(sensors) do
+    Enum.reduce_while(sensors, {:ok, %{}}, fn sensor, {:ok, acc} ->
+      case strict_sensor(sensor) do
+        {:ok, key, lock} ->
+          if Map.has_key?(acc, key) do
+            {:halt, {:error, :duplicate_sensor_lock}}
+          else
+            {:cont, {:ok, Map.put(acc, key, lock)}}
+          end
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp strict_sensors(_sensors), do: {:error, :invalid_sensors}
+
+  defp strict_sensor(%{} = sensor) do
+    hardware_identifier = fetch(sensor, :hardware_identifier, "hardware_identifier")
+    parameter = fetch(sensor, :parameter, "parameter")
+    locked = fetch(sensor, :locked, "locked")
+    value = fetch(sensor, :value, "value")
+
+    with true <- is_binary(hardware_identifier) and hardware_identifier != "",
+         hex when is_binary(hex) and hex != "" <-
+           NmeaIdentity.canonical_hardware_id(hardware_identifier),
+         true <- is_binary(parameter) and parameter in @parameters,
+         true <- is_boolean(locked),
+         true <- is_nil(value) or is_number(value),
+         true <- not locked or is_number(value) do
+      {:ok, {hex, parameter}, %{locked: locked, value: value}}
+    else
+      _other -> {:error, :invalid_sensor_lock}
+    end
+  end
+
+  defp strict_sensor(_sensor), do: {:error, :invalid_sensor_lock}
+
+  # --- Legacy normalization (string OR atom keys -> canonical) ---
 
   defp normalize(%{} = raw) do
     with {:ok, version} <- fetch_version(raw) do

@@ -25,6 +25,8 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Store do
 
   require Logger
 
+  alias RacingOrg.Tracker.Pro.DesiredState.AtomicFile
+
   @filename "current.calibration"
   # Bump if the persisted representation changes incompatibly; older/unknown
   # versions are ignored on load.
@@ -55,11 +57,10 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Store do
     end
   end
 
-  @doc "Remove any persisted calibration state under `dir`."
-  @spec clear(Path.t()) :: :ok
-  def clear(dir) do
-    _ = File.rm(path(dir))
-    :ok
+  @doc "Durably remove any persisted calibration state under `dir`."
+  @spec clear(Path.t(), keyword()) :: :ok | {:error, term()}
+  def clear(dir, opts \\ []) do
+    AtomicFile.remove(path(dir), Keyword.put_new(opts, :directory_root, dir))
   end
 
   defp decode(binary, dir) do

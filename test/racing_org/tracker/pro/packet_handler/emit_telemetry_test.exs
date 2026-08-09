@@ -39,6 +39,8 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetryTest do
 
   # Attach a handler that only forwards events tagged with our unique marker
   # (device_id) so a concurrently-running emitter can never pollute assertions.
+  defp unique_device_id, do: <<System.unique_integer([:positive])::64>>
+
   defp attach(event, marker) do
     id = "emit-telemetry-clock-test-#{System.unique_integer([:positive])}"
     test = self()
@@ -76,7 +78,7 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetryTest do
   end
 
   test "default (no clock-source config) emits the frame receive timestamp — current behavior" do
-    marker = "emit-default-#{System.unique_integer([:positive])}"
+    marker = unique_device_id()
     :ok = attach([:racing_org, :wind, :apparent], marker)
     {:ok, clock} = Config.start_link(name: nil, store_dir: nil)
     emit = start_emitter(clock)
@@ -90,7 +92,7 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetryTest do
   end
 
   test "an unavailable clock-source server falls back to the frame receive timestamp" do
-    marker = "emit-unavailable-#{System.unique_integer([:positive])}"
+    marker = unique_device_id()
     :ok = attach([:racing_org, :wind, :apparent], marker)
     emit = start_emitter(:no_such_clock_source_server)
 
@@ -101,7 +103,7 @@ defmodule RacingOrg.Tracker.Pro.PacketHandler.EmitTelemetryTest do
   end
 
   test "sensor_priority derives the telemetry timestamp from GPS + monotonic delta" do
-    marker = "emit-sensor-#{System.unique_integer([:positive])}"
+    marker = unique_device_id()
     :ok = attach([:racing_org, :wind, :apparent], marker)
 
     {:ok, clock} = Config.start_link(name: nil, store_dir: nil)

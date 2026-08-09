@@ -65,6 +65,11 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
     for i <- samples, do: Archive.record(archive, ds(i))
   end
 
+  defp finish(archive) do
+    send(archive, {:sampling_phase, :finish, :complete})
+    assert Archive.current_recording_id(archive) == nil
+  end
+
   test "opens a recording on race start and tracks the active recording id", %{base: base} do
     %{commands: c, archive: a} = start_archive(base)
     race(a, c, "2026-06-03-7", [1, 2])
@@ -74,7 +79,7 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
   test "finalizes at complete, uploads a manifest, and keeps the recording on disk", %{base: base} do
     %{commands: c, archive: a} = start_archive(base)
     race(a, c, "2026-06-03-7", [1, 2, 3])
-    send(a, {:sampling_phase, :finish, :complete})
+    finish(a)
 
     assert_receive {:enqueued, binary}
     manifest = DataSet.decode(binary).manifest
@@ -90,7 +95,7 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
   test "deletes the recording once RacingOrg confirms it complete", %{base: base} do
     %{commands: c, archive: a} = start_archive(base)
     race(a, c, "2026-06-03-7", [1])
-    send(a, {:sampling_phase, :finish, :complete})
+    finish(a)
     assert_receive {:enqueued, _manifest}
 
     verification =
@@ -110,7 +115,7 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
   test "re-sends requested missing chunks", %{base: base} do
     %{commands: c, archive: a} = start_archive(base)
     race(a, c, "2026-06-03-7", [1, 2])
-    send(a, {:sampling_phase, :finish, :complete})
+    finish(a)
     assert_receive {:enqueued, manifest_binary}
     [chunk] = DataSet.decode(manifest_binary).manifest.chunks
 
@@ -123,6 +128,7 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
       )
 
     send(a, {:racing_org_command, request})
+    _recording_id = Archive.current_recording_id(a)
 
     # The two archived samples are re-enqueued from the chunk.
     assert_receive {:enqueued, resent1}
@@ -140,7 +146,7 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
       )
 
     race(a, c, "2026-06-03-7", [1, 2], race_session_id: "sess-abc")
-    send(a, {:sampling_phase, :finish, :complete})
+    finish(a)
 
     assert_receive {:bulk_upload, opts}
     assert opts[:base_dir] == base
@@ -161,7 +167,7 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
       )
 
     race(a, c, "2026-06-03-7", [1])
-    send(a, {:sampling_phase, :finish, :complete})
+    finish(a)
 
     # The legacy UDP manifest still goes out...
     assert_receive {:enqueued, _manifest}

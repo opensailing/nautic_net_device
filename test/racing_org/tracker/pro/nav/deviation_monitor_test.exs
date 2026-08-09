@@ -58,8 +58,16 @@ defmodule RacingOrg.Tracker.Pro.Nav.DeviationMonitorTest do
 
   defp marks do
     [
-      struct(CourseMark, code: "1", sequence: 1, position: struct(LatLon, latitude: elem(@origin, 0), longitude: elem(@origin, 1))),
-      struct(CourseMark, code: "2", sequence: 2, position: struct(LatLon, latitude: elem(@dest, 0), longitude: elem(@dest, 1)))
+      struct(CourseMark,
+        code: "1",
+        sequence: 1,
+        position: struct(LatLon, latitude: elem(@origin, 0), longitude: elem(@origin, 1))
+      ),
+      struct(CourseMark,
+        code: "2",
+        sequence: 2,
+        position: struct(LatLon, latitude: elem(@dest, 0), longitude: elem(@dest, 1))
+      )
     ]
   end
 
@@ -281,7 +289,10 @@ defmodule RacingOrg.Tracker.Pro.Nav.DeviationMonitorTest do
   describe "robustness" do
     test "a crashing channel push never takes down the monitor" do
       test_pid = self()
-      {:ok, commands} = start_supervised({Commands, device_id: "dev"}, id: {Commands, System.unique_integer([:positive])})
+
+      {:ok, commands} =
+        start_supervised({Commands, device_id: "dev"}, id: {Commands, System.unique_integer([:positive])})
+
       {:ok, phase} = FakePhase.start(:racing)
       {:ok, threshold} = FakeThreshold.start(50.0)
 
@@ -321,8 +332,12 @@ defmodule RacingOrg.Tracker.Pro.Nav.DeviationMonitorTest do
 
   defp eventually(fun, retries \\ 50) do
     cond do
-      fun.() -> true
-      retries <= 0 -> false
+      fun.() ->
+        true
+
+      retries <= 0 ->
+        false
+
       true ->
         Process.sleep(5)
         eventually(fun, retries - 1)

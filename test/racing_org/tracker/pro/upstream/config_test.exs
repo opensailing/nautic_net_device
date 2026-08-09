@@ -1,12 +1,21 @@
 defmodule RacingOrg.Tracker.Pro.Upstream.ConfigTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias RacingOrg.Tracker.Pro.Upstream.Config
   alias RacingOrg.Tracker.Pro.Upstream.Store
 
+  @persistent_term_key {Config, :disabled_signals}
+
   setup do
     dir = Path.join(System.tmp_dir!(), "nn_upstream_cfg_#{System.unique_integer([:positive])}")
-    on_exit(fn -> File.rm_rf(dir) end)
+    File.rm_rf!(dir)
+    :persistent_term.erase(@persistent_term_key)
+
+    on_exit(fn ->
+      File.rm_rf(dir)
+      :persistent_term.erase(@persistent_term_key)
+    end)
+
     %{dir: dir}
   end
 

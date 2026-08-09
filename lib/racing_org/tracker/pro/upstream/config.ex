@@ -87,6 +87,22 @@ defmodule RacingOrg.Tracker.Pro.Upstream.Config do
     GenServer.call(server, {:apply_config, payload})
   end
 
+  @doc "Purely validate and normalize a desired upstream config."
+  @spec validate_config(term()) :: {:ok, config()} | {:error, term()}
+  def validate_config(payload), do: strict_normalize(payload)
+
+  @doc "Durably reconcile authoritative desired state, regardless of legacy version order."
+  @spec reconcile_config(GenServer.server(), map()) :: {:ok, config()} | {:error, term()}
+  def reconcile_config(server, payload) when is_map(payload) do
+    GenServer.call(server, {:reconcile_config, payload})
+  end
+
+  @doc "Durably clear desired upstream authority and restore all signals enabled."
+  @spec reset_config(GenServer.server()) :: :ok | {:error, term()}
+  def reset_config(server) do
+    GenServer.call(server, :reset_config)
+  end
+
   @doc "The last applied config version, or nil before any config."
   @spec applied_version(GenServer.server()) :: integer() | nil
   def applied_version(server), do: GenServer.call(server, :applied_version)
@@ -130,10 +146,22 @@ defmodule RacingOrg.Tracker.Pro.Upstream.Config do
     state =
       case Store.load(store_dir) do
         {:ok, %{version: version, signals: signals}} ->
-          %{store_dir: store_dir, version: version, signals: resolve_signals(signals), publishes?: publishes?}
+          %{
+            store_dir: store_dir,
+            store_opts: Keyword.take(opts, [:file_system, :fault_injector]),
+            version: version,
+            signals: resolve_signals(signals),
+            publishes?: publishes?
+          }
 
         :empty ->
-          %{store_dir: store_dir, version: nil, signals: all_on(), publishes?: publishes?}
+          %{
+            store_dir: store_dir,
+            store_opts: Keyword.take(opts, [:file_system, :fault_injector]),
+            version: nil,
+            signals: all_on(),
+            publishes?: publishes?
+          }
       end
 
     if publishes?, do: publish(state.signals)
@@ -142,20 +170,33 @@ defmodule RacingOrg.Tracker.Pro.Upstream.Config do
 
   @impl true
   def handle_call({:apply_config, payload}, _from, state) do
-    with {:ok, version} <- parse_version(payload),
-         {:ok, signals} <- parse_signals(payload) do
+    with {:ok, config} <- normalize(payload) do
       cond do
-        is_integer(state.version) and version <= state.version ->
+        is_integer(state.version) and config.version <= state.version ->
           {:reply, {:ok, :unchanged}, state}
 
         true ->
-          config = %{version: version, signals: signals}
           _ = Store.save(state.store_dir, config)
-          new_state = %{state | version: version, signals: signals}
-          if state.publishes?, do: publish(signals)
+          new_state = install_config(state, config)
           {:reply, {:ok, config}, new_state}
       end
     else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:reconcile_config, payload}, _from, state) do
+    with {:ok, config} <- strict_normalize(payload),
+         :ok <- Store.save(state.store_dir, config) do
+      {:reply, {:ok, config}, install_config(state, config)}
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call(:reset_config, _from, state) do
+    case Store.clear(state.store_dir, state.store_opts) do
+      :ok -> {:reply, :ok, install_config(state, %{version: nil, signals: all_on()})}
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
   end
@@ -180,6 +221,47 @@ defmodule RacingOrg.Tracker.Pro.Upstream.Config do
   end
 
   # --- Parsing (string or atom keys; malformed input never changes state) ---
+
+  defp normalize(payload) when is_map(payload) do
+    with {:ok, version} <- parse_version(payload),
+         {:ok, signals} <- parse_signals(payload) do
+      {:ok, %{version: version, signals: signals}}
+    end
+  end
+
+  defp normalize(_payload), do: {:error, :malformed}
+
+  # --- Strict Desired State normalization ---
+  #
+  # The backend projection is COMPLETE, so every filterable signal must be
+  # present with a boolean value. The legacy `set_upstream` path above
+  # deliberately resolves a MISSING signal to ON (absence must never silently
+  # mute telemetry from an older server); here an absent signal means the
+  # generation does not match the contract and is rejected outright.
+  defp strict_normalize(payload) when is_map(payload) do
+    with {:ok, version} <- parse_version(payload),
+         {:ok, signals} <- strict_signals(Map.get(payload, "signals", Map.get(payload, :signals))) do
+      {:ok, %{version: version, signals: signals}}
+    end
+  end
+
+  defp strict_normalize(_payload), do: {:error, :malformed}
+
+  defp strict_signals(%{} = raw) do
+    Enum.reduce_while(@signals, {:ok, %{}}, fn signal, {:ok, acc} ->
+      case Map.get(raw, Atom.to_string(signal), Map.get(raw, signal)) do
+        value when is_boolean(value) -> {:cont, {:ok, Map.put(acc, signal, value)}}
+        _other -> {:halt, {:error, {:invalid_signal_value, signal}}}
+      end
+    end)
+  end
+
+  defp strict_signals(_raw), do: {:error, :invalid_signals}
+
+  defp install_config(state, config) do
+    if state.publishes?, do: publish(config.signals)
+    %{state | version: config.version, signals: config.signals}
+  end
 
   defp parse_version(%{"version" => version}) when is_integer(version) and version >= 0, do: {:ok, version}
   defp parse_version(%{version: version}) when is_integer(version) and version >= 0, do: {:ok, version}

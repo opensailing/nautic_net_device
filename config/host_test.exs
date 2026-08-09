@@ -15,6 +15,7 @@ config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.Serial, false
 # Tests pass explicit per-test temp store dirs; this is a defensive default for
 # the application-supervised instance on a CI/host machine.
 config :racing_org_tracker_pro,
+  upstream_config_name: nil,
   upstream_directory: Path.join(System.tmp_dir!(), "racing_org_tracker_upstream_test")
 
 # Device-identity key store: never write to the target's /data path under test.

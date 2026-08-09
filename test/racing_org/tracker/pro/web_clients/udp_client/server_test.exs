@@ -94,6 +94,10 @@ defmodule RacingOrg.Tracker.Pro.WebClients.UDPClient.ServerTest do
 
     GenServer.cast(server, {:send, frame})
 
+    # A call from the same sender is ordered after the cast, so scheduler load
+    # cannot be mistaken for outbound packet loss.
+    _state = :sys.get_state(server)
+
     assert {:ok, {_address, _port, ^frame}} = :gen_udp.recv(receiver, 0, 100)
   end
 
@@ -125,6 +129,7 @@ defmodule RacingOrg.Tracker.Pro.WebClients.UDPClient.ServerTest do
     replacement = session(:crypto.strong_rand_bytes(16), 4)
     assert {:ok, _replacement} = SessionHolder.publish(holder, replacement)
     :ok = :sys.resume(server)
+    _state = :sys.get_state(server)
 
     assert {:error, :timeout} = :gen_udp.recv(receiver, 0, 100)
   end

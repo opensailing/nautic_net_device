@@ -22,6 +22,8 @@ defmodule RacingOrg.Tracker.Pro.Compute.Store do
 
   require Logger
 
+  alias RacingOrg.Tracker.Pro.DesiredState.AtomicFile
+
   @type config :: %{version: integer(), values: [map()]}
 
   @filename "current.computed_values"
@@ -54,11 +56,10 @@ defmodule RacingOrg.Tracker.Pro.Compute.Store do
     end
   end
 
-  @doc "Remove any persisted computed-values config under `dir`."
-  @spec clear(Path.t()) :: :ok
-  def clear(dir) do
-    _ = File.rm(path(dir))
-    :ok
+  @doc "Durably remove any persisted computed-values config under `dir`."
+  @spec clear(Path.t(), keyword()) :: :ok | {:error, term()}
+  def clear(dir, opts \\ []) do
+    AtomicFile.remove(path(dir), Keyword.put_new(opts, :directory_root, dir))
   end
 
   defp decode(binary, dir) do

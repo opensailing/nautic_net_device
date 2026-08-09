@@ -3,6 +3,8 @@ defmodule RacingOrg.Tracker.Pro.Telemetry.ReporterTest do
 
   import Telemetry.Metrics
 
+  @production_device_id <<1::64>>
+
   describe "the :asap? option" do
     test "reports metrics as soon as they are emitted" do
       start_reporter([last_value("some.metric.value", reporter_options: [asap?: true])])
@@ -15,24 +17,20 @@ defmodule RacingOrg.Tracker.Pro.Telemetry.ReporterTest do
 
   describe "the :every_ms option" do
     test "reports metrics at a timed interval" do
-      start_reporter([last_value("racing_org.gps.position", reporter_options: [every_ms: 10])])
+      start_reporter([last_value("some.metric.value", reporter_options: [every_ms: 10])])
 
-      :telemetry.execute([:racing_org, :gps], %{position: %{lat: 1.23, lon: 4.56}}, %{
-        device_id: {123, 456}
-      })
+      telemetry_execute_value(999)
 
       # Should be sent within 10ms
-      assert_receive {:report, [:racing_org, :gps, :position], %{lat: 1.23, lon: 4.56}}, 20
+      assert_receive {:report, [:some, :metric, :value], 999}, 20
 
       # Shouldn't repeat until more values come in
-      refute_receive {:report, [:racing_org, :gps, :position], %{lat: 1.23, lon: 4.56}}, 20
+      refute_receive {:report, [:some, :metric, :value], 999}, 20
 
       # Check again
-      :telemetry.execute([:racing_org, :gps], %{position: %{lat: 1.23, lon: 4.56}}, %{
-        device_id: {123, 456}
-      })
+      telemetry_execute_value(999)
 
-      assert_receive {:report, [:racing_org, :gps, :position], %{lat: 1.23, lon: 4.56}}, 20
+      assert_receive {:report, [:some, :metric, :value], 999}, 20
     end
   end
 
@@ -150,6 +148,28 @@ defmodule RacingOrg.Tracker.Pro.Telemetry.ReporterTest do
     end
   end
 
+  describe "application reporter isolation" do
+    test "production-shaped smoothing fixtures do not crash the application reporter" do
+      application_reporter = Process.whereis(RacingOrg.Tracker.Pro.Telemetry.Reporter)
+      assert is_pid(application_reporter)
+      monitor_ref = Process.monitor(application_reporter)
+
+      pid =
+        start_reporter(
+          [last_value([:racing_org, :speed, :water, :speed_m_s], reporter_options: [every_ms: 10_000])],
+          flush_interval_ms: 10_000
+        )
+
+      emit_scalar_full([:racing_org, :speed, :water], :speed_m_s, %{value: 6.3}, 1_000)
+      flush(pid)
+      send(application_reporter, :flush_all)
+
+      assert is_map(:sys.get_state(application_reporter))
+      refute_receive {:DOWN, ^monitor_ref, :process, ^application_reporter, _reason}
+      Process.demonitor(monitor_ref, [:flush])
+    end
+  end
+
   defp start_reporter(metrics, opts \\ []) do
     test_pid = self()
 
@@ -178,14 +198,14 @@ defmodule RacingOrg.Tracker.Pro.Telemetry.ReporterTest do
 
   defp emit_scalar_full(event, field, value_map, mono_ms) do
     :telemetry.execute(event, %{field => Map.put(value_map, :timestamp, DateTime.utc_now())}, %{
-      device_id: {1, 2},
+      device_id: @production_device_id,
       timestamp_monotonic_ms: mono_ms
     })
   end
 
   defp emit_vector(event, field, %{angle: _, magnitude: _} = v, mono_ms) do
     :telemetry.execute(event, %{field => Map.put(v, :timestamp, DateTime.utc_now())}, %{
-      device_id: {1, 2},
+      device_id: @production_device_id,
       timestamp_monotonic_ms: mono_ms
     })
   end

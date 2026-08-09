@@ -130,9 +130,11 @@ defmodule RacingOrg.Tracker.Pro.Compute.PolarEngineTest do
       assert {:ok, _} = Engine.apply_config(pid, payload(0, [def]))
 
       # The engine must pull the lookup once (on apply/subscribe), then compute.
-      :telemetry.execute([:racing_org, :speed, :water], %{speed_m_s: %{value: 6.3}}, %{
-        timestamp_monotonic_ms: 1_000
-      })
+      :telemetry.execute(
+        [:racing_org, :speed, :water],
+        %{speed_m_s: %{value: 6.3, timestamp: DateTime.utc_now()}},
+        %{timestamp_monotonic_ms: 1_000, device_id: <<1::64>>}
+      )
 
       Engine.put_signal(pid, "true_wind_angle", 90.0, 1_000)
       Engine.put_signal(pid, "true_wind_speed", 10.0, 1_000)

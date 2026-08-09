@@ -17,11 +17,22 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
   """
   use ExUnit.Case, async: false
 
+  alias RacingOrg.Tracker.Pro.DesiredState.{
+    Applier,
+    Manager,
+    OperationalGate,
+    OperationalGate.AuthorityRegistry,
+    OperationalGate.AuthorityRegistry.Root,
+    OperationalGate.AuthorityRegistry.Store,
+    RuntimeIdentity
+  }
+
   alias RacingOrg.Tracker.Pro.Race.BulkUploader
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
+  alias RacingOrg.Tracker.Pro.Upstream.Config, as: UpstreamConfig
 
   @supervisor RacingOrg.Tracker.Pro.Supervisor
 
@@ -43,6 +54,12 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
 
   test "the application is running and its top supervisor is alive" do
     assert Process.whereis(@supervisor) |> is_pid()
+  end
+
+  test "the host test application leaves the global Upstream.Config name available" do
+    assert {UpstreamConfig, pid, :worker, [UpstreamConfig]} = child(UpstreamConfig)
+    assert is_pid(pid)
+    refute Process.whereis(UpstreamConfig)
   end
 
   test "SessionHolder is supervised, alive, and idle (no live session) on host" do
@@ -94,6 +111,18 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
     refute RacingOrg.Tracker.Pro.Race.BulkUploader in child_ids()
   end
 
+  test "the desired-state runtime is not started on host" do
+    ids = child_ids()
+
+    refute RuntimeIdentity in ids
+    refute Root in ids
+    refute Store in ids
+    refute AuthorityRegistry in ids
+    refute OperationalGate in ids
+    refute Applier in ids
+    refute Manager in ids
+  end
+
   describe "secure_transport_configured?/1 gate predicate" do
     setup do
       prev = Application.get_env(:racing_org_tracker_pro, ServerIdentity)
@@ -127,7 +156,30 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
       assert RacingOrg.Tracker.Pro.Application.secure_transport_configured?(:racing_org_rpi3)
     end
 
-    test "secure transport starts deterministically after SessionHolder and bootstrap precedes the channel" do
+    test "logger shares one private controller capability between the gate and manager" do
+      Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+
+      specs =
+        :logger
+        |> RacingOrg.Tracker.Pro.Application.child_specs(:racing_org_rpi3)
+        |> Enum.map(&Supervisor.child_spec(&1, []))
+
+      gate_spec = Enum.find(specs, &(&1.id == OperationalGate))
+      manager_spec = Enum.find(specs, &(&1.id == Manager))
+
+      assert {OperationalGate, :start_link, [gate_opts]} = gate_spec.start
+
+      assert {RacingOrg.Tracker.Pro.DesiredState.Runtime, :start_manager, [manager_opts]} =
+               manager_spec.start
+
+      gate_capability = Keyword.fetch!(gate_opts, :controller_capability)
+      manager_capability = Keyword.fetch!(manager_opts, :controller_capability)
+
+      assert is_reference(gate_capability)
+      assert manager_capability == gate_capability
+    end
+
+    test "logger starts the complete desired-state runtime before channel traffic" do
       Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
 
       ids =
@@ -135,14 +187,48 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
         |> RacingOrg.Tracker.Pro.Application.child_specs(:racing_org_rpi3)
         |> spec_ids()
 
-      session_holder_index = Enum.find_index(ids, &(&1 == SessionHolder))
-      boot_provisioner_index = Enum.find_index(ids, &(&1 == BootProvisioner))
-      channel_client_index = Enum.find_index(ids, &(&1 == ChannelClient))
-      bulk_uploader_index = Enum.find_index(ids, &(&1 == BulkUploader))
+      ordered_ids = [
+        SessionHolder,
+        RuntimeIdentity,
+        Root,
+        Store,
+        AuthorityRegistry,
+        Applier,
+        BootProvisioner,
+        Manager,
+        OperationalGate,
+        ChannelClient,
+        BulkUploader
+      ]
 
-      assert session_holder_index < boot_provisioner_index
-      assert boot_provisioner_index < channel_client_index
-      assert channel_client_index < bulk_uploader_index
+      indices =
+        Enum.map(ordered_ids, fn expected ->
+          Enum.find_index(ids, &(&1 == expected))
+        end)
+
+      assert Enum.all?(indices, &is_integer/1)
+      assert indices == Enum.sort(indices)
+    end
+
+    test "uplink does not start the logger-only desired-state runtime" do
+      Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+
+      ids =
+        :uplink
+        |> RacingOrg.Tracker.Pro.Application.child_specs(:racing_org_rpi3)
+        |> spec_ids()
+
+      assert SessionHolder in ids
+      assert BootProvisioner in ids
+      assert ChannelClient in ids
+
+      refute RuntimeIdentity in ids
+      refute Root in ids
+      refute Store in ids
+      refute AuthorityRegistry in ids
+      refute OperationalGate in ids
+      refute Applier in ids
+      refute Manager in ids
     end
   end
 

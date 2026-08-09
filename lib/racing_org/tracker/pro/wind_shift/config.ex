@@ -89,6 +89,22 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Config do
     GenServer.call(server, {:apply_config, config})
   end
 
+  @doc "Purely validate and normalize a desired wind-shift config."
+  @spec validate_config(term()) :: {:ok, config()} | {:error, term()}
+  def validate_config(config), do: strict_normalize(config)
+
+  @doc "Durably reconcile authoritative desired state, regardless of legacy version order."
+  @spec reconcile_config(GenServer.server(), map()) :: {:ok, config()} | {:error, term()}
+  def reconcile_config(server \\ __MODULE__, config) when is_map(config) do
+    GenServer.call(server, {:reconcile_config, config})
+  end
+
+  @doc "Durably clear desired wind-shift authority and restore compile-time defaults."
+  @spec reset_config(GenServer.server()) :: :ok | {:error, term()}
+  def reset_config(server \\ __MODULE__) do
+    GenServer.call(server, :reset_config)
+  end
+
   @doc """
   The full current policy (defaults when nothing is applied yet):
   `%{version, windows, alarms, wally_mode}`. The Observer reads this on boot
@@ -130,6 +146,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Config do
   def init(opts) do
     state = %{
       store_dir: Keyword.get(opts, :store_dir, @default_store_dir),
+      store_opts: Keyword.take(opts, [:file_system, :fault_injector]),
       # nil = nothing applied yet, so any incoming version (incl. 0) is newer.
       applied_version: nil,
       windows: @default_windows,
@@ -145,6 +162,30 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Config do
   def handle_call({:apply_config, config}, _from, state) do
     {result, state} = do_apply(config, state)
     {:reply, result, state}
+  end
+
+  def handle_call({:reconcile_config, config}, _from, state) do
+    {result, state} = do_reconcile(config, state)
+    {:reply, result, state}
+  end
+
+  def handle_call(:reset_config, _from, state) do
+    case clear_persisted(state) do
+      :ok ->
+        state = %{
+          state
+          | applied_version: nil,
+            windows: @default_windows,
+            alarms: @default_alarms,
+            wally_mode: @default_wally_mode
+        }
+
+        notify(state)
+        {:reply, :ok, state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
+    end
   end
 
   def handle_call(:current, _from, state) do
@@ -217,6 +258,75 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Config do
         {{:ok, config}, state}
     end
   end
+
+  defp do_reconcile(raw, state) do
+    with {:ok, config} <- strict_normalize(raw),
+         :ok <- maybe_persist(state.store_dir, config) do
+      state = apply_config_to_state(state, config)
+      notify(state)
+      {{:ok, config}, state}
+    else
+      {:error, reason} -> {{:error, reason}, state}
+    end
+  end
+
+  # --- Strict Desired State normalization ---
+  #
+  # The backend projection is COMPLETE: `windows`, `alarms` and `wally` are all
+  # required and every field must already hold its canonical type. This is the
+  # deliberate opposite of the legacy channel path below, where a missing or
+  # invalid window/alarm value silently falls back to its default — a lenient
+  # default here would let an out-of-contract generation become effective while
+  # reporting success.
+  defp strict_normalize(%{} = raw) do
+    with {:ok, version} <- strict_version(fetch(raw, :version, "version")),
+         {:ok, windows} <- strict_windows(fetch(raw, :windows, "windows")),
+         {:ok, alarms} <- strict_alarms(fetch(raw, :alarms, "alarms")),
+         {:ok, wally_mode} <- strict_wally(fetch(raw, :wally, "wally")) do
+      {:ok, %{version: version, windows: windows, alarms: alarms, wally_mode: wally_mode}}
+    end
+  end
+
+  defp strict_normalize(_raw), do: {:error, :malformed}
+
+  defp strict_version(version) when is_integer(version) and version >= 0, do: {:ok, version}
+  defp strict_version(_version), do: {:error, :bad_version}
+
+  defp strict_windows(%{} = windows) do
+    Enum.reduce_while([:fast_s, :mid_s, :slow_s, :envelope_s], {:ok, %{}}, fn key, {:ok, acc} ->
+      case fetch(windows, key, Atom.to_string(key)) do
+        value when is_number(value) and value > 0 -> {:cont, {:ok, Map.put(acc, key, value / 1)}}
+        _other -> {:halt, {:error, {:bad_window, key}}}
+      end
+    end)
+  end
+
+  defp strict_windows(_windows), do: {:error, :bad_windows}
+
+  defp strict_alarms(%{} = alarms) do
+    margin = fetch(alarms, :new_extreme_margin_deg, "new_extreme_margin_deg")
+    enabled = fetch(alarms, :enabled, "enabled")
+
+    cond do
+      not (is_number(margin) and margin > 0) -> {:error, :bad_alarm_margin}
+      not is_boolean(enabled) -> {:error, :bad_alarm_enabled}
+      true -> {:ok, %{new_extreme_margin_deg: margin / 1, enabled: enabled}}
+    end
+  end
+
+  defp strict_alarms(_alarms), do: {:error, :bad_alarms}
+
+  defp strict_wally(%{} = wally) do
+    case fetch(wally, :mode, "mode") do
+      mode when is_binary(mode) and mode in @wally_modes -> {:ok, mode}
+      _other -> {:error, :bad_wally_mode}
+    end
+  end
+
+  defp strict_wally(_wally), do: {:error, :bad_wally_mode}
+
+  defp clear_persisted(%{store_dir: nil}), do: :ok
+  defp clear_persisted(state), do: Store.clear(state.store_dir, state.store_opts)
 
   defp maybe_persist(nil, _config), do: :ok
   defp maybe_persist(dir, config), do: Store.save(dir, config)

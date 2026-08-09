@@ -7,11 +7,36 @@ defmodule RacingOrg.Tracker.Pro.CAN.Fake.Driver do
 
   alias RacingOrg.Tracker.Pro.CAN.Fake.Server
 
+  @stale_server_shutdown_timeout 5_000
+
   @impl RacingOrg.Tracker.Pro.CAN.Driver
-  def init(driver_config) do
+  def init(driver_config), do: start_server(driver_config)
+
+  defp start_server(driver_config) do
     case Server.start_link(driver_config) do
-      {:ok, _pid} -> :ok
-      _ -> :error
+      {:ok, _pid} ->
+        :ok
+
+      {:error, {:already_started, stale_pid}} when is_pid(stale_pid) ->
+        with :ok <- await_stale_server_shutdown(stale_pid) do
+          start_server(driver_config)
+        end
+
+      _other ->
+        :error
+    end
+  end
+
+  defp await_stale_server_shutdown(stale_pid) do
+    monitor_ref = Process.monitor(stale_pid)
+
+    receive do
+      {:DOWN, ^monitor_ref, :process, ^stale_pid, _reason} ->
+        :ok
+    after
+      @stale_server_shutdown_timeout ->
+        Process.demonitor(monitor_ref, [:flush])
+        :error
     end
   end
 

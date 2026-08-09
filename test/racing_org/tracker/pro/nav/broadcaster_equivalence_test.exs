@@ -103,7 +103,15 @@ defmodule RacingOrg.Tracker.Pro.Nav.BroadcasterEquivalenceTest do
     test_pid = self()
 
     race = struct(RaceAssignment, course_marks: course_marks(), active_mark_code: "2")
-    assignment = %Assignment{assignment_id: "a1", version: 1, command_id: "c1", race_assignment: race, active_mark_code: "2"}
+
+    assignment = %Assignment{
+      assignment_id: "a1",
+      version: 1,
+      command_id: "c1",
+      race_assignment: race,
+      active_mark_code: "2"
+    }
+
     {:ok, commands} = StubCommands.start(assignment)
 
     ref = :atomics.new(1, [])

@@ -175,6 +175,54 @@ defmodule RacingOrg.Tracker.Pro.SamplingTest do
     assert_receive {:damping, 4.0}
   end
 
+  test "reconfigure uses the supplied config without calling back into Tracking.Config" do
+    commands = start_supervised!({Commands, device_id: "dev"})
+    reporter = start_supervised!({StubReporter, self()})
+    missing_config = :"missing_tracking_config_#{System.unique_integer([:positive])}"
+
+    sampling =
+      start_supervised!(
+        {Sampling,
+         commands: commands,
+         reporter: reporter,
+         tracking_config: missing_config,
+         now_fn: fn -> @start end,
+         reevaluate_interval_ms: 60_000}
+      )
+
+    assert_receive {:flush_interval, 1000}
+    assert_receive {:damping, initial_damping}
+    assert_in_delta initial_damping, 0.0, 1.0e-12
+
+    supplied =
+      put_in(@config, [:states, :pre_race], %{
+        damping_seconds: 4.0,
+        send_rate_hz: 2.0
+      })
+
+    assert :ok = Sampling.reconfigure(sampling, supplied)
+    assert_receive {:flush_interval, 500}
+    assert_receive {:damping, 4.0}
+  end
+
+  test "authoritative reconfigure reports an unavailable Reporter" do
+    commands = start_supervised!({Commands, device_id: "dev"})
+    missing_reporter = :"missing_reporter_#{System.unique_integer([:positive])}"
+    missing_config = :"missing_tracking_config_#{System.unique_integer([:positive])}"
+
+    sampling =
+      start_supervised!(
+        {Sampling,
+         commands: commands,
+         reporter: missing_reporter,
+         tracking_config: missing_config,
+         now_fn: fn -> @start end,
+         reevaluate_interval_ms: 60_000}
+      )
+
+    assert {:error, :reporter_unavailable} = Sampling.reconfigure(sampling, @config)
+  end
+
   test "the tracking status reflects what Sampling is applying" do
     %{sampling: s, commands: c} = start_sampling(DateTime.add(@start, 120, :second))
     apply_race_assignment(c, [])

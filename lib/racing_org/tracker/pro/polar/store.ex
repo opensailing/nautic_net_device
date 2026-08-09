@@ -47,10 +47,13 @@ defmodule RacingOrg.Tracker.Pro.Polar.Store do
   end
 
   @doc "Remove any persisted polar under `dir`."
-  @spec clear(Path.t()) :: :ok
+  @spec clear(Path.t()) :: :ok | {:error, term()}
   def clear(dir) do
-    _ = File.rm(path(dir))
-    :ok
+    case File.rm(path(dir)) do
+      :ok -> :ok
+      {:error, :enoent} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
   end
 
   defp decode(binary, dir) do

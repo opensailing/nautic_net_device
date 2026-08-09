@@ -1054,11 +1054,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     :exit, _ -> false
   end
 
-  # The version that was just applied: prefer the version from the apply result,
-  # else echo the payload's version. On error/unchanged we still echo the payload
-  # version so the server records which config the device acknowledged.
+  # Report a version only when the Wi-Fi owner established durable authority for
+  # it. A successful apply returns that exact version; `:unchanged` means the
+  # requested version was already covered by durable authority. Errors, especially
+  # an indeterminate marker write, must never echo the uncommitted request version.
   defp applied_version({:ok, %{version: version}}, _payload), do: version
-  defp applied_version(_result, payload), do: payload_version(payload)
+  defp applied_version({:ok, :unchanged}, payload), do: payload_version(payload)
+  defp applied_version(_result, _payload), do: nil
 
   defp payload_version(%{"version" => v}), do: v
   defp payload_version(%{version: v}), do: v
