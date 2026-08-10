@@ -1020,16 +1020,18 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   defp persist(%{dirty_persist: false} = state), do: state
 
   defp persist(state) do
-    _ =
-      Store.save(state.dir, %{
-        session: state.session,
-        seq: state.seq,
-        pending_timeline: state.pending_timeline,
-        pending_events: state.pending_events,
-        last_summary: state.last_summary
-      })
+    snapshot = %{
+      session: state.session,
+      seq: state.seq,
+      pending_timeline: state.pending_timeline,
+      pending_events: state.pending_events,
+      last_summary: state.last_summary
+    }
 
-    %{state | dirty_persist: false, last_persist_ms: state.now_fn.()}
+    case Store.save(state.dir, snapshot) do
+      :ok -> %{state | dirty_persist: false, last_persist_ms: state.now_fn.()}
+      {:error, _reason} -> state
+    end
   end
 
   defp restore_authoritative_runtime(snapshot, fingerprint, state) do

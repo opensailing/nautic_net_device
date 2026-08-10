@@ -592,6 +592,19 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
       assert Observer.stats(observer).accepted == 2
     end
 
+    test "a failed save keeps persistence dirty without advancing its cadence timestamp", %{dir: dir} do
+      File.mkdir_p!(dir)
+      blocked_dir = Path.join(dir, "not-a-directory")
+      File.write!(blocked_dir, "blocks observer persistence")
+
+      ctx = new_script()
+      observer = start_observer(ctx, dir: blocked_dir, persist_ms: 60_000, sync_ms: 3_600_000)
+
+      drive(observer, ctx, [%{t_ms: 60_000, twd_deg: 200.0, tws_mps: 6.0}])
+
+      assert %{dirty_persist: true, last_persist_ms: 0} = :sys.get_state(observer)
+    end
+
     test "session started_at_ms is stable across a simulated reboot and seq stays monotonic", %{dir: dir} do
       ctx = new_script()
       {:ok, observer} = Observer.start_link(observer_opts(ctx, dir: dir))
