@@ -706,6 +706,56 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
                SessionHolder.publish(h, old_session, new.generation)
     end
 
+    test "uses a finite default credential-epoch session identity limit", %{holder: h} do
+      assert %{session_identity_limit: 4_096} = :sys.get_state(h)
+    end
+
+    test "fails closed when the credential epoch session-id history reaches capacity" do
+      child_spec =
+        Supervisor.child_spec(
+          {SessionHolder, name: nil, session_identity_limit: 2},
+          id: {:bounded_session_holder, make_ref()}
+        )
+
+      assert {:ok, h} = start_supervised(child_spec)
+
+      first_session = session(session_id: <<20::128>>, epoch: 7)
+      assert {:ok, first} = SessionHolder.publish(h, first_session)
+      assert_control_counter(h, first.generation, 0)
+
+      second_session = session(session_id: <<21::128>>, epoch: 7)
+      assert {:ok, second} = SessionHolder.publish(h, second_session, first.generation)
+      assert_control_counter(h, second.generation, 0)
+      assert {:ok, %{counter: 0}} = SessionHolder.take_send_counter(h, second.generation)
+
+      second_frame = control_frame(peer_session(second_session), :control_accept, 0)
+
+      assert {:ok, :control_accept, _payload} =
+               SessionHolder.open_control(h, second.generation, second_frame)
+
+      fresh_session = session(session_id: <<22::128>>, epoch: 7)
+
+      assert {:error, :session_identity_limit_reached} =
+               SessionHolder.publish(h, fresh_session, second.generation)
+
+      assert {:error, :session_identity_limit_reached} =
+               SessionHolder.put(h, fresh_session)
+
+      assert {:error, :session_reused} =
+               SessionHolder.publish(h, first_session, second.generation)
+
+      assert SessionHolder.generation(h) == second.generation
+      assert_control_counter(h, second.generation, 1)
+      assert {:ok, %{counter: 1}} = SessionHolder.take_send_counter(h, second.generation)
+
+      assert {:error, :replayed} =
+               SessionHolder.open_control(h, second.generation, second_frame)
+
+      rotated_session = session(session_id: <<22::128>>, epoch: 8)
+      assert {:ok, rotated} = SessionHolder.publish(h, rotated_session, second.generation)
+      assert_control_counter(h, rotated.generation, 0)
+    end
+
     test "reports control counter rekey and exhaustion without advancing state", %{holder: h} do
       assert {:ok, published} = SessionHolder.publish(h, session(session_id: <<14::128>>))
       payload = control_payload(:readiness)

@@ -73,6 +73,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   alias RacingOrg.Tracker.Pro.SecureTransport.Session
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Control
 
+  # Bounds retained reconnect history while allowing thousands of fresh sessions
+  # between credential rotations. Tests may inject a smaller limit through init opts.
+  @default_session_identity_limit 4_096
+
   @type generation :: non_neg_integer()
 
   @type counter_grant :: %{
@@ -86,7 +90,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
         }
 
   @type session_error :: :no_session | :stale_session
-  @type publication_error :: :stale_session | :epoch_downgrade | :session_reused
+
+  @type publication_error ::
+          :stale_session
+          | :epoch_downgrade
+          | :session_reused
+          | :session_identity_limit_reached
 
   # --- Client API ---
 
@@ -106,11 +115,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   session.
   """
   @spec put(GenServer.server(), Session.t()) ::
-          :ok | {:error, :epoch_downgrade | :session_reused}
+          :ok | {:error, :epoch_downgrade | :session_reused | :session_identity_limit_reached}
   def put(server \\ __MODULE__, %Session{} = session) do
     case publish(server, session) do
-      {:ok, %Session{}} -> :ok
-      {:error, reason} = error when reason in [:epoch_downgrade, :session_reused] -> error
+      {:ok, %Session{}} ->
+        :ok
+
+      {:error, reason} = error
+      when reason in [:epoch_downgrade, :session_reused, :session_identity_limit_reached] ->
+        error
     end
   end
 
@@ -119,11 +132,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   A cryptographic `session_id` already used in the current credential epoch is
   rejected even after replacement or clear, preventing holder-owned counters and
-  replay windows from resetting under reused keys. A higher credential epoch starts
-  a fresh id set because its keys and nonce epoch are distinct.
+  replay windows from resetting under reused keys. The retained identity ledger is
+  finite; once full, publication fails with `:session_identity_limit_reached` until
+  the credential epoch advances. A higher epoch starts a fresh ledger because its
+  keys and nonce epoch are distinct.
   """
   @spec publish(GenServer.server(), Session.t()) ::
-          {:ok, Session.t()} | {:error, :epoch_downgrade | :session_reused}
+          {:ok, Session.t()}
+          | {:error, :epoch_downgrade | :session_reused | :session_identity_limit_reached}
   def publish(server \\ __MODULE__, %Session{} = session) do
     GenServer.call(server, {:publish, session, :any})
   end
@@ -308,22 +324,32 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   # --- Server ---
 
   @impl true
-  def init(_opts) do
-    {:ok,
-     %{
-       session: nil,
-       control: nil,
-       generation: 0,
-       credential_epoch: nil,
-       used_session_ids: MapSet.new()
-     }}
+  def init(opts) do
+    session_identity_limit =
+      Keyword.get(opts, :session_identity_limit, @default_session_identity_limit)
+
+    if is_integer(session_identity_limit) and session_identity_limit > 0 and
+         session_identity_limit <= @default_session_identity_limit do
+      {:ok,
+       %{
+         session: nil,
+         control: nil,
+         generation: 0,
+         credential_epoch: nil,
+         used_session_ids: MapSet.new(),
+         session_identity_limit: session_identity_limit
+       }}
+    else
+      {:stop, :invalid_session_identity_limit}
+    end
   end
 
   @impl true
   def handle_call({:publish, session, expected_generation}, _from, state) do
     with :ok <- check_generation(state, expected_generation),
          :ok <- check_credential_epoch(state, session.credential_epoch),
-         :ok <- check_fresh_session(state, session) do
+         :ok <- check_fresh_session(state, session),
+         :ok <- check_session_identity_capacity(state, session) do
       generation = state.generation + 1
       published = %{session | generation: generation}
       used_session_ids = remember_session_id(state, published)
@@ -338,7 +364,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
            used_session_ids: used_session_ids
        }}
     else
-      {:error, reason} = error when reason in [:stale_session, :epoch_downgrade, :session_reused] ->
+      {:error, reason} = error
+      when reason in [
+             :stale_session,
+             :epoch_downgrade,
+             :session_reused,
+             :session_identity_limit_reached
+           ] ->
         {:reply, error, state}
     end
   end
@@ -524,6 +556,21 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   end
 
   defp check_fresh_session(_state, _session), do: :ok
+
+  defp check_session_identity_capacity(
+         %{
+           credential_epoch: credential_epoch,
+           used_session_ids: used_session_ids,
+           session_identity_limit: session_identity_limit
+         },
+         %Session{credential_epoch: credential_epoch}
+       ) do
+    if MapSet.size(used_session_ids) < session_identity_limit,
+      do: :ok,
+      else: {:error, :session_identity_limit_reached}
+  end
+
+  defp check_session_identity_capacity(_state, _session), do: :ok
 
   defp remember_session_id(
          %{credential_epoch: credential_epoch, used_session_ids: used_session_ids},
