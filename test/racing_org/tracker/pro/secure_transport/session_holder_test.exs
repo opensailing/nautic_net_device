@@ -288,6 +288,290 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
     assert {:error, :stale_session} = SessionHolder.take_send_counter(h, generation)
   end
 
+  describe "public callback leases" do
+    test "with_session runs blocking re-entrant work in its caller while reads stay responsive and mutations wait", %{
+      holder: h
+    } do
+      parent = self()
+      release_ref = make_ref()
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<30::128>>))
+
+      callback_task =
+        Task.async(fn ->
+          SessionHolder.with_session(h, first.generation, fn current ->
+            snapshot =
+              {SessionHolder.live?(h), SessionHolder.generation(h), SessionHolder.get_current_session(h)}
+
+            send(parent, {:with_session_blocked, self(), current, snapshot})
+
+            receive do
+              {:release_callback, ^release_ref} -> :session_done
+            end
+          end)
+        end)
+
+      assert_receive {:with_session_blocked, callback_pid, current, snapshot}, 1_000
+      assert callback_pid == callback_task.pid
+      assert current.session_id == first.session_id
+      assert_live_snapshot(snapshot, first)
+      assert_live_snapshot(holder_snapshot(h), first)
+
+      replace_task =
+        Task.async(fn ->
+          SessionHolder.publish(h, session(session_id: <<31::128>>), first.generation)
+        end)
+
+      assert eventually(fn -> deferred_count(h) == 1 end)
+      clear_task = Task.async(fn -> SessionHolder.clear(h) end)
+      assert eventually(fn -> deferred_count(h) == 2 end)
+      assert Task.yield(replace_task, 20) == nil
+      assert Task.yield(clear_task, 20) == nil
+      assert_live_snapshot(holder_snapshot(h), first)
+
+      send(callback_pid, {:release_callback, release_ref})
+
+      assert {:ok, :session_done} = Task.await(callback_task)
+      assert {:ok, replacement} = Task.await(replace_task)
+      assert replacement.generation > first.generation
+      assert :ok = Task.await(clear_task)
+      refute SessionHolder.live?(h)
+    end
+
+    test "with_send_counter grants atomically then runs blocking re-entrant send work in its caller", %{
+      holder: h
+    } do
+      parent = self()
+      release_ref = make_ref()
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<32::128>>))
+
+      callback_task =
+        Task.async(fn ->
+          SessionHolder.with_send_counter(h, first.generation, fn grant ->
+            snapshot =
+              {SessionHolder.live?(h), SessionHolder.generation(h), SessionHolder.get_current_session(h)}
+
+            send(parent, {:with_send_counter_blocked, self(), grant, snapshot})
+
+            receive do
+              {:release_callback, ^release_ref} -> :send_done
+            end
+          end)
+        end)
+
+      assert_receive {:with_send_counter_blocked, callback_pid, grant, snapshot}, 1_000
+      assert callback_pid == callback_task.pid
+      assert grant.generation == first.generation
+      assert grant.session_id == first.session_id
+      assert grant.counter == 0
+      assert_live_snapshot(snapshot, first, send_counter: 1)
+      assert_live_snapshot(holder_snapshot(h), first, send_counter: 1)
+
+      replace_task =
+        Task.async(fn ->
+          SessionHolder.publish(h, session(session_id: <<33::128>>), first.generation)
+        end)
+
+      assert eventually(fn -> deferred_count(h) == 1 end)
+      clear_task = Task.async(fn -> SessionHolder.clear(h) end)
+      assert eventually(fn -> deferred_count(h) == 2 end)
+      assert Task.yield(replace_task, 20) == nil
+      assert Task.yield(clear_task, 20) == nil
+      assert_live_snapshot(holder_snapshot(h), first, send_counter: 1)
+
+      send(callback_pid, {:release_callback, release_ref})
+
+      assert {:ok, :send_done} = Task.await(callback_task)
+      assert {:ok, replacement} = Task.await(replace_task)
+      assert replacement.generation > first.generation
+      assert :ok = Task.await(clear_task)
+      refute SessionHolder.live?(h)
+    end
+
+    test "with_control_send seals atomically then runs blocking re-entrant transport work in its caller", %{
+      holder: h
+    } do
+      parent = self()
+      release_ref = make_ref()
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<34::128>>))
+
+      callback_task =
+        Task.async(fn ->
+          SessionHolder.with_control_send(
+            h,
+            first.generation,
+            :readiness,
+            control_payload(:readiness),
+            fn frame ->
+              snapshot =
+                {SessionHolder.live?(h), SessionHolder.generation(h), SessionHolder.get_current_session(h)}
+
+              send(parent, {:with_control_send_blocked, self(), frame, snapshot})
+
+              receive do
+                {:release_callback, ^release_ref} -> :control_done
+              end
+            end
+          )
+        end)
+
+      assert_receive {:with_control_send_blocked, callback_pid, frame, snapshot}, 1_000
+      assert callback_pid == callback_task.pid
+      assert control_counter(frame) == 0
+      assert_live_snapshot(snapshot, first)
+      assert_live_snapshot(holder_snapshot(h), first)
+
+      replace_task =
+        Task.async(fn ->
+          SessionHolder.publish(h, session(session_id: <<35::128>>), first.generation)
+        end)
+
+      assert eventually(fn -> deferred_count(h) == 1 end)
+      clear_task = Task.async(fn -> SessionHolder.clear(h) end)
+      assert eventually(fn -> deferred_count(h) == 2 end)
+      assert Task.yield(replace_task, 20) == nil
+      assert Task.yield(clear_task, 20) == nil
+      assert_live_snapshot(holder_snapshot(h), first)
+
+      send(callback_pid, {:release_callback, release_ref})
+
+      assert {:ok, :control_done} = Task.await(callback_task)
+      assert {:ok, replacement} = Task.await(replace_task)
+      assert replacement.generation > first.generation
+      assert :ok = Task.await(clear_task)
+      refute SessionHolder.live?(h)
+    end
+
+    test "normal return, raise, throw, and exit all release callback leases with legacy results", %{
+      holder: h
+    } do
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<36::128>>))
+
+      assert {:ok, :normal} =
+               SessionHolder.with_session(h, first.generation, fn _session -> :normal end)
+
+      assert {:error, :session_callback_failed} =
+               SessionHolder.with_session(h, first.generation, fn _session -> raise "failed" end)
+
+      assert {:ok, second} =
+               SessionHolder.publish(h, session(session_id: <<37::128>>), first.generation)
+
+      assert {:error, :send_failed} =
+               SessionHolder.with_send_counter(h, second.generation, fn _grant ->
+                 throw(:failed)
+               end)
+
+      assert {:ok, third} =
+               SessionHolder.publish(h, session(session_id: <<38::128>>), second.generation)
+
+      assert {:error, :control_send_failed} =
+               SessionHolder.with_control_send(
+                 h,
+                 third.generation,
+                 :readiness,
+                 control_payload(:readiness),
+                 fn _frame -> exit(:failed) end
+               )
+
+      assert {:ok, fourth} =
+               SessionHolder.publish(h, session(session_id: <<39::128>>), third.generation)
+
+      assert fourth.generation > third.generation
+    end
+
+    test "a callback owner attempting session mutations fails fast instead of deadlocking", %{
+      holder: h
+    } do
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<40::128>>))
+
+      assert {:ok,
+              %{
+                publish: {:error, :send_lease_active},
+                clear: {:error, :send_lease_active},
+                fence: {:error, :send_lease_active}
+              }} =
+               SessionHolder.with_session(h, first.generation, fn _session ->
+                 %{
+                   publish:
+                     SessionHolder.publish(
+                       h,
+                       session(session_id: <<41::128>>),
+                       first.generation
+                     ),
+                   clear: SessionHolder.clear(h, first.generation),
+                   fence: SessionHolder.fence_for_credential_epoch(h, first.credential_epoch + 1)
+                 }
+               end)
+
+      assert_live_snapshot(holder_snapshot(h), first)
+    end
+
+    test "concurrent caller-side UDP grants remain unique", %{holder: h} do
+      assert {:ok, published} = SessionHolder.publish(h, session(session_id: <<42::128>>))
+      count = 100
+
+      counters =
+        1..count
+        |> Task.async_stream(
+          fn _ ->
+            assert {:ok, counter} =
+                     SessionHolder.with_send_counter(h, published.generation, & &1.counter)
+
+            counter
+          end,
+          max_concurrency: 50,
+          ordered: false
+        )
+        |> Enum.map(fn {:ok, counter} -> counter end)
+
+      assert Enum.sort(counters) == Enum.to_list(0..(count - 1))
+      assert length(Enum.uniq(counters)) == count
+    end
+
+    test "an expired caller-side lease kills a hung owner before allowing replacement", %{
+      holder: _default_holder
+    } do
+      {:ok, h} =
+        start_supervised(
+          {SessionHolder, name: nil, send_lease_ttl: 200},
+          id: {:expiring_lease_holder, make_ref()}
+        )
+
+      parent = self()
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<43::128>>))
+
+      owner =
+        spawn(fn ->
+          SessionHolder.with_send_counter(h, first.generation, fn grant ->
+            send(parent, {:hung_send_started, self(), grant})
+
+            receive do
+              :transmit_old_session -> send(parent, :expired_old_session_transmitted)
+            end
+          end)
+        end)
+
+      owner_ref = Process.monitor(owner)
+      assert_receive {:hung_send_started, callback_pid, %{counter: 0}}, 1_000
+      assert callback_pid == owner
+
+      replace_task =
+        Task.async(fn ->
+          SessionHolder.publish(h, session(session_id: <<44::128>>), first.generation)
+        end)
+
+      assert eventually(fn -> deferred_count(h) == 1 end)
+      assert Task.yield(replace_task, 20) == nil
+
+      assert {:ok, replacement} = Task.await(replace_task, 1_000)
+      assert replacement.generation > first.generation
+      assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
+      refute Process.alive?(owner)
+
+      send(owner, :transmit_old_session)
+      refute_receive :expired_old_session_transmitted, 50
+    end
+  end
+
   describe "send leases" do
     # A lease keeps the 881ae91 guarantee — replacement/clear cannot overtake an
     # approved send — WITHOUT parking the holder inside caller transport work.
@@ -1086,6 +1370,20 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
     :sys.replace_state(holder, fn state ->
       put_in(state.control.send_counter, counter)
     end)
+  end
+
+  defp holder_snapshot(holder) do
+    {SessionHolder.live?(holder), SessionHolder.generation(holder), SessionHolder.get_current_session(holder)}
+  end
+
+  defp assert_live_snapshot({true, generation, {:ok, current}}, published, opts \\ []) do
+    assert generation == published.generation
+    assert current.generation == published.generation
+    assert current.session_id == published.session_id
+
+    if expected_counter = Keyword.get(opts, :send_counter) do
+      assert current.send_counter == expected_counter
+    end
   end
 
   # How many session mutations are currently parked behind open send leases. Used
