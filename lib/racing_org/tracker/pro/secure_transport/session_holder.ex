@@ -72,6 +72,22 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   Nonce allocation NEVER leaves the holder. Only the transport write does.
 
+  ## Session identity history is bounded and EVICTING
+
+  Re-publishing a recently fenced `session_id` is refused, because re-installing a
+  prior session would restart holder-owned counters and the replay window under
+  keys that already carried traffic. The retained history is a bounded ring that
+  evicts its oldest entry; it must never refuse a fresh session, since a device
+  that cannot rotate its own credentials would be permanently unable to reconnect.
+
+  This is defense-in-depth, not the uniqueness primitive. Uniqueness comes from the
+  handshake: `session_id` and both direction keys are HKDF-derived from a single
+  transcript binding fresh ephemeral keys and the server nonce, so every handshake
+  yields a distinct id AND distinct keys. Reproducing an evicted id means
+  reproducing that transcript — an RNG failure that already breaks the session keys
+  themselves. The ring is also process-local, so it can never be a durable
+  invariant across a holder restart in any size.
+
   ## Lifecycle
 
     * `put/1`        — ChannelClient publishes a freshly-established session
@@ -92,12 +108,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   use GenServer
 
+  alias RacingOrg.Tracker.Pro.SecureTransport.Primitives
   alias RacingOrg.Tracker.Pro.SecureTransport.Session
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Control
 
-  # Bounds retained reconnect history while allowing thousands of fresh sessions
-  # between credential rotations. Tests may inject a smaller limit through init opts.
-  @default_session_identity_limit 4_096
+  # How many recent session identities are retained per credential epoch for
+  # duplicate-publication rejection. The ring EVICTS past this bound; it never
+  # refuses a fresh session, so reconnects stay unbounded. See
+  # `check_fresh_session/2` for why aging out is sound.
+  @session_identity_history 256
 
   @type generation :: non_neg_integer()
 
@@ -123,7 +142,6 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
           :stale_session
           | :epoch_downgrade
           | :session_reused
-          | :session_identity_limit_reached
 
   # --- Client API ---
 
@@ -143,14 +161,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   session.
   """
   @spec put(GenServer.server(), Session.t()) ::
-          :ok | {:error, :epoch_downgrade | :session_reused | :session_identity_limit_reached}
+          :ok | {:error, :epoch_downgrade | :session_reused}
   def put(server \\ __MODULE__, %Session{} = session) do
     case publish(server, session) do
       {:ok, %Session{}} ->
         :ok
 
-      {:error, reason} = error
-      when reason in [:epoch_downgrade, :session_reused, :session_identity_limit_reached] ->
+      {:error, reason} = error when reason in [:epoch_downgrade, :session_reused] ->
         error
     end
   end
@@ -158,16 +175,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   @doc """
   Publish a replacement session and return it with its new monotonic generation.
 
-  A cryptographic `session_id` already used in the current credential epoch is
-  rejected even after replacement or clear, preventing holder-owned counters and
-  replay windows from resetting under reused keys. The retained identity ledger is
-  finite; once full, publication fails with `:session_identity_limit_reached` until
-  the credential epoch advances. A higher epoch starts a fresh ledger because its
-  keys and nonce epoch are distinct.
+  Re-publishing the identity the holder is currently fencing is rejected, including
+  after a `clear/1`, so holder-owned counters and replay windows can never restart
+  under keys that already carried traffic. That is the whole reuse boundary: the
+  handshake derives `session_id` and both direction keys from one transcript, so a
+  repeated id means repeated keys, and any genuinely new handshake yields both a
+  new id and new keys. Reconnects are therefore unbounded — no history is retained
+  and no reconnect count can refuse a fresh session.
   """
   @spec publish(GenServer.server(), Session.t()) ::
-          {:ok, Session.t()}
-          | {:error, :epoch_downgrade | :session_reused | :session_identity_limit_reached}
+          {:ok, Session.t()} | {:error, :epoch_downgrade | :session_reused}
   def publish(server \\ __MODULE__, %Session{} = session) do
     GenServer.call(server, {:publish, session, :any})
   end
@@ -409,28 +426,22 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   # --- Server ---
 
   @impl true
-  def init(opts) do
-    session_identity_limit =
-      Keyword.get(opts, :session_identity_limit, @default_session_identity_limit)
-
-    if is_integer(session_identity_limit) and session_identity_limit > 0 and
-         session_identity_limit <= @default_session_identity_limit do
-      {:ok,
-       %{
-         session: nil,
-         control: nil,
-         generation: 0,
-         credential_epoch: nil,
-         used_session_ids: MapSet.new(),
-         session_identity_limit: session_identity_limit,
-         # ref => monitor_ref for every authorized send still in flight.
-         send_leases: %{},
-         # Mutations parked behind those leases, replayed in arrival order.
-         deferred: :queue.new()
-       }}
-    else
-      {:stop, :invalid_session_identity_limit}
-    end
+  def init(_opts) do
+    {:ok,
+     %{
+       session: nil,
+       control: nil,
+       generation: 0,
+       credential_epoch: nil,
+       # Bounded newest-first ring of recently fenced identities, retained across
+       # clear so a re-derived (therefore same-keyed) session cannot restart its
+       # counters. Evicts rather than refusing — see `check_fresh_session/2`.
+       used_session_ids: [],
+       # ref => monitor_ref for every authorized send still in flight.
+       send_leases: %{},
+       # Mutations parked behind those leases, replayed in arrival order.
+       deferred: :queue.new()
+     }}
   end
 
   # Session-mutating calls must not overtake an authorized send. While any lease is
@@ -622,11 +633,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   defp apply_request({:publish, session, expected_generation}, state) do
     with :ok <- check_generation(state, expected_generation),
          :ok <- check_credential_epoch(state, session.credential_epoch),
-         :ok <- check_fresh_session(state, session),
-         :ok <- check_session_identity_capacity(state, session) do
+         :ok <- check_fresh_session(state, session) do
       generation = state.generation + 1
       published = %{session | generation: generation}
-      used_session_ids = remember_session_id(state, published)
 
       {{:ok, published},
        %{
@@ -635,16 +644,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
            control: new_control_state(published),
            generation: generation,
            credential_epoch: session.credential_epoch,
-           used_session_ids: used_session_ids
+           used_session_ids: remember_session_id(state, published)
        }}
     else
       {:error, reason} = error
-      when reason in [
-             :stale_session,
-             :epoch_downgrade,
-             :session_reused,
-             :session_identity_limit_reached
-           ] ->
+      when reason in [:stale_session, :epoch_downgrade, :session_reused] ->
         {error, state}
     end
   end
@@ -679,6 +683,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
        when current_epoch < credential_epoch do
     generation = state.generation + 1
 
+    # A strictly higher credential epoch re-keys everything: the epoch is bound into
+    # the transcript, so no id from the old epoch can be re-derived under the new
+    # one and the retained identity is meaningless there.
     {{:ok, generation, :evicted},
      %{
        state
@@ -686,7 +693,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
          control: nil,
          generation: generation,
          credential_epoch: credential_epoch,
-         used_session_ids: MapSet.new()
+         used_session_ids: []
      }}
   end
 
@@ -735,43 +742,48 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   defp check_generation(%{generation: generation}, generation), do: :ok
   defp check_generation(_state, _expected_generation), do: {:error, :stale_session}
 
-  # Reinstalling any cryptographic session already used in this credential epoch
-  # would reset holder-owned counters/windows and reuse AEAD nonces. Remember ids
-  # across replacement and clear; a strictly higher epoch can safely prune them.
+  # Refuse to reinstall a cryptographic identity this holder recently fenced.
+  #
+  # Reinstating a prior session restarts holder-owned counters and the replay
+  # window under keys that already carried traffic, which IS nonce reuse — so the
+  # check cannot narrow to "the current session only". But the retained history
+  # must not become an availability cliff either: the previous implementation
+  # REFUSED publication once the ledger filled, so ~4k legitimate reconnects on one
+  # credential epoch permanently bricked reconnect on a device that cannot rotate
+  # its own credentials.
+  #
+  # The history is therefore a bounded ring that EVICTS its oldest entry instead of
+  # refusing a fresh session. Reconnects are unbounded; only replay protection ages
+  # out, and it ages out along the axis where it stops mattering.
+  #
+  # Aging out is sound because the real uniqueness boundary is the HANDSHAKE:
+  # `session_id` and both direction keys are HKDF-derived from one transcript that
+  # binds freshly generated ephemeral keys plus the server nonce. Re-deriving an
+  # evicted id requires reproducing that transcript — i.e. the device repeating its
+  # own ephemeral key — which is an RNG failure that already breaks the session
+  # keys themselves. The ring is defense-in-depth against a duplicate/retried
+  # publication, not the primitive that provides uniqueness. (It also cannot be a
+  # DURABLE invariant in any size: it is process-local and a holder restart erases
+  # it, so it never survived the boundary an unbounded ledger appeared to protect.)
   defp check_fresh_session(
          %{credential_epoch: credential_epoch, used_session_ids: used_session_ids},
          %Session{credential_epoch: credential_epoch, session_id: session_id}
        ) do
-    if MapSet.member?(used_session_ids, session_id),
+    if Enum.any?(used_session_ids, &Primitives.secure_compare(&1, session_id)),
       do: {:error, :session_reused},
       else: :ok
   end
 
   defp check_fresh_session(_state, _session), do: :ok
 
-  defp check_session_identity_capacity(
-         %{
-           credential_epoch: credential_epoch,
-           used_session_ids: used_session_ids,
-           session_identity_limit: session_identity_limit
-         },
-         %Session{credential_epoch: credential_epoch}
-       ) do
-    if MapSet.size(used_session_ids) < session_identity_limit,
-      do: :ok,
-      else: {:error, :session_identity_limit_reached}
-  end
-
-  defp check_session_identity_capacity(_state, _session), do: :ok
-
+  # Newest first, oldest evicted past the cap — bounded memory, never a refusal.
   defp remember_session_id(
          %{credential_epoch: credential_epoch, used_session_ids: used_session_ids},
          %Session{credential_epoch: credential_epoch, session_id: session_id}
        ),
-       do: MapSet.put(used_session_ids, session_id)
+       do: Enum.take([session_id | used_session_ids], @session_identity_history)
 
-  defp remember_session_id(_state, %Session{session_id: session_id}),
-    do: MapSet.new([session_id])
+  defp remember_session_id(_state, %Session{session_id: session_id}), do: [session_id]
 
   defp check_credential_epoch(%{credential_epoch: nil}, _credential_epoch), do: :ok
 

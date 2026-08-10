@@ -865,53 +865,109 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
                SessionHolder.publish(h, old_session, new.generation)
     end
 
-    test "uses a finite default credential-epoch session identity limit", %{holder: h} do
-      assert %{session_identity_limit: 4_096} = :sys.get_state(h)
+    # The uniqueness that matters is CRYPTOGRAPHIC, and the handshake already
+    # provides it: `session_id` and both direction keys are HKDF-derived from a
+    # transcript binding fresh ephemeral keys and the server nonce, so every
+    # handshake yields distinct keys AND a distinct session_id. Two sessions can
+    # only collide by re-deriving the same transcript, which also re-derives the
+    # same keys — the accepting-a-duplicate case the holder must refuse. Rejecting
+    # the CURRENT session's id is exactly that check, and it needs no history.
+    #
+    # A process-local denylist cannot be a durable nonce-reuse invariant anyway: it
+    # is lost on every holder restart, so it never actually protected across the
+    # boundary it appears to. What it DID create is an availability cliff — after
+    # enough legitimate reconnects on one credential epoch, publication fails until
+    # the epoch rotates, permanently bricking reconnect on a device that cannot
+    # rotate on its own.
+    @tag :session_identity_cliff
+    test "many legitimate reconnects on one credential epoch never brick publication", %{holder: h} do
+      reconnects = 5_000
+
+      final =
+        Enum.reduce(1..reconnects, nil, fn n, previous ->
+          expected = if previous, do: previous.generation, else: SessionHolder.generation(h)
+
+          assert {:ok, published} =
+                   SessionHolder.publish(h, session(session_id: <<n::128>>, epoch: 7), expected),
+                 "reconnect ##{n} was refused on a single credential epoch"
+
+          published
+        end)
+
+      assert final.generation == reconnects
+      assert SessionHolder.live?(h)
+
+      # Fresh sessions still work, and the CURRENT one is still refused.
+      assert {:error, :session_reused} = SessionHolder.publish(h, final, final.generation)
     end
 
-    test "fails closed when the credential epoch session-id history reaches capacity" do
-      child_spec =
-        Supervisor.child_spec(
-          {SessionHolder, name: nil, session_identity_limit: 2},
-          id: {:bounded_session_holder, make_ref()}
-        )
+    # Distinct keys are the whole point: a re-derived session_id means re-derived
+    # keys, so accepting a RECENT one would reset counters/replay windows under keys
+    # that already carried traffic.
+    @tag :session_identity_cliff
+    test "a recently fenced identity is refused even after clear", %{holder: h} do
+      live = session(session_id: <<0xAB::128>>, epoch: 7)
+      assert {:ok, published} = SessionHolder.publish(h, live)
+      assert {:error, :session_reused} = SessionHolder.publish(h, live, published.generation)
 
-      assert {:ok, h} = start_supervised(child_spec)
+      # Clearing drops the session, and a re-published identity would restart its
+      # counters and replay window from zero under the SAME derived keys.
+      assert :ok = SessionHolder.clear(h, published.generation)
+      cleared = SessionHolder.generation(h)
+      assert {:error, :session_reused} = SessionHolder.publish(h, live, cleared)
 
+      # A genuinely different handshake (different transcript -> different id and
+      # keys) is accepted, so reconnect is never bricked.
+      assert {:ok, next} = SessionHolder.publish(h, session(session_id: <<0xAC::128>>, epoch: 7), cleared)
+      assert next.generation > published.generation
+    end
+
+    # The identity history is bounded, but it must EVICT rather than refuse: a full
+    # ring may age out old replay protection, it may never turn a fresh, legitimate
+    # session into a publication failure.
+    @tag :session_identity_cliff
+    test "a full identity history evicts the oldest entry instead of refusing", %{holder: h} do
       first_session = session(session_id: <<20::128>>, epoch: 7)
       assert {:ok, first} = SessionHolder.publish(h, first_session)
       assert_control_counter(h, first.generation, 0)
 
-      second_session = session(session_id: <<21::128>>, epoch: 7)
-      assert {:ok, second} = SessionHolder.publish(h, second_session, first.generation)
-      assert_control_counter(h, second.generation, 0)
-      assert {:ok, %{counter: 0}} = SessionHolder.take_send_counter(h, second.generation)
+      # Recent identities are still refused...
+      assert {:error, :session_reused} = SessionHolder.publish(h, first_session, first.generation)
 
-      second_frame = control_frame(peer_session(second_session), :control_accept, 0)
+      # ...while a long run of genuinely new handshakes keeps publishing.
+      final =
+        Enum.reduce(1..512, first, fn n, previous ->
+          assert {:ok, published} =
+                   SessionHolder.publish(h, session(session_id: <<n + 100::128>>, epoch: 7), previous.generation)
 
-      assert {:ok, :control_accept, _payload} =
-               SessionHolder.open_control(h, second.generation, second_frame)
+          published
+        end)
 
-      fresh_session = session(session_id: <<22::128>>, epoch: 7)
+      # Memory is bounded: the ring holds at most its cap, oldest evicted first.
+      assert length(:sys.get_state(h).used_session_ids) <= 256
 
-      assert {:error, :session_identity_limit_reached} =
-               SessionHolder.publish(h, fresh_session, second.generation)
+      # The most recent identities are still refused (protection where it counts).
+      assert {:error, :session_reused} = SessionHolder.publish(h, final, final.generation)
 
-      assert {:error, :session_identity_limit_reached} =
-               SessionHolder.put(h, fresh_session)
+      # And an evicted, long-superseded identity no longer blocks availability.
+      assert {:ok, revived} = SessionHolder.publish(h, first_session, final.generation)
+      assert revived.generation > final.generation
+      assert_control_counter(h, revived.generation, 0)
+    end
 
-      assert {:error, :session_reused} =
-               SessionHolder.publish(h, first_session, second.generation)
+    test "a higher credential epoch prunes the identity history" do
+      {:ok, h} = start_supervised({SessionHolder, name: nil}, id: {:epoch_holder, make_ref()})
 
-      assert SessionHolder.generation(h) == second.generation
-      assert_control_counter(h, second.generation, 1)
-      assert {:ok, %{counter: 1}} = SessionHolder.take_send_counter(h, second.generation)
+      reused = session(session_id: <<22::128>>, epoch: 7)
+      assert {:ok, published} = SessionHolder.publish(h, reused)
+      assert {:error, :session_reused} = SessionHolder.publish(h, reused, published.generation)
 
-      assert {:error, :replayed} =
-               SessionHolder.open_control(h, second.generation, second_frame)
+      assert {:ok, rotated_generation, :evicted} = SessionHolder.fence_for_credential_epoch(h, 8)
 
+      # The epoch is bound into the transcript, so the same id under a HIGHER epoch
+      # is a different session with different keys — it must publish cleanly.
       rotated_session = session(session_id: <<22::128>>, epoch: 8)
-      assert {:ok, rotated} = SessionHolder.publish(h, rotated_session, second.generation)
+      assert {:ok, rotated} = SessionHolder.publish(h, rotated_session, rotated_generation)
       assert_control_counter(h, rotated.generation, 0)
     end
 
