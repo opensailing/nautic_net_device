@@ -6,6 +6,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
   @dir_mode 0o700
   @file_mode 0o600
   @temp_attempts 8
+  @temp_suffix_pattern ~r/\A[A-Za-z0-9_-]{16}(?:\.[2-8])?\z/
+  @reserved_temp_path_pattern ~r/\A.+\.tmp\.[A-Za-z0-9_-]{16}(?:\.[2-8])?\z/s
 
   @type fault_stage ::
           :temp_opened
@@ -61,6 +63,157 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
       end
     end)
   end
+
+  @doc false
+  @spec reserved_temporary_path?(Path.t()) :: boolean()
+  def reserved_temporary_path?(path) when is_binary(path),
+    do: Regex.match?(@reserved_temp_path_pattern, Path.basename(path))
+
+  def reserved_temporary_path?(_path), do: false
+
+  @type cleanup_error :: {:orphan_temp_cleanup, term()}
+
+  @doc """
+  Remove this destination's abandoned random temporary files.
+
+  The caller must hold the destination store's canonical path or ownership lock
+  for the complete call. This function is intentionally not part of `write/3`:
+  without that external exclusion, a matching file may belong to a live writer.
+  """
+  @spec cleanup_orphan_temps(Path.t(), keyword()) :: :ok | {:error, cleanup_error()}
+  def cleanup_orphan_temps(path, opts \\ [])
+
+  def cleanup_orphan_temps(path, opts) when is_binary(path) and path != "" and is_list(opts) do
+    directory = Path.dirname(path)
+    destination = Path.basename(path)
+    fs = file_system(opts)
+
+    with {:ok, filenames, directory_state} <- list_orphan_temps(fs, directory, destination),
+         :ok <- remove_orphan_temps(fs, directory, filenames),
+         :ok <- sync_existing_cleanup_directory(fs, directory, directory_state) do
+      :ok
+    end
+  end
+
+  def cleanup_orphan_temps(_path, _opts),
+    do: {:error, {:orphan_temp_cleanup, :invalid_destination}}
+
+  defp list_orphan_temps(fs, directory, destination) do
+    result = cleanup_fs_call(fs, :list_dir, [directory], fn -> File.ls(directory) end)
+
+    case result do
+      {:ok, filenames} when is_list(filenames) ->
+        {:ok,
+         filenames
+         |> Enum.filter(&orphan_temp?(&1, destination))
+         |> Enum.sort(), :present}
+
+      {:error, :enoent} ->
+        {:ok, [], :missing}
+
+      {:error, reason} ->
+        cleanup_error({:list_directory, reason})
+
+      other ->
+        cleanup_error({:list_directory, other})
+    end
+  end
+
+  defp orphan_temp?(filename, destination) when is_binary(filename) do
+    prefix = destination <> ".tmp."
+
+    if String.starts_with?(filename, prefix) do
+      suffix = binary_part(filename, byte_size(prefix), byte_size(filename) - byte_size(prefix))
+      Regex.match?(@temp_suffix_pattern, suffix)
+    else
+      false
+    end
+  end
+
+  defp orphan_temp?(_filename, _destination), do: false
+
+  defp remove_orphan_temps(fs, directory, filenames) do
+    Enum.reduce_while(filenames, :ok, fn filename, :ok ->
+      path = Path.join(directory, filename)
+
+      case lstat_temp(fs, path) do
+        {:ok, %File.Stat{type: :regular}} ->
+          case cleanup_fs_call(fs, :remove, [path], fn -> File.rm(path) end) do
+            :ok -> {:cont, :ok}
+            {:error, reason} -> {:halt, cleanup_error({:remove_temp, reason})}
+            other -> {:halt, cleanup_error({:remove_temp, other})}
+          end
+
+        {:ok, %File.Stat{}} ->
+          {:halt, cleanup_error(:invalid_temp_type)}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp lstat_temp(fs, path) do
+    case cleanup_fs_call(fs, :lstat, [path], fn -> File.lstat(path) end) do
+      {:ok, %File.Stat{} = stat} -> {:ok, stat}
+      {:error, reason} -> cleanup_error({:lstat_temp, reason})
+      other -> cleanup_error({:lstat_temp, other})
+    end
+  end
+
+  defp sync_existing_cleanup_directory(_fs, _directory, :missing), do: :ok
+
+  defp sync_existing_cleanup_directory(fs, directory, :present) do
+    open_result =
+      cleanup_fs_call(fs, :open, [directory, [:read, :raw, :directory]], fn ->
+        File.open(directory, [:read, :raw, :directory])
+      end)
+
+    case open_result do
+      {:ok, device} ->
+        sync_result = cleanup_fs_call(fs, :sync, [device], fn -> :file.sync(device) end)
+        close_result = cleanup_fs_call(fs, :close, [device], fn -> :file.close(device) end)
+
+        case {sync_result, close_result} do
+          {:ok, :ok} -> :ok
+          {{:error, reason}, _close_result} -> cleanup_error({:sync_directory, {:directory_sync, reason}})
+          {other, _close_result} when other != :ok -> cleanup_error({:sync_directory, {:directory_sync, other}})
+          {:ok, {:error, reason}} -> cleanup_error({:sync_directory, {:directory_close, reason}})
+          {:ok, other} -> cleanup_error({:sync_directory, {:directory_close, other}})
+        end
+
+      {:error, reason} ->
+        cleanup_error({:sync_directory, {:directory_open, reason}})
+
+      other ->
+        cleanup_error({:sync_directory, {:directory_open, other}})
+    end
+  end
+
+  defp cleanup_fs_call(fs, callback, args, fallback) do
+    operation =
+      if is_atom(fs) and Code.ensure_loaded?(fs) and function_exported?(fs, callback, length(args)) do
+        fn -> apply(fs, callback, args) end
+      else
+        fallback
+      end
+
+    safe_fs_operation(operation)
+  end
+
+  defp fs_callback(fs, callback, args),
+    do: safe_fs_operation(fn -> apply(fs, callback, args) end)
+
+  defp safe_fs_operation(operation) do
+    operation.()
+  rescue
+    _exception -> {:error, {:callback_failed, :raise}}
+  catch
+    :throw, _reason -> {:error, {:callback_failed, :throw}}
+    :exit, _reason -> {:error, {:callback_failed, :exit}}
+  end
+
+  defp cleanup_error(reason), do: {:error, {:orphan_temp_cleanup, reason}}
 
   defp commit_temp(temp_path, path, opts) do
     case inject_fault(:before_rename, opts) do
@@ -213,10 +366,10 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
   defp sync_directory(directory, opts) do
     fs = file_system(opts)
 
-    case fs.open(directory, [:read, :raw, :directory]) do
+    case fs_callback(fs, :open, [directory, [:read, :raw, :directory]]) do
       {:ok, device} ->
-        sync_result = fs_result(fs.sync(device), :directory_sync)
-        close_result = fs_result(fs.close(device), :directory_close)
+        sync_result = fs_result(fs_callback(fs, :sync, [device]), :directory_sync)
+        close_result = fs_result(fs_callback(fs, :close, [device]), :directory_close)
 
         case {sync_result, close_result} do
           {:ok, :ok} -> :ok

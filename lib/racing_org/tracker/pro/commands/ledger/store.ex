@@ -33,6 +33,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   @recovery_proofs [:effect_not_started, :effect_verified_absent]
   @rejection_plan_keys [:action, :command_hash, :command_id, :command_type, :proof, :reason]
   @max_command_result_size Contract.max_command_result_size()
+  @path_lock_attempts 8
 
   @enforce_keys [
     :path,
@@ -63,13 +64,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   @spec open(Path.t(), keyword()) :: {:ok, t()} | {:error, term()}
   def open(path, opts) when is_binary(path) and is_list(opts) do
     with {:ok, store} <- new_store(path, opts) do
-      with_path_lock(store, fn ->
-        case read_snapshot(store) do
-          {:ok, snapshot} -> open_existing(store, snapshot)
-          {:error, :enoent} -> initialize(store)
-          {:error, reason} -> {:error, reason}
-        end
-      end)
+      open_with_path_lock(store, @path_lock_attempts)
     end
   end
 
@@ -330,6 +325,16 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   end
 
   defp run_recovery_verifier(store, verifier, transition) do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+
+    try do
+      do_run_recovery_verifier(store, verifier, transition)
+    after
+      Process.flag(:trap_exit, previous_trap_exit)
+    end
+  end
+
+  defp do_run_recovery_verifier(store, verifier, transition) do
     caller = self()
     result_ref = make_ref()
     transition_ref = make_ref()
@@ -337,23 +342,27 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
     transition_results = :ets.new(__MODULE__, [:set, :public])
 
     {pid, monitor_ref} =
-      spawn_monitor(fn ->
-        result =
-          invoke_recovery_verifier(
-            verifier,
-            transition,
-            transition_state,
-            transition_results,
-            caller,
-            transition_ref
-          )
+      :erlang.spawn_opt(
+        fn ->
+          result =
+            invoke_recovery_verifier(
+              verifier,
+              transition,
+              transition_state,
+              transition_results,
+              caller,
+              transition_ref
+            )
 
-        send(caller, {result_ref, result})
-      end)
+          send(caller, {result_ref, result})
+        end,
+        [:link, :monitor]
+      )
 
     result =
       receive do
         {^result_ref, result} ->
+          Process.unlink(pid)
           Process.demonitor(monitor_ref, [:flush])
           result
 
@@ -375,8 +384,18 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
           )
       end
 
+    Process.unlink(pid)
+    flush_link_exit(pid)
     :ets.delete(transition_results)
     result
+  end
+
+  defp flush_link_exit(pid) do
+    receive do
+      {:EXIT, ^pid, _reason} -> :ok
+    after
+      0 -> :ok
+    end
   end
 
   defp cancel_recovery_verifier(
@@ -500,7 +519,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
     true = :ets.insert(transition_results, {:executor, executor})
 
     if :atomics.get(transition_state, 1) == 1 do
-      result = invoke_recovery_transition(transition)
+      result = invoke_recovery_transition(transition, transition_observer)
       true = :ets.insert(transition_results, {:result, result})
       completion = :atomics.compare_exchange(transition_state, 1, 1, 2)
       :ets.delete_object(transition_results, {:executor, executor})
@@ -527,8 +546,21 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
     _kind, _reason -> {:error, :effect_non_application_unverified}
   end
 
-  defp invoke_recovery_transition(transition) do
-    transition.()
+  defp invoke_recovery_transition(transition, lock_holder) do
+    {:links, links} = Process.info(self(), :links)
+    already_linked? = lock_holder in links
+
+    if Process.info(self(), :trap_exit) == {:trap_exit, false} do
+      unless already_linked?, do: Process.link(lock_holder)
+
+      try do
+        transition.()
+      after
+        unless already_linked?, do: Process.unlink(lock_holder)
+      end
+    else
+      {:error, {:command_ledger_durability_uncertain, :command_recovery_transition_failed}}
+    end
   rescue
     _exception ->
       {:error, {:command_ledger_durability_uncertain, :command_recovery_transition_failed}}
@@ -689,7 +721,8 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   end
 
   defp new_store(path, opts) do
-    with {:ok, identity} <- identity(opts),
+    with :ok <- available_destination_path(path),
+         {:ok, identity} <- identity(opts),
          {:ok, max_outcomes} <- positive_option(opts, :max_outcomes),
          {:ok, max_result_bytes} <- positive_option(opts, :max_result_bytes),
          {:ok, admission_authority} <- admission_authority(opts),
@@ -697,6 +730,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
          {:ok, recovery_timeout_ms} <- recovery_timeout(opts),
          {:ok, file_system} <- file_system(opts),
          {:ok, canonical_path} <- canonical_ledger_path(path),
+         :ok <- available_destination_path(canonical_path),
          {:ok, snapshot} <- Snapshot.new(identity) do
       atomic_opts =
         opts
@@ -717,6 +751,12 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
          atomic_opts: atomic_opts
        }}
     end
+  end
+
+  defp available_destination_path(path) do
+    if AtomicFile.reserved_temporary_path?(path),
+      do: {:error, {:invalid_command_ledger_path, :reserved_atomic_temp_name}},
+      else: :ok
   end
 
   defp canonical_ledger_path(path) do
@@ -832,20 +872,66 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
     end
   end
 
+  defp open_with_path_lock(_store, 0), do: {:error, :command_ledger_path_unstable}
+
+  defp open_with_path_lock(store, attempts_remaining) do
+    case with_path_lock(store, fn -> prepare_and_open_locked(store) end, classify_holder_death?: false) do
+      {:retry_command_ledger_path, canonical_path} ->
+        store
+        |> rebase_store_path(canonical_path)
+        |> open_with_path_lock(attempts_remaining - 1)
+
+      result ->
+        result
+    end
+  end
+
+  defp prepare_and_open_locked(store) do
+    with :ok <- prepare_parent_directory(store),
+         {:ok, canonical_path} <- canonical_ledger_path(store.path),
+         :ok <- available_destination_path(canonical_path) do
+      if canonical_path == store.path do
+        case read_snapshot(store) do
+          {:ok, snapshot} -> open_existing(store, snapshot)
+          {:error, :enoent} -> initialize(store)
+          {:error, reason} -> {:error, reason}
+        end
+      else
+        {:retry_command_ledger_path, canonical_path}
+      end
+    end
+  end
+
+  defp prepare_parent_directory(store) do
+    case AtomicFile.ensure_directory(Path.dirname(store.path), store.atomic_opts) do
+      :ok -> :ok
+      {:error, reason} -> {:error, {:prepare_command_ledger_directory, reason}}
+    end
+  end
+
+  defp rebase_store_path(store, canonical_path) do
+    atomic_opts = Keyword.put(store.atomic_opts, :directory_root, Path.dirname(canonical_path))
+    %{store | path: canonical_path, atomic_opts: atomic_opts}
+  end
+
   defp initialize(store) do
-    case persist_snapshot(store, store.snapshot) do
-      {:ok, initialized} -> {:ok, initialized}
-      {:error, reason} -> {:error, reason}
+    with :ok <- cleanup_orphan_temps(store),
+         {:ok, initialized} <- persist_snapshot(store, store.snapshot) do
+      {:ok, initialized}
     end
   end
 
   defp open_existing(store, snapshot) do
     with :ok <- exact_identity(store.snapshot, snapshot),
          :ok <- pending_recovery_available(store, snapshot),
+         :ok <- cleanup_orphan_temps(store),
          {:ok, reestablished} <- persist_snapshot(store, snapshot) do
       {:ok, reestablished}
     end
   end
+
+  defp cleanup_orphan_temps(store),
+    do: AtomicFile.cleanup_orphan_temps(store.path, store.atomic_opts)
 
   defp pending_recovery_available(_store, %Snapshot{pending_intent: nil}), do: :ok
 
@@ -862,7 +948,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
     end
   end
 
-  defp with_path_lock(store, transition) when is_function(transition, 0) do
+  defp with_path_lock(store, transition, opts \\ []) when is_function(transition, 0) do
     caller = self()
     result_ref = make_ref()
 
@@ -879,7 +965,21 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
         result
 
       {:DOWN, ^monitor_ref, :process, ^holder, _reason} ->
-        {:error, :command_ledger_lock_holder_failed}
+        holder_failure_result(store, opts)
+    end
+  end
+
+  defp holder_failure_result(store, opts) do
+    if Keyword.get(opts, :classify_holder_death?, true) do
+      case read_snapshot(store) do
+        {:ok, snapshot} when snapshot == store.snapshot ->
+          {:error, :command_ledger_lock_holder_failed}
+
+        _changed_or_unreadable ->
+          {:error, {:command_ledger_durability_uncertain, :command_ledger_lock_holder_failed}}
+      end
+    else
+      {:error, :command_ledger_lock_holder_failed}
     end
   end
 

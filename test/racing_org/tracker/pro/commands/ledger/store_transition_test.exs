@@ -132,6 +132,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
     alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
 
     def read(path), do: FileSystem.read(path)
+    def list_dir(path), do: FileSystem.list_dir(path)
     def mkdir_p(path), do: FileSystem.mkdir_p(path)
     def chmod(path, mode), do: FileSystem.chmod(path, mode)
     def open(path, modes), do: FileSystem.open(path, modes)
@@ -157,6 +158,67 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
         FileSystem.sync(device)
       end
     end
+  end
+
+  defmodule BlockingMkdirFileSystem do
+    alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
+
+    def attach(owner, blocked_path), do: :persistent_term.put({__MODULE__, :block}, {owner, blocked_path})
+    def detach, do: :persistent_term.erase({__MODULE__, :block})
+
+    def read(path), do: FileSystem.read(path)
+    def list_dir(path), do: FileSystem.list_dir(path)
+    def lstat(path), do: File.lstat(path)
+
+    def mkdir_p(path) do
+      case :persistent_term.get({__MODULE__, :block}, nil) do
+        {owner, blocked_path} ->
+          if Path.basename(path) == Path.basename(blocked_path) do
+            send(owner, {:ledger_parent_mkdir_blocked, self()})
+
+            receive do
+              :release_ledger_parent_mkdir -> :ok
+            end
+          end
+
+        _other ->
+          :ok
+      end
+
+      FileSystem.mkdir_p(path)
+    end
+
+    def chmod(path, mode), do: FileSystem.chmod(path, mode)
+    def open(path, modes), do: FileSystem.open(path, modes)
+    def write(device, contents), do: FileSystem.write(device, contents)
+    def sync(device), do: FileSystem.sync(device)
+    def close(device), do: FileSystem.close(device)
+    def rename(source, destination), do: FileSystem.rename(source, destination)
+    def remove(path), do: FileSystem.remove(path)
+  end
+
+  defmodule ToggleReadFailureFileSystem do
+    alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
+
+    def fail_reads, do: :persistent_term.put({__MODULE__, :fail_reads?}, true)
+    def reset, do: :persistent_term.erase({__MODULE__, :fail_reads?})
+
+    def read(path) do
+      if :persistent_term.get({__MODULE__, :fail_reads?}, false),
+        do: {:error, :simulated_read_failure},
+        else: FileSystem.read(path)
+    end
+
+    def list_dir(path), do: FileSystem.list_dir(path)
+    def lstat(path), do: FileSystem.lstat(path)
+    def mkdir_p(path), do: FileSystem.mkdir_p(path)
+    def chmod(path, mode), do: FileSystem.chmod(path, mode)
+    def open(path, modes), do: FileSystem.open(path, modes)
+    def write(device, contents), do: FileSystem.write(device, contents)
+    def sync(device), do: FileSystem.sync(device)
+    def close(device), do: FileSystem.close(device)
+    def rename(source, destination), do: FileSystem.rename(source, destination)
+    def remove(path), do: FileSystem.remove(path)
   end
 
   defmodule ReclassifyingAdmissionAuthority do
@@ -207,7 +269,13 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
 
   setup do
     root = Path.join(System.tmp_dir!(), "command_ledger_transition_#{System.unique_integer([:positive])}")
-    on_exit(fn -> File.rm_rf(root) end)
+
+    on_exit(fn ->
+      File.rm_rf(root)
+      BlockingMkdirFileSystem.detach()
+      ToggleReadFailureFileSystem.reset()
+    end)
+
     %{root: root, path: Path.join(root, "ledger.snapshot")}
   end
 
@@ -856,6 +924,349 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
     assert Store.snapshot(reopened).outcomes == %{}
   end
 
+  test "a detached recovery writer cannot outlive the path lock and overwrite applied state", %{root: root} do
+    path = Path.join(root, "detached-recovery-overwrite.snapshot")
+    parent = self()
+    {:ok, armed} = Agent.start_link(fn -> false end)
+    {:ok, verifier_waiter} = Agent.start_link(fn -> nil end)
+
+    injector = fn
+      :before_rename ->
+        if Agent.get(armed, & &1) do
+          send(Agent.get(verifier_waiter, & &1), :async_recovery_transition_started)
+          send(parent, {:detached_recovery_before_rename, self()})
+
+          receive do
+            :release_detached_recovery_writer -> :ok
+          end
+        end
+
+        :ok
+
+      _stage ->
+        :ok
+    end
+
+    assert {:ok, store} =
+             open_store(path,
+               fault_injector: injector,
+               recovery_timeout_ms: 100,
+               recovery_verifiers: %{
+                 set_tracking: {AsyncTransitionRecoveryVerifier, {self(), {:await_started, verifier_waiter}}}
+               }
+             )
+
+    delivery = delivery(command_id: command_id(1))
+    assert {:ok, intent, pending} = Store.begin_intent(store, execution_plan(delivery, :set_tracking, 8))
+    Agent.update(armed, fn _disarmed -> true end)
+    plan = rejection_plan(intent, :effect_verified_absent, :operational_gate_closed)
+    rejection_task = Task.async(fn -> Store.reject_intent(pending, plan) end)
+
+    assert_receive {:detached_recovery_before_rename, detached_writer}, 2_000
+    holder = linked_process!(detached_writer)
+    holder_monitor = Process.monitor(holder)
+    writer_monitor = Process.monitor(detached_writer)
+
+    Process.exit(holder, :kill)
+
+    assert_receive {:DOWN, ^holder_monitor, :process, ^holder, :killed}, 2_000
+    assert_receive {:DOWN, ^writer_monitor, :process, ^detached_writer, :killed}, 2_000
+    assert {:error, :command_ledger_lock_holder_failed} = Task.await(rejection_task)
+
+    Agent.update(armed, fn _armed -> false end)
+    assert {:ok, _ack, _applied} = Store.complete_intent(pending, "applied")
+
+    assert {:ok, reopened} = open_store(path)
+    assert Store.pending_intent(reopened) == nil
+    assert Map.fetch!(Store.snapshot(reopened).outcomes, delivery.command_id).status == :applied
+  end
+
+  test "reopen reclaims a detached recovery temp only after holder death fences its writer", %{root: root} do
+    path = Path.join(root, "detached-recovery-cleanup.snapshot")
+    parent = self()
+    suffix = "DeTaChEdWrItEr01"
+    {:ok, armed} = Agent.start_link(fn -> false end)
+    {:ok, verifier_waiter} = Agent.start_link(fn -> nil end)
+
+    injector = fn
+      :temp_synced ->
+        if Agent.get(armed, & &1) do
+          send(Agent.get(verifier_waiter, & &1), :async_recovery_transition_started)
+          send(parent, {:detached_recovery_temp_synced, self()})
+
+          receive do
+            :release_detached_recovery_temp -> :ok
+          end
+        end
+
+        :ok
+
+      _stage ->
+        :ok
+    end
+
+    assert {:ok, store} =
+             open_store(path,
+               fault_injector: injector,
+               temp_suffix: fn -> suffix end,
+               recovery_timeout_ms: 100,
+               recovery_verifiers: %{
+                 set_tracking: {AsyncTransitionRecoveryVerifier, {self(), {:await_started, verifier_waiter}}}
+               }
+             )
+
+    delivery = delivery(command_id: command_id(1))
+    assert {:ok, intent, pending} = Store.begin_intent(store, execution_plan(delivery, :set_tracking, 8))
+    Agent.update(armed, fn _disarmed -> true end)
+    plan = rejection_plan(intent, :effect_verified_absent, :operational_gate_closed)
+    rejection_task = Task.async(fn -> Store.reject_intent(pending, plan) end)
+
+    assert_receive {:detached_recovery_temp_synced, detached_writer}, 2_000
+    holder = linked_process!(detached_writer)
+    holder_monitor = Process.monitor(holder)
+    writer_monitor = Process.monitor(detached_writer)
+    orphan = path <> ".tmp." <> suffix
+
+    Process.exit(holder, :kill)
+
+    assert_receive {:DOWN, ^holder_monitor, :process, ^holder, :killed}, 2_000
+    assert_receive {:DOWN, ^writer_monitor, :process, ^detached_writer, :killed}, 2_000
+    assert {:error, :command_ledger_lock_holder_failed} = Task.await(rejection_task)
+    assert File.exists?(orphan)
+
+    assert {:ok, _reopened} = open_store(path)
+    refute File.exists?(orphan)
+  end
+
+  test "holder death after parent sync reports typed durability uncertainty", %{root: root} do
+    path = Path.join(root, "holder-death-after-parent-sync.snapshot")
+    parent = self()
+    {:ok, armed} = Agent.start_link(fn -> false end)
+
+    injector = fn
+      :parent_synced ->
+        if Agent.get(armed, & &1) do
+          send(parent, :holder_parent_synced)
+          Process.exit(self(), :kill)
+        end
+
+        :ok
+
+      _stage ->
+        :ok
+    end
+
+    assert {:ok, store} = open_store(path, fault_injector: injector)
+    Agent.update(armed, fn _disarmed -> true end)
+    plan = execution_plan(delivery(command_id: command_id(1)), :set_tracking, 8)
+
+    assert {:error, {:command_ledger_durability_uncertain, :command_ledger_lock_holder_failed}} =
+             Store.begin_intent(store, plan)
+
+    assert_receive :holder_parent_synced, 2_000
+    assert {:ok, reopened} = open_store(path)
+    assert Store.pending_intent(reopened) != nil
+  end
+
+  test "unreadable authority after holder death reports typed durability uncertainty", %{root: root} do
+    path = Path.join(root, "holder-death-unreadable.snapshot")
+    parent = self()
+    suffix = "UnReAdAbLeStAtE1"
+    {:ok, armed} = Agent.start_link(fn -> false end)
+
+    injector = fn
+      :temp_synced ->
+        if Agent.get(armed, & &1) do
+          send(parent, {:unreadable_holder_temp_synced, self()})
+
+          receive do
+            :never_release_unreadable_holder -> :ok
+          end
+        end
+
+        :ok
+
+      _stage ->
+        :ok
+    end
+
+    assert {:ok, store} =
+             open_store(path,
+               file_system: ToggleReadFailureFileSystem,
+               fault_injector: injector,
+               temp_suffix: fn -> suffix end
+             )
+
+    Agent.update(armed, fn _disarmed -> true end)
+    plan = execution_plan(delivery(command_id: command_id(1)), :set_tracking, 8)
+    writer_task = Task.async(fn -> Store.begin_intent(store, plan) end)
+    assert_receive {:unreadable_holder_temp_synced, holder}, 2_000
+
+    ToggleReadFailureFileSystem.fail_reads()
+    Process.exit(holder, :kill)
+
+    assert {:error, {:command_ledger_durability_uncertain, :command_ledger_lock_holder_failed}} =
+             Task.await(writer_task)
+
+    ToggleReadFailureFileSystem.reset()
+    assert {:ok, reopened} = open_store(path)
+    assert Store.pending_intent(reopened) == nil
+  end
+
+  test "externally killed writers parked after temp sync accumulate until reopen", %{root: root} do
+    path = Path.join(root, "externally-killed-writer.snapshot")
+    parent = self()
+    suffix = "AbCdEfGhIjKlMnOp"
+    {:ok, armed} = Agent.start_link(fn -> false end)
+
+    injector = fn
+      :temp_synced ->
+        if Agent.get(armed, & &1) do
+          send(parent, {:ledger_writer_parked_after_temp_sync, self()})
+
+          receive do
+            :never_release_parked_ledger_writer -> :ok
+          end
+        end
+
+        :ok
+
+      _stage ->
+        :ok
+    end
+
+    assert {:ok, store} =
+             open_store(path,
+               fault_injector: injector,
+               temp_suffix: fn -> suffix end
+             )
+
+    plan = execution_plan(delivery(command_id: command_id(1)), :set_tracking, 8)
+    Agent.update(armed, fn _disarmed -> true end)
+
+    for expected_temp <- [path <> ".tmp." <> suffix, path <> ".tmp." <> suffix <> ".2"] do
+      writer_task = Task.async(fn -> Store.begin_intent(store, plan) end)
+      assert_receive {:ledger_writer_parked_after_temp_sync, writer}, 2_000
+      Process.exit(writer, :kill)
+      assert {:error, :command_ledger_lock_holder_failed} = Task.await(writer_task)
+      assert File.exists?(expected_temp)
+    end
+
+    assert Enum.sort(Path.wildcard(path <> ".tmp.*")) ==
+             Enum.sort([path <> ".tmp." <> suffix, path <> ".tmp." <> suffix <> ".2"])
+
+    assert {:ok, reopened} = open_store(path)
+    assert Store.pending_intent(reopened) == nil
+    assert Store.snapshot(reopened).outcomes == %{}
+    assert Path.wildcard(path <> ".tmp.*") == []
+  end
+
+  test "reopen cannot reclaim a live writer temp while the path lock is held", %{root: root} do
+    path = Path.join(root, "live-writer-temp.snapshot")
+    parent = self()
+    suffix = "QrStUvWxYz012345"
+    {:ok, armed} = Agent.start_link(fn -> false end)
+
+    injector = fn
+      :temp_synced ->
+        if Agent.get(armed, & &1) do
+          send(parent, {:live_ledger_writer_parked_after_temp_sync, self()})
+
+          receive do
+            :release_live_ledger_writer -> :ok
+          end
+        end
+
+        :ok
+
+      _stage ->
+        :ok
+    end
+
+    assert {:ok, store} =
+             open_store(path,
+               fault_injector: injector,
+               temp_suffix: fn -> suffix end
+             )
+
+    delivery = delivery(command_id: command_id(1))
+    plan = execution_plan(delivery, :set_tracking, 8)
+    Agent.update(armed, fn _disarmed -> true end)
+    writer_task = Task.async(fn -> Store.begin_intent(store, plan) end)
+
+    assert_receive {:live_ledger_writer_parked_after_temp_sync, writer}, 2_000
+    live_temp = path <> ".tmp." <> suffix
+    assert File.exists?(live_temp)
+
+    reopen_task = Task.async(fn -> open_store(path) end)
+    assert Task.yield(reopen_task, 75) == nil
+    assert File.exists?(live_temp)
+
+    send(writer, :release_live_ledger_writer)
+    assert {:ok, intent, _persisted} = Task.await(writer_task)
+    assert {:ok, reopened} = Task.await(reopen_task)
+    assert Store.pending_intent(reopened) == intent
+    assert Path.wildcard(path <> ".tmp.*") == []
+  end
+
+  test "missing-parent symlink changes reacquire the canonical path lock before I/O", %{root: root} do
+    target_dir = Path.join(root, "target")
+    alias_dir = Path.join(root, "alias")
+    direct_path = Path.join(target_dir, "ledger.snapshot")
+    alias_path = Path.join(alias_dir, "ledger.snapshot")
+    parent = self()
+    suffix = "SyMlInKrAcE_1234"
+    {:ok, armed} = Agent.start_link(fn -> false end)
+
+    injector = fn
+      :temp_synced ->
+        if Agent.get(armed, & &1) do
+          send(parent, {:direct_writer_parked_for_symlink_race, self()})
+
+          receive do
+            :release_direct_writer_after_symlink_race -> :ok
+          end
+        end
+
+        :ok
+
+      _stage ->
+        :ok
+    end
+
+    assert {:ok, direct_store} =
+             open_store(direct_path,
+               fault_injector: injector,
+               temp_suffix: fn -> suffix end
+             )
+
+    plan = execution_plan(delivery(command_id: command_id(1)), :set_tracking, 8)
+    Agent.update(armed, fn _disarmed -> true end)
+    writer_task = Task.async(fn -> Store.begin_intent(direct_store, plan) end)
+    assert_receive {:direct_writer_parked_for_symlink_race, direct_writer}, 2_000
+
+    BlockingMkdirFileSystem.attach(self(), alias_dir)
+    alias_task = Task.async(fn -> open_store(alias_path, file_system: BlockingMkdirFileSystem) end)
+    assert_receive {:ledger_parent_mkdir_blocked, mkdir_holder}, 2_000
+    File.ln_s!(target_dir, alias_dir)
+    send(mkdir_holder, :release_ledger_parent_mkdir)
+
+    premature_alias_result = Task.yield(alias_task, 75)
+    assert File.exists?(direct_path <> ".tmp." <> suffix)
+    send(direct_writer, :release_direct_writer_after_symlink_race)
+    assert {:ok, intent, _persisted} = Task.await(writer_task)
+
+    alias_result =
+      case premature_alias_result do
+        nil -> Task.await(alias_task)
+        {:ok, result} -> result
+      end
+
+    assert premature_alias_result == nil
+    assert {:ok, alias_store} = alias_result
+    assert Store.pending_intent(alias_store) == intent
+  end
+
   test "verifier death after a completed transition reports committed uncertainty", %{root: root} do
     path = Path.join(root, "recovery-verifier-post-commit-death.snapshot")
 
@@ -937,7 +1348,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
         atomic_opts: Keyword.put(pending.atomic_opts, :file_system, PostRenameCrashFileSystem)
     }
 
-    assert {:error, {:command_ledger_durability_uncertain, :command_recovery_transition_failed}} =
+    assert {:error, {:command_ledger_durability_uncertain, {:directory_sync, {:callback_failed, :raise}}}} =
              Store.reject_intent(faulted, plan)
 
     assert {:ok, reopened} = open_store(path)
@@ -1755,6 +2166,15 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
   end
 
   defp command_id(n), do: <<n::128>>
+
+  defp linked_process!(pid) do
+    {:links, links} = Process.info(pid, :links)
+
+    case links do
+      [linked] -> linked
+      _other -> flunk("expected recovery writer to link only to the command-ledger lock holder")
+    end
+  end
 
   defp armed_fail_at(stage) do
     {:ok, armed} = Agent.start_link(fn -> false end)

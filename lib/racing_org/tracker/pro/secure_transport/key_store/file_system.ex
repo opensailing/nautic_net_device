@@ -10,6 +10,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem do
   @type modes :: [atom()]
 
   @callback read(Path.t()) :: {:ok, binary()} | {:error, File.posix()}
+  @callback list_dir(Path.t()) :: {:ok, [binary()]} | {:error, File.posix()}
+  @callback lstat(Path.t()) :: {:ok, File.Stat.t()} | {:error, File.posix()}
   @callback mkdir_p(Path.t()) :: :ok | {:error, File.posix()}
   @callback chmod(Path.t(), non_neg_integer()) :: :ok | {:error, File.posix()}
   @callback open(Path.t(), modes()) :: {:ok, device()} | {:error, File.posix()}
@@ -19,8 +21,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem do
   @callback rename(Path.t(), Path.t()) :: :ok | {:error, File.posix()}
   @callback remove(Path.t()) :: :ok | {:error, File.posix()}
 
+  @optional_callbacks list_dir: 1, lstat: 1
+
   @doc false
   def read(path), do: File.read(path)
+
+  @doc false
+  def list_dir(path), do: File.ls(path)
+
+  @doc false
+  def lstat(path), do: File.lstat(path)
 
   @doc false
   def mkdir_p(path), do: File.mkdir_p(path)
