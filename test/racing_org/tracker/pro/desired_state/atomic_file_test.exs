@@ -105,6 +105,21 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
     def remove(path), do: RealFileSystem.remove(path)
   end
 
+  defmodule MissingLstatFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+    def remove(path), do: RealFileSystem.remove(path)
+  end
+
   defmodule CallbackFailureFileSystem do
     @behaviour RealFileSystem
 
@@ -310,14 +325,30 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
     assert first_remove < directory_sync
   end
 
-  test "cleanup remains compatible with legacy filesystem adapters", ctx do
+  test "cleanup fails closed when a custom filesystem omits list_dir", ctx do
     File.mkdir_p!(ctx.base)
     destination = Path.join(ctx.base, "record")
     orphan = destination <> ".tmp.ABCDEFGHIJKLMNOP"
     File.write!(orphan, "non-sensitive-state")
 
-    assert :ok = AtomicFile.cleanup_orphan_temps(destination, file_system: LegacyFileSystem)
-    refute File.exists?(orphan)
+    assert {:error, {:orphan_temp_cleanup, {:list_directory, {:callback_unavailable, :list_dir}}}} =
+             AtomicFile.cleanup_orphan_temps(destination, file_system: LegacyFileSystem)
+
+    assert File.exists?(orphan)
+  end
+
+  test "cleanup fails closed when a custom filesystem omits lstat", ctx do
+    File.mkdir_p!(ctx.base)
+    destination = Path.join(ctx.base, "record")
+    orphan = destination <> ".tmp.ABCDEFGHIJKLMNOP"
+    File.write!(orphan, "non-sensitive-state")
+
+    assert {:error, {:orphan_temp_cleanup, {:lstat_temp, {:callback_unavailable, :lstat}}}} =
+             AtomicFile.cleanup_orphan_temps(destination,
+               file_system: MissingLstatFileSystem
+             )
+
+    assert File.exists?(orphan)
   end
 
   test "cleanup fsyncs an existing empty parent directory", ctx do

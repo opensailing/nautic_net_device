@@ -9,6 +9,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreSnapshotTest do
 
     def read(path), do: RealFileSystem.read(path)
     def list_dir(path), do: File.ls(path)
+    def lstat(path), do: File.lstat(path)
     def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
     def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
     def open(path, modes), do: RealFileSystem.open(path, modes)

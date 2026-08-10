@@ -99,7 +99,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
     do: {:error, {:orphan_temp_cleanup, :invalid_destination}}
 
   defp list_orphan_temps(fs, directory, destination) do
-    result = cleanup_fs_call(fs, :list_dir, [directory], fn -> File.ls(directory) end)
+    result = cleanup_fs_call(fs, :list_dir, [directory])
 
     case result do
       {:ok, filenames} when is_list(filenames) ->
@@ -138,7 +138,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
 
       case lstat_temp(fs, path) do
         {:ok, %File.Stat{type: :regular}} ->
-          case cleanup_fs_call(fs, :remove, [path], fn -> File.rm(path) end) do
+          case cleanup_fs_call(fs, :remove, [path]) do
             :ok -> {:cont, :ok}
             {:error, reason} -> {:halt, cleanup_error({:remove_temp, reason})}
             other -> {:halt, cleanup_error({:remove_temp, other})}
@@ -154,7 +154,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
   end
 
   defp lstat_temp(fs, path) do
-    case cleanup_fs_call(fs, :lstat, [path], fn -> File.lstat(path) end) do
+    case cleanup_fs_call(fs, :lstat, [path]) do
       {:ok, %File.Stat{} = stat} -> {:ok, stat}
       {:error, reason} -> cleanup_error({:lstat_temp, reason})
       other -> cleanup_error({:lstat_temp, other})
@@ -164,15 +164,12 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
   defp sync_existing_cleanup_directory(_fs, _directory, :missing), do: :ok
 
   defp sync_existing_cleanup_directory(fs, directory, :present) do
-    open_result =
-      cleanup_fs_call(fs, :open, [directory, [:read, :raw, :directory]], fn ->
-        File.open(directory, [:read, :raw, :directory])
-      end)
+    open_result = cleanup_fs_call(fs, :open, [directory, [:read, :raw, :directory]])
 
     case open_result do
       {:ok, device} ->
-        sync_result = cleanup_fs_call(fs, :sync, [device], fn -> :file.sync(device) end)
-        close_result = cleanup_fs_call(fs, :close, [device], fn -> :file.close(device) end)
+        sync_result = cleanup_fs_call(fs, :sync, [device])
+        close_result = cleanup_fs_call(fs, :close, [device])
 
         case {sync_result, close_result} do
           {:ok, :ok} -> :ok
@@ -190,15 +187,12 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
     end
   end
 
-  defp cleanup_fs_call(fs, callback, args, fallback) do
-    operation =
-      if is_atom(fs) and Code.ensure_loaded?(fs) and function_exported?(fs, callback, length(args)) do
-        fn -> apply(fs, callback, args) end
-      else
-        fallback
-      end
-
-    safe_fs_operation(operation)
+  defp cleanup_fs_call(fs, callback, args) do
+    if is_atom(fs) and Code.ensure_loaded?(fs) and function_exported?(fs, callback, length(args)) do
+      safe_fs_operation(fn -> apply(fs, callback, args) end)
+    else
+      {:error, {:callback_unavailable, callback}}
+    end
   end
 
   defp fs_callback(fs, callback, args),
