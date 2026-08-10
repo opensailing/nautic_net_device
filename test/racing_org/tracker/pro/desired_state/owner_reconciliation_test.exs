@@ -394,12 +394,13 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.OwnerReconciliationTest do
 
     RemoveFaultFileSystem.arm()
 
-    assert {:error, {:remove, :remove_fault}} = CalibrationConfig.reset_config(calibration)
-    assert {:error, {:remove, :remove_fault}} = ClockSourceConfig.reset_config(clock_source)
-    assert {:error, {:remove, :remove_fault}} = Engine.reset_config(engine)
-    assert {:error, {:remove, :remove_fault}} = TrackingConfig.reset_config(tracking)
-    assert {:error, {:remove, :remove_fault}} = UpstreamConfig.reset_config(upstream)
-    assert {:error, {:remove, :remove_fault}} = WindShiftConfig.reset_config(wind_shift)
+    expected_error = {:error, {:pre_remove, {:remove, :remove_fault}}}
+    assert ^expected_error = CalibrationConfig.reset_config(calibration)
+    assert ^expected_error = ClockSourceConfig.reset_config(clock_source)
+    assert ^expected_error = Engine.reset_config(engine)
+    assert ^expected_error = TrackingConfig.reset_config(tracking)
+    assert ^expected_error = UpstreamConfig.reset_config(upstream)
+    assert ^expected_error = WindShiftConfig.reset_config(wind_shift)
 
     assert CalibrationConfig.applied_version(calibration) == 1
     assert CalibrationConfig.status(calibration).modes["awa_offset"] == "off"

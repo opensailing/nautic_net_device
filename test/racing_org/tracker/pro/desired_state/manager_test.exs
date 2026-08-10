@@ -1488,7 +1488,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     retry = :sys.get_state(pid)
 
     assert match?(
-             {:superseded_activation_retirement, {:rename, :path_fault}},
+             {:superseded_activation_retirement, {:pre_rename, {:rename, :path_fault}}},
              retry.recovery_error
            )
 
