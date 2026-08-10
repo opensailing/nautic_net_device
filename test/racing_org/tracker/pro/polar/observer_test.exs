@@ -517,6 +517,35 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverTest do
       assert seq2 > seq1
     end
 
+    test "automatic sync reservations honor the persistence write throttle" do
+      dir = Path.join(System.tmp_dir!(), "nn_observer_sync_throttle_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(dir) end)
+      {:ok, clock} = Agent.start_link(fn -> 0 end)
+
+      pid =
+        start_observer(
+          signals_fn: fn -> signals(Agent.get(clock, & &1)) end,
+          sender: collecting_sender(),
+          dir: dir,
+          window_size: 1,
+          gate: [min_dwell: 1],
+          persist_ms: 60_000,
+          sync_ms: 10_000,
+          now_fn: fn -> Agent.get(clock, & &1) end
+        )
+
+      assert :ok = Observer.tick(pid)
+      Agent.update(clock, fn _ -> 10_000 end)
+      assert :ok = Observer.tick(pid)
+      refute_received {:sailed_update, _}
+      refute File.exists?(Path.join(dir, "sailed.polar"))
+
+      Agent.update(clock, fn _ -> 60_000 end)
+      assert :ok = Observer.tick(pid)
+      assert_received {:sailed_update, %{seq: 1}}
+      assert File.exists?(Path.join(dir, "sailed.polar"))
+    end
+
     test "throttling holds — no per-sample sends" do
       # Clock pinned at 0, sync_ms 30_000 -> the per-tick maybe_sync never fires.
       pid =

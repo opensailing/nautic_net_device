@@ -49,6 +49,21 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.StoreTest do
     assert {:ok, runtime.cells} == Store.load(dir)
   end
 
+  test "format-2 migration uses source generation as a conservative sequence floor", %{dir: dir} do
+    runtime = runtime()
+
+    legacy_runtime =
+      {2, runtime.authority, runtime.policy_hash, runtime.source_generation, runtime.last_restore_fingerprint,
+       runtime.p, runtime.bins, runtime.cells}
+
+    File.mkdir_p!(dir)
+    File.write!(Path.join(dir, "sailed.polar"), :erlang.term_to_binary(legacy_runtime))
+
+    assert {:ok, migrated} = Store.load_runtime(dir)
+    assert migrated.seq == runtime.source_generation
+    assert migrated.upgrade?
+  end
+
   test "runtime persistence reports post-rename durability uncertainty", %{dir: dir} do
     fault_injector = fn
       :renamed -> {:error, :power_loss}
@@ -112,7 +127,7 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.StoreTest do
 
   test "save uses an atomic rename and leaves no temp file", %{dir: dir} do
     assert :ok = Store.save(dir, cells())
-    refute File.exists?(Path.join(dir, "sailed.polar.tmp"))
+    assert Path.wildcard(Path.join(dir, "sailed.polar.tmp.*")) == []
     assert File.exists?(Path.join(dir, "sailed.polar"))
   end
 

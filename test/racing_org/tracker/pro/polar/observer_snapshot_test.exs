@@ -95,6 +95,19 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverSnapshotTest do
 
       assert {:error, :invalid_checkpoint_config} =
                Observer.start_link(Keyword.put(base, :p, 1))
+
+      for invalid_opts <- [
+            [gate: [min_dwell: 0]],
+            [gate: [max_tws_sd_mps: -1.0]],
+            [gate: [angle_band_deg: {90.0, 45.0}]],
+            [gate: [heel_band_deg: :malformed]],
+            [gate: [angle_key: :unknown]],
+            [window_size: 9, gate: [min_dwell: 10]],
+            [min_stw_mps: -0.1]
+          ] do
+        assert {:error, :invalid_checkpoint_config} =
+                 Observer.start_link(Keyword.merge(base, invalid_opts))
+      end
     end
 
     test "captures canonical polar-v2 content and hash at GenServer call time" do
@@ -352,6 +365,38 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverSnapshotTest do
       refute :sys.get_state(target).force_persist
     end
 
+    test "post-rename uncertainty keeps memory aligned with the renamed runtime until retry", %{dir: dir} do
+      source = start_observer()
+      :ok = put_cells(source, cells(), 10)
+      assert {:ok, snapshot} = Observer.snapshot(source)
+
+      {:ok, inject_fault?} = Agent.start_link(fn -> true end)
+
+      fault_injector = fn
+        :renamed ->
+          Agent.get_and_update(inject_fault?, fn
+            true -> {{:error, :power_loss}, false}
+            false -> {:ok, false}
+          end)
+
+        _stage ->
+          :ok
+      end
+
+      target = start_observer(dir: dir, store_opts: [fault_injector: fault_injector])
+
+      assert {:error, {:persistence_failed, {:durability_uncertain, _reason}}} =
+               Observer.restore(target, snapshot)
+
+      assert {:ok, ^snapshot} = Observer.snapshot(target)
+      assert :sys.get_state(target).restore_durability_pending
+      assert {:ok, %{cells: persisted_cells}} = Store.load_runtime(dir)
+      assert persisted_cells == cells()
+
+      assert :ok = Observer.restore(target, snapshot)
+      refute :sys.get_state(target).restore_durability_pending
+    end
+
     test "a failed ordinary persist remains dirty and immediately retryable", %{dir: dir} do
       File.mkdir_p!(dir)
       blocker = Path.join(dir, "not-a-directory")
@@ -453,6 +498,32 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverSnapshotTest do
         assert {:ok, persisted} = Store.load(case_dir)
         assert persisted == %{}
       end
+    end
+
+    test "same-authority policy scrub preserves the durable upstream sequence", %{dir: dir} do
+      writer = start_observer(dir: dir)
+      :ok = put_cells(writer, cells(), 77)
+
+      :sys.replace_state(writer, fn state -> %{state | seq: 42} end)
+      assert :ok = Observer.persist_now(writer)
+      GenServer.stop(writer)
+
+      target = start_observer(dir: dir, p: 0.8)
+      state = :sys.get_state(target)
+      assert state.cells == %{}
+      assert state.source_generation == 0
+      assert state.seq == 42
+      assert state.force_persist
+    end
+
+    test "cross-authority scrub resets the source-local upstream sequence", %{dir: dir} do
+      writer = start_observer(dir: dir)
+      :sys.replace_state(writer, fn state -> %{state | seq: 42} end)
+      assert :ok = Observer.persist_now(writer)
+      GenServer.stop(writer)
+
+      target = start_observer(dir: dir, boat_identifier: "other-boat")
+      assert :sys.get_state(target).seq == 0
     end
 
     test "startup semantically validates legacy cells and durably scrubs rejected state", %{dir: dir} do

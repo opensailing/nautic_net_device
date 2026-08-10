@@ -15,8 +15,8 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Store do
   learner revision, durable upstream sequence, and last accepted restore
   fingerprint. The legacy format-1 cell-only reader remains for in-place upgrade;
   the Observer semantically validates and rewrites it under the complete binding
-  before use. Runtime format 2 is read once with sequence zero and marked for an
-  immediate format-3 rewrite.
+  before use. Runtime format 2 is read once using its learner revision as a
+  conservative sequence floor and marked for an immediate format-3 rewrite.
   """
 
   require Logger
@@ -152,7 +152,7 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Store do
           authority,
           policy_hash,
           source_generation,
-          0,
+          source_generation,
           fingerprint,
           p,
           bins,
