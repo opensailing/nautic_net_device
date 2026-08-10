@@ -45,7 +45,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1ContractTest do
       assert {:error, :unknown_section} = Contract.section_code(:race_policy)
     end
 
-    test "freezes desired-state-only control messages and reserves later task ranges" do
+    test "freezes control message assignments and reserved task ranges" do
       assert Contract.message_types() == %{
                control_accept: {0x01, :server_to_device},
                readiness: {0x02, :device_to_server},
@@ -53,7 +53,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1ContractTest do
                section_chunk: {0x04, :server_to_device},
                resume: {0x05, :device_to_server},
                secret_delivery: {0x06, :server_to_device},
-               ack: {0x07, :device_to_server}
+               ack: {0x07, :device_to_server},
+               delivery_receipt: {0x30, :server_to_device},
+               checkpoint_submission: {0x31, :device_to_server},
+               checkpoint_hydration: {0x32, :server_to_device}
              }
 
       assert Contract.reserved_message_ranges() == [

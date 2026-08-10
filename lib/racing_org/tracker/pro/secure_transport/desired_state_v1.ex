@@ -17,6 +17,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   @max_section_size 16_777_216
   @max_generation_size 33_554_432
   @max_secret_size 1_024
+  @max_checkpoint_size 65_327
   @max_capability_versions 8
   @max_capabilities 64
   @max_missing_ranges_per_section 512
@@ -39,6 +40,29 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   @section_by_code Map.new(@sections, fn {name, code, schema, tombstone} ->
                      {code, %{name: name, schema_version: schema, tombstone_allowed: tombstone}}
                    end)
+
+  @delivery_streams [
+    {:telemetry, 0x01},
+    {:race_recording_chunk, 0x02},
+    {:race_recording_manifest, 0x03},
+    {:desired_state_ack, 0x04},
+    {:checkpoint, 0x05},
+    {:health, 0x06}
+  ]
+  @delivery_stream_by_name Map.new(@delivery_streams)
+  @delivery_stream_by_code Map.new(@delivery_streams, fn {name, code} -> {code, name} end)
+
+  @checkpoint_kinds [
+    {:calibration, 0x01, 0x0001},
+    {:polar, 0x02, 0x0001},
+    {:wind_shift, 0x03, 0x0001}
+  ]
+  @checkpoint_kind_by_name Map.new(@checkpoint_kinds, fn {name, code, schema_version} ->
+                             {name, {code, schema_version}}
+                           end)
+  @checkpoint_kind_by_code Map.new(@checkpoint_kinds, fn {name, code, schema_version} ->
+                             {code, {name, schema_version}}
+                           end)
 
   @capabilities [
     {:atomic_generation, 0x0001, 0x0001},
@@ -68,7 +92,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
     section_chunk: {0x04, :server_to_device},
     resume: {0x05, :device_to_server},
     secret_delivery: {0x06, :server_to_device},
-    ack: {0x07, :device_to_server}
+    ack: {0x07, :device_to_server},
+    delivery_receipt: {0x30, :server_to_device},
+    checkpoint_submission: {0x31, :device_to_server},
+    checkpoint_hydration: {0x32, :server_to_device}
   }
   @message_by_code Map.new(@message_types, fn {name, {code, direction}} ->
                      {code, {name, direction}}
@@ -81,13 +108,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
     section_chunk: "RacingOrg-DesiredStateSectionChunk-v1",
     resume: "RacingOrg-DesiredStateResume-v1",
     secret_delivery: "RacingOrg-DesiredStateSecret-v1",
-    ack: "RacingOrg-DesiredStateAck-v1"
+    ack: "RacingOrg-DesiredStateAck-v1",
+    delivery_receipt: "RacingOrg-DurableDeliveryReceipt-v1",
+    checkpoint_submission: "RacingOrg-CheckpointSubmission-v1",
+    checkpoint_hydration: "RacingOrg-CheckpointHydration-v1"
   }
 
   @offer_domain "RacingOrg-ControlOffer-v1"
   @manifest_domain "RacingOrg-DesiredStateManifest-v1"
   @section_domain "RacingOrg-DesiredStateSection-v1"
   @secret_digest_domain "RacingOrg-DesiredStateSecretDigest-v1"
+  @delivery_receipt_hash_domain "RacingOrg-DurableDeliveryReceiptHash-v1"
+  @checkpoint_content_hash_domain "RacingOrg-CheckpointContentHash-v1"
+  @checkpoint_hash_domain "RacingOrg-CheckpointRecordHash-v1"
 
   @secret_kinds %{wifi_psk: 0x01}
   @secret_kind_by_code Map.new(@secret_kinds, fn {name, code} -> {code, name} end)
@@ -155,6 +188,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   def max_section_size, do: @max_section_size
   def max_generation_size, do: @max_generation_size
   def max_secret_size, do: @max_secret_size
+  def max_checkpoint_size, do: @max_checkpoint_size
   def max_capability_versions, do: @max_capability_versions
   def max_capabilities, do: @max_capabilities
   def max_missing_ranges_per_section, do: @max_missing_ranges_per_section
@@ -193,6 +227,42 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
       :error -> false
     end
   end
+
+  def delivery_streams, do: @delivery_streams
+
+  def delivery_stream(name) when is_atom(name) do
+    case Map.fetch(@delivery_stream_by_name, name) do
+      {:ok, code} -> {:ok, code}
+      :error -> {:error, :unknown_delivery_stream}
+    end
+  end
+
+  def delivery_stream(code) when is_integer(code) do
+    case Map.fetch(@delivery_stream_by_code, code) do
+      {:ok, name} -> {:ok, name}
+      :error -> {:error, :unknown_delivery_stream}
+    end
+  end
+
+  def delivery_stream(_), do: {:error, :unknown_delivery_stream}
+
+  def checkpoint_kinds, do: @checkpoint_kinds
+
+  def checkpoint_kind(name) when is_atom(name) do
+    case Map.fetch(@checkpoint_kind_by_name, name) do
+      {:ok, {code, schema_version}} -> {:ok, code, schema_version}
+      :error -> {:error, :unknown_checkpoint_kind}
+    end
+  end
+
+  def checkpoint_kind(code) when is_integer(code) do
+    case Map.fetch(@checkpoint_kind_by_code, code) do
+      {:ok, {name, schema_version}} -> {:ok, name, schema_version}
+      :error -> {:error, :unknown_checkpoint_kind}
+    end
+  end
+
+  def checkpoint_kind(_), do: {:error, :unknown_checkpoint_kind}
 
   def capabilities, do: @capabilities
 
@@ -238,6 +308,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   def manifest_domain, do: @manifest_domain
   def section_domain, do: @section_domain
   def secret_digest_domain, do: @secret_digest_domain
+  def delivery_receipt_hash_domain, do: @delivery_receipt_hash_domain
+  def checkpoint_content_hash_domain, do: @checkpoint_content_hash_domain
+  def checkpoint_hash_domain, do: @checkpoint_hash_domain
 
   def secret_kind(kind) when is_atom(kind) do
     case Map.fetch(@secret_kinds, kind) do

@@ -8,7 +8,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   """
 
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
-  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Manifest
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{Checkpoint, Manifest, Receipt}
 
   @device_id_size 16
   @incarnation_id_size 16
@@ -16,10 +16,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   @secret_ref_size 16
   @u32_max 0xFFFF_FFFF
   @u64_max 0xFFFF_FFFF_FFFF_FFFF
+  @database_int_max 9_223_372_036_854_775_807
   @max_firmware_size 80
   @max_git_sha_size 40
 
   @identity_keys [:device_id, :credential_epoch, :boot_id, :storage_epoch]
+  @durable_identity_keys [:device_id, :credential_epoch, :storage_epoch]
 
   @doc "Encode one registered authenticated payload."
   def encode(type, attrs) when is_atom(type) and is_map(attrs) do
@@ -68,6 +70,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   defp encode_body(:resume, attrs), do: encode_resume(attrs)
   defp encode_body(:secret_delivery, attrs), do: encode_secret_delivery(attrs)
   defp encode_body(:ack, attrs), do: encode_ack(attrs)
+  defp encode_body(:delivery_receipt, attrs), do: encode_delivery_receipt(attrs)
+  defp encode_body(:checkpoint_submission, attrs), do: encode_checkpoint_submission(attrs)
+  defp encode_body(:checkpoint_hydration, attrs), do: encode_checkpoint_hydration(attrs)
+  defp encode_body(_type, _attrs), do: {:error, :unsupported_message_type}
 
   defp decode_body(:control_accept, bytes), do: decode_control_accept(bytes)
   defp decode_body(:readiness, bytes), do: decode_readiness(bytes)
@@ -76,6 +82,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   defp decode_body(:resume, bytes), do: decode_resume(bytes)
   defp decode_body(:secret_delivery, bytes), do: decode_secret_delivery(bytes)
   defp decode_body(:ack, bytes), do: decode_ack(bytes)
+  defp decode_body(:delivery_receipt, bytes), do: decode_delivery_receipt(bytes)
+  defp decode_body(:checkpoint_submission, bytes), do: decode_checkpoint_submission(bytes)
+  defp decode_body(:checkpoint_hydration, bytes), do: decode_checkpoint_hydration(bytes)
+  defp decode_body(_type, _bytes), do: {:error, :unsupported_message_type}
 
   # control_accept
 
@@ -445,7 +455,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
     end
   end
 
-  defp decode_ack_status(:staged, identity, generation, manifest_hash, <<count::16, rest::binary>>) do
+  defp decode_ack_status(
+         :staged,
+         identity,
+         generation,
+         manifest_hash,
+         <<count::16, rest::binary>>
+       ) do
     with {:ok, sections, trailing} <- take_section_summaries(rest, count, []) do
       {:ok,
        Map.merge(identity, %{
@@ -500,6 +516,278 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
     with {:ok, identity} <- encode_identity(attrs),
          :ok <- validate_generation_hash(attrs) do
       {:ok, identity <> <<attrs.generation::64, attrs.manifest_hash::binary-size(@hash_size)>>}
+    end
+  end
+
+  # delivery_receipt
+
+  defp encode_delivery_receipt(attrs) do
+    expected =
+      @durable_identity_keys ++
+        [:stream, :sequence, :payload_hash, :cumulative_sequence, :receipt_hash]
+
+    with :ok <- exact_keys(attrs, expected, :invalid_delivery_receipt),
+         :ok <- fixed_binary(attrs.device_id, @device_id_size, :invalid_device_id),
+         :ok <- u32(attrs.credential_epoch, :invalid_credential_epoch),
+         :ok <-
+           nonzero_binary(
+             attrs.storage_epoch,
+             @incarnation_id_size,
+             :invalid_storage_epoch
+           ),
+         {:ok, stream_code} <- delivery_stream_code(attrs.stream),
+         :ok <- positive_database_int(attrs.sequence, :invalid_delivery_sequence),
+         :ok <- fixed_binary(attrs.payload_hash, @hash_size, :invalid_payload_hash),
+         :ok <- database_int(attrs.cumulative_sequence, :invalid_cumulative_sequence),
+         :ok <- fixed_binary(attrs.receipt_hash, @hash_size, :invalid_receipt_hash),
+         {:ok, expected_hash} <- Receipt.hash(Map.delete(attrs, :receipt_hash)),
+         :ok <- ensure(secure_equal(expected_hash, attrs.receipt_hash), :receipt_hash_mismatch) do
+      {:ok,
+       <<attrs.device_id::binary-size(@device_id_size), attrs.credential_epoch::32,
+         attrs.storage_epoch::binary-size(@incarnation_id_size), stream_code, attrs.sequence::64,
+         attrs.payload_hash::binary-size(@hash_size), attrs.cumulative_sequence::64,
+         attrs.receipt_hash::binary-size(@hash_size)>>}
+    end
+  end
+
+  defp decode_delivery_receipt(
+         <<device_id::binary-size(@device_id_size), credential_epoch::32,
+           storage_epoch::binary-size(@incarnation_id_size), stream_code, sequence::64,
+           payload_hash::binary-size(@hash_size), cumulative_sequence::64, receipt_hash::binary-size(@hash_size),
+           rest::binary>>
+       ) do
+    with {:ok, stream} <- Contract.delivery_stream(stream_code),
+         attrs = %{
+           device_id: device_id,
+           credential_epoch: credential_epoch,
+           storage_epoch: storage_epoch,
+           stream: stream,
+           sequence: sequence,
+           payload_hash: payload_hash,
+           cumulative_sequence: cumulative_sequence,
+           receipt_hash: receipt_hash
+         },
+         {:ok, _encoded} <- encode_body(:delivery_receipt, attrs) do
+      {:ok, attrs, rest}
+    end
+  end
+
+  defp decode_delivery_receipt(_), do: {:error, :truncated}
+
+  # checkpoint_submission
+
+  defp encode_checkpoint_submission(attrs) do
+    expected =
+      @durable_identity_keys ++
+        [
+          :sequence,
+          :kind,
+          :schema_version,
+          :source_generation,
+          :parent_hash,
+          :content_hash,
+          :checkpoint_hash,
+          :content
+        ]
+
+    with :ok <- exact_keys(attrs, expected, :invalid_checkpoint_submission),
+         :ok <- fixed_binary(attrs.device_id, @device_id_size, :invalid_device_id),
+         :ok <- u32(attrs.credential_epoch, :invalid_credential_epoch),
+         :ok <-
+           nonzero_binary(
+             attrs.storage_epoch,
+             @incarnation_id_size,
+             :invalid_storage_epoch
+           ),
+         :ok <- positive_database_int(attrs.sequence, :invalid_delivery_sequence),
+         {:ok, kind_code} <- checkpoint_identity(attrs.kind, attrs.schema_version),
+         :ok <- database_int(attrs.source_generation, :invalid_source_generation),
+         :ok <- fixed_binary(attrs.parent_hash, @hash_size, :invalid_parent_hash),
+         :ok <- fixed_binary(attrs.content_hash, @hash_size, :invalid_checkpoint_content_hash),
+         :ok <- fixed_binary(attrs.checkpoint_hash, @hash_size, :invalid_checkpoint_hash),
+         {:ok, expected_content_hash} <-
+           Checkpoint.content_hash(attrs.kind, attrs.schema_version, attrs.content),
+         :ok <-
+           ensure(
+             secure_equal(expected_content_hash, attrs.content_hash),
+             :checkpoint_content_hash_mismatch
+           ),
+         {:ok, expected_checkpoint_hash} <-
+           Checkpoint.hash(Map.drop(attrs, [:checkpoint_hash, :content])),
+         :ok <-
+           ensure(
+             secure_equal(expected_checkpoint_hash, attrs.checkpoint_hash),
+             :checkpoint_hash_mismatch
+           ) do
+      {:ok,
+       <<attrs.device_id::binary-size(@device_id_size), attrs.credential_epoch::32,
+         attrs.storage_epoch::binary-size(@incarnation_id_size), attrs.sequence::64, kind_code,
+         attrs.schema_version::16, attrs.source_generation::64, attrs.parent_hash::binary-size(@hash_size),
+         attrs.content_hash::binary-size(@hash_size), attrs.checkpoint_hash::binary-size(@hash_size),
+         byte_size(attrs.content)::32, attrs.content::binary>>}
+    end
+  end
+
+  defp decode_checkpoint_submission(
+         <<device_id::binary-size(@device_id_size), credential_epoch::32,
+           storage_epoch::binary-size(@incarnation_id_size), sequence::64, kind_code, schema_version::16,
+           source_generation::64, parent_hash::binary-size(@hash_size), content_hash::binary-size(@hash_size),
+           checkpoint_hash::binary-size(@hash_size), content_length::32, rest::binary>>
+       ) do
+    with {:ok, kind, _expected_schema} <- Contract.checkpoint_kind(kind_code),
+         true <- byte_size(rest) >= content_length || {:error, :truncated},
+         <<content::binary-size(content_length), trailing::binary>> <- rest,
+         attrs = %{
+           device_id: device_id,
+           credential_epoch: credential_epoch,
+           storage_epoch: storage_epoch,
+           sequence: sequence,
+           kind: kind,
+           schema_version: schema_version,
+           source_generation: source_generation,
+           parent_hash: parent_hash,
+           content_hash: content_hash,
+           checkpoint_hash: checkpoint_hash,
+           content: content
+         },
+         {:ok, _encoded} <- encode_body(:checkpoint_submission, attrs) do
+      {:ok, attrs, trailing}
+    else
+      false -> {:error, :truncated}
+      {:error, _reason} = error -> error
+      _ -> {:error, :truncated}
+    end
+  end
+
+  defp decode_checkpoint_submission(_), do: {:error, :truncated}
+
+  # checkpoint_hydration
+
+  defp encode_checkpoint_hydration(attrs) do
+    expected =
+      @durable_identity_keys ++
+        [
+          :origin_credential_epoch,
+          :origin_storage_epoch,
+          :sequence,
+          :kind,
+          :schema_version,
+          :source_generation,
+          :parent_hash,
+          :content_hash,
+          :checkpoint_hash,
+          :content
+        ]
+
+    with :ok <- exact_keys(attrs, expected, :invalid_checkpoint_hydration),
+         :ok <- fixed_binary(attrs.device_id, @device_id_size, :invalid_device_id),
+         :ok <- u32(attrs.credential_epoch, :invalid_credential_epoch),
+         :ok <-
+           nonzero_binary(
+             attrs.storage_epoch,
+             @incarnation_id_size,
+             :invalid_storage_epoch
+           ),
+         :ok <- u32(attrs.origin_credential_epoch, :invalid_origin_credential_epoch),
+         :ok <-
+           nonzero_binary(
+             attrs.origin_storage_epoch,
+             @incarnation_id_size,
+             :invalid_origin_storage_epoch
+           ),
+         :ok <- positive_database_int(attrs.sequence, :invalid_delivery_sequence),
+         {:ok, kind_code} <- checkpoint_identity(attrs.kind, attrs.schema_version),
+         :ok <- database_int(attrs.source_generation, :invalid_source_generation),
+         :ok <- fixed_binary(attrs.parent_hash, @hash_size, :invalid_parent_hash),
+         :ok <- fixed_binary(attrs.content_hash, @hash_size, :invalid_checkpoint_content_hash),
+         :ok <- fixed_binary(attrs.checkpoint_hash, @hash_size, :invalid_checkpoint_hash),
+         {:ok, expected_content_hash} <-
+           Checkpoint.content_hash(attrs.kind, attrs.schema_version, attrs.content),
+         :ok <-
+           ensure(
+             secure_equal(expected_content_hash, attrs.content_hash),
+             :checkpoint_content_hash_mismatch
+           ),
+         {:ok, expected_checkpoint_hash} <- hydration_checkpoint_hash(attrs),
+         :ok <-
+           ensure(
+             secure_equal(expected_checkpoint_hash, attrs.checkpoint_hash),
+             :checkpoint_hash_mismatch
+           ) do
+      {:ok,
+       <<attrs.device_id::binary-size(@device_id_size), attrs.credential_epoch::32,
+         attrs.storage_epoch::binary-size(@incarnation_id_size), attrs.origin_credential_epoch::32,
+         attrs.origin_storage_epoch::binary-size(@incarnation_id_size), attrs.sequence::64, kind_code,
+         attrs.schema_version::16, attrs.source_generation::64, attrs.parent_hash::binary-size(@hash_size),
+         attrs.content_hash::binary-size(@hash_size), attrs.checkpoint_hash::binary-size(@hash_size),
+         byte_size(attrs.content)::32, attrs.content::binary>>}
+    end
+  end
+
+  defp decode_checkpoint_hydration(
+         <<device_id::binary-size(@device_id_size), credential_epoch::32,
+           storage_epoch::binary-size(@incarnation_id_size), origin_credential_epoch::32,
+           origin_storage_epoch::binary-size(@incarnation_id_size), sequence::64, kind_code, schema_version::16,
+           source_generation::64, parent_hash::binary-size(@hash_size), content_hash::binary-size(@hash_size),
+           checkpoint_hash::binary-size(@hash_size), content_length::32, rest::binary>>
+       ) do
+    with {:ok, kind, _expected_schema} <- Contract.checkpoint_kind(kind_code),
+         true <- byte_size(rest) >= content_length || {:error, :truncated},
+         <<content::binary-size(content_length), trailing::binary>> <- rest,
+         attrs = %{
+           device_id: device_id,
+           credential_epoch: credential_epoch,
+           storage_epoch: storage_epoch,
+           origin_credential_epoch: origin_credential_epoch,
+           origin_storage_epoch: origin_storage_epoch,
+           sequence: sequence,
+           kind: kind,
+           schema_version: schema_version,
+           source_generation: source_generation,
+           parent_hash: parent_hash,
+           content_hash: content_hash,
+           checkpoint_hash: checkpoint_hash,
+           content: content
+         },
+         {:ok, _encoded} <- encode_body(:checkpoint_hydration, attrs) do
+      {:ok, attrs, trailing}
+    else
+      false -> {:error, :truncated}
+      {:error, _reason} = error -> error
+      _ -> {:error, :truncated}
+    end
+  end
+
+  defp decode_checkpoint_hydration(_), do: {:error, :truncated}
+
+  defp hydration_checkpoint_hash(attrs) do
+    Checkpoint.hash(%{
+      device_id: attrs.device_id,
+      credential_epoch: attrs.origin_credential_epoch,
+      storage_epoch: attrs.origin_storage_epoch,
+      sequence: attrs.sequence,
+      kind: attrs.kind,
+      schema_version: attrs.schema_version,
+      source_generation: attrs.source_generation,
+      parent_hash: attrs.parent_hash,
+      content_hash: attrs.content_hash
+    })
+  end
+
+  defp delivery_stream_code(stream) when is_atom(stream) do
+    case Contract.delivery_stream(stream) do
+      {:ok, code} when is_integer(code) -> {:ok, code}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp delivery_stream_code(_stream), do: {:error, :unknown_delivery_stream}
+
+  defp checkpoint_identity(kind, schema_version) do
+    case Contract.checkpoint_kind(kind) do
+      {:ok, code, ^schema_version} -> {:ok, code}
+      {:ok, _code, _expected_schema} -> {:error, :unsupported_checkpoint_schema}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -612,7 +900,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
 
   defp encode_capabilities(capabilities) when is_list(capabilities) do
     with :ok <- ensure_proper_list(capabilities, :invalid_capabilities),
-         :ok <- ensure(length(capabilities) <= Contract.max_capabilities(), :too_many_capabilities),
+         :ok <-
+           ensure(length(capabilities) <= Contract.max_capabilities(), :too_many_capabilities),
          {:ok, normalized} <- normalize_capabilities(capabilities),
          :ok <- validate_capability_order(normalized) do
       encoded = Enum.map(normalized, &<<&1.id::16, &1.version::16>>)
@@ -757,7 +1046,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
          :ok <- positive_u64(entry.total_content_length, :invalid_total_content_length),
          :ok <-
            ensure(entry.total_content_length <= Contract.max_section_size(), :section_too_large),
-         {:ok, ranges} <- validate_missing_ranges(entry.missing_ranges, entry.total_content_length) do
+         {:ok, ranges} <-
+           validate_missing_ranges(entry.missing_ranges, entry.total_content_length) do
       {:ok,
        Map.merge(entry, %{
          code: code,
@@ -1099,6 +1389,18 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
        do: :ok
 
   defp positive_u64(_value, error), do: {:error, error}
+
+  defp database_int(value, _error)
+       when is_integer(value) and value >= 0 and value <= @database_int_max,
+       do: :ok
+
+  defp database_int(_value, error), do: {:error, error}
+
+  defp positive_database_int(value, _error)
+       when is_integer(value) and value > 0 and value <= @database_int_max,
+       do: :ok
+
+  defp positive_database_int(_value, error), do: {:error, error}
 
   defp decode_boolean(0), do: {:ok, false}
   defp decode_boolean(1), do: {:ok, true}

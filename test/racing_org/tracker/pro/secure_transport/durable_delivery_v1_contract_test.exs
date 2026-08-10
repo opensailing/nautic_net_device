@@ -15,6 +15,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
   @replacement_storage_epoch Base.decode16!("102132435465768798a9bacbdcedfe0f", case: :lower)
   @payload_hash :binary.copy(<<0xA1>>, 32)
   @parent_hash :binary.copy(<<0xB2>>, 32)
+  @database_int_max 9_223_372_036_854_775_807
 
   describe "closed durable-delivery registries" do
     test "freezes message codes, directions, streams, and checkpoint schemas" do
@@ -45,7 +46,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
       assert Contract.checkpoint_hash_domain() ==
                "RacingOrg-CheckpointRecordHash-v1"
 
-      assert Contract.max_checkpoint_size() == 8_388_608
+      assert Contract.max_checkpoint_size() == 65_327
 
       assert Contract.delivery_streams() == [
                {:telemetry, 0x01},
@@ -116,6 +117,40 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
                    @payload_hash::binary, 4::64, expected_hash::binary-size(32)>>
     end
 
+    test "bounds durable receipt integers to signed database storage" do
+      receipt = receipt_attrs()
+
+      oversized_sequence =
+        receipt
+        |> Map.delete(:receipt_hash)
+        |> Map.put(:sequence, @database_int_max + 1)
+
+      assert {:error, :invalid_delivery_sequence} = Receipt.hash(oversized_sequence)
+
+      assert {:error, :invalid_delivery_sequence} =
+               Messages.encode(
+                 :delivery_receipt,
+                 Map.put(oversized_sequence, :receipt_hash, raw_receipt_hash(oversized_sequence))
+               )
+
+      oversized_cumulative =
+        receipt
+        |> Map.delete(:receipt_hash)
+        |> Map.put(:cumulative_sequence, @database_int_max + 1)
+
+      assert {:error, :invalid_cumulative_sequence} = Receipt.hash(oversized_cumulative)
+
+      assert {:error, :invalid_cumulative_sequence} =
+               Messages.encode(
+                 :delivery_receipt,
+                 Map.put(
+                   oversized_cumulative,
+                   :receipt_hash,
+                   raw_receipt_hash(oversized_cumulative)
+                 )
+               )
+    end
+
     test "rejects sequence zero, unknown streams, malformed hashes, and receipt tampering" do
       receipt = receipt_attrs()
 
@@ -124,6 +159,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
 
       assert {:error, :unknown_delivery_stream} =
                Messages.encode(:delivery_receipt, %{receipt | stream: :arbitrary})
+
+      assert {:error, :unknown_delivery_stream} =
+               Messages.encode(:delivery_receipt, %{receipt | stream: 0x01})
+
+      assert {:error, :unknown_delivery_stream} =
+               receipt
+               |> Map.delete(:receipt_hash)
+               |> Map.put(:stream, 0x01)
+               |> Receipt.hash()
 
       assert {:error, :invalid_payload_hash} =
                Messages.encode(:delivery_receipt, %{receipt | payload_hash: <<0>>})
@@ -218,10 +262,43 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
                    byte_size(hydration.content)::32, hydration.content::binary>>
     end
 
+    test "bounds durable checkpoint integers to signed database storage" do
+      submission = checkpoint_submission_attrs()
+      checkpoint_attrs = Map.drop(submission, [:checkpoint_hash, :content])
+
+      oversized_sequence = Map.put(checkpoint_attrs, :sequence, @database_int_max + 1)
+
+      assert {:error, :invalid_delivery_sequence} = Checkpoint.hash(oversized_sequence)
+
+      assert {:error, :invalid_delivery_sequence} =
+               Messages.encode(
+                 :checkpoint_submission,
+                 submission
+                 |> Map.put(:sequence, oversized_sequence.sequence)
+                 |> Map.put(:checkpoint_hash, raw_checkpoint_hash(oversized_sequence))
+               )
+
+      oversized_generation =
+        Map.put(checkpoint_attrs, :source_generation, @database_int_max + 1)
+
+      assert {:error, :invalid_source_generation} = Checkpoint.hash(oversized_generation)
+
+      assert {:error, :invalid_source_generation} =
+               Messages.encode(
+                 :checkpoint_submission,
+                 submission
+                 |> Map.put(:source_generation, oversized_generation.source_generation)
+                 |> Map.put(:checkpoint_hash, raw_checkpoint_hash(oversized_generation))
+               )
+    end
+
     test "rejects hash mismatches, unsupported schemas, and invalid parent hashes" do
       submission = checkpoint_submission_attrs()
       root_attrs = %{submission | parent_hash: :binary.copy(<<0>>, 32)}
-      assert {:ok, root_hash} = Checkpoint.hash(Map.drop(root_attrs, [:checkpoint_hash, :content]))
+
+      assert {:ok, root_hash} =
+               Checkpoint.hash(Map.drop(root_attrs, [:checkpoint_hash, :content]))
+
       root = %{root_attrs | checkpoint_hash: root_hash}
       assert {:ok, _root_bytes} = Messages.encode(:checkpoint_submission, root)
 
@@ -248,6 +325,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
 
       assert {:error, :unknown_checkpoint_kind} =
                Messages.encode(:checkpoint_submission, %{submission | kind: :arbitrary})
+
+      assert {:error, :unknown_checkpoint_kind} =
+               Messages.encode(:checkpoint_submission, %{submission | kind: 0x02})
     end
 
     test "rejects secret-capable and open-ended checkpoint content" do
@@ -409,6 +489,31 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
       "seq" => 0,
       "session" => nil
     }
+  end
+
+  defp raw_receipt_hash(attrs) do
+    assert {:ok, stream_code} = Contract.delivery_stream(attrs.stream)
+
+    :crypto.hash(
+      :sha256,
+      Contract.delivery_receipt_hash_domain() <>
+        <<Contract.version(), attrs.device_id::binary-size(16), attrs.credential_epoch::32,
+          attrs.storage_epoch::binary-size(16), stream_code, attrs.sequence::64, attrs.payload_hash::binary-size(32),
+          attrs.cumulative_sequence::64>>
+    )
+  end
+
+  defp raw_checkpoint_hash(attrs) do
+    schema_version = attrs.schema_version
+    assert {:ok, kind_code, ^schema_version} = Contract.checkpoint_kind(attrs.kind)
+
+    :crypto.hash(
+      :sha256,
+      Contract.checkpoint_hash_domain() <>
+        <<Contract.version(), attrs.device_id::binary-size(16), attrs.credential_epoch::32,
+          attrs.storage_epoch::binary-size(16), attrs.sequence::64, kind_code, attrs.schema_version::16,
+          attrs.source_generation::64, attrs.parent_hash::binary-size(32), attrs.content_hash::binary-size(32)>>
+    )
   end
 
   defp replace_version(bytes, type, version) do
