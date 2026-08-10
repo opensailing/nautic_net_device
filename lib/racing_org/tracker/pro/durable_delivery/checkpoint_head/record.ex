@@ -52,6 +52,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   @u32_max 0xFFFF_FFFF
   @database_int_max 9_223_372_036_854_775_807
   @genesis_parent <<0::256>>
+  @max_encoded_size Contract.max_checkpoint_size() + 4_096
 
   @build_keys [
     :device_id,
@@ -118,6 +119,10 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   @spec format_version() :: pos_integer()
   def format_version, do: @format_version
 
+  @doc false
+  @spec max_encoded_size() :: pos_integer()
+  def max_encoded_size, do: @max_encoded_size
+
   @doc """
   Build one complete record, validating the closed kind/schema/content registry
   and deriving all three hashes.
@@ -169,8 +174,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   @spec encode(t()) :: {:ok, binary()} | {:error, atom()}
   def encode(record) when is_map(record) do
     with :ok <- exact_keys(record, @record_keys),
-         :ok <- verify(record) do
-      {:ok, :erlang.term_to_binary({@format_version, @record_tag, record})}
+         :ok <- verify(record),
+         bytes = :erlang.term_to_binary({@format_version, @record_tag, record}),
+         true <- byte_size(bytes) <= @max_encoded_size do
+      {:ok, bytes}
+    else
+      false -> {:error, :checkpoint_head_too_large}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -186,7 +196,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   distinguish a tampering strategy.
   """
   @spec decode(binary()) :: {:ok, t()} | {:error, :corrupt_checkpoint_head}
-  def decode(bytes) when is_binary(bytes) do
+  def decode(bytes) when is_binary(bytes) and byte_size(bytes) <= @max_encoded_size do
     with {@format_version, @record_tag, record} when is_map(record) <- safe_term(bytes),
          :ok <- exact_keys(record, @record_keys),
          :ok <- verify(record) do
@@ -302,6 +312,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   # `binary_to_term/2` ignores bytes after a complete term, so appended garbage
   # would otherwise decode successfully. `:used` makes that trailing input an
   # explicit failure.
+  defp safe_term(<<131, 80, _compressed::binary>>), do: :corrupt
+
   defp safe_term(bytes) do
     case :erlang.binary_to_term(bytes, [:safe, :used]) do
       {term, used} when used == byte_size(bytes) -> term
@@ -309,6 +321,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
     end
   rescue
     _exception -> :corrupt
+  catch
+    _kind, _reason -> :corrupt
   end
 
   defp exact_keys(value, expected) when is_map(value) do

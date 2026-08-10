@@ -217,6 +217,22 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.RecordTest do
       assert {:error, :corrupt_checkpoint_head} = Record.decode(:not_a_binary)
     end
 
+    test "rejects compressed or oversized external-term input before decoding" do
+      assert {:ok, record} = Record.build(attrs())
+
+      compressed =
+        :erlang.term_to_binary(
+          {Record.format_version(), :checkpoint_head, record},
+          compressed: 9
+        )
+
+      assert {:error, :corrupt_checkpoint_head} = Record.decode(compressed)
+
+      oversized = :binary.copy(<<0>>, Record.max_encoded_size() + 1)
+      assert {:error, :corrupt_checkpoint_head} = Record.decode(oversized)
+      assert Record.max_encoded_size() < 2 * Contract.max_checkpoint_size()
+    end
+
     test "reject a wrong format version or record tag" do
       assert {:ok, record} = Record.build(attrs())
 
