@@ -9,7 +9,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Manifest do
   @device_id_size 16
   @hash_size 32
   @u32_max 0xFFFF_FFFF
-  @u64_max 0xFFFF_FFFF_FFFF_FFFF
+  @database_int_max 9_223_372_036_854_775_807
   @max_firmware_size 80
   @attrs [:device_id, :credential_epoch, :generation, :minimum_firmware, :required_capabilities, :sections]
 
@@ -18,7 +18,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Manifest do
     with :ok <- exact_keys(attrs, @attrs),
          :ok <- fixed_binary(attrs.device_id, @device_id_size, :invalid_device_id),
          :ok <- u32(attrs.credential_epoch, :invalid_credential_epoch),
-         :ok <- positive_u64(attrs.generation, :invalid_generation),
+         :ok <- positive_database_int(attrs.generation, :invalid_generation),
          {:ok, firmware} <- encode_firmware(attrs.minimum_firmware),
          {:ok, capabilities} <- encode_capabilities(attrs.required_capabilities),
          {:ok, sections} <- encode_sections(attrs.sections) do
@@ -357,11 +357,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Manifest do
   defp u32(value, _error) when is_integer(value) and value >= 0 and value <= @u32_max, do: :ok
   defp u32(_value, error), do: {:error, error}
 
-  defp positive_u64(value, _error)
-       when is_integer(value) and value > 0 and value <= @u64_max,
+  defp positive_database_int(value, _error)
+       when is_integer(value) and value > 0 and value <= @database_int_max,
        do: :ok
 
-  defp positive_u64(_value, error), do: {:error, error}
+  defp positive_database_int(_value, error), do: {:error, error}
 
   defp ensure_proper_list([]), do: :ok
   defp ensure_proper_list([_ | rest]), do: ensure_proper_list(rest)

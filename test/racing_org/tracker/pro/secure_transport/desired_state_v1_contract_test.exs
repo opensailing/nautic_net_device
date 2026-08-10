@@ -18,6 +18,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1ContractTest do
   @offer_hash :binary.copy(<<0xA1>>, 32)
   @manifest_hash :binary.copy(<<0xB2>>, 32)
   @section_hash :binary.copy(<<0xC3>>, 32)
+  @database_int_max 9_223_372_036_854_775_807
 
   describe "closed registries" do
     test "freezes the authoritative nine-section set and schema versions" do
@@ -265,6 +266,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1ContractTest do
       assert decoded.complete_hash == decoded.hash
     end
 
+    test "caps authoritative generations at the signed database range" do
+      attrs = %{manifest_attrs(complete_sections()) | generation: @database_int_max}
+
+      assert {:ok, bytes} = Manifest.encode(attrs)
+      assert {:ok, %{generation: @database_int_max}} = Manifest.decode(bytes)
+
+      assert {:error, :invalid_generation} =
+               Manifest.encode(%{attrs | generation: @database_int_max + 1})
+    end
+
     test "rejects missing, duplicate, unknown, out-of-order, oversized, and invalid compatibility data" do
       sections = complete_sections()
 
@@ -487,6 +498,68 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1ContractTest do
                  :readiness,
                  prefix <> <<1, 6::32, 0::64, @manifest_hash::binary>>
                )
+    end
+
+    test "caps every desired-generation control identity at the signed database range" do
+      readiness = %{
+        device_id: @device_id,
+        credential_epoch: 7,
+        boot_id: @boot_id,
+        storage_epoch: @storage_epoch,
+        selected_control_version: 1,
+        selected_desired_version: 1,
+        offer_hash: @offer_hash,
+        firmware_version: "3.0.0",
+        firmware_git_sha: "0123abc",
+        capabilities: required_capabilities(),
+        effective: %{
+          credential_epoch: 7,
+          generation: @database_int_max,
+          manifest_hash: @manifest_hash
+        }
+      }
+
+      assert {:ok, _bytes} = Messages.encode(:readiness, readiness)
+
+      assert {:error, :invalid_generation} =
+               readiness
+               |> put_in([:effective, :generation], @database_int_max + 1)
+               |> then(&Messages.encode(:readiness, &1))
+
+      manifest_attrs = %{manifest_attrs(complete_sections()) | generation: @database_int_max}
+      assert {:ok, manifest} = Manifest.encode(manifest_attrs)
+      manifest_hash = Manifest.hash(manifest)
+
+      delivery =
+        identity_fields(%{
+          generation: @database_int_max,
+          manifest_hash: manifest_hash,
+          manifest: manifest
+        })
+
+      assert {:ok, _bytes} = Messages.encode(:manifest_delivery, delivery)
+
+      assert {:error, :invalid_generation} =
+               Messages.encode(:manifest_delivery, %{delivery | generation: @database_int_max + 1})
+
+      chunk =
+        identity_fields(%{
+          generation: @database_int_max,
+          manifest_hash: @manifest_hash,
+          section: :tracking,
+          section_schema_version: 1,
+          section_hash: @section_hash,
+          total_content_length: 1,
+          chunk_index: 0,
+          chunk_count: 1,
+          chunk_offset: 0,
+          chunk: <<0>>
+        })
+
+      assert {:ok, _bytes} = Messages.encode(:section_chunk, chunk)
+
+      assert {:error, :invalid_generation} =
+               Messages.encode(:section_chunk, %{chunk | generation: @database_int_max + 1})
     end
 
     test "binds manifest delivery to device, epoch, incarnation, generation, and hash" do

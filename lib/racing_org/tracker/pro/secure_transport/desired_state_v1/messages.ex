@@ -212,7 +212,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
 
     with :ok <- exact_keys(attrs, expected, :invalid_manifest_delivery),
          {:ok, identity} <- encode_identity(attrs),
-         :ok <- positive_u64(attrs.generation, :invalid_generation),
+         :ok <- positive_database_int(attrs.generation, :invalid_generation),
          :ok <- fixed_binary(attrs.manifest_hash, @hash_size, :invalid_manifest_hash),
          :ok <- manifest_size(attrs.manifest),
          {:ok, manifest} <- Manifest.decode(attrs.manifest),
@@ -1047,7 +1047,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
 
     with :ok <- exact_keys(effective, expected, :invalid_effective_identity),
          :ok <- u32(effective.credential_epoch, :invalid_credential_epoch),
-         :ok <- positive_u64(effective.generation, :invalid_generation),
+         :ok <- positive_database_int(effective.generation, :invalid_generation),
          :ok <- fixed_binary(effective.manifest_hash, @hash_size, :invalid_manifest_hash) do
       {:ok,
        <<1, effective.credential_epoch::32, effective.generation::64, effective.manifest_hash::binary-size(@hash_size)>>}
@@ -1496,7 +1496,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   # Validation and framing helpers
 
   defp validate_generation_hash(attrs) do
-    with :ok <- positive_u64(Map.get(attrs, :generation), :invalid_generation),
+    with :ok <- positive_database_int(Map.get(attrs, :generation), :invalid_generation),
          :ok <- fixed_binary(Map.get(attrs, :manifest_hash), @hash_size, :invalid_manifest_hash) do
       :ok
     end
@@ -1604,17 +1604,17 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
 
   defp positive_u64(_value, error), do: {:error, error}
 
-  defp database_int(value, _error)
-       when is_integer(value) and value >= 0 and value <= @database_int_max,
-       do: :ok
-
-  defp database_int(_value, error), do: {:error, error}
-
   defp positive_database_int(value, _error)
        when is_integer(value) and value > 0 and value <= @database_int_max,
        do: :ok
 
   defp positive_database_int(_value, error), do: {:error, error}
+
+  defp database_int(value, _error)
+       when is_integer(value) and value >= 0 and value <= @database_int_max,
+       do: :ok
+
+  defp database_int(_value, error), do: {:error, error}
 
   defp decode_boolean(0), do: {:ok, false}
   defp decode_boolean(1), do: {:ok, true}
