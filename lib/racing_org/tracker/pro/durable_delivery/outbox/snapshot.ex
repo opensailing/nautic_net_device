@@ -50,6 +50,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Snapshot do
 
   def decode(_binary), do: {:error, :invalid_snapshot}
 
+  defp decode_payload(<<131, 80, _rest::binary>>), do: {:error, :compressed_snapshot}
+
   defp decode_payload(payload) do
     case :erlang.binary_to_term(payload, [:safe]) do
       snapshot when is_map(snapshot) -> {:ok, snapshot}

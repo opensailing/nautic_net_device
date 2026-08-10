@@ -230,7 +230,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
         {:reply, {:ok, removed}, %{state | store: store}}
 
       {:error, :receipt_entry_not_found} ->
-        if Keyword.get(opts, :idempotent, false) do
+        if Keyword.get(opts, :idempotent, false) and Store.resolved_receipt?(state.store, receipt) do
           {:reply, {:ok, []}, state}
         else
           {:reply, {:error, :receipt_entry_not_found}, state}
@@ -353,7 +353,15 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
         max_entries: Keyword.get(opts, :max_entries, @default_max_entries),
         max_bytes: Keyword.get(opts, :max_bytes, @default_max_bytes),
         segment_max_bytes: Keyword.get(opts, :segment_max_bytes, @default_segment_max_bytes)
-      ] ++ Keyword.take(opts, [:max_disk_bytes, :file_system, :entry_id_generator])
+      ] ++
+        Keyword.take(opts, [
+          :max_disk_bytes,
+          :max_loss_authorizations,
+          :max_entry_id_tombstones,
+          :max_resolved_receipts,
+          :file_system,
+          :entry_id_generator
+        ])
 
     Store.open(root, store_opts)
   end
@@ -361,7 +369,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   defp option_root(opts) do
     case Keyword.fetch(opts, :root) do
       {:ok, root} when is_binary(root) and root != "" ->
-        if Path.type(root) == :absolute, do: {:ok, Path.expand(root)}, else: {:error, :invalid_root}
+        if Path.type(root) == :absolute, do: Store.canonical_root(root), else: {:error, :invalid_root}
 
       {:ok, _root} ->
         {:error, :invalid_root}

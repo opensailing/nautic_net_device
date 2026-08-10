@@ -22,11 +22,20 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   persisted origin.
   """
 
-  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.{Entry, FileSystem, Record, Snapshot}
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.{Entry, FileSystem, Record, RunState, Snapshot}
 
   @dir_mode 0o700
   @file_mode 0o600
   @segment_pattern ~r/^segment-(\d{20})\.log$/
+  @snapshot_temp_pattern ~r/^snapshot\.bin\.tmp\.[0-9a-f]+$/
+  @run_state_temp_pattern ~r/^run-state\.bin\.tmp\.[0-9a-f]+$/
+  @run_state_marker "RODM\x01"
+  @snapshot_schema_version 2
+  @default_max_loss_authorizations 128
+  @default_max_entry_id_tombstones 4_096
+  @default_max_resolved_receipts 4_096
+  @entry_id_tombstone_domain "RacingOrg-DurableOutboxEntryIdTombstone-v1"
+  @max_symlink_hops 40
   @u32_max 0xFFFF_FFFF
   @zero_device_id <<0::128>>
 
@@ -46,6 +55,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     :max_bytes,
     :max_disk_bytes,
     :segment_max_bytes,
+    :max_loss_authorizations,
+    :max_entry_id_tombstones,
+    :max_resolved_receipts,
     :file_system,
     :entry_id_generator
   ]
@@ -57,6 +69,16 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
                 snapshot_bytes: 0,
                 snapshot_hash: nil,
                 snapshot_covered_segment_id: 0,
+                run_state_bytes: 0,
+                run_state_hash: nil,
+                run_state_marker_bytes: 0,
+                segment_high_water: 0,
+                committed_segment_sizes: %{},
+                run_state_required: false,
+                sequence_floors: %{},
+                entry_id_history_complete: true,
+                entry_id_tombstones: [],
+                resolved_receipts: [],
                 segment_paths: [],
                 segment_sizes: %{},
                 next_sequences: %{},
@@ -79,6 +101,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
           max_bytes: pos_integer(),
           max_disk_bytes: pos_integer(),
           segment_max_bytes: pos_integer(),
+          max_loss_authorizations: pos_integer(),
+          max_entry_id_tombstones: pos_integer(),
+          max_resolved_receipts: pos_integer(),
           file_system: module(),
           entry_id_generator: (-> binary()),
           entries: [Entry.t()],
@@ -87,6 +112,16 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
           snapshot_bytes: non_neg_integer(),
           snapshot_hash: <<_::256>> | nil,
           snapshot_covered_segment_id: non_neg_integer(),
+          run_state_bytes: non_neg_integer(),
+          run_state_hash: <<_::256>> | nil,
+          run_state_marker_bytes: non_neg_integer(),
+          segment_high_water: non_neg_integer(),
+          committed_segment_sizes: %{optional(pos_integer()) => non_neg_integer()},
+          run_state_required: boolean(),
+          sequence_floors: %{required(atom()) => pos_integer()},
+          entry_id_history_complete: boolean(),
+          entry_id_tombstones: [<<_::256>>],
+          resolved_receipts: [map()],
           segment_paths: [Path.t()],
           segment_sizes: %{required(Path.t()) => non_neg_integer()},
           next_sequences: %{required(atom()) => pos_integer()},
@@ -98,24 +133,47 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
           current_segment_bytes: non_neg_integer()
         }
 
+  @doc false
+  @spec canonical_root(Path.t()) :: {:ok, Path.t()} | {:error, term()}
+  def canonical_root(root_path) when is_binary(root_path) and root_path != "" do
+    root_path
+    |> Path.expand()
+    |> canonicalize_path(@max_symlink_hops)
+  end
+
+  def canonical_root(_root_path), do: {:error, :invalid_root}
+
   @doc "Open a root and replay all segments into an outbox state handle."
   @spec open(Path.t(), keyword()) :: {:ok, t()} | {:error, term()}
   def open(root_path, opts) when is_binary(root_path) and is_list(opts) do
-    with {:ok, store} <- new_store(root_path, opts),
-         :ok <- ensure_root(store),
-         :ok <- ensure_not_quarantined(store),
-         {:ok, store} <- load_snapshot(store),
-         {:ok, segments} <- list_segments(store),
-         {:ok, store, active_segments} <- discard_superseded_segments(store, segments),
-         :ok <- validate_segment_sequence(active_segments, store.snapshot_covered_segment_id + 1),
-         {:ok, active_segments} <- prepare_segments(store, active_segments),
-         :ok <- ensure_prepared_disk_capacity(store, active_segments),
-         {:ok, store} <- scan_segments(store, active_segments) do
-      {:ok, store}
+    with {:ok, store} <- new_store(root_path, opts) do
+      with_mutation_lock(store, fn -> do_open(store) end)
     end
   end
 
   def open(_root_path, _opts), do: {:error, :invalid_options}
+
+  defp do_open(store) do
+    with :ok <- ensure_root(store),
+         :ok <- ensure_not_quarantined(store),
+         {:ok, store} <- load_snapshot(store),
+         {:ok, store} <- load_run_state_marker(store),
+         {:ok, store} <- load_run_state(store),
+         :ok <- reclaim_orphan_temps(store),
+         {:ok, segments} <- list_segments(store),
+         {:ok, store, active_segments} <- discard_superseded_segments(store, segments),
+         :ok <- validate_segment_sequence(active_segments, store.snapshot_covered_segment_id + 1),
+         :ok <- validate_segment_high_water(store, active_segments),
+         {:ok, active_segments} <- prepare_segments(store, active_segments),
+         :ok <- ensure_prepared_disk_capacity(store, active_segments),
+         {:ok, store, truncation} <- scan_segments(store, active_segments),
+         :ok <- validate_sequence_floors(store),
+         {:ok, store} <- apply_recovery_truncation(store, truncation),
+         {:ok, store} <- persist_run_state(store),
+         {:ok, store} <- ensure_run_state_marker(store) do
+      {:ok, store}
+    end
+  end
 
   @doc "Append and fsync one new entry before exposing enqueue success."
   @spec enqueue(t(), atom(), binary(), keyword()) ::
@@ -125,7 +183,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   end
 
   defp do_enqueue(store, stream, payload, opts) do
-    with {:ok, stream_name} <- configured_stream_name(store, stream),
+    with :ok <- complete_entry_id_history(store),
+         {:ok, stream_name} <- configured_stream_name(store, stream),
          :ok <- validate_payload(payload),
          {:ok, priority} <- priority(opts),
          {:ok, entry_id} <- entry_id(store, opts),
@@ -162,8 +221,10 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          prospective = add_entry(store, entry),
          covered_segment_id <- append_segment_id(store, byte_size(encoded)),
          {:ok, snapshot_bytes} <- encode_snapshot(prospective, covered_segment_id),
-         {:ok, appended} <- append_encoded(store, encoded, byte_size(snapshot_bytes)) do
-      {:ok, entry, add_entry(appended, entry)}
+         {:ok, appended} <- append_encoded(store, encoded, byte_size(snapshot_bytes)),
+         committed = add_entry(appended, entry),
+         {:ok, committed} <- persist_run_state_after_append(committed) do
+      {:ok, entry, committed}
     end
   end
 
@@ -196,6 +257,17 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   @spec loss_authorizations(t()) :: [map()]
   def loss_authorizations(%__MODULE__{loss_authorizations: authorizations}), do: authorizations
 
+  @doc "Return whether bounded durable history proves this exact six-field receipt identity was resolved."
+  @spec resolved_receipt?(t(), map()) :: boolean()
+  def resolved_receipt?(%__MODULE__{} = store, receipt) when is_map(receipt) do
+    case validate_identity(store, receipt) do
+      {:ok, identity} -> Enum.any?(store.resolved_receipts, &same_receipt_identity?(&1, identity))
+      {:error, _reason} -> false
+    end
+  end
+
+  def resolved_receipt?(%__MODULE__{}, _receipt), do: false
+
   @doc """
   Durably apply an already authenticated receipt map.
 
@@ -226,10 +298,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
              cumulative_sequence: normalized.cumulative_sequence
            }),
          covered_segment_id <- append_segment_id(store, byte_size(encoded)),
-         resolved = remove_entries(store, removed),
+         resolved = store |> resolve_entries(removed) |> remember_resolved_entries(removed),
          {:ok, snapshot_bytes} <- encode_snapshot(resolved, covered_segment_id),
          {:ok, appended} <- append_encoded(store, encoded, byte_size(snapshot_bytes)),
-         resolved = remove_entries(appended, removed),
+         resolved = appended |> resolve_entries(removed) |> remember_resolved_entries(removed),
+         {:ok, resolved} <- persist_run_state_after_append(resolved),
          {:ok, compacted} <- compact_store(resolved, snapshot_bytes) do
       {:ok, removed, compacted}
     end
@@ -262,16 +335,22 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
            }),
          authorization = authorization_from_entry(entry, reason),
          resolved = %{
-           remove_entries(store, [entry])
-           | loss_authorizations: store.loss_authorizations ++ [authorization]
+           resolve_entries(store, [entry])
+           | loss_authorizations:
+               retain_latest(store.loss_authorizations ++ [authorization], store.max_loss_authorizations)
          },
          covered_segment_id <- append_segment_id(store, byte_size(encoded)),
          {:ok, snapshot_bytes} <- encode_snapshot(resolved, covered_segment_id),
          {:ok, appended} <- append_encoded(store, encoded, byte_size(snapshot_bytes)),
          resolved = %{
-           remove_entries(appended, [entry])
-           | loss_authorizations: appended.loss_authorizations ++ [authorization]
+           resolve_entries(appended, [entry])
+           | loss_authorizations:
+               retain_latest(
+                 appended.loss_authorizations ++ [authorization],
+                 appended.max_loss_authorizations
+               )
          },
+         {:ok, resolved} <- persist_run_state_after_append(resolved),
          {:ok, compacted} <- compact_store(resolved, snapshot_bytes) do
       {:ok, entry, compacted}
     end
@@ -287,7 +366,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   end
 
   defp new_store(root_path, opts) do
-    with {:ok, device_id} <- option_device_id(opts),
+    with {:ok, root_path} <- canonical_root(root_path),
+         {:ok, device_id} <- option_device_id(opts),
          {:ok, credential_epoch} <- option_credential_epoch(opts),
          {:ok, storage_epoch} <- option_storage_epoch(opts),
          {:ok, stream_names, streams_by_name} <- option_streams(opts),
@@ -295,11 +375,17 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          {:ok, max_bytes} <- positive_option(opts, :max_bytes),
          {:ok, segment_max_bytes} <- positive_option(opts, :segment_max_bytes),
          {:ok, max_disk_bytes} <- option_max_disk_bytes(opts, max_bytes, segment_max_bytes),
+         {:ok, max_loss_authorizations} <-
+           positive_option_default(opts, :max_loss_authorizations, @default_max_loss_authorizations),
+         {:ok, max_entry_id_tombstones} <-
+           positive_option_default(opts, :max_entry_id_tombstones, @default_max_entry_id_tombstones),
+         {:ok, max_resolved_receipts} <-
+           positive_option_default(opts, :max_resolved_receipts, @default_max_resolved_receipts),
          {:ok, file_system} <- option_file_system(opts),
          {:ok, entry_id_generator} <- option_entry_id_generator(opts) do
       {:ok,
        %__MODULE__{
-         root_path: Path.expand(root_path),
+         root_path: root_path,
          device_id: device_id,
          credential_epoch: credential_epoch,
          storage_epoch: storage_epoch,
@@ -309,9 +395,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          max_bytes: max_bytes,
          max_disk_bytes: max_disk_bytes,
          segment_max_bytes: segment_max_bytes,
+         max_loss_authorizations: max_loss_authorizations,
+         max_entry_id_tombstones: max_entry_id_tombstones,
+         max_resolved_receipts: max_resolved_receipts,
          file_system: file_system,
          entry_id_generator: entry_id_generator,
-         next_sequences: Map.new(stream_names, fn {stream, _name} -> {stream, 1} end)
+         next_sequences: Map.new(stream_names, fn {stream, _name} -> {stream, 1} end),
+         sequence_floors: Map.new(stream_names, fn {stream, _name} -> {stream, 1} end)
        }}
     end
   end
@@ -366,6 +456,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     end
   end
 
+  defp positive_option_default(opts, key, default) do
+    case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value > 0 -> {:ok, value}
+      _other -> {:error, {:invalid_option, key}}
+    end
+  end
+
   defp option_max_disk_bytes(opts, max_bytes, segment_max_bytes) do
     case Keyword.get(opts, :max_disk_bytes, max_bytes + segment_max_bytes) do
       value when is_integer(value) and value > 0 -> {:ok, value}
@@ -407,6 +504,226 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     end
   end
 
+  defp reclaim_orphan_temps(store) do
+    fs = store.file_system
+
+    with {:ok, files} <- list_dir_result(fs.list_dir(store.root_path), :list_orphan_temps),
+         temps <-
+           Enum.filter(files, fn filename ->
+             Regex.match?(@snapshot_temp_pattern, filename) or
+               Regex.match?(@run_state_temp_pattern, filename)
+           end),
+         :ok <- remove_orphan_temps(store, temps) do
+      :ok
+    end
+  end
+
+  defp remove_orphan_temps(_store, []), do: :ok
+
+  defp remove_orphan_temps(store, filenames) do
+    result =
+      Enum.reduce_while(filenames, :ok, fn filename, :ok ->
+        path = Path.join(store.root_path, filename)
+
+        case store.file_system.stat(path) do
+          {:ok, %File.Stat{type: :regular}} ->
+            case store.file_system.remove(path) do
+              :ok ->
+                {:cont, :ok}
+
+              {:error, reason} ->
+                operation =
+                  if String.starts_with?(filename, "snapshot.bin.tmp."),
+                    do: :remove_snapshot_temp,
+                    else: :remove_run_state_temp
+
+                {:halt, {:error, {:orphan_temp_cleanup, {operation, reason}}}}
+
+              other ->
+                {:halt, {:error, {:orphan_temp_cleanup, {:remove_temp, other}}}}
+            end
+
+          {:ok, %File.Stat{}} ->
+            {:halt, {:error, {:orphan_temp_cleanup, :invalid_temp_type}}}
+
+          {:error, reason} ->
+            {:halt, {:error, {:orphan_temp_cleanup, {:stat_temp, reason}}}}
+
+          other ->
+            {:halt, {:error, {:orphan_temp_cleanup, {:stat_temp, other}}}}
+        end
+      end)
+
+    with :ok <- result,
+         :ok <- sync_directory(store, store.root_path) do
+      :ok
+    end
+  end
+
+  defp load_run_state_marker(store) do
+    path = run_state_marker_path(store)
+    fs = store.file_system
+
+    case fs.stat(path) do
+      {:error, :enoent} ->
+        {:ok, store}
+
+      {:ok, %File.Stat{type: :regular, size: size}} when size == byte_size(@run_state_marker) ->
+        with :ok <- fs_result(fs.chmod(path, @file_mode), :chmod_run_state_marker),
+             {:ok, @run_state_marker} <- read_result(fs.read(path), :read_run_state_marker) do
+          {:ok,
+           %{
+             store
+             | disk_bytes: store.disk_bytes + size,
+               run_state_marker_bytes: size,
+               run_state_required: true
+           }}
+        else
+          {:ok, _other} -> {:error, :invalid_run_state_marker}
+          {:error, _reason} = error -> error
+        end
+
+      {:ok, %File.Stat{type: :regular}} ->
+        {:error, :invalid_run_state_marker}
+
+      {:ok, %File.Stat{}} ->
+        {:error, :invalid_run_state_marker_type}
+
+      {:error, reason} ->
+        {:error, {:stat_run_state_marker, reason}}
+
+      other ->
+        {:error, {:stat_run_state_marker, other}}
+    end
+  end
+
+  defp load_run_state(store) do
+    path = run_state_path(store)
+    fs = store.file_system
+
+    case fs.stat(path) do
+      {:error, :enoent} when store.run_state_required ->
+        {:error, :run_state_missing}
+
+      {:error, :enoent} ->
+        {:ok, store}
+
+      {:ok, %File.Stat{type: :regular, size: size}} when size <= store.max_disk_bytes ->
+        with :ok <- fs_result(fs.chmod(path, @file_mode), :chmod_run_state),
+             {:ok, bytes} <- read_result(fs.read(path), :read_run_state),
+             {:ok, state} <- RunState.decode(bytes),
+             {:ok, hydrated} <- hydrate_run_state(store, state, size) do
+          {:ok, %{hydrated | run_state_hash: :crypto.hash(:sha256, bytes)}}
+        end
+
+      {:ok, %File.Stat{type: :regular, size: size}} ->
+        {:error, {:run_state_capacity_exceeded, size, store.max_disk_bytes}}
+
+      {:ok, %File.Stat{}} ->
+        {:error, :invalid_run_state_type}
+
+      {:error, reason} ->
+        {:error, {:stat_run_state, reason}}
+
+      other ->
+        {:error, {:stat_run_state, other}}
+    end
+  end
+
+  defp hydrate_run_state(
+         store,
+         %{
+           "device_id" => device_id,
+           "credential_epoch" => credential_epoch,
+           "storage_epoch" => storage_epoch,
+           "streams" => streams,
+           "segment_high_water" => segment_high_water,
+           "sequence_floors" => sequence_floors
+         } = state,
+         size
+       ) do
+    with :ok <- exact_device_id(store, device_id),
+         :ok <- exact_credential_epoch(store, credential_epoch),
+         :ok <- exact_storage_epoch(store, storage_epoch),
+         :ok <- hydrate_stream_set(store, streams, :invalid_run_state),
+         true <- is_integer(segment_high_water) and segment_high_water >= store.snapshot_covered_segment_id,
+         {:ok, committed_segment_sizes} <- hydrate_committed_segment_sizes(state, segment_high_water),
+         {:ok, floors} <- hydrate_next_sequences(store, sequence_floors, :invalid_run_state) do
+      {:ok,
+       %{
+         store
+         | run_state_bytes: size,
+           disk_bytes: store.disk_bytes + size,
+           segment_high_water: segment_high_water,
+           committed_segment_sizes: committed_segment_sizes,
+           sequence_floors: floors,
+           run_state_required: true
+       }}
+    else
+      false -> {:error, :invalid_run_state}
+      error -> error
+    end
+  end
+
+  defp hydrate_run_state(_store, _state, _size), do: {:error, :invalid_run_state}
+
+  defp hydrate_stream_set(store, streams, invalid_reason) when is_list(streams) do
+    if Enum.all?(streams, &is_binary/1) and length(Enum.uniq(streams)) == length(streams) do
+      if MapSet.new(streams) == MapSet.new(Map.values(store.stream_names)),
+        do: :ok,
+        else: {:error, :stream_set_mismatch}
+    else
+      {:error, invalid_reason}
+    end
+  end
+
+  defp hydrate_stream_set(_store, _streams, invalid_reason), do: {:error, invalid_reason}
+
+  defp hydrate_committed_segment_sizes(state, segment_high_water) do
+    case Map.fetch(state, "committed_segment_sizes") do
+      {:ok, values} -> validate_committed_segment_sizes(values, segment_high_water)
+      :error -> hydrate_legacy_committed_segment_size(state, segment_high_water)
+    end
+  end
+
+  defp validate_committed_segment_sizes(values, segment_high_water) when is_list(values) do
+    valid? =
+      Enum.all?(values, fn
+        {segment_id, size} ->
+          is_integer(segment_id) and segment_id > 0 and segment_id <= segment_high_water and
+            is_integer(size) and size >= 0
+
+        _value ->
+          false
+      end)
+
+    ids =
+      Enum.flat_map(values, fn
+        {segment_id, _size} -> [segment_id]
+        _value -> []
+      end)
+
+    if valid? and length(Enum.uniq(ids)) == length(ids),
+      do: {:ok, Map.new(values)},
+      else: {:error, :invalid_run_state}
+  end
+
+  defp validate_committed_segment_sizes(_values, _segment_high_water),
+    do: {:error, :invalid_run_state}
+
+  defp hydrate_legacy_committed_segment_size(state, segment_high_water) do
+    case Map.get(state, "committed_segment_bytes", 0) do
+      size when is_integer(size) and size >= 0 and segment_high_water > 0 and size > 0 ->
+        {:ok, %{segment_high_water => size}}
+
+      size when is_integer(size) and size >= 0 ->
+        {:ok, %{}}
+
+      _size ->
+        {:error, :invalid_run_state}
+    end
+  end
+
   defp load_snapshot(store) do
     path = snapshot_path(store)
     fs = store.file_system
@@ -417,17 +734,37 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
       {:ok, %File.Stat{type: :regular, size: size}} when size <= store.max_disk_bytes ->
         with :ok <- fs_result(fs.chmod(path, @file_mode), :chmod_snapshot),
-             {:ok, bytes} <- read_result(fs.read(path), :read_snapshot),
-             {:ok, snapshot} <- Snapshot.decode(bytes),
-             {:ok, hydrated} <- hydrate_snapshot(store, snapshot, size) do
-          {:ok, %{hydrated | snapshot_hash: :crypto.hash(:sha256, bytes)}}
-        else
-          {:error, reason} when reason in @origin_mismatch_reasons -> {:error, reason}
-          {:error, reason} -> quarantine_segment(store, path, reason)
+             {:ok, bytes} <- read_result(fs.read(path), :read_snapshot) do
+          case Snapshot.decode(bytes) do
+            {:ok, snapshot} ->
+              case hydrate_snapshot(store, snapshot, size) do
+                {:ok, hydrated} ->
+                  {:ok, %{hydrated | snapshot_hash: :crypto.hash(:sha256, bytes)}}
+
+                {:error, reason}
+                when reason in @origin_mismatch_reasons or
+                       reason in [:stream_set_mismatch, :unsupported_snapshot_schema] ->
+                  {:error, reason}
+
+                {:error, reason} ->
+                  quarantine_segment(store, path, reason)
+              end
+
+            {:error, reason}
+            when reason in [
+                   :unsupported_snapshot_version,
+                   :snapshot_too_large,
+                   :compressed_snapshot
+                 ] ->
+              {:error, reason}
+
+            {:error, reason} ->
+              quarantine_segment(store, path, reason)
+          end
         end
 
-      {:ok, %File.Stat{type: :regular}} ->
-        quarantine_segment(store, path, :snapshot_too_large)
+      {:ok, %File.Stat{type: :regular, size: size}} ->
+        {:error, {:snapshot_capacity_exceeded, size, store.max_disk_bytes}}
 
       {:ok, %File.Stat{}} ->
         quarantine_segment(store, path, :invalid_snapshot_type)
@@ -440,7 +777,19 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     end
   end
 
-  defp hydrate_snapshot(
+  defp hydrate_snapshot(store, snapshot, snapshot_bytes) when is_map(snapshot) do
+    case Map.get(snapshot, "schema_version", 1) do
+      version when version in [1, @snapshot_schema_version] ->
+        do_hydrate_snapshot(store, snapshot, snapshot_bytes, version)
+
+      _version ->
+        {:error, :unsupported_snapshot_schema}
+    end
+  end
+
+  defp hydrate_snapshot(_store, _snapshot, _snapshot_bytes), do: {:error, :invalid_snapshot}
+
+  defp do_hydrate_snapshot(
          store,
          %{
            "covered_segment_id" => covered_segment_id,
@@ -450,17 +799,29 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
            "next_sequences" => next_sequences,
            "entries" => entries,
            "loss_authorizations" => loss_authorizations
-         },
-         snapshot_bytes
+         } = snapshot,
+         snapshot_bytes,
+         schema_version
        ) do
     with true <- is_integer(covered_segment_id) and covered_segment_id >= 0,
          :ok <- exact_device_id(store, device_id),
          :ok <- exact_credential_epoch(store, credential_epoch),
          :ok <- exact_storage_epoch(store, storage_epoch),
-         {:ok, next_sequences} <- hydrate_next_sequences(store, next_sequences),
-         {:ok, entries, live_bytes, seen_entry_ids} <-
+         {:ok, next_sequences} <- hydrate_next_sequences(store, next_sequences, :invalid_snapshot),
+         {:ok, entries, live_bytes, live_entry_ids} <-
            hydrate_entries(store, entries, next_sequences),
-         {:ok, loss_authorizations} <- hydrate_loss_authorizations(store, loss_authorizations) do
+         {:ok, loss_authorizations} <- hydrate_loss_authorizations(store, loss_authorizations),
+         {:ok, entry_id_history_complete} <-
+           hydrate_entry_id_history_complete(
+             snapshot,
+             schema_version,
+             next_sequences,
+             entries,
+             loss_authorizations
+           ),
+         {:ok, entry_id_tombstones} <-
+           hydrate_entry_id_tombstones(store, snapshot, schema_version, live_entry_ids),
+         {:ok, resolved_receipts} <- hydrate_resolved_receipts(store, snapshot, schema_version) do
       {:ok,
        %{
          store
@@ -469,9 +830,15 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
            disk_bytes: snapshot_bytes,
            snapshot_bytes: snapshot_bytes,
            snapshot_covered_segment_id: covered_segment_id,
+           segment_high_water: covered_segment_id,
+           run_state_required: schema_version == @snapshot_schema_version,
            next_sequences: next_sequences,
-           seen_entry_ids: seen_entry_ids,
-           loss_authorizations: loss_authorizations,
+           sequence_floors: next_sequences,
+           entry_id_history_complete: entry_id_history_complete,
+           seen_entry_ids: rebuild_seen_entry_ids(entries, entry_id_tombstones),
+           entry_id_tombstones: entry_id_tombstones,
+           resolved_receipts: resolved_receipts,
+           loss_authorizations: retain_latest(loss_authorizations, store.max_loss_authorizations),
            next_ordinal: length(entries) + 1,
            current_segment_id: covered_segment_id
        }}
@@ -481,40 +848,36 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     end
   end
 
-  defp hydrate_snapshot(_store, _snapshot, _snapshot_bytes), do: {:error, :invalid_snapshot}
-
-  defp hydrate_next_sequences(store, values) when is_list(values) do
-    result =
-      Enum.reduce_while(values, {:ok, %{}}, fn
-        {stream_name, sequence}, {:ok, acc}
-        when is_binary(stream_name) and is_integer(sequence) and sequence > 0 ->
-          case configured_stream(store, stream_name) do
-            {:ok, stream} ->
-              if Map.has_key?(acc, stream),
-                do: {:halt, {:error, :invalid_snapshot}},
-                else: {:cont, {:ok, Map.put(acc, stream, sequence)}}
-
-            {:error, _reason} ->
-              {:halt, {:error, :unknown_stream}}
-          end
-
-        _value, _acc ->
-          {:halt, {:error, :invalid_snapshot}}
+  defp hydrate_next_sequences(store, values, invalid_reason) when is_list(values) do
+    valid_values? =
+      Enum.all?(values, fn
+        {stream_name, sequence} -> is_binary(stream_name) and is_integer(sequence) and sequence > 0
+        _value -> false
       end)
 
-    case result do
-      {:ok, sequences} when map_size(sequences) == map_size(store.stream_names) ->
-        {:ok, sequences}
+    if valid_values? do
+      names = Enum.map(values, fn {stream_name, _sequence} -> stream_name end)
+      configured_names = Map.values(store.stream_names)
 
-      {:ok, _sequences} ->
-        {:error, :invalid_snapshot}
+      cond do
+        length(Enum.uniq(names)) != length(names) ->
+          {:error, invalid_reason}
 
-      error ->
-        error
+        MapSet.new(names) != MapSet.new(configured_names) ->
+          {:error, :stream_set_mismatch}
+
+        true ->
+          {:ok,
+           Map.new(values, fn {stream_name, sequence} ->
+             {Map.fetch!(store.streams_by_name, stream_name), sequence}
+           end)}
+      end
+    else
+      {:error, invalid_reason}
     end
   end
 
-  defp hydrate_next_sequences(_store, _values), do: {:error, :invalid_snapshot}
+  defp hydrate_next_sequences(_store, _values, invalid_reason), do: {:error, invalid_reason}
 
   defp hydrate_entries(store, values, next_sequences) when is_list(values) do
     result =
@@ -522,13 +885,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
                                                                                 {:ok, entries, live_bytes, entry_ids,
                                                                                  identities, ordinal} ->
         with {:ok, entry, encoded_size} <- hydrate_entry(store, value, next_sequences, ordinal),
-             false <- MapSet.member?(entry_ids, entry.entry_id),
+             entry_id_hash = entry_id_hash(entry.entry_id),
+             false <- MapSet.member?(entry_ids, entry_id_hash),
              identity = {entry.stream, entry.sequence},
              false <- MapSet.member?(identities, identity) do
           hydrated = %{entry | encoded_size: encoded_size}
 
           {:cont,
-           {:ok, entries ++ [hydrated], live_bytes + encoded_size, MapSet.put(entry_ids, entry.entry_id),
+           {:ok, entries ++ [hydrated], live_bytes + encoded_size, MapSet.put(entry_ids, entry_id_hash),
             MapSet.put(identities, identity), ordinal + 1}}
         else
           true -> {:halt, {:error, :invalid_snapshot}}
@@ -659,6 +1023,135 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
   defp hydrate_loss_authorization(_store, _value), do: {:error, :invalid_snapshot}
 
+  defp hydrate_entry_id_history_complete(_snapshot, 1, next_sequences, entries, loss_authorizations) do
+    complete? =
+      Enum.all?(next_sequences, fn {stream, next_sequence} ->
+        allocated = next_sequence - 1
+
+        known_sequences =
+          entries
+          |> Enum.filter(&(&1.stream == stream))
+          |> Enum.map(& &1.sequence)
+          |> Kernel.++(
+            loss_authorizations
+            |> Enum.filter(&(&1.stream == stream))
+            |> Enum.map(& &1.sequence)
+          )
+          |> MapSet.new()
+
+        MapSet.size(known_sequences) == allocated and
+          Enum.all?(known_sequences, &(&1 >= 1 and &1 <= allocated))
+      end)
+
+    {:ok, complete?}
+  end
+
+  defp hydrate_entry_id_history_complete(snapshot, @snapshot_schema_version, _next, _entries, _losses) do
+    case Map.get(snapshot, "entry_id_history_complete", true) do
+      complete? when is_boolean(complete?) -> {:ok, complete?}
+      _complete? -> {:error, :invalid_snapshot}
+    end
+  end
+
+  defp hydrate_entry_id_tombstones(store, snapshot, 1, live_entry_ids) do
+    tombstones =
+      snapshot
+      |> Map.get("loss_authorizations", [])
+      |> Enum.flat_map(fn
+        %{"entry_id" => entry_id} when is_binary(entry_id) -> [entry_id_hash(entry_id)]
+        _authorization -> []
+      end)
+      |> Enum.uniq()
+      |> Enum.reject(&MapSet.member?(live_entry_ids, &1))
+
+    validate_entry_id_tombstones(store, tombstones, live_entry_ids)
+  end
+
+  defp hydrate_entry_id_tombstones(store, snapshot, @snapshot_schema_version, live_entry_ids) do
+    validate_entry_id_tombstones(
+      store,
+      Map.get(snapshot, "entry_id_tombstones", []),
+      live_entry_ids
+    )
+  end
+
+  defp validate_entry_id_tombstones(store, tombstones, live_entry_ids) when is_list(tombstones) do
+    retained = retain_latest(tombstones, store.max_entry_id_tombstones)
+
+    cond do
+      not Enum.all?(tombstones, &(is_binary(&1) and byte_size(&1) == 32)) ->
+        {:error, :invalid_snapshot}
+
+      length(Enum.uniq(tombstones)) != length(tombstones) ->
+        {:error, :invalid_snapshot}
+
+      Enum.any?(retained, &MapSet.member?(live_entry_ids, &1)) ->
+        {:error, :invalid_snapshot}
+
+      true ->
+        {:ok, retained}
+    end
+  end
+
+  defp validate_entry_id_tombstones(_store, _tombstones, _live_entry_ids),
+    do: {:error, :invalid_snapshot}
+
+  defp hydrate_resolved_receipts(_store, _snapshot, 1), do: {:ok, []}
+
+  defp hydrate_resolved_receipts(store, snapshot, @snapshot_schema_version) do
+    values = Map.get(snapshot, "resolved_receipts", [])
+
+    if is_list(values) do
+      values
+      |> Enum.reduce_while({:ok, []}, fn value, {:ok, acc} ->
+        case hydrate_resolved_receipt(store, value) do
+          {:ok, receipt} -> {:cont, {:ok, acc ++ [receipt]}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+      |> case do
+        {:ok, receipts} -> {:ok, retain_latest(receipts, store.max_resolved_receipts)}
+        error -> error
+      end
+    else
+      {:error, :invalid_snapshot}
+    end
+  end
+
+  defp hydrate_resolved_receipt(
+         store,
+         %{
+           "stream" => stream_name,
+           "device_id" => device_id,
+           "credential_epoch" => credential_epoch,
+           "storage_epoch" => storage_epoch,
+           "sequence" => sequence,
+           "payload_hash" => payload_hash
+         }
+       ) do
+    with {:ok, stream} <- configured_stream(store, stream_name),
+         :ok <- exact_device_id(store, device_id),
+         :ok <- exact_credential_epoch(store, credential_epoch),
+         :ok <- exact_storage_epoch(store, storage_epoch),
+         true <- is_integer(sequence) and sequence > 0,
+         true <- is_binary(payload_hash) and byte_size(payload_hash) == 32 do
+      {:ok,
+       %{
+         stream: stream,
+         device_id: device_id,
+         credential_epoch: credential_epoch,
+         storage_epoch: storage_epoch,
+         sequence: sequence,
+         payload_hash: payload_hash
+       }}
+    else
+      false -> {:error, :invalid_snapshot}
+      error -> error
+    end
+  end
+
+  defp hydrate_resolved_receipt(_store, _value), do: {:error, :invalid_snapshot}
+
   defp discard_superseded_segments(store, segments) do
     {superseded, active} =
       Enum.split_with(segments, fn {id, _path} -> id <= store.snapshot_covered_segment_id end)
@@ -701,6 +1194,18 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     if ids == expected, do: :ok, else: {:error, {:segment_gap, ids}}
   end
 
+  defp validate_segment_high_water(store, segments) do
+    observed =
+      case List.last(segments) do
+        {id, _path} -> id
+        nil -> store.snapshot_covered_segment_id
+      end
+
+    if observed < store.segment_high_water,
+      do: {:error, {:missing_trailing_segments, store.segment_high_water, observed}},
+      else: :ok
+  end
+
   defp prepare_segments(store, segments) do
     result =
       Enum.reduce_while(segments, {:ok, [], 0}, fn {id, path}, {:ok, prepared, total} ->
@@ -731,57 +1236,54 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
   defp ensure_prepared_disk_capacity(store, segments) do
     segment_bytes = Enum.reduce(segments, 0, fn {_id, _path, size}, total -> total + size end)
-    total = store.snapshot_bytes + segment_bytes
+    total = store.snapshot_bytes + store.run_state_bytes + store.run_state_marker_bytes + segment_bytes
 
     if total <= store.max_disk_bytes,
       do: :ok,
       else: {:error, {:disk_capacity_exceeded, total, store.max_disk_bytes}}
   end
 
-  defp scan_segments(store, []), do: {:ok, store}
+  defp scan_segments(store, []), do: {:ok, store, nil}
 
   defp scan_segments(store, segments) do
     {final_id, _final_path, _final_size} = List.last(segments)
 
-    result =
-      Enum.reduce_while(segments, {:ok, store}, fn {id, path, _size}, {:ok, acc} ->
-        final? = id == final_id
+    Enum.reduce_while(segments, {:ok, store, nil}, fn {id, path, _size}, {:ok, acc, pending_truncation} ->
+      final? = id == final_id
 
-        case store.file_system.read(path) do
-          {:ok, bytes} ->
-            case scan_segment(acc, path, bytes, 0, final?) do
-              {:ok, scanned, valid_size} ->
-                current = %{
-                  scanned
-                  | current_segment_id: id,
-                    current_segment_path: path,
-                    current_segment_bytes: valid_size,
-                    segment_paths: scanned.segment_paths ++ [path],
-                    segment_sizes: Map.put(scanned.segment_sizes, path, valid_size),
-                    disk_bytes: scanned.disk_bytes + valid_size
-                }
+      case store.file_system.read(path) do
+        {:ok, bytes} ->
+          case scan_segment(acc, path, bytes, 0, final?) do
+            {:ok, scanned, valid_size, truncation} ->
+              current = %{
+                scanned
+                | current_segment_id: id,
+                  current_segment_path: path,
+                  current_segment_bytes: valid_size,
+                  segment_paths: scanned.segment_paths ++ [path],
+                  segment_sizes: Map.put(scanned.segment_sizes, path, valid_size),
+                  disk_bytes: scanned.disk_bytes + valid_size
+              }
 
-                {:cont, {:ok, current}}
+              {:cont, {:ok, current, truncation || pending_truncation}}
 
-              {:corrupt, reason} ->
-                {:halt, quarantine_segment(acc, path, reason)}
+            {:corrupt, reason} ->
+              {:halt, quarantine_segment(acc, path, reason)}
 
-              {:error, reason} ->
-                {:halt, {:error, reason}}
-            end
+            {:error, reason} ->
+              {:halt, {:error, reason}}
+          end
 
-          {:error, reason} ->
-            {:halt, {:error, {:read_segment, path, reason}}}
+        {:error, reason} ->
+          {:halt, {:error, {:read_segment, path, reason}}}
 
-          other ->
-            {:halt, {:error, {:read_segment, path, other}}}
-        end
-      end)
-
-    result
+        other ->
+          {:halt, {:error, {:read_segment, path, other}}}
+      end
+    end)
   end
 
-  defp scan_segment(store, _path, <<>>, offset, _final?), do: {:ok, store, offset}
+  defp scan_segment(store, _path, <<>>, offset, _final?), do: {:ok, store, offset, nil}
 
   defp scan_segment(store, path, bytes, offset, final?) do
     case Record.decode_next(bytes) do
@@ -798,17 +1300,85 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
         end
 
       {:incomplete, _expected_size} when final? ->
-        case truncate_path(store, path, offset) do
-          :ok -> {:ok, store, offset}
-          {:error, reason} -> {:error, reason}
-        end
+        {:ok, store, offset, {path, offset}}
 
       {:incomplete, _expected_size} ->
         {:corrupt, {:incomplete_record, offset}}
 
       {:error, reason} ->
-        {:corrupt, reason}
+        if final? and recoverable_zero_padded_tail?(bytes),
+          do: {:ok, store, offset, {path, offset}},
+          else: {:corrupt, reason}
     end
+  end
+
+  defp validate_sequence_floors(store) do
+    sequence_result =
+      Enum.reduce_while(store.sequence_floors, :ok, fn {stream, persisted_floor}, :ok ->
+        recovered = Map.fetch!(store.next_sequences, stream)
+
+        if recovered < persisted_floor,
+          do: {:halt, {:error, {:sequence_floor_violation, stream, persisted_floor, recovered}}},
+          else: {:cont, :ok}
+      end)
+
+    with :ok <- sequence_result do
+      validate_segment_byte_floors(store)
+    end
+  end
+
+  defp validate_segment_byte_floors(store) do
+    observed_sizes =
+      Enum.reduce(store.segment_paths, %{}, fn path, acc ->
+        Map.put(acc, segment_id_from_path(path), Map.fetch!(store.segment_sizes, path))
+      end)
+
+    Enum.reduce_while(store.committed_segment_sizes, :ok, fn {segment_id, committed_size}, :ok ->
+      cond do
+        segment_id <= store.snapshot_covered_segment_id ->
+          {:cont, :ok}
+
+        Map.get(observed_sizes, segment_id, -1) < committed_size ->
+          recovered_size = Map.get(observed_sizes, segment_id, 0)
+
+          {:halt, {:error, {:segment_byte_floor_violation, segment_id, committed_size, recovered_size}}}
+
+        true ->
+          {:cont, :ok}
+      end
+    end)
+  end
+
+  defp apply_recovery_truncation(store, nil), do: {:ok, store}
+
+  defp apply_recovery_truncation(store, {path, offset}) do
+    case truncate_path(store, path, offset) do
+      :ok -> {:ok, store}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp recoverable_zero_padded_tail?(bytes) do
+    trimmed = trim_trailing_zeroes(bytes)
+
+    zero_padding_size = byte_size(bytes) - byte_size(trimmed)
+
+    cond do
+      trimmed == <<>> -> true
+      zero_padding_size < 8 -> false
+      match?({:incomplete, _expected_size}, Record.decode_next(trimmed)) -> true
+      true -> false
+    end
+  end
+
+  defp trim_trailing_zeroes(bytes), do: trim_trailing_zeroes(bytes, byte_size(bytes))
+
+  defp trim_trailing_zeroes(_bytes, 0), do: <<>>
+
+  defp trim_trailing_zeroes(bytes, size) do
+    if :binary.at(bytes, size - 1) == 0,
+      do: trim_trailing_zeroes(bytes, size - 1),
+      else: binary_part(bytes, 0, size)
   end
 
   defp replay_record(store, %{kind: :entry} = record, encoded_size) do
@@ -843,7 +1413,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          {:ok, stream} <- configured_stream(store, record.stream),
          normalized = %{record | stream: stream},
          {:ok, removed} <- acknowledged_entries(store, normalized) do
-      {:ok, remove_entries(store, removed)}
+      {:ok, store |> resolve_entries(removed) |> remember_resolved_entries(removed)}
     end
   end
 
@@ -859,8 +1429,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
       {:ok,
        %{
-         remove_entries(store, [entry])
-         | loss_authorizations: store.loss_authorizations ++ [authorization]
+         resolve_entries(store, [entry])
+         | loss_authorizations:
+             retain_latest(store.loss_authorizations ++ [authorization], store.max_loss_authorizations)
        }}
     else
       false -> {:error, :entry_id_mismatch}
@@ -894,11 +1465,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp quarantine_segment(store, path, reason) do
     fs = store.file_system
     directory = quarantine_dir(store)
-    destination = Path.join(directory, Path.basename(path) <> ".corrupt-" <> quarantine_suffix())
 
     result =
       with :ok <- fs_result(fs.mkdir_p(directory), :quarantine_mkdir),
            :ok <- fs_result(fs.chmod(directory, @dir_mode), :quarantine_chmod),
+           {:ok, destination} <- claim_quarantine_destination(store, path, directory, 8),
            :ok <- fs_result(fs.rename(path, destination), :quarantine_rename),
            :ok <- sync_directory(store, directory),
            :ok <- sync_directory(store, store.root_path) do
@@ -908,6 +1479,38 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     case result do
       {:error, {:quarantined, _reason, _destination}} = quarantined -> quarantined
       {:error, quarantine_error} -> {:error, {:corruption_detected, reason, quarantine_error}}
+    end
+  end
+
+  defp claim_quarantine_destination(_store, _path, _directory, 0),
+    do: {:error, :quarantine_name_exhausted}
+
+  defp claim_quarantine_destination(store, path, directory, attempts) do
+    destination = Path.join(directory, Path.basename(path) <> ".corrupt-" <> quarantine_suffix())
+    fs = store.file_system
+
+    case fs.open(destination, [:write, :binary, :raw, :exclusive]) do
+      {:ok, device} ->
+        operation = fs_result(fs.chmod(destination, @file_mode), :quarantine_destination_chmod)
+        close_result = fs_result(fs.close(device), :close)
+
+        case combine_results(operation, close_result) do
+          :ok ->
+            {:ok, destination}
+
+          {:error, reason} ->
+            _ = fs.remove(destination)
+            {:error, reason}
+        end
+
+      {:error, :eexist} ->
+        claim_quarantine_destination(store, path, directory, attempts - 1)
+
+      {:error, reason} ->
+        {:error, {:quarantine_destination_open, reason}}
+
+      other ->
+        {:error, {:quarantine_destination_open, other}}
     end
   end
 
@@ -953,8 +1556,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     _kind, _reason -> {:error, :invalid_entry_id}
   end
 
+  defp complete_entry_id_history(%__MODULE__{entry_id_history_complete: true}), do: :ok
+  defp complete_entry_id_history(%__MODULE__{}), do: {:error, :entry_id_history_incomplete}
+
   defp unique_entry_id(store, entry_id) do
-    if MapSet.member?(store.seen_entry_ids, entry_id),
+    if MapSet.member?(store.seen_entry_ids, entry_id_hash(entry_id)),
       do: {:error, :duplicate_entry_id},
       else: :ok
   end
@@ -977,6 +1583,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp verify_fresh(store) do
     with :ok <- ensure_not_quarantined(store),
          :ok <- verify_snapshot_fresh(store),
+         :ok <- verify_run_state_fresh(store),
+         :ok <- verify_run_state_marker_fresh(store),
          {:ok, segments} <- list_segments(store),
          :ok <- validate_segment_sequence(segments, store.snapshot_covered_segment_id + 1),
          {:ok, prepared} <- prepare_segments(store, segments) do
@@ -985,7 +1593,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       segment_bytes = Enum.reduce(prepared, 0, fn {_id, _path, size}, total -> total + size end)
 
       if paths == store.segment_paths and sizes == store.segment_sizes and
-           segment_bytes + store.snapshot_bytes == store.disk_bytes,
+           segment_bytes + store.snapshot_bytes + store.run_state_bytes + store.run_state_marker_bytes ==
+             store.disk_bytes,
          do: :ok,
          else: {:error, :stale_store}
     end
@@ -1005,6 +1614,45 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          true <- size == store.snapshot_bytes,
          {:ok, bytes} <- store.file_system.read(path),
          true <- :crypto.hash(:sha256, bytes) == store.snapshot_hash do
+      :ok
+    else
+      _other -> {:error, :stale_store}
+    end
+  end
+
+  defp verify_run_state_fresh(%__MODULE__{run_state_hash: nil} = store) do
+    case store.file_system.stat(run_state_path(store)) do
+      {:error, :enoent} -> :ok
+      _other -> {:error, :stale_store}
+    end
+  end
+
+  defp verify_run_state_fresh(store) do
+    path = run_state_path(store)
+
+    with {:ok, %File.Stat{type: :regular, size: size}} <- store.file_system.stat(path),
+         true <- size == store.run_state_bytes,
+         {:ok, bytes} <- store.file_system.read(path),
+         true <- :crypto.hash(:sha256, bytes) == store.run_state_hash do
+      :ok
+    else
+      _other -> {:error, :stale_store}
+    end
+  end
+
+  defp verify_run_state_marker_fresh(%__MODULE__{run_state_marker_bytes: 0} = store) do
+    case store.file_system.stat(run_state_marker_path(store)) do
+      {:error, :enoent} -> :ok
+      _other -> {:error, :stale_store}
+    end
+  end
+
+  defp verify_run_state_marker_fresh(store) do
+    path = run_state_marker_path(store)
+
+    with {:ok, %File.Stat{type: :regular, size: size}} <- store.file_system.stat(path),
+         true <- size == store.run_state_marker_bytes,
+         {:ok, @run_state_marker} <- store.file_system.read(path) do
       :ok
     else
       _other -> {:error, :stale_store}
@@ -1155,8 +1803,186 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     end
   end
 
+  defp persist_run_state_after_append(store) do
+    case persist_run_state(store) do
+      {:ok, persisted} -> {:ok, persisted}
+      {:error, {:durability_uncertain, _reason}} = error -> error
+      {:error, reason} -> {:error, {:durability_uncertain, reason}}
+    end
+  end
+
+  defp persist_run_state(store) do
+    segment_high_water = max(store.segment_high_water, store.current_segment_id)
+
+    committed_segment_sizes =
+      store.segment_paths
+      |> Enum.map(fn path -> {segment_id_from_path(path), Map.fetch!(store.segment_sizes, path)} end)
+      |> Enum.sort()
+
+    state = %{
+      "device_id" => store.device_id,
+      "credential_epoch" => store.credential_epoch,
+      "storage_epoch" => store.storage_epoch,
+      "streams" => store.stream_names |> Map.values() |> Enum.sort(),
+      "segment_high_water" => segment_high_water,
+      "committed_segment_sizes" => committed_segment_sizes,
+      "sequence_floors" =>
+        store.next_sequences
+        |> Enum.map(fn {stream, sequence} -> {Map.fetch!(store.stream_names, stream), sequence} end)
+        |> Enum.sort()
+    }
+
+    with {:ok, bytes} <- RunState.encode(state),
+         marker_reserve =
+           if(store.run_state_bytes == 0 and store.run_state_marker_bytes == 0,
+             do: byte_size(@run_state_marker),
+             else: 0
+           ),
+         :ok <- ensure_atomic_replace_capacity(store, byte_size(bytes) + marker_reserve),
+         :ok <- atomic_replace(store, run_state_path(store), bytes, :run_state) do
+      size = byte_size(bytes)
+
+      {:ok,
+       %{
+         store
+         | disk_bytes: store.disk_bytes - store.run_state_bytes + size,
+           run_state_bytes: size,
+           run_state_hash: :crypto.hash(:sha256, bytes),
+           segment_high_water: segment_high_water,
+           committed_segment_sizes: Map.new(committed_segment_sizes),
+           sequence_floors: store.next_sequences,
+           run_state_required: true
+       }}
+    end
+  end
+
+  defp ensure_run_state_marker(%__MODULE__{run_state_marker_bytes: size} = store) when size > 0,
+    do: {:ok, store}
+
+  defp ensure_run_state_marker(store) do
+    size = byte_size(@run_state_marker)
+
+    if store.disk_bytes + size > store.max_disk_bytes do
+      {:error, {:backpressure, :disk_capacity}}
+    else
+      create_run_state_marker(store, size)
+    end
+  end
+
+  defp create_run_state_marker(store, size) do
+    path = run_state_marker_path(store)
+    fs = store.file_system
+
+    case fs.open(path, [:write, :binary, :raw, :exclusive]) do
+      {:ok, device} ->
+        operation =
+          with :ok <- fs_result(fs.chmod(path, @file_mode), :chmod_run_state_marker),
+               :ok <- fs_result(fs.write(device, @run_state_marker), :write_run_state_marker),
+               :ok <- fs_result(fs.sync(device), :run_state_marker_sync) do
+            :ok
+          end
+
+        close_result = fs_result(fs.close(device), :close)
+
+        case combine_results(operation, close_result) do
+          :ok ->
+            case sync_directory(store, store.root_path) do
+              :ok ->
+                {:ok,
+                 %{
+                   store
+                   | disk_bytes: store.disk_bytes + size,
+                     run_state_marker_bytes: size,
+                     run_state_required: true
+                 }}
+
+              {:error, reason} ->
+                {:error, {:durability_uncertain, reason}}
+            end
+
+          {:error, reason} ->
+            _ = fs.remove(path)
+            {:error, reason}
+        end
+
+      {:error, :eexist} ->
+        load_run_state_marker(store)
+
+      {:error, reason} ->
+        {:error, {:run_state_marker_open, reason}}
+
+      other ->
+        {:error, {:run_state_marker_open, other}}
+    end
+  end
+
+  defp ensure_atomic_replace_capacity(store, replacement_size) do
+    if store.disk_bytes + replacement_size <= store.max_disk_bytes,
+      do: :ok,
+      else: {:error, {:backpressure, :disk_capacity}}
+  end
+
+  defp atomic_replace(store, destination, bytes, kind) do
+    with {:ok, temporary} <- write_atomic_temp(store, destination, bytes, kind, 8),
+         :ok <- fs_result(store.file_system.rename(temporary, destination), atomic_rename_operation(kind)),
+         :ok <- sync_directory(store, store.root_path) do
+      :ok
+    end
+  end
+
+  defp write_atomic_temp(_store, _destination, _bytes, _kind, 0),
+    do: {:error, :temporary_name_exhausted}
+
+  defp write_atomic_temp(store, destination, bytes, kind, attempts) do
+    temporary = destination <> ".tmp." <> temporary_suffix()
+    fs = store.file_system
+
+    case fs.open(temporary, [:write, :binary, :raw, :exclusive]) do
+      {:ok, device} ->
+        operation =
+          with :ok <- fs_result(fs.chmod(temporary, @file_mode), atomic_chmod_operation(kind)),
+               :ok <- fs_result(fs.write(device, bytes), atomic_write_operation(kind)),
+               :ok <- fs_result(fs.sync(device), atomic_sync_operation(kind)) do
+            :ok
+          end
+
+        close_result = fs_result(fs.close(device), :close)
+
+        case combine_results(operation, close_result) do
+          :ok ->
+            {:ok, temporary}
+
+          {:error, reason} ->
+            _ = fs.remove(temporary)
+            {:error, reason}
+        end
+
+      {:error, :eexist} ->
+        write_atomic_temp(store, destination, bytes, kind, attempts - 1)
+
+      {:error, reason} ->
+        {:error, {atomic_open_operation(kind), reason}}
+
+      other ->
+        {:error, {atomic_open_operation(kind), other}}
+    end
+  end
+
+  defp atomic_open_operation(:run_state), do: :run_state_open
+  defp atomic_open_operation(:snapshot), do: :snapshot_open
+  defp atomic_chmod_operation(:run_state), do: :chmod_run_state
+  defp atomic_chmod_operation(:snapshot), do: :chmod_snapshot
+  defp atomic_write_operation(:run_state), do: :write_run_state
+  defp atomic_write_operation(:snapshot), do: :write_snapshot
+  defp atomic_sync_operation(:run_state), do: :run_state_sync
+  defp atomic_sync_operation(:snapshot), do: :snapshot_sync
+  defp atomic_rename_operation(:run_state), do: :run_state_rename
+  defp atomic_rename_operation(:snapshot), do: :snapshot_rename
+
   defp encode_snapshot(store, covered_segment_id) do
     Snapshot.encode(%{
+      "schema_version" => @snapshot_schema_version,
+      "run_state_required" => true,
       "covered_segment_id" => covered_segment_id,
       "device_id" => store.device_id,
       "credential_epoch" => store.credential_epoch,
@@ -1166,6 +1992,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
         |> Enum.map(fn {stream, sequence} -> {Map.fetch!(store.stream_names, stream), sequence} end)
         |> Enum.sort(),
       "entries" => Enum.map(store.entries, &snapshot_entry(store, &1)),
+      "entry_id_history_complete" => store.entry_id_history_complete,
+      "entry_id_tombstones" => store.entry_id_tombstones,
+      "resolved_receipts" => Enum.map(store.resolved_receipts, &snapshot_resolved_receipt(store, &1)),
       "loss_authorizations" => Enum.map(store.loss_authorizations, &snapshot_loss_authorization(store, &1))
     })
   end
@@ -1181,6 +2010,17 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       "payload_hash" => entry.payload_hash,
       "payload" => entry.payload,
       "priority" => entry.priority
+    }
+  end
+
+  defp snapshot_resolved_receipt(store, receipt) do
+    %{
+      "stream" => Map.fetch!(store.stream_names, receipt.stream),
+      "device_id" => receipt.device_id,
+      "credential_epoch" => receipt.credential_epoch,
+      "storage_epoch" => receipt.storage_epoch,
+      "sequence" => receipt.sequence,
+      "payload_hash" => receipt.payload_hash
     }
   end
 
@@ -1211,20 +2051,19 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
   defp do_compact_store(store, snapshot_bytes) do
     destination = snapshot_path(store)
-    temporary = destination <> ".tmp." <> temporary_suffix()
 
-    with :ok <- write_snapshot_temp(store, temporary, snapshot_bytes),
-         :ok <- activate_snapshot(store, temporary, destination),
+    with :ok <- atomic_replace(store, destination, snapshot_bytes, :snapshot),
          :ok <- remove_segments(store, store.segment_paths) do
       size = byte_size(snapshot_bytes)
 
       {:ok,
        %{
          store
-         | disk_bytes: size,
+         | disk_bytes: size + store.run_state_bytes + store.run_state_marker_bytes,
            snapshot_bytes: size,
            snapshot_hash: :crypto.hash(:sha256, snapshot_bytes),
            snapshot_covered_segment_id: store.current_segment_id,
+           committed_segment_sizes: %{},
            segment_paths: [],
            segment_sizes: %{},
            current_segment_path: nil,
@@ -1232,41 +2071,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
        }}
     else
       {:error, reason} = error ->
-        _ = store.file_system.remove(temporary)
-
         if snapshot_activated?(store, destination, snapshot_bytes),
           do: {:error, {:durability_uncertain, reason}},
           else: error
-    end
-  end
-
-  defp write_snapshot_temp(store, path, snapshot_bytes) do
-    fs = store.file_system
-
-    case fs.open(path, [:write, :binary, :raw, :exclusive]) do
-      {:ok, device} ->
-        operation =
-          with :ok <- fs_result(fs.chmod(path, @file_mode), :chmod_snapshot),
-               :ok <- fs_result(fs.write(device, snapshot_bytes), :write_snapshot),
-               :ok <- fs_result(fs.sync(device), :snapshot_sync) do
-            :ok
-          end
-
-        close_result = fs_result(fs.close(device), :close)
-        combine_results(operation, close_result)
-
-      {:error, reason} ->
-        {:error, {:snapshot_open, reason}}
-
-      other ->
-        {:error, {:snapshot_open, other}}
-    end
-  end
-
-  defp activate_snapshot(store, temporary, destination) do
-    with :ok <- fs_result(store.file_system.rename(temporary, destination), :snapshot_rename),
-         :ok <- sync_directory(store, store.root_path) do
-      :ok
     end
   end
 
@@ -1300,8 +2107,24 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       | entries: store.entries ++ [entry],
         live_bytes: store.live_bytes + entry.encoded_size,
         next_sequences: Map.put(store.next_sequences, entry.stream, entry.sequence + 1),
-        seen_entry_ids: MapSet.put(store.seen_entry_ids, entry.entry_id),
+        seen_entry_ids: MapSet.put(store.seen_entry_ids, entry_id_hash(entry.entry_id)),
         next_ordinal: store.next_ordinal + 1
+    }
+  end
+
+  defp resolve_entries(store, entries) do
+    removed = remove_entries(store, entries)
+
+    tombstones =
+      store.entry_id_tombstones
+      |> Kernel.++(Enum.map(entries, &entry_id_hash(&1.entry_id)))
+      |> Enum.uniq()
+      |> retain_latest(store.max_entry_id_tombstones)
+
+    %{
+      removed
+      | entry_id_tombstones: tombstones,
+        seen_entry_ids: rebuild_seen_entry_ids(removed.entries, tombstones)
     }
   end
 
@@ -1316,10 +2139,42 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     }
   end
 
+  defp remember_resolved_entries(store, entries) do
+    Enum.reduce(entries, store, fn entry, acc -> remember_resolved_receipt(acc, entry) end)
+  end
+
+  defp remember_resolved_receipt(store, receipt) do
+    identity = Map.take(receipt, [:stream, :device_id, :credential_epoch, :storage_epoch, :sequence, :payload_hash])
+
+    receipts =
+      store.resolved_receipts
+      |> Enum.reject(&same_receipt_identity?(&1, identity))
+      |> Kernel.++([identity])
+      |> retain_latest(store.max_resolved_receipts)
+
+    %{store | resolved_receipts: receipts}
+  end
+
+  defp same_receipt_identity?(left, right) do
+    left.stream == right.stream and left.device_id == right.device_id and
+      left.credential_epoch == right.credential_epoch and left.storage_epoch == right.storage_epoch and
+      left.sequence == right.sequence and left.payload_hash == right.payload_hash
+  end
+
+  defp rebuild_seen_entry_ids(entries, tombstones) do
+    Enum.reduce(entries, MapSet.new(tombstones), fn entry, acc ->
+      MapSet.put(acc, entry_id_hash(entry.entry_id))
+    end)
+  end
+
+  defp entry_id_hash(entry_id), do: :crypto.hash(:sha256, [@entry_id_tombstone_domain, entry_id])
+
+  defp retain_latest(values, limit), do: Enum.take(values, -limit)
+
   defp validate_receipt(store, receipt) do
     with {:ok, identity} <- validate_identity(store, receipt),
          {:ok, cumulative_sequence} <- map_nonnegative_integer(receipt, :cumulative_sequence),
-         true <- cumulative_sequence <= identity.sequence do
+         true <- cumulative_sequence < Map.fetch!(store.next_sequences, identity.stream) do
       {:ok, Map.put(identity, :cumulative_sequence, cumulative_sequence)}
     else
       false -> {:error, :invalid_cumulative_sequence}
@@ -1449,25 +2304,21 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       |> Enum.filter(&(&1.stream == stream and &1.sequence <= cumulative_sequence))
       |> Enum.sort_by(& &1.sequence)
 
-    cond do
-      prefix == [] ->
-        {:ok, []}
+    accepted_sequences =
+      store.resolved_receipts
+      |> Enum.filter(&(&1.stream == stream and &1.sequence <= cumulative_sequence))
+      |> Enum.map(& &1.sequence)
+      |> Kernel.++(Enum.map(prefix, & &1.sequence))
+      |> MapSet.new()
 
-      List.last(prefix).sequence != cumulative_sequence ->
-        {:error, :non_contiguous_cumulative_prefix}
-
-      contiguous_entries?(prefix) ->
-        {:ok, prefix}
-
-      true ->
-        {:error, :non_contiguous_cumulative_prefix}
-    end
+    if complete_cumulative_coverage?(accepted_sequences, cumulative_sequence),
+      do: {:ok, prefix},
+      else: {:error, :non_contiguous_cumulative_prefix}
   end
 
-  defp contiguous_entries?([_entry]), do: true
-
-  defp contiguous_entries?([first, second | rest]) do
-    second.sequence == first.sequence + 1 and contiguous_entries?([second | rest])
+  defp complete_cumulative_coverage?(sequences, cumulative_sequence) do
+    MapSet.size(sequences) == cumulative_sequence and MapSet.member?(sequences, 1) and
+      MapSet.member?(sequences, cumulative_sequence)
   end
 
   defp authorization_from_entry(entry, reason) do
@@ -1498,10 +2349,57 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     Path.join(store.root_path, "segment-" <> String.pad_leading(Integer.to_string(id), 20, "0") <> ".log")
   end
 
+  defp segment_id_from_path(path) do
+    [id] = Regex.run(@segment_pattern, Path.basename(path), capture: :all_but_first)
+    String.to_integer(id)
+  end
+
   defp snapshot_path(store), do: Path.join(store.root_path, "snapshot.bin")
+  defp run_state_path(store), do: Path.join(store.root_path, "run-state.bin")
+  defp run_state_marker_path(store), do: Path.join(store.root_path, "run-state.required")
   defp quarantine_dir(store), do: Path.join(store.root_path, "quarantine")
-  defp quarantine_suffix, do: Integer.to_string(System.unique_integer([:positive, :monotonic]))
-  defp temporary_suffix, do: quarantine_suffix()
+  defp quarantine_suffix, do: random_suffix()
+
+  defp canonicalize_path(path, symlink_hops) do
+    case Path.split(path) do
+      [root | components] -> canonicalize_components(root, components, symlink_hops)
+      _parts -> {:error, :invalid_root}
+    end
+  end
+
+  defp canonicalize_components(current, [], _symlink_hops), do: {:ok, Path.expand(current)}
+
+  defp canonicalize_components(current, [component | rest], symlink_hops) do
+    candidate = Path.join(current, component)
+
+    case :file.read_link(String.to_charlist(candidate)) do
+      {:ok, target} when symlink_hops > 0 ->
+        target = List.to_string(target)
+
+        resolved =
+          if Path.type(target) == :absolute,
+            do: Path.expand(target),
+            else: Path.expand(target, Path.dirname(candidate))
+
+        continued = Enum.reduce(rest, resolved, fn part, acc -> Path.join(acc, part) end)
+        canonicalize_path(continued, symlink_hops - 1)
+
+      {:ok, _target} ->
+        {:error, :too_many_symlinks}
+
+      {:error, :einval} ->
+        canonicalize_components(candidate, rest, symlink_hops)
+
+      {:error, :enoent} ->
+        {:ok, Enum.reduce(rest, candidate, fn part, acc -> Path.join(acc, part) end)}
+
+      {:error, reason} ->
+        {:error, {:root_realpath, reason}}
+    end
+  end
+
+  defp temporary_suffix, do: random_suffix()
+  defp random_suffix, do: Base.encode16(:crypto.strong_rand_bytes(16), case: :lower)
 
   defp sync_directory(store, directory) do
     fs = store.file_system
@@ -1519,6 +2417,10 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
         {:error, {:directory_open, other}}
     end
   end
+
+  defp list_dir_result({:ok, files}, _operation) when is_list(files), do: {:ok, files}
+  defp list_dir_result({:error, reason}, operation), do: {:error, {operation, reason}}
+  defp list_dir_result(other, operation), do: {:error, {operation, other}}
 
   defp read_result({:ok, bytes}, _operation) when is_binary(bytes), do: {:ok, bytes}
   defp read_result({:error, reason}, operation), do: {:error, {operation, reason}}

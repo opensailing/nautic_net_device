@@ -19,6 +19,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       assert {:ok, owner} = start_owner(root)
       assert {:error, {:root_already_owned, _existing}} = start_owner(root)
 
+      alias_root = root <> "_alias"
+      File.ln_s!(root, alias_root)
+      on_exit(fn -> File.rm(alias_root) end)
+      assert {:error, {:root_already_owned, _existing}} = start_owner(alias_root)
+
       other_root = root <> "_other"
       on_exit(fn -> File.rm_rf(other_root) end)
       assert {:ok, _other} = start_owner(other_root)
@@ -170,6 +175,83 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
 
       assert [%{sequence: 2}] = Owner.pending(owner)
       assert %{pending_entries: 1} = Owner.status(owner)
+    end
+
+    test "idempotence requires durable proof of the exact six-field resolved receipt", %{root: root} do
+      assert {:ok, owner} = start_owner(root)
+      assert {:ok, receipt} = Owner.enqueue(owner, :telemetry, "payload")
+      assert {:ok, [_removed]} = Owner.acknowledge(owner, receipt)
+      GenServer.stop(owner)
+
+      assert {:ok, reopened} = start_owner(root)
+      assert {:ok, []} = Owner.acknowledge(reopened, receipt, idempotent: true)
+
+      assert {:error, :receipt_entry_not_found} =
+               Owner.acknowledge(
+                 reopened,
+                 %{receipt | sequence: receipt.sequence + 100},
+                 idempotent: true
+               )
+
+      assert {:error, :receipt_entry_not_found} =
+               Owner.acknowledge(reopened, %{receipt | payload_hash: <<7::256>>}, idempotent: true)
+    end
+
+    test "a cumulative receipt can close only gaps proven by exact resolved history", %{root: root} do
+      assert {:ok, owner} = start_owner(root)
+      assert {:ok, first} = Owner.enqueue(owner, :telemetry, "first", priority: 0)
+      assert {:ok, second} = Owner.enqueue(owner, :telemetry, "second", priority: 10)
+      assert Enum.map(Owner.pending(owner), & &1.sequence) == [2, 1]
+
+      assert {:ok, [_second]} = Owner.acknowledge(owner, second)
+      cumulative = %{first | cumulative_sequence: 2}
+      assert {:ok, [removed]} = Owner.acknowledge(owner, cumulative)
+      assert removed.sequence == 1
+      assert Owner.pending(owner) == []
+      assert {:ok, []} = Owner.acknowledge(owner, cumulative, idempotent: true)
+
+      refute_result = %{cumulative | payload_hash: <<9::256>>}
+
+      assert {:error, :receipt_entry_not_found} =
+               Owner.acknowledge(owner, refute_result, idempotent: true)
+    end
+
+    test "a cumulative receipt durably proves every exact entry it resolves", %{root: root} do
+      assert {:ok, owner} = start_owner(root)
+      assert {:ok, first} = Owner.enqueue(owner, :telemetry, "first")
+      assert {:ok, _second} = Owner.enqueue(owner, :telemetry, "second")
+      assert {:ok, third} = Owner.enqueue(owner, :telemetry, "third")
+
+      assert {:ok, removed} = Owner.acknowledge(owner, %{third | cumulative_sequence: 3})
+      assert Enum.map(removed, & &1.sequence) == [1, 2, 3]
+      GenServer.stop(owner)
+
+      assert {:ok, reopened} = start_owner(root)
+      assert {:ok, []} = Owner.acknowledge(reopened, first, idempotent: true)
+      assert {:ok, fourth} = Owner.enqueue(reopened, :telemetry, "fourth")
+      assert {:ok, [removed_fourth]} = Owner.acknowledge(reopened, %{fourth | cumulative_sequence: 4})
+      assert removed_fourth.sequence == fourth.sequence
+    end
+
+    test "a cumulative receipt cannot infer an unproven missing acceptance", %{root: root} do
+      assert {:ok, owner} = start_owner(root)
+      assert {:ok, first} = Owner.enqueue(owner, :telemetry, "first")
+      assert {:ok, second} = Owner.enqueue(owner, :telemetry, "second")
+      assert {:ok, third} = Owner.enqueue(owner, :telemetry, "third")
+
+      assert {:ok, [_first]} = Owner.acknowledge(owner, first)
+      GenServer.stop(owner)
+
+      snapshot = Path.join(root, "snapshot.bin")
+      bytes = File.read!(snapshot)
+      File.write!(snapshot, bytes)
+      assert {:ok, reopened} = start_owner(root, max_resolved_receipts: 1)
+      assert {:ok, [_second]} = Owner.acknowledge(reopened, second)
+
+      assert {:error, :non_contiguous_cumulative_prefix} =
+               Owner.acknowledge(reopened, %{third | cumulative_sequence: 3})
+
+      assert Enum.map(Owner.pending(reopened), & &1.sequence) == [3]
     end
 
     test "a stale receipt from a superseded storage epoch is refused", %{root: root} do
