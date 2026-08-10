@@ -54,11 +54,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.Frame do
   management.
 
   This is what the P9-job-4 UDP telemetry path uses. `RacingOrg.Tracker.Pro.SecureTransport.SessionHolder`
-  is the single owner of the send counter; it hands back a `(session_id, out_key,
-  epoch, counter)` grant via `take_send_counter/1`, and this function turns that
-  grant + the encoded DataSet into the wire frame. Because the counter is reserved
-  by the holder (never re-used), this function does not need — and must not have —
-  any mutable state, which is what makes concurrent sends safe by construction.
+  is the single owner of the send counter; `with_send_counter/2,3` hands its
+  caller a `(session_id, out_key, epoch, counter)` grant under a bounded send lease,
+  and this function turns that grant + the encoded DataSet into the wire frame.
+  Because the counter is reserved by the holder (never re-used), this function does
+  not need — and must not have — mutable state. The lease separately prevents that
+  reserved old-session frame from crossing transport after replacement.
+
+  `take_send_counter/1,2` can also supply these inputs, but those grants are
+  reservation-only and must not be carried directly to a production transport
+  boundary without an equivalent session lease/freshness gate.
 
   The produced bytes are BYTE-IDENTICAL to `seal/2` for the same inputs (the golden
   DATA frame proves it): `header(35) || ciphertext || tag(16)`, nonce `epoch||counter`,

@@ -20,12 +20,13 @@ defmodule RacingOrg.Tracker.Pro.WebClients.UDPClient do
       low level). Telemetry is never sent in the clear; the device re-sends on the
       next sample once a session is live.
 
-  Counter monotonicity is owned by `SessionHolder` (its `take_send_counter/1`
-  reserves a unique `(epoch, counter)` + the out key); the actual sealing is the
-  stateless `Frame.seal_with/5`, so concurrent sends can never reuse a `(key,
-  nonce)` pair. A crypto/seal error or a session that was just cleared (race) never
-  crashes the telemetry pipeline: the one datagram is dropped (UDP is lossy and the
-  device re-sends on the next sample).
+  Counter monotonicity and the send boundary are owned by `SessionHolder`:
+  `with_send_counter/2,3` atomically reserves a unique `(epoch, counter)` plus a
+  bounded send lease, then sealing and transport run in this caller. The actual
+  sealing is the stateless `Frame.seal_with/5`, so concurrent sends can never reuse
+  a `(key, nonce)` pair and replacement cannot overtake an authorized send. A
+  crypto/seal error or stale session never crashes the telemetry pipeline: the one
+  datagram is dropped (UDP is lossy and the device re-sends on the next sample).
 
   Legacy UDP replies on the device-initiated socket remain temporarily supported,
   but `RacingOrg.Tracker.Pro.WebClients.UDPClient.Server` forwards them only while a
@@ -70,9 +71,10 @@ defmodule RacingOrg.Tracker.Pro.WebClients.UDPClient do
     end
   end
 
-  # Reserve, seal, and cross the final send boundary while the holder serializes
-  # replacement/clear calls. A counter grant and old key can therefore never be
-  # used after another session generation has become current.
+  # Reserve atomically, then seal and cross the final send boundary in this caller
+  # under a holder lease. A counter grant and old key can therefore never be used
+  # after another session generation has become current, while holder reads remain
+  # responsive to unrelated work.
   defp secure_send(holder, expected_generation, proto_binary, send_fun) do
     send_boundary = fn grant -> send_secure(proto_binary, grant, send_fun) end
 

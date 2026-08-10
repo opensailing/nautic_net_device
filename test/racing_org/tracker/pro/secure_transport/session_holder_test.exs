@@ -270,8 +270,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
         end)
       end)
 
-    assert_receive {:send_started, holder_pid, %{generation: generation}}
-    assert holder_pid == h
+    assert_receive {:send_started, callback_pid, %{generation: generation}}
+    assert callback_pid == send_task.pid
     assert generation == first.generation
 
     replace_task =
@@ -280,7 +280,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
       end)
 
     assert Task.yield(replace_task, 20) == nil
-    send(h, :finish_send)
+    send(callback_pid, :finish_send)
 
     assert {:ok, {:sent, generation}} = Task.await(send_task)
     assert {:ok, replacement} = Task.await(replace_task)
@@ -485,12 +485,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
 
       assert {:ok,
               %{
+                put: {:error, :send_lease_active},
                 publish: {:error, :send_lease_active},
                 clear: {:error, :send_lease_active},
                 fence: {:error, :send_lease_active}
               }} =
                SessionHolder.with_session(h, first.generation, fn _session ->
                  %{
+                   put: SessionHolder.put(h, session(session_id: <<45::128>>)),
                    publish:
                      SessionHolder.publish(
                        h,
@@ -569,6 +571,40 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
 
       send(owner, :transmit_old_session)
       refute_receive :expired_old_session_transmitted, 50
+    end
+
+    test "normal release cancels the lease timer without killing its still-live owner", %{
+      holder: _default_holder
+    } do
+      {:ok, h} =
+        start_supervised(
+          {SessionHolder, name: nil, send_lease_ttl: 50},
+          id: {:released_lease_holder, make_ref()}
+        )
+
+      parent = self()
+      assert {:ok, published} = SessionHolder.publish(h, session(session_id: <<46::128>>))
+
+      owner =
+        spawn(fn ->
+          result =
+            SessionHolder.with_session(h, published.generation, fn _session -> :released end)
+
+          send(parent, {:released_callback_result, self(), result})
+
+          receive do
+            :prove_still_alive -> send(parent, {:released_owner_alive, self()})
+          end
+        end)
+
+      owner_ref = Process.monitor(owner)
+      assert_receive {:released_callback_result, ^owner, {:ok, :released}}, 1_000
+      Process.sleep(100)
+      refute_receive {:DOWN, ^owner_ref, :process, ^owner, _reason}
+
+      send(owner, :prove_still_alive)
+      assert_receive {:released_owner_alive, ^owner}
+      assert_receive {:DOWN, ^owner_ref, :process, ^owner, :normal}
     end
   end
 
@@ -655,6 +691,37 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
 
       assert {:ok, replacement} = Task.await(replace_task)
       assert replacement.generation > first.generation
+    end
+
+    test "take_send_counter_lease reserves the UDP nonce and fences its transport", %{
+      holder: h
+    } do
+      assert {:ok, published} = SessionHolder.publish(h, session(session_id: <<24::128>>))
+
+      assert {:ok, grant, lease} =
+               SessionHolder.take_send_counter_lease(h, published.generation)
+
+      assert grant.counter == 0
+      assert grant.generation == published.generation
+      assert grant.session_id == published.session_id
+      assert lease.generation == published.generation
+      assert lease.session_id == published.session_id
+      assert_live_snapshot(holder_snapshot(h), published, send_counter: 1)
+
+      replace_task =
+        Task.async(fn ->
+          SessionHolder.publish(
+            h,
+            session(session_id: <<25::128>>),
+            published.generation
+          )
+        end)
+
+      assert eventually(fn -> deferred_count(h) == 1 end)
+      assert Task.yield(replace_task, 20) == nil
+      assert :ok = SessionHolder.release_send_lease(h, lease)
+      assert {:ok, replacement} = Task.await(replace_task)
+      assert replacement.generation > published.generation
     end
 
     # The control path DOES allocate a nonce, so the seal must stay inside the
@@ -965,8 +1032,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
           )
         end)
 
-      assert_receive {:control_send_started, holder_pid, 0}
-      assert holder_pid == h
+      assert_receive {:control_send_started, callback_pid, 0}
+      assert callback_pid == send_task.pid
 
       replacement_task =
         Task.async(fn ->
@@ -974,7 +1041,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
         end)
 
       assert Task.yield(replacement_task, 20) == nil
-      send(h, :finish_control_send)
+      send(callback_pid, :finish_control_send)
 
       assert {:ok, :sent} = Task.await(send_task)
       assert {:ok, replacement} = Task.await(replacement_task)

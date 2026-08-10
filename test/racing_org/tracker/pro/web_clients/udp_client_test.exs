@@ -186,14 +186,19 @@ defmodule RacingOrg.Tracker.Pro.WebClients.UDPClientTest do
         end)
 
       assert_receive {:udp_send_started, send_process, frame}
-      assert send_process == holder
+      assert send_process == send_task.pid
       assert {:ok, @dataset_plaintext, _server_session} = Frame.open(first_server, frame)
+      assert SessionHolder.live?(holder)
+      assert SessionHolder.generation(holder) == first.generation
+      assert {:ok, current} = SessionHolder.get_current_session(holder)
+      assert current.session_id == first.session_id
+      assert current.send_counter == 1
 
       replace_task =
         Task.async(fn -> SessionHolder.publish(holder, second_device, first.generation) end)
 
       assert Task.yield(replace_task, 20) == nil
-      send(holder, :finish_udp_send)
+      send(send_process, :finish_udp_send)
 
       assert :ok = Task.await(send_task)
       assert {:ok, replacement} = Task.await(replace_task)

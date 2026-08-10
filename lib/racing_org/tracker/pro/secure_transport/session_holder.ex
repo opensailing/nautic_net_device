@@ -18,26 +18,37 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   To make that safe by construction, this holder OWNS counter monotonicity: it is
   the single writer of the send counter. A sealer never mutates a `Session`'s
-  `send_counter` itself; instead it calls `take_send_counter/1` (or
-  `take_send_counters/2` for a batch), which atomically returns the next
-  counter value(s) and advances the stored counter. Because the GenServer
-  serializes these calls, two concurrent sealers can never receive the same
-  counter.
+  `send_counter` itself; instead it calls `with_send_counter/2,3` for a fenced send,
+  or `take_send_counter/1,2` (`take_send_counters/2,3` for a batch) when it only
+  needs to reserve nonce material. Because the GenServer serializes allocation,
+  two concurrent sealers can never receive the same counter.
 
   ## API contract (job-4)
 
-  Job-4 seals a UDP telemetry frame like this:
+  Job-4 seals and transmits a UDP telemetry frame like this:
 
-      {:ok, %{session_id: sid, out_key: key, epoch: epoch, counter: ctr}} =
-        SessionHolder.take_send_counter()
-      frame = Frame.seal_with(key, epoch, ctr, plaintext)  # job-4 helper
+      SessionHolder.with_send_counter(fn grant ->
+        {:ok, frame} =
+          Frame.seal_with(
+            grant.session_id,
+            grant.epoch,
+            grant.counter,
+            grant.out_key,
+            plaintext
+          )
 
-  i.e. `take_send_counter/1` hands back everything needed to seal exactly ONE
-  frame: the sealing key (`out_key` = device→server `k_d2s`), the `epoch`, the
-  cleartext `session_id` (for routing/the frame header), and a UNIQUE, never-reused
-  `counter`. The counter is reserved the instant it is returned, so even if the
-  caller crashes before sealing, that counter is simply skipped (gaps are safe;
-  reuse is not).
+        transport.(frame)
+      end)
+
+  `with_send_counter/2,3` atomically reserves everything needed to seal exactly
+  one frame plus a monitored send lease. The callback and transport run in the
+  CALLER, while replacement/clear remain deferred until the callback returns.
+
+  `take_send_counter/1,2` returns the same nonce material WITHOUT a lease. It is a
+  reservation-only primitive: the counter is never reused, but the grant does not
+  fence session replacement. A caller that can reach a transport boundary must use
+  `with_send_counter/2,3` (or establish an equivalent lease) so it cannot transmit
+  reserved old-session bytes after replacement.
 
   When there is no live session, the take/get functions return
   `{:error, :no_session}` — callers must not seal.
@@ -54,23 +65,28 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   ## Send leases — why transport work must not run in the holder
 
-  The `with_*` callback APIs run caller work INSIDE the holder, which serializes
-  that work against replacement and clear. That is the right guarantee, but it is
-  the wrong place to do NETWORK I/O: a `Slipstream` push is itself a synchronous
-  call into the connection process, so a slow or unanswered push parks the single
-  writer and every unrelated caller — `live?/1`, `take_send_counter/1`, `clear/1` —
-  queues behind foreign transport until that push times out.
+  The public `with_session/3`, `with_send_counter/2,3`, and
+  `with_control_send/5` APIs preserve their callback/result contracts but implement
+  them with CALLER-SIDE work under a holder-owned lease. The holder authorizes (and,
+  for UDP/control, consumes the nonce atomically) and replies IMMEDIATELY; the
+  caller runs arbitrary work and releases in `after`. A slow or re-entrant callback
+  therefore cannot park the single writer or block `live?/1`, `generation/1`, and
+  `get_current_session/1`.
 
-  `acquire_send_lease/2` and `seal_control_send/4` split the two concerns without
-  weakening the guarantee. The holder authorizes (and, for control, consumes the
-  nonce atomically) and replies IMMEDIATELY; the caller then transmits and releases.
-  While a lease is open the holder answers every read normally, but `publish/2,3`,
+  While a lease is open the holder answers reads normally, but `publish/2,3`,
   `clear/1,2`, and `fence_for_credential_epoch/2` are DEFERRED — parked in arrival
-  order and replayed once the last lease clears — so a replacement can still never
-  overtake an authorized send. Leaseholders are monitored, so a caller that dies
-  mid-send releases its lease automatically and cannot wedge replacement.
+  order and replayed once the last lease clears — so replacement still cannot
+  overtake an authorized send. A mutation attempted by the SAME lease owner fails
+  fast with `{:error, :send_lease_active}` rather than self-deadlocking.
 
-  Nonce allocation NEVER leaves the holder. Only the transport write does.
+  Leaseholders are monitored and every lease has a bounded TTL (30 seconds by
+  default, configurable with `:send_lease_ttl`). If an owner dies, the lease is
+  released automatically. If a live owner exceeds the TTL, the holder first kills
+  it with an untrappable `:kill` signal and only releases the lease after `:DOWN`;
+  it never merely revokes authorization while old-session transport could continue.
+  The default deliberately exceeds Slipstream's 5-second synchronous push timeout.
+
+  Nonce allocation NEVER leaves the holder. Only callback/transport work does.
 
   ## Session identity history is bounded and EVICTING
 
@@ -92,12 +108,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
     * `put/1`        — ChannelClient publishes a freshly-established session
                        (resets UDP and control state for the new session).
-    * `take_send_counter/1`, `take_send_counters/2` — reserve UDP counter(s) to seal.
-    * `with_control_send/5`, `open_control/3` — own fenced control sealing/replay.
-    * `acquire_send_lease/2`, `seal_control_send/4`, `release_send_lease/2` —
-                       authorize/seal in the holder, transmit outside it.
+    * `take_send_counter/1`, `take_send_counters/2` — reservation-only UDP
+                       counter grants; they do not fence later transport.
+    * `with_send_counter/2,3`, `with_control_send/5` — allocate atomically and run
+                       fenced callback/transport work in the caller.
+    * `open_control/3` — own fenced control replay state.
+    * `acquire_send_lease/2`, `take_send_counter_lease/2`,
+      `seal_control_send/4`, `release_send_lease/2` — low-level lease primitives.
     * `get_current_session/0` — read-only UDP snapshot (counter NOT advanced); for
-                       inspection/telemetry. UDP sealers MUST use the take functions.
+                       inspection only. Transport sealers use the leased wrappers.
     * `clear/0`      — ChannelClient drops both states on disconnect/eviction.
 
   The holder is a plain `GenServer` (no ETS/`:persistent_term`): a single writer
@@ -117,6 +136,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   # refuses a fresh session, so reconnects stay unbounded. See
   # `check_fresh_session/2` for why aging out is sound.
   @session_identity_history 256
+
+  # Long enough to exceed Slipstream's 5-second synchronous push timeout while
+  # still bounding a live-but-hung owner. Tests can lower this deterministically.
+  @default_send_lease_ttl 30_000
 
   @type generation :: non_neg_integer()
 
@@ -138,8 +161,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
           session_id: binary()
         }
 
+  @type mutation_error :: :stale_session | :send_lease_active
+
   @type publication_error ::
-          :stale_session
+          mutation_error()
           | :epoch_downgrade
           | :session_reused
 
@@ -161,13 +186,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   session.
   """
   @spec put(GenServer.server(), Session.t()) ::
-          :ok | {:error, :epoch_downgrade | :session_reused}
+          :ok | {:error, :epoch_downgrade | :session_reused | :send_lease_active}
   def put(server \\ __MODULE__, %Session{} = session) do
     case publish(server, session) do
       {:ok, %Session{}} ->
         :ok
 
-      {:error, reason} = error when reason in [:epoch_downgrade, :session_reused] ->
+      {:error, reason} = error
+      when reason in [:epoch_downgrade, :session_reused, :send_lease_active] ->
         error
     end
   end
@@ -180,13 +206,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   under keys that already carried traffic. That is the whole reuse boundary: the
   handshake derives `session_id` and both direction keys from one transcript, so a
   repeated id means repeated keys, and any genuinely new handshake yields both a
-  new id and new keys. Reconnects are therefore unbounded — no history is retained
-  and no reconnect count can refuse a fresh session.
+  new id and new keys. Reconnects are therefore unbounded: a bounded newest-first
+  history evicts its oldest identity and no reconnect count can refuse a fresh
+  session merely because the history reached capacity.
   """
   @spec publish(GenServer.server(), Session.t()) ::
-          {:ok, Session.t()} | {:error, :epoch_downgrade | :session_reused}
+          {:ok, Session.t()} | {:error, :epoch_downgrade | :session_reused | :send_lease_active}
   def publish(server \\ __MODULE__, %Session{} = session) do
-    GenServer.call(server, {:publish, session, :any})
+    GenServer.call(server, {:publish, session, :any}, :infinity)
   end
 
   @doc "Publish only if `expected_generation` is still the holder's current fence."
@@ -194,7 +221,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
           {:ok, Session.t()} | {:error, publication_error()}
   def publish(server, %Session{} = session, expected_generation)
       when is_integer(expected_generation) and expected_generation >= 0 do
-    GenServer.call(server, {:publish, session, expected_generation})
+    GenServer.call(server, {:publish, session, expected_generation}, :infinity)
   end
 
   @doc "Return the current monotonic generation fence, including while no session is live."
@@ -209,32 +236,33 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   epoch reuses the current generation; a lower requested epoch is rejected.
   """
   @spec fence_for_credential_epoch(GenServer.server(), non_neg_integer()) ::
-          {:ok, generation(), :current | :evicted} | {:error, :epoch_downgrade}
+          {:ok, generation(), :current | :evicted}
+          | {:error, :epoch_downgrade | :send_lease_active}
   def fence_for_credential_epoch(server \\ __MODULE__, credential_epoch)
       when is_integer(credential_epoch) and credential_epoch >= 0 and
              credential_epoch <= 0xFFFF_FFFF do
-    GenServer.call(server, {:fence_for_credential_epoch, credential_epoch})
+    GenServer.call(server, {:fence_for_credential_epoch, credential_epoch}, :infinity)
   end
 
   @doc "Drop the current session and advance the generation fence."
-  @spec clear(GenServer.server()) :: :ok
+  @spec clear(GenServer.server()) :: :ok | {:error, :send_lease_active}
   def clear(server \\ __MODULE__) do
-    GenServer.call(server, {:clear, :any})
+    GenServer.call(server, {:clear, :any}, :infinity)
   end
 
   @doc "Drop the session only if it is still the expected generation."
-  @spec clear(GenServer.server(), generation()) :: :ok | {:error, :stale_session}
+  @spec clear(GenServer.server(), generation()) :: :ok | {:error, mutation_error()}
   def clear(server, expected_generation)
       when is_integer(expected_generation) and expected_generation >= 0 do
-    GenServer.call(server, {:clear, expected_generation})
+    GenServer.call(server, {:clear, expected_generation}, :infinity)
   end
 
   @doc """
   Read-only snapshot of the current session, or `{:error, :no_session}`.
 
   The returned `Session`'s `send_counter` reflects the NEXT counter that would be
-  handed out, but reading it here does NOT reserve it. Sealers MUST use
-  `take_send_counter/1` instead so the counter is reserved atomically.
+  handed out, but reading it here does NOT reserve it. Production transport sealers
+  must use `with_send_counter/2,3` so reservation and session fencing are atomic.
   """
   @spec get_current_session(GenServer.server()) :: {:ok, Session.t()} | {:error, :no_session}
   def get_current_session(server \\ __MODULE__) do
@@ -251,9 +279,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   Atomically reserve the next send counter and return everything needed to seal
   ONE outbound (device→server) frame.
 
+  This is RESERVATION-ONLY: the counter is never handed out again, but no send
+  lease is taken and replacement is not fenced after this call returns. Code that
+  can reach a transport boundary must use `with_send_counter/2,3` (or the low-level
+  `take_send_counter_lease/2` with `try/after`) so an old-session grant cannot be
+  transmitted after replacement.
+
   Returns `{:ok, grant}` where `grant` is a `t:counter_grant/0`, or
-  `{:error, :no_session}` when no session is live. The reserved counter is never
-  handed out again for this session.
+  `{:error, :no_session}` when no session is live.
   """
   @spec take_send_counter(GenServer.server()) ::
           {:ok, counter_grant()} | {:error, :no_session}
@@ -271,7 +304,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   @doc """
   Atomically reserve `count` consecutive send counters, returning a grant for
-  each (ascending). Useful for sealing a batch without N round-trips.
+  each (ascending). This is also reservation-only: it guarantees nonce uniqueness,
+  not that later transport remains within the granted session generation.
   """
   @spec take_send_counters(GenServer.server(), pos_integer()) ::
           {:ok, [counter_grant()]} | {:error, :no_session}
@@ -288,44 +322,54 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     GenServer.call(server, {:take_send_counters, count, expected_generation})
   end
 
-  @doc "Run work against the current session while replacement/clear remains serialized."
+  @doc """
+  Run caller-side work against the current session under a monitored, bounded
+  lease, so replacement/clear remains serialized without blocking holder reads.
+  """
   @spec with_session(GenServer.server(), generation(), (Session.t() -> result)) ::
           {:ok, result} | {:error, session_error() | :session_callback_failed}
         when result: term()
   def with_session(server, expected_generation, fun)
       when is_integer(expected_generation) and expected_generation >= 0 and is_function(fun, 1) do
-    GenServer.call(server, {:with_session, expected_generation, fun})
+    case GenServer.call(server, {:take_session_lease, expected_generation}) do
+      {:ok, session, lease} ->
+        invoke_leased_callback(server, lease, fun, session, :session_callback_failed)
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   @doc """
-  Reserve one counter and run `fun` while replacement/clear calls remain serialized
-  behind that send boundary. This prevents a granted old-session key from being
-  used after the holder has moved to another generation.
+  Atomically reserve one counter plus a monitored, bounded send lease, then run
+  `fun` in the CALLER while replacement/clear remain serialized behind that send
+  boundary. This prevents a granted old-session key from being used after the
+  holder has moved to another generation without parking the holder in transport.
   """
   @spec with_send_counter(GenServer.server(), (counter_grant() -> result)) ::
           {:ok, result} | {:error, :no_session | :send_failed}
         when result: term()
   def with_send_counter(server \\ __MODULE__, fun) when is_function(fun, 1) do
-    GenServer.call(server, {:with_send_counter, :any, fun})
+    with_send_counter_lease(server, :any, fun)
   end
 
-  @doc "Run fenced send work only if `expected_generation` is still current."
+  @doc "Run caller-side fenced send work only if `expected_generation` is still current."
   @spec with_send_counter(GenServer.server(), generation(), (counter_grant() -> result)) ::
           {:ok, result} | {:error, session_error() | :send_failed}
         when result: term()
   def with_send_counter(server, expected_generation, fun)
       when is_integer(expected_generation) and expected_generation >= 0 and is_function(fun, 1) do
-    GenServer.call(server, {:with_send_counter, expected_generation, fun})
+    with_send_counter_lease(server, expected_generation, fun)
   end
 
   @doc """
-  Seal one device-to-server `control_v1` payload and run transport work while the
-  authenticated session generation remains current.
+  Seal one device-to-server `control_v1` payload atomically, then run transport
+  work in the CALLER under the returned monitored, bounded lease.
 
   The holder owns the complete independent control state. It consumes the control
   counter before invoking `fun`, so a callback failure can skip a nonce but can
   never cause nonce reuse. Session replacement and clear remain serialized behind
-  the callback.
+  the caller-side callback while holder reads stay responsive.
   """
   @spec with_control_send(
           GenServer.server(),
@@ -338,10 +382,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   def with_control_send(server, expected_generation, type, encoded_payload, fun)
       when is_integer(expected_generation) and expected_generation >= 0 and is_atom(type) and
              is_binary(encoded_payload) and is_function(fun, 1) do
-    GenServer.call(
-      server,
-      {:with_control_send, expected_generation, type, encoded_payload, fun}
-    )
+    case seal_control_send(server, expected_generation, type, encoded_payload) do
+      {:ok, frame, lease} ->
+        invoke_leased_callback(server, lease, fun, frame, :control_send_failed)
+
+      {:error, _reason} = error ->
+        error
+    end
   end
 
   @doc """
@@ -363,24 +410,36 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   Authorize an outbound send under `expected_generation` and hold the session
   against replacement until the lease is released.
 
-  This exists because transport work must NOT run inside a holder callback: a
-  `Slipstream` push is a synchronous call into the connection process, so running
-  it in `with_session/3` parks the single writer that serializes nonce allocation
-  for every subsystem, and unrelated callers (`live?/1`, `take_send_counter/1`)
-  queue behind foreign transport.
+  This is the low-level authorization primitive used by code that cannot express
+  transport as one of the public `with_*` callbacks. It preserves mutual exclusion
+  without head-of-line blocking: while a lease is open the holder answers every
+  read normally, but `publish/2,3` and `clear/1,2` wait, so replacement cannot
+  overtake an authorized send.
 
-  A lease preserves the same mutual exclusion without that head-of-line blocking:
-  while a lease is open the holder answers every read normally, but `publish/2,3`
-  and `clear/1,2` BLOCK until it is released, so a replacement can never overtake
-  a send this caller already authorized. The holder monitors the leaseholder and
-  releases the lease automatically if it dies, so a crashed sender cannot wedge
-  session replacement.
+  The holder monitors the owner and bounds every lease with `:send_lease_ttl`. A
+  crashed sender releases automatically; a hung live sender is killed before its
+  lease is released, so it cannot resume old-session transport after replacement.
   """
   @spec acquire_send_lease(GenServer.server(), generation()) ::
           {:ok, send_lease()} | {:error, session_error()}
   def acquire_send_lease(server, expected_generation)
       when is_integer(expected_generation) and expected_generation >= 0 do
     GenServer.call(server, {:acquire_send_lease, expected_generation})
+  end
+
+  @doc """
+  Atomically reserve one UDP counter grant and return it with an open send lease.
+
+  Unlike reservation-only `take_send_counter/1,2`, this fences replacement/clear
+  from the instant the nonce is allocated until the lease is released. Counter
+  allocation stays inside the holder; sealing and transport run in the caller.
+  Callers MUST release in `try/after`, or rely on owner monitoring/TTL termination.
+  """
+  @spec take_send_counter_lease(GenServer.server(), generation()) ::
+          {:ok, counter_grant(), send_lease()} | {:error, session_error()}
+  def take_send_counter_lease(server, expected_generation)
+      when is_integer(expected_generation) and expected_generation >= 0 do
+    GenServer.call(server, {:take_send_counter_lease, expected_generation})
   end
 
   @doc """
@@ -407,13 +466,36 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   end
 
   @doc """
-  Release a lease taken by `acquire_send_lease/2` or `seal_control_send/4`,
+  Release a lease taken by `acquire_send_lease/2`, `take_send_counter_lease/2`,
+  or `seal_control_send/4`,
   unblocking deferred replacement/clear. Releasing an unknown, already-released,
   or superseded lease is inert, so callers can release unconditionally.
   """
   @spec release_send_lease(GenServer.server(), send_lease()) :: :ok
   def release_send_lease(server, %{ref: ref}) when is_reference(ref) do
     GenServer.call(server, {:release_send_lease, ref})
+  end
+
+  defp with_send_counter_lease(server, expected_generation, fun) do
+    case GenServer.call(server, {:take_send_counter_lease, expected_generation}) do
+      {:ok, grant, lease} ->
+        invoke_leased_callback(server, lease, fun, grant, :send_failed)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp invoke_leased_callback(server, lease, fun, value, failure_reason) do
+    try do
+      {:ok, fun.(value)}
+    rescue
+      _exception -> {:error, failure_reason}
+    catch
+      _kind, _reason -> {:error, failure_reason}
+    after
+      release_send_lease(server, lease)
+    end
   end
 
   defp take_one_send_counter(server, expected_generation) do
@@ -426,22 +508,30 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   # --- Server ---
 
   @impl true
-  def init(_opts) do
-    {:ok,
-     %{
-       session: nil,
-       control: nil,
-       generation: 0,
-       credential_epoch: nil,
-       # Bounded newest-first ring of recently fenced identities, retained across
-       # clear so a re-derived (therefore same-keyed) session cannot restart its
-       # counters. Evicts rather than refusing — see `check_fresh_session/2`.
-       used_session_ids: [],
-       # ref => monitor_ref for every authorized send still in flight.
-       send_leases: %{},
-       # Mutations parked behind those leases, replayed in arrival order.
-       deferred: :queue.new()
-     }}
+  def init(opts) do
+    send_lease_ttl = Keyword.get(opts, :send_lease_ttl, @default_send_lease_ttl)
+
+    if is_integer(send_lease_ttl) and send_lease_ttl > 0 do
+      {:ok,
+       %{
+         session: nil,
+         control: nil,
+         generation: 0,
+         credential_epoch: nil,
+         # Bounded newest-first ring of recently fenced identities, retained across
+         # clear so a re-derived (therefore same-keyed) session cannot restart its
+         # counters. Evicts rather than refusing — see `check_fresh_session/2`.
+         used_session_ids: [],
+         # ref => %{owner, monitor_ref, timer_ref, expiring?} for every authorized
+         # send still in flight.
+         send_leases: %{},
+         send_lease_ttl: send_lease_ttl,
+         # Mutations parked behind those leases, replayed in arrival order.
+         deferred: :queue.new()
+       }}
+    else
+      {:stop, :invalid_send_lease_ttl}
+    end
   end
 
   # Session-mutating calls must not overtake an authorized send. While any lease is
@@ -462,16 +552,34 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   def handle_call({:acquire_send_lease, expected_generation}, {pid, _tag}, state) do
     with :ok <- check_generation(state, expected_generation),
-         %Session{} = session <- state.session do
-      ref = make_ref()
-      monitor_ref = Process.monitor(pid)
-
-      lease = %{ref: ref, generation: state.generation, session_id: session.session_id}
-
-      {:reply, {:ok, lease}, %{state | send_leases: Map.put(state.send_leases, ref, monitor_ref)}}
+         %Session{} <- state.session do
+      {lease, next_state} = new_send_lease(state, pid)
+      {:reply, {:ok, lease}, next_state}
     else
       nil -> {:reply, {:error, :no_session}, state}
       {:error, :stale_session} = error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call({:take_session_lease, expected_generation}, {pid, _tag}, state) do
+    with :ok <- check_generation(state, expected_generation),
+         %Session{} = session <- state.session do
+      {lease, next_state} = new_send_lease(state, pid)
+      {:reply, {:ok, session, lease}, next_state}
+    else
+      nil -> {:reply, {:error, :no_session}, state}
+      {:error, :stale_session} = error -> {:reply, error, state}
+    end
+  end
+
+  def handle_call({:take_send_counter_lease, expected_generation}, {pid, _tag}, state) do
+    case reserve_counters(state, 1, expected_generation) do
+      {:ok, [grant], reserved_state} ->
+        {lease, next_state} = new_send_lease(reserved_state, pid)
+        {:reply, {:ok, grant, lease}, next_state}
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
     end
   end
 
@@ -488,13 +596,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     with :ok <- check_generation(state, expected_generation),
          {:ok, control} <- current_control(state),
          {:ok, frame, next_control} <- Control.seal(control, type, encoded_payload) do
-      ref = make_ref()
-      monitor_ref = Process.monitor(pid)
-
-      lease = %{ref: ref, generation: state.generation, session_id: state.session.session_id}
-
-      {:reply, {:ok, frame, lease},
-       %{state | control: next_control, send_leases: Map.put(state.send_leases, ref, monitor_ref)}}
+      {lease, leased_state} = new_send_lease(%{state | control: next_control}, pid)
+      {:reply, {:ok, frame, lease}, leased_state}
     else
       {:error, reason} -> {:reply, {:error, reason}, state}
     end
@@ -523,41 +626,6 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     end
   end
 
-  def handle_call({:with_session, expected_generation, fun}, _from, state) do
-    with :ok <- check_generation(state, expected_generation),
-         %Session{} = session <- state.session do
-      {:reply, invoke_callback(fun, session, :session_callback_failed), state}
-    else
-      nil -> {:reply, {:error, :no_session}, state}
-      {:error, :stale_session} = error -> {:reply, error, state}
-    end
-  end
-
-  def handle_call({:with_send_counter, expected_generation, fun}, _from, state) do
-    case reserve_counters(state, 1, expected_generation) do
-      {:ok, [grant], next_state} ->
-        {:reply, invoke_callback(fun, grant, :send_failed), next_state}
-
-      {:error, reason} ->
-        {:reply, {:error, reason}, state}
-    end
-  end
-
-  def handle_call(
-        {:with_control_send, expected_generation, type, encoded_payload, fun},
-        _from,
-        state
-      ) do
-    with :ok <- check_generation(state, expected_generation),
-         {:ok, control} <- current_control(state),
-         {:ok, frame, next_control} <- Control.seal(control, type, encoded_payload) do
-      next_state = %{state | control: next_control}
-      {:reply, invoke_callback(fun, frame, :control_send_failed), next_state}
-    else
-      {:error, reason} -> {:reply, {:error, reason}, state}
-    end
-  end
-
   def handle_call({:open_control, expected_generation, frame}, _from, state) do
     with :ok <- check_generation(state, expected_generation),
          {:ok, control} <- current_control(state) do
@@ -579,9 +647,28 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   # A leaseholder that dies mid-send must never wedge session replacement.
   @impl true
   def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
-    case Enum.find(state.send_leases, fn {_ref, mref} -> mref == monitor_ref end) do
-      {ref, _monitor_ref} -> {:noreply, release_lease(state, ref, :already_demonitored)}
+    case Enum.find(state.send_leases, fn {_ref, lease_state} ->
+           lease_state.monitor_ref == monitor_ref
+         end) do
+      {ref, _lease_state} -> {:noreply, release_lease(state, ref, :owner_down)}
       nil -> {:noreply, state}
+    end
+  end
+
+  # A live-but-hung owner cannot hold transitions forever. Fail closed: kill the
+  # owner first, retain the lease, and wait for its monitored DOWN before replaying
+  # deferred mutations. Merely revoking here would let old-session bytes transmit
+  # after replacement if the callback later resumed.
+  def handle_info({:send_lease_expired, ref}, state) do
+    case Map.fetch(state.send_leases, ref) do
+      {:ok, %{owner: owner} = lease_state} ->
+        Process.exit(owner, :kill)
+
+        expiring = %{lease_state | timer_ref: nil, expiring?: true}
+        {:noreply, put_in(state.send_leases[ref], expiring)}
+
+      :error ->
+        {:noreply, state}
     end
   end
 
@@ -595,21 +682,65 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     {:reply, reply, next_state}
   end
 
-  defp maybe_defer(request, from, state) do
-    {:noreply, %{state | deferred: :queue.in({request, from}, state.deferred)}}
+  defp maybe_defer(request, {pid, _tag} = from, state) when is_pid(pid) do
+    if lease_owner?(state, pid) do
+      {:reply, {:error, :send_lease_active}, state}
+    else
+      {:noreply, %{state | deferred: :queue.in({request, from}, state.deferred)}}
+    end
   end
 
-  defp release_lease(state, ref, demonitor \\ :demonitor) do
-    case Map.pop(state.send_leases, ref) do
-      {nil, _leases} ->
+  defp new_send_lease(%{session: %Session{} = session} = state, owner) when is_pid(owner) do
+    ref = make_ref()
+    monitor_ref = Process.monitor(owner)
+    timer_ref = Process.send_after(self(), {:send_lease_expired, ref}, state.send_lease_ttl)
+
+    lease = %{ref: ref, generation: state.generation, session_id: session.session_id}
+
+    lease_state = %{
+      owner: owner,
+      monitor_ref: monitor_ref,
+      timer_ref: timer_ref,
+      expiring?: false
+    }
+
+    {lease, %{state | send_leases: Map.put(state.send_leases, ref, lease_state)}}
+  end
+
+  defp lease_owner?(state, pid) do
+    Enum.any?(state.send_leases, fn {_ref, lease_state} -> lease_state.owner == pid end)
+  end
+
+  defp release_lease(state, ref, release_reason \\ :owner_release) do
+    case Map.fetch(state.send_leases, ref) do
+      :error ->
         state
 
-      {monitor_ref, leases} ->
-        if demonitor == :demonitor do
-          Process.demonitor(monitor_ref, [:flush])
+      # Expiry has already killed the owner. Keep the lease until DOWN proves that
+      # process can no longer resume old-session transport.
+      {:ok, %{expiring?: true}} when release_reason == :owner_release ->
+        state
+
+      {:ok, lease_state} ->
+        if release_reason == :owner_release do
+          Process.demonitor(lease_state.monitor_ref, [:flush])
         end
 
+        cancel_lease_timer(ref, lease_state.timer_ref)
+        leases = Map.delete(state.send_leases, ref)
         flush_deferred(%{state | send_leases: leases})
+    end
+  end
+
+  defp cancel_lease_timer(_ref, nil), do: :ok
+
+  defp cancel_lease_timer(ref, timer_ref) do
+    _ = Process.cancel_timer(timer_ref, async: false, info: false)
+
+    receive do
+      {:send_lease_expired, ^ref} -> :ok
+    after
+      0 -> :ok
     end
   end
 
@@ -792,12 +923,4 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
        do: :ok
 
   defp check_credential_epoch(_state, _credential_epoch), do: {:error, :epoch_downgrade}
-
-  defp invoke_callback(fun, value, failure_reason) do
-    {:ok, fun.(value)}
-  rescue
-    _exception -> {:error, failure_reason}
-  catch
-    _kind, _reason -> {:error, failure_reason}
-  end
 end

@@ -410,7 +410,10 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploaderTest do
     {:ok, current} = SessionHolder.get_current_session(ctx.holder)
     upload_task = Task.async(fn -> BulkUploader.upload(upload_opts(ctx, {nil, adapter})) end)
     assert_receive {:bulk_request_started, request_process, _env}
-    assert request_process == ctx.holder
+    assert request_process == upload_task.pid
+    assert SessionHolder.live?(ctx.holder)
+    assert SessionHolder.generation(ctx.holder) == current.generation
+    assert {:ok, ^current} = SessionHolder.get_current_session(ctx.holder)
 
     replacement =
       Session.new(
@@ -427,7 +430,7 @@ defmodule RacingOrg.Tracker.Pro.Race.BulkUploaderTest do
       Task.async(fn -> SessionHolder.publish(ctx.holder, replacement, current.generation) end)
 
     assert Task.yield(replace_task, 20) == nil
-    send(ctx.holder, :finish_bulk_request)
+    send(request_process, :finish_bulk_request)
 
     assert {:ok, :complete} = Task.await(upload_task)
     assert {:ok, published_replacement} = Task.await(replace_task)

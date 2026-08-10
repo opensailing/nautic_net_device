@@ -127,6 +127,41 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     defdelegate close(device), to: FileSystem
   end
 
+  defmodule BlockingFileSystem do
+    @behaviour FileSystem
+
+    def block_rename(path, listener),
+      do: :persistent_term.put({__MODULE__, :rename, path}, listener)
+
+    def clear_rename(path),
+      do: :persistent_term.erase({__MODULE__, :rename, path})
+
+    def rename(source, destination) do
+      case :persistent_term.get({__MODULE__, :rename, destination}, nil) do
+        listener when is_pid(listener) ->
+          send(listener, {:active_pointer_rename_blocked, self()})
+
+          receive do
+            :continue_active_pointer_rename ->
+              send(listener, {:active_pointer_rename_resumed, self()})
+              FileSystem.rename(source, destination)
+          end
+
+        nil ->
+          FileSystem.rename(source, destination)
+      end
+    end
+
+    defdelegate mkdir_p(path), to: FileSystem
+    defdelegate chmod(path, mode), to: FileSystem
+    defdelegate open(path, modes), to: FileSystem
+    defdelegate write(device, contents), to: FileSystem
+    defdelegate sync(device), to: FileSystem
+    defdelegate close(device), to: FileSystem
+    defdelegate read(path), to: FileSystem
+    defdelegate remove(path), to: FileSystem
+  end
+
   setup do
     base = Path.join(System.tmp_dir!(), "desired_manager_#{System.unique_integer([:positive])}")
     term_key = {__MODULE__, make_ref()}
@@ -846,6 +881,80 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
       assert Store.active(ctx.store) == {:ok, pointer(prior)}
       assert OperationalGate.status(ctx.gate) == {:open, gate_binding(prior)}
     end)
+  end
+
+  test "lease expiry kills the fenced mutation executor before session replacement", ctx do
+    prior = fully_stage(ctx.store, DS.generation_fixture(generation: 1))
+    assert {:ok, nil} = Store.activate(ctx.store, 1, prior.manifest_hash)
+
+    holder =
+      start_supervised!(
+        Supervisor.child_spec(
+          {SessionHolder, name: nil, send_lease_ttl: 100},
+          id: make_ref()
+        )
+      )
+
+    {:ok, current_session} = SessionHolder.publish(holder, session(<<2::128>>))
+
+    store =
+      Store.new(
+        base_dir: ctx.base,
+        storage_epoch: DS.storage_epoch(),
+        file_system: BlockingFileSystem
+      )
+
+    ctx = %{
+      ctx
+      | holder: holder,
+        session_generation: current_session.generation,
+        store: store
+    }
+
+    pid = start_manager(ctx, owner_retry_base_ms: 10)
+    assert_receive {:applier, :reconcile, _startup}
+
+    candidate = DS.generation_fixture(generation: 2)
+    final_chunk = deliver_until_final_chunk(pid, candidate, ctx.session_generation)
+    active_pointer_path = Store.active_pointer_path(store)
+    BlockingFileSystem.block_rename(active_pointer_path, self())
+    on_exit(fn -> BlockingFileSystem.clear_rename(active_pointer_path) end)
+
+    caller = self()
+
+    spawn(fn ->
+      result =
+        try do
+          Manager.deliver_chunk(pid, ctx.session_generation, final_chunk)
+        catch
+          :exit, reason -> {:exit, reason}
+        end
+
+      send(caller, {:expired_transition_result, result})
+    end)
+
+    assert_receive {:ack, %{status: :staged}, _meta}, 1_000
+    assert_receive {:active_pointer_rename_blocked, ^pid}, 1_000
+
+    manager_ref = Process.monitor(pid)
+
+    replacement_task =
+      Task.async(fn ->
+        :ok = SessionHolder.clear(holder)
+        SessionHolder.publish(holder, session(<<3::128>>))
+      end)
+
+    assert Task.yield(replacement_task, 20) == nil
+    assert {:ok, %Session{generation: replacement_generation}} = Task.await(replacement_task, 1_000)
+    assert replacement_generation > ctx.session_generation
+
+    send(pid, :continue_active_pointer_rename)
+
+    refute_receive {:active_pointer_rename_resumed, ^pid}, 100
+    assert_receive {:DOWN, ^manager_ref, :process, ^pid, :killed}, 1_000
+    assert_receive {:expired_transition_result, {:exit, _reason}}, 1_000
+    assert Store.active(store) == {:ok, pointer(prior)}
+    refute_receive {:ack, %{status: :effective, generation: 2}, _meta}
   end
 
   test "an ACK sink may consult SessionHolder without deadlocking delivery", ctx do
