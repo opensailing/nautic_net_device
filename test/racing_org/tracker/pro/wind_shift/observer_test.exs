@@ -24,7 +24,17 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
   defp new_script do
     {:ok, script} =
       Agent.start_link(fn ->
-        %{t_ms: 0, twd: nil, tws: nil, twa: nil, heading: nil, lat: nil, lon: nil, stale: false}
+        %{
+          t_ms: 0,
+          wall_offset_ms: 0,
+          twd: nil,
+          tws: nil,
+          twa: nil,
+          heading: nil,
+          lat: nil,
+          lon: nil,
+          stale: false
+        }
       end)
 
     {:ok, sink} = Agent.start_link(fn -> [] end)
@@ -61,7 +71,10 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
       broadcast_enabled: false,
       signals_fn: signals_fn,
       now_fn: fn -> Agent.get(script, & &1.t_ms) end,
-      utc_now_fn: fn -> DateTime.add(@utc_base, Agent.get(script, & &1.t_ms), :millisecond) end,
+      utc_now_fn: fn ->
+        %{t_ms: t_ms, wall_offset_ms: wall_offset_ms} = Agent.get(script, & &1)
+        DateTime.add(@utc_base, t_ms + wall_offset_ms, :millisecond)
+      end,
       put_signals_fn: fn updates, mono -> Agent.update(sink, &[{updates, mono} | &1]) end,
       sender: fn _cc, update -> send(parent, {:sync, update}) end,
       transmit_fn: fn priority, pgn, payload -> send(parent, {:tx, priority, pgn, payload}) end
@@ -278,6 +291,37 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     assert Enum.any?(events, &(&1.kind == "regime_change" and &1.detail.to == "persistent_step"))
     assert last_batch(ctx)["wind_regime"] == 4
     assert Observer.status(observer).regime == "persistent_step"
+  end
+
+  test "clamps a derived step onset to the current session start" do
+    ctx = new_script()
+
+    observer =
+      start_observer(ctx,
+        sync_ms: 3_600_000_000,
+        timeline_ms: 3_600_000_000
+      )
+
+    drive(observer, ctx, [%{t_ms: 0, twd_deg: 200.0, tws_mps: 6.0}])
+    Agent.update(ctx.script, &%{&1 | t_ms: 1_000, twd: 230.0, tws: 6.0})
+
+    :sys.replace_state(observer, fn state ->
+      confirmed_step = %{
+        state.step
+        | status: :confirmed,
+          dir: :up,
+          onset_ms: -1_000,
+          magnitude: 30.0
+      }
+
+      %{state | step: confirmed_step, prev_step_status: :candidate}
+    end)
+
+    Observer.tick(observer)
+
+    assert %{detail: %{onset_t_ms: @wall_base}} =
+             :sys.get_state(observer).pending_events
+             |> Enum.find(&(&1.kind == "step"))
   end
 
   test "keeps current events before a delayed older oscillation extreme" do
@@ -571,6 +615,107 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
       assert started == @wall_base
     end
 
+    test "normalizes same-day legacy persisted directions without changing durable ordering or sequence", %{
+      dir: dir
+    } do
+      legacy = %{
+        session: %{
+          started_at_ms: @wall_base,
+          lat_sum: 41.0,
+          lon_sum: -71.0,
+          pos_n: 1,
+          tws_sum: 6.0,
+          tws_n: 1
+        },
+        seq: 9,
+        pending_timeline: [
+          %{
+            t_ms: @wall_base + 10_000,
+            mean_twd_deg: -1.0,
+            phase_deg: -2.0,
+            amplitude_deg: 4.0,
+            period_s: 480.0,
+            trend_deg_per_hr: 1.0,
+            tws_mps: 6.0
+          },
+          %{
+            t_ms: @wall_base + 20_000,
+            mean_twd_deg: 360.0,
+            phase_deg: 2.0,
+            amplitude_deg: 4.0,
+            period_s: 480.0,
+            trend_deg_per_hr: 1.0,
+            tws_mps: 6.0
+          }
+        ],
+        pending_events: [
+          %{
+            t_ms: @wall_base + 20_000,
+            kind: "new_high",
+            twd_deg: -1.0,
+            magnitude_deg: 2.0,
+            detail: %{min_deg: -2.0, max_deg: 360.0}
+          },
+          %{
+            t_ms: @wall_base + 10_000,
+            kind: "lift_extreme",
+            twd_deg: 360.0,
+            magnitude_deg: 4.0,
+            detail: %{phase_deg: -4.0}
+          },
+          %{
+            t_ms: @wall_base + 30_000,
+            kind: "new_low",
+            twd_deg: 721.0,
+            magnitude_deg: 2.0,
+            detail: %{min_deg: 360.0, max_deg: -1.0}
+          }
+        ],
+        last_summary: %{
+          mean_twd_deg: 720.0,
+          trend_deg_per_hr: 1.0,
+          oscillation_period_s: 480.0,
+          oscillation_amplitude_deg: 4.0,
+          regime: "oscillating",
+          tws_mean_mps: 6.0
+        }
+      }
+
+      :ok = Store.save(dir, legacy)
+      ctx = new_script()
+      observer = start_observer(ctx, dir: dir)
+      state = :sys.get_state(observer)
+
+      assert state.session == legacy.session
+      assert state.seq == 9
+
+      assert state.pending_timeline == [
+               %{Enum.at(legacy.pending_timeline, 0) | mean_twd_deg: 359.0},
+               %{Enum.at(legacy.pending_timeline, 1) | mean_twd_deg: 0.0}
+             ]
+
+      assert state.pending_events == [
+               %{
+                 Enum.at(legacy.pending_events, 0)
+                 | twd_deg: 359.0,
+                   detail: %{min_deg: 358.0, max_deg: 0.0}
+               },
+               %{Enum.at(legacy.pending_events, 1) | twd_deg: 0.0},
+               %{
+                 Enum.at(legacy.pending_events, 2)
+                 | twd_deg: 1.0,
+                   detail: %{min_deg: 0.0, max_deg: 359.0}
+               }
+             ]
+
+      assert state.last_summary == %{legacy.last_summary | mean_twd_deg: 0.0}
+
+      :ok = Observer.persist_now(observer)
+      assert {:ok, migrated} = Store.load(dir)
+      assert migrated.seq == 9
+      assert {:ok, _content} = WindCheckpoint.project(migrated)
+    end
+
     test "a persisted session from a previous UTC day starts a fresh session (seq still monotonic)", %{dir: dir} do
       alias RacingOrg.Tracker.Pro.WindShift.Observer.Store
 
@@ -633,6 +778,118 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     assert update.timeline != []
     assert Enum.all?(update.timeline, &(&1.t_ms >= started))
     refute_receive {:sync, _}, 20
+  end
+
+  test "a backward wall-clock correction to the previous UTC date rotates the session" do
+    ctx = new_script()
+
+    observer =
+      start_observer(ctx,
+        sync_ms: 3_600_000_000,
+        timeline_ms: 3_600_000_000
+      )
+
+    drive(observer, ctx, [%{t_ms: 0, twd_deg: 200.0, tws_mps: 6.0}])
+
+    corrected_started_at_ms = @wall_base - 24 * 60 * 60 * 1_000 - 1_000
+
+    drive(
+      observer,
+      ctx,
+      [%{t_ms: 1_000, twd_deg: 210.0, tws_mps: 7.0}],
+      %{wall_offset_ms: -24 * 60 * 60 * 1_000 - 2_000}
+    )
+
+    assert_receive {:sync, %{seq: 1, session: %{started_at_ms: @wall_base}}}
+    assert Observer.session(observer).started_at_ms == corrected_started_at_ms
+  end
+
+  test "a backward same-day wall-clock correction rotates the session and preserves projectable state" do
+    dir =
+      Path.join(
+        System.tmp_dir!(),
+        "wind_shift_clock_rollback_test_#{System.unique_integer([:positive])}"
+      )
+
+    on_exit(fn -> File.rm_rf(dir) end)
+    ctx = new_script()
+
+    {:ok, observer} =
+      Observer.start_link(
+        observer_opts(ctx,
+          dir: dir,
+          persist_ms: 3_600_000_000,
+          sync_ms: 3_600_000_000,
+          timeline_ms: 60_000
+        )
+      )
+
+    drive(observer, ctx, gen([%{dur_s: 70, base: 200.0}]), %{
+      lat: 41.0,
+      lon: -71.0
+    })
+
+    old_extreme_ms = @wall_base + 30_000
+
+    :sys.replace_state(observer, fn state ->
+      candidate_step = %{
+        state.step
+        | status: :candidate,
+          dir: :up,
+          onset_ms: 60_000,
+          magnitude: 12.0
+      }
+
+      %{
+        state
+        | step: candidate_step,
+          prev_step_status: :candidate,
+          xing: %{side: :pos, extreme: {5.0, 205.0, old_extreme_ms}}
+      }
+    end)
+
+    correction_mono_ms = 70_000
+    wall_offset_ms = -3_670_000
+    corrected_started_at_ms = @wall_base - 3_600_000
+
+    drive(
+      observer,
+      ctx,
+      [%{t_ms: correction_mono_ms, twd_deg: 210.0, tws_mps: 7.0}],
+      %{wall_offset_ms: wall_offset_ms, lat: 42.0, lon: -72.0}
+    )
+
+    assert_receive {:sync, %{seq: 1, session: %{started_at_ms: @wall_base}} = old_session}
+    assert [%{t_ms: old_timeline_ms}] = old_session.timeline
+    assert old_timeline_ms == @wall_base + 60_000
+
+    state = :sys.get_state(observer)
+
+    assert state.session == %{
+             started_at_ms: corrected_started_at_ms,
+             lat_sum: 42.0,
+             lon_sum: -72.0,
+             pos_n: 1,
+             tws_sum: 7.0,
+             tws_n: 1
+           }
+
+    assert StepDetect.snapshot(state.step).status == :none
+    assert state.prev_step_status == :none
+    refute state.xing.extreme == {5.0, 205.0, old_extreme_ms}
+
+    if state.xing.extreme do
+      assert elem(state.xing.extreme, 2) >= corrected_started_at_ms
+    end
+
+    :ok = Observer.sync_now(observer)
+
+    assert_receive {:sync, %{seq: 2, session: %{started_at_ms: ^corrected_started_at_ms}}}
+
+    :ok = Observer.persist_now(observer)
+    assert {:ok, snapshot} = Store.load(dir)
+    assert snapshot.seq == 2
+    assert {:ok, _content} = WindCheckpoint.project(snapshot)
   end
 
   test "UTC rotation resets a step candidate before any new-session confirmation" do

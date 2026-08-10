@@ -306,7 +306,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
         last_sync_ms: boot_ms,
         last_timeline_ms: boot_ms,
         last_tx_ms: nil,
-        dirty_persist: false,
+        dirty_persist: Map.get(persisted, :dirty_persist, false),
         stats: %{samples: 0, accepted: 0, rejected: 0, reject_reasons: %{}}
       }
       |> put_policy(fetch_policy(config))
@@ -492,14 +492,15 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   defp ensure_session(%{session: nil} = state, wall_ms), do: start_session(state, wall_ms)
 
-  # A device powered through midnight UTC must not accumulate one multi-day
-  # session: once the wall clock's UTC date has advanced past the session's,
-  # the old session is ROTATED — flushed with a final sync under its own
-  # identity (throttle bypassed), then a fresh identity starts with fresh
-  # centroid/summary accumulators. `seq` continues monotonically across the
-  # rotation (the flush increments it; the backend orders per boat by seq).
+  # A device powered through a UTC date change or whose wall clock is corrected
+  # behind the current session start must not accumulate one invalid session.
+  # The old session is ROTATED — flushed with a final sync under its own identity
+  # (throttle bypassed), then a fresh identity starts with fresh centroid/summary
+  # accumulators. `seq` continues monotonically across the rotation (the flush
+  # increments it; the backend orders per boat by seq).
   defp ensure_session(%{session: %{started_at_ms: started_ms}} = state, wall_ms) do
-    if Date.compare(utc_date(wall_ms), utc_date(started_ms)) == :gt do
+    if wall_ms < started_ms or
+         Date.compare(utc_date(wall_ms), utc_date(started_ms)) != :eq do
       rotate_session(state, wall_ms)
     else
       state
@@ -517,15 +518,15 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   end
 
   defp rotate_session(state, wall_ms) do
-    Logger.info("[WindShift.Observer] UTC day rollover: rotating the wind-shift session")
+    Logger.info("[WindShift.Observer] UTC clock boundary: rotating the wind-shift session")
     state = sync(state)
 
     # The flush can only be skipped while no verdict exists yet (a batch
-    # restored at boot, rotated before the first classified tick). Old-day rows
-    # must never attach to the new session, so they are dropped — the same
-    # policy restore/2 applies to a previous-day snapshot at boot.
+    # restored at boot, rotated before the first classified tick). Prior-session
+    # rows must never attach to the new session, so they are dropped — the same
+    # policy restore/2 applies to a previous-date snapshot at boot.
     if state.pending_timeline != [] or state.pending_events != [] do
-      Logger.warning("[WindShift.Observer] dropping unsynced previous-day rows at UTC rollover")
+      Logger.warning("[WindShift.Observer] dropping unsynced rows at a UTC clock boundary")
     end
 
     # last_summary resets so the new session's FIRST sync always goes out.
@@ -605,7 +606,11 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   defp step_event({state, events}, step_snap, twd, wall_ms, now) do
     events =
       if step_snap.status == :confirmed and state.prev_step_status != :confirmed do
-        onset_t_ms = wall_ms - (now - step_snap.onset_ms)
+        onset_t_ms =
+          max(
+            wall_ms - (now - step_snap.onset_ms),
+            state.session.started_at_ms
+          )
 
         [
           %{
@@ -979,7 +984,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     case Store.load(dir) do
       {:ok, persisted} ->
         if same_utc_day?(Map.get(persisted, :session), utc_now_fn.()) do
-          persisted
+          normalize_restored_directions(persisted)
         else
           %{seq: Map.get(persisted, :seq, 0)}
         end
@@ -988,6 +993,60 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
         %{}
     end
   end
+
+  defp normalize_restored_directions(persisted) do
+    normalized =
+      persisted
+      |> Map.update(:pending_timeline, [], fn rows ->
+        Enum.map(rows, &normalize_restored_timeline/1)
+      end)
+      |> Map.update(:pending_events, [], fn events ->
+        Enum.map(events, &normalize_restored_event/1)
+      end)
+      |> Map.update(:last_summary, nil, &normalize_restored_summary/1)
+
+    migrated? =
+      :erlang.term_to_binary(normalized) !=
+        :erlang.term_to_binary(persisted)
+
+    Map.put(normalized, :dirty_persist, migrated?)
+  end
+
+  defp normalize_restored_timeline(%{mean_twd_deg: direction} = row),
+    do: %{row | mean_twd_deg: normalize_restored_direction(direction)}
+
+  defp normalize_restored_timeline(row), do: row
+
+  defp normalize_restored_event(%{twd_deg: direction} = event) do
+    event = %{event | twd_deg: normalize_restored_direction(direction)}
+
+    case event do
+      %{kind: kind, detail: %{min_deg: min_deg, max_deg: max_deg} = detail}
+      when kind in ["new_high", "new_low"] ->
+        %{
+          event
+          | detail: %{
+              detail
+              | min_deg: normalize_restored_direction(min_deg),
+                max_deg: normalize_restored_direction(max_deg)
+            }
+        }
+
+      _other ->
+        event
+    end
+  end
+
+  defp normalize_restored_event(event), do: event
+
+  defp normalize_restored_summary(%{mean_twd_deg: direction} = summary),
+    do: %{summary | mean_twd_deg: normalize_restored_direction(direction)}
+
+  defp normalize_restored_summary(summary), do: summary
+
+  defp normalize_restored_direction(nil), do: nil
+  defp normalize_restored_direction(direction) when is_number(direction), do: Circular.normalize(direction)
+  defp normalize_restored_direction(direction), do: direction
 
   defp same_utc_day?(%{started_at_ms: ms}, %DateTime{} = now) when is_integer(ms) do
     DateTime.to_date(DateTime.from_unix!(ms, :millisecond)) == DateTime.to_date(now)
