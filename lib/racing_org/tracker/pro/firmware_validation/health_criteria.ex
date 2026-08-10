@@ -11,7 +11,9 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.HealthCriteria do
   `process_health` is deliberately an aggregate supplied by the integration layer:
   `:supervisor` represents all required supervisor processes and `:owner` represents
   all required owner processes. The integration layer also owns the continuous-soak
-  clock and must reset `soak_started_at_ms` whenever health continuity is broken.
+  clock and must reset `soak_started_at_ms` whenever health continuity is broken. All
+  timing values must share one trusted millisecond clock domain. Soak accrued after
+  `deadline_at_ms` never rescues a trial that missed its deadline.
 
   Input maps must have exactly the documented keys. Unknown keys, arbitrary metadata,
   PIDs, receipt payloads, and secrets are rejected. Diagnostics contain only stable
@@ -19,6 +21,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.HealthCriteria do
   """
 
   @max_u32 0xFFFF_FFFF
+  @max_generation 0x7FFF_FFFF_FFFF_FFFF
   @max_u64 0xFFFF_FFFF_FFFF_FFFF
   @git_sha_bytes 40
   @max_version_bytes 128
@@ -280,7 +283,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.HealthCriteria do
         :outbox_critical_pressure
       ),
       failed_unless(
-        soak_elapsed?(snapshot.timing, target.soak_period_ms),
+        soak_elapsed?(snapshot.timing, target.soak_period_ms, target.deadline_at_ms),
         :soak_period,
         :soak_period_incomplete
       )
@@ -303,8 +306,12 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.HealthCriteria do
   defp unmet(criterion, diagnostic_code),
     do: %{criterion: criterion, diagnostic_code: diagnostic_code}
 
-  defp soak_elapsed?(%{observed_at_ms: observed_at_ms, soak_started_at_ms: soak_started_at_ms}, soak_period_ms) do
-    observed_at_ms - soak_started_at_ms >= soak_period_ms
+  defp soak_elapsed?(
+         %{observed_at_ms: observed_at_ms, soak_started_at_ms: soak_started_at_ms},
+         soak_period_ms,
+         deadline_at_ms
+       ) do
+    min(observed_at_ms, deadline_at_ms) - soak_started_at_ms >= soak_period_ms
   end
 
   defp validate_snapshot(
@@ -346,7 +353,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.HealthCriteria do
     with true <- exact_keys?(target, @target_keys),
          true <- valid_target_firmware?(firmware),
          true <- uint32?(credential_epoch),
-         true <- positive_uint64?(desired_generation),
+         true <- positive_generation?(desired_generation),
          true <- positive_uint64?(soak_period_ms),
          true <- uint64?(deadline_at_ms) do
       {:ok, target}
@@ -382,7 +389,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.HealthCriteria do
   defp valid_session?(_session), do: false
 
   defp valid_desired_state?(%{generation: generation, effective: effective, compatible: compatible} = desired_state) do
-    exact_keys?(desired_state, @desired_state_keys) and positive_uint64?(generation) and
+    exact_keys?(desired_state, @desired_state_keys) and positive_generation?(generation) and
       is_boolean(effective) and is_boolean(compatible)
   end
 
@@ -437,5 +444,6 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.HealthCriteria do
 
   defp uint32?(value), do: is_integer(value) and value >= 0 and value <= @max_u32
   defp uint64?(value), do: is_integer(value) and value >= 0 and value <= @max_u64
+  defp positive_generation?(value), do: is_integer(value) and value > 0 and value <= @max_generation
   defp positive_uint64?(value), do: is_integer(value) and value > 0 and value <= @max_u64
 end

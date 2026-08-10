@@ -5,6 +5,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.HealthCriteriaTest do
 
   @git_sha "0123456789abcdef0123456789abcdef01234567"
   @other_git_sha "abcdef0123456789abcdef0123456789abcdef01"
+  @max_generation 9_223_372_036_854_775_807
 
   test "returns ready only when every health criterion passes and soak has elapsed" do
     assert :ready = HealthCriteria.evaluate(healthy_snapshot(), expected_target())
@@ -133,7 +134,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.HealthCriteriaTest do
              |> HealthCriteria.evaluate(expected_target())
   end
 
-  test "a fully healthy snapshot remains ready at or after the deadline" do
+  test "health whose soak completed by the deadline remains ready afterward" do
     assert :ready =
              healthy_snapshot()
              |> put_in([:timing, :observed_at_ms], 20_000)
@@ -143,6 +144,40 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.HealthCriteriaTest do
              healthy_snapshot()
              |> put_in([:timing, :observed_at_ms], 20_001)
              |> HealthCriteria.evaluate(expected_target())
+  end
+
+  test "health attained only after the deadline cannot rescue the trial" do
+    deadline_snapshot = %{
+      healthy_snapshot()
+      | timing: %{observed_at_ms: 20_000, soak_started_at_ms: 16_000}
+    }
+
+    after_deadline_snapshot = put_in(deadline_snapshot, [:timing, :observed_at_ms], 21_000)
+    expected = [unmet(:soak_period, :soak_period_incomplete)]
+
+    assert {:rollback_required, ^expected} =
+             HealthCriteria.evaluate(deadline_snapshot, expected_target())
+
+    assert {:rollback_required, ^expected} =
+             HealthCriteria.evaluate(after_deadline_snapshot, expected_target())
+  end
+
+  test "desired generations use the positive signed-bigint domain" do
+    max_target = Map.put(expected_target(), :desired_generation, @max_generation)
+    max_snapshot = put_in(healthy_snapshot(), [:desired_state, :generation], @max_generation)
+
+    assert :ready = HealthCriteria.evaluate(max_snapshot, max_target)
+
+    assert {:pending, [unmet(:input, :invalid_snapshot)]} ==
+             healthy_snapshot()
+             |> put_in([:desired_state, :generation], @max_generation + 1)
+             |> HealthCriteria.evaluate(expected_target())
+
+    assert {:rollback_required, [unmet(:input, :invalid_target)]} ==
+             HealthCriteria.evaluate(
+               healthy_snapshot(),
+               Map.put(expected_target(), :desired_generation, @max_generation + 1)
+             )
   end
 
   test "malformed snapshots fail closed without raising" do
