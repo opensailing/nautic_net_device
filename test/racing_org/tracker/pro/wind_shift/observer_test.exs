@@ -1519,6 +1519,217 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
       assert Observer.snapshot(target) == {:ok, before}
     end
 
+    test "reconciles a legacy split fingerprint and runtime across an immediate hard restart" do
+      dir = Path.join(System.tmp_dir!(), "wind_shift_runtime_split_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      source_ctx = new_script()
+      source = start_observer(source_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      drive(source, source_ctx, for(i <- 0..3, do: %{t_ms: i * 1_000, twd_deg: 200.0 + i, tws_mps: 6.0}))
+      assert {:ok, authoritative} = Observer.snapshot(source)
+
+      fingerprint = :crypto.hash(:sha256, :erlang.term_to_binary(authoritative, [:deterministic]))
+
+      assert :ok =
+               Store.save(dir, %{
+                 session: nil,
+                 seq: 0,
+                 pending_timeline: [],
+                 pending_events: [],
+                 last_summary: nil
+               })
+
+      File.write!(Path.join(dir, "observer.wind_shift.authoritative"), <<"WSAF", 1, fingerprint::binary>>)
+
+      target_ctx = new_script()
+      Agent.update(target_ctx.script, &%{&1 | t_ms: 30_000, wall_offset_ms: -27_000})
+
+      {:ok, target} =
+        Observer.start_link(
+          observer_opts(target_ctx,
+            dir: dir,
+            sync_ms: 3_600_000_000,
+            timeline_ms: 3_600_000_000
+          )
+        )
+
+      refute Observer.snapshot(target) == {:ok, authoritative}
+      assert :ok = Observer.restore(target, authoritative)
+      assert Observer.snapshot(target) == {:ok, authoritative}
+
+      captured_at_utc_ms = @wall_base + 3_000
+
+      assert {:ok,
+              %{
+                authoritative_runtime: %{
+                  captured_at_utc_ms: ^captured_at_utc_ms,
+                  fingerprint: ^fingerprint,
+                  snapshot: ^authoritative
+                }
+              }} = Store.load(dir)
+
+      Process.unlink(target)
+      ref = Process.monitor(target)
+      Process.exit(target, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^target, :killed}
+
+      Agent.update(source_ctx.script, &%{&1 | t_ms: 8_000})
+      assert {:ok, expected_after_outage} = Observer.snapshot(source)
+
+      restarted_ctx = new_script()
+      Agent.update(restarted_ctx.script, &%{&1 | t_ms: 80_000, wall_offset_ms: -72_000})
+
+      {:ok, restarted} =
+        Observer.start_link(
+          observer_opts(restarted_ctx,
+            dir: dir,
+            sync_ms: 3_600_000_000,
+            timeline_ms: 3_600_000_000
+          )
+        )
+
+      assert Observer.snapshot(restarted) == {:ok, expected_after_outage}
+
+      Agent.update(restarted_ctx.script, &%{&1 | t_ms: 81_000, twd: 220.0, tws: 6.0})
+      assert :ok = Observer.tick(restarted)
+      assert {:ok, progressed} = Observer.snapshot(restarted)
+      refute progressed == authoritative
+
+      assert :ok = Observer.restore(restarted, authoritative)
+      assert Observer.snapshot(restarted) == {:ok, progressed}
+      GenServer.stop(restarted)
+    end
+
+    test "retains a fingerprint tombstone when reboot wall time precedes its durable capture" do
+      dir = Path.join(System.tmp_dir!(), "wind_shift_runtime_clock_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      source_ctx = new_script()
+      source = start_observer(source_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      drive(source, source_ctx, for(i <- 0..3, do: %{t_ms: i * 1_000, twd_deg: 200.0 + i, tws_mps: 6.0}))
+      Agent.update(source_ctx.script, &%{&1 | t_ms: 10_000})
+      assert {:ok, authoritative} = Observer.snapshot(source)
+      fingerprint = :crypto.hash(:sha256, :erlang.term_to_binary(authoritative, [:deterministic]))
+
+      target_ctx = new_script()
+      Agent.update(target_ctx.script, &%{&1 | t_ms: 30_000, wall_offset_ms: -20_000})
+
+      {:ok, target} =
+        Observer.start_link(
+          observer_opts(target_ctx,
+            dir: dir,
+            sync_ms: 3_600_000_000,
+            timeline_ms: 3_600_000_000
+          )
+        )
+
+      assert :ok = Observer.restore(target, authoritative)
+      Process.unlink(target)
+      ref = Process.monitor(target)
+      Process.exit(target, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^target, :killed}
+
+      backward_ctx = new_script()
+      Agent.update(backward_ctx.script, &%{&1 | t_ms: 80_000, wall_offset_ms: -75_000})
+
+      {:ok, restarted} =
+        Observer.start_link(
+          observer_opts(backward_ctx,
+            dir: dir,
+            sync_ms: 3_600_000_000,
+            timeline_ms: 3_600_000_000
+          )
+        )
+
+      assert {:ok, before_redelivery} = Observer.snapshot(restarted)
+      refute before_redelivery == authoritative
+      assert :sys.get_state(restarted).last_authoritative_fingerprint == fingerprint
+      assert :sys.get_state(restarted).restore_durability_pending
+
+      assert :ok = Observer.restore(restarted, authoritative)
+      assert Observer.snapshot(restarted) == {:ok, before_redelivery}
+      refute :sys.get_state(restarted).restore_durability_pending
+      GenServer.stop(restarted)
+
+      corrected_ctx = new_script()
+      Agent.update(corrected_ctx.script, &%{&1 | t_ms: 120_000, wall_offset_ms: -100_000})
+
+      {:ok, corrected} =
+        Observer.start_link(
+          observer_opts(corrected_ctx,
+            dir: dir,
+            sync_ms: 3_600_000_000,
+            timeline_ms: 3_600_000_000
+          )
+        )
+
+      assert {:ok, before_corrected_redelivery} = Observer.snapshot(corrected)
+      assert before_corrected_redelivery.means.fast == nil
+      assert :ok = Observer.restore(corrected, authoritative)
+      assert Observer.snapshot(corrected) == {:ok, before_corrected_redelivery}
+      GenServer.stop(corrected)
+    end
+
+    test "does not acknowledge or install a restore that cannot reach the durable store" do
+      source_ctx = new_script()
+      source = start_observer(source_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      drive(source, source_ctx, [%{t_ms: 0, twd_deg: 200.0, tws_mps: 6.0}])
+      assert {:ok, authoritative} = Observer.snapshot(source)
+
+      blocked_dir = Path.join(System.tmp_dir!(), "wind_shift_runtime_blocked_#{System.unique_integer([:positive])}")
+      File.write!(blocked_dir, "not a directory")
+      on_exit(fn -> File.rm(blocked_dir) end)
+
+      target_ctx = new_script()
+      target = start_observer(target_ctx, dir: blocked_dir)
+      assert {:ok, before} = Observer.snapshot(target)
+
+      assert {:error, {:persistence_failed, {:pre_rename, _reason}}} =
+               Observer.restore(target, authoritative)
+
+      assert Observer.snapshot(target) == {:ok, before}
+    end
+
+    test "retries a post-rename uncertain restore without rolling memory backward" do
+      dir = Path.join(System.tmp_dir!(), "wind_shift_runtime_uncertain_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      source_ctx = new_script()
+      source = start_observer(source_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      drive(source, source_ctx, [%{t_ms: 0, twd_deg: 200.0, tws_mps: 6.0}])
+      assert {:ok, authoritative} = Observer.snapshot(source)
+
+      {:ok, inject_fault?} = Agent.start_link(fn -> true end)
+
+      fault_injector = fn
+        :renamed ->
+          Agent.get_and_update(inject_fault?, fn
+            true -> {{:error, :power_loss}, false}
+            false -> {:ok, false}
+          end)
+
+        _stage ->
+          :ok
+      end
+
+      target_ctx = new_script()
+
+      target =
+        start_observer(target_ctx,
+          dir: dir,
+          store_opts: [fault_injector: fault_injector]
+        )
+
+      assert {:error, {:persistence_failed, {:durability_uncertain, _reason}}} =
+               Observer.restore(target, authoritative)
+
+      assert Observer.snapshot(target) == {:ok, authoritative}
+      assert :sys.get_state(target).restore_durability_pending
+
+      assert :ok = Observer.restore(target, authoritative)
+      refute :sys.get_state(target).restore_durability_pending
+    end
+
     test "duplicate authoritative restore remains non-regressive across progress, core rebuild, and restart" do
       dir = Path.join(System.tmp_dir!(), "wind_shift_runtime_head_#{System.unique_integer([:positive])}")
       on_exit(fn -> File.rm_rf(dir) end)

@@ -6,17 +6,18 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Store do
   sync sequence, and the not-yet-synced timeline rows / events — so a mid-day
   reboot keeps the SAME session and sequence instead of starting a new one.
 
-  The main session snapshot deliberately excludes the estimation cores (means /
-  envelope / Kalman cycle / step detector). A separate fixed-format sidecar
-  stores only the SHA-256 fingerprint of the last accepted authoritative runtime
-  snapshot, never the runtime map itself. That marker makes exact redelivery a
-  durable no-op without defining another runtime-state codec.
+  The ordinary session snapshot deliberately excludes the estimation cores
+  (means / envelope / Kalman cycle / step detector). After an authoritative
+  runtime restore, however, the complete closed learner snapshot, its accepted
+  SHA-256 fingerprint, and its UTC capture time are stored in this SAME record.
+  One durable atomic replacement therefore cannot expose a new duplicate marker
+  with old learner bytes after power loss. Historical split-fingerprint sidecars
+  are ignored; `clear/1` removes any orphan left by an older release.
 
-  Mirrors `RacingOrg.Tracker.Pro.Calibration.Observer.Store`: the snapshot is
-  written to a temp file and atomically renamed into place, so a crash
-  mid-write can never leave a partially written file. Loading a missing,
-  unreadable, corrupt, or unknown-version file returns `:empty` rather than
-  raising — the Observer simply starts a fresh session.
+  Writes use `DesiredState.AtomicFile`, including file and parent-directory sync,
+  so `:ok` means the complete replacement is durably committed. Loading a
+  missing, unreadable, corrupt, or unknown-version file returns `:empty` rather
+  than raising — the Observer simply starts a fresh session.
 
   This is a SEPARATE file (`observer.wind_shift`) from
   `RacingOrg.Tracker.Pro.WindShift.Store`'s `current.wind_shift` (the
@@ -31,60 +32,44 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Store do
         seq: non_neg_integer(),
         pending_timeline: [map()],
         pending_events: [map()],
-        last_summary: map() | nil
+        last_summary: map() | nil,
+        optional(:authoritative_runtime) => %{
+          captured_at_utc_ms: integer(),
+          fingerprint: <<_::256>>,
+          snapshot: map()
+        }
       }
   """
 
   require Logger
 
+  alias RacingOrg.Tracker.Pro.DesiredState.AtomicFile
+
   @filename "observer.wind_shift"
   @authoritative_filename "observer.wind_shift.authoritative"
-  @authoritative_magic "WSAF"
-  @authoritative_version 1
-  @fingerprint_bytes 32
   # Bump if the persisted representation changes incompatibly; older/unknown
   # versions are ignored on load (the Observer starts a fresh session).
   @format_version 1
 
-  @doc "Atomically persist the Observer `snapshot` under `dir`. Best-effort; never raises."
-  @spec save(Path.t(), map()) :: :ok | {:error, term()}
-  def save(dir, %{} = snapshot) do
-    File.mkdir_p!(dir)
-    path = path(dir)
-    tmp = path <> ".tmp"
-    File.write!(tmp, :erlang.term_to_binary({@format_version, snapshot}))
-    File.rename!(tmp, path)
-    :ok
+  @doc "Durably atomically persist the complete Observer record under `dir`. Never raises."
+  @spec save(Path.t(), map(), keyword()) :: :ok | {:error, term()}
+  def save(dir, snapshot, opts \\ [])
+
+  def save(dir, %{} = snapshot, opts) do
+    atomic_opts = Keyword.put_new(opts, :directory_root, dir)
+
+    case AtomicFile.write(path(dir), :erlang.term_to_binary({@format_version, snapshot}), atomic_opts) do
+      :ok ->
+        :ok
+
+      {:error, reason} = error ->
+        Logger.warning("Failed to persist wind-shift observer state to #{inspect(dir)}: #{inspect(reason)}")
+        error
+    end
   rescue
     error ->
       Logger.warning("Failed to persist wind-shift observer state to #{inspect(dir)}: #{inspect(error)}")
       {:error, error}
-  end
-
-  @doc "Persist the fixed SHA-256 fingerprint of the last accepted authoritative runtime snapshot."
-  @spec save_authoritative_fingerprint(Path.t(), <<_::256>>) :: :ok | {:error, term()}
-  def save_authoritative_fingerprint(dir, fingerprint)
-      when is_binary(fingerprint) and byte_size(fingerprint) == @fingerprint_bytes do
-    File.mkdir_p!(dir)
-    path = authoritative_path(dir)
-    tmp = path <> ".tmp"
-    File.write!(tmp, <<@authoritative_magic, @authoritative_version, fingerprint::binary>>)
-    File.rename!(tmp, path)
-    :ok
-  rescue
-    error ->
-      Logger.warning("Failed to persist wind-shift authoritative fingerprint to #{inspect(dir)}: #{inspect(error)}")
-      {:error, error}
-  end
-
-  @doc "Load the last accepted authoritative runtime fingerprint, or `:empty`."
-  @spec load_authoritative_fingerprint(Path.t()) :: {:ok, <<_::256>>} | :empty
-  def load_authoritative_fingerprint(dir) do
-    case File.read(authoritative_path(dir)) do
-      {:ok, binary} -> decode_authoritative_fingerprint(binary, dir)
-      {:error, :enoent} -> :empty
-      {:error, reason} -> warn_empty(dir, "could not read authoritative fingerprint", reason)
-    end
   end
 
   @doc "Load the persisted snapshot from `dir`, or `:empty` if absent/unusable."
@@ -113,15 +98,6 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Store do
   rescue
     error -> warn_empty(dir, "corrupt", error)
   end
-
-  defp decode_authoritative_fingerprint(
-         <<@authoritative_magic, @authoritative_version, fingerprint::binary-size(@fingerprint_bytes)>>,
-         _dir
-       ),
-       do: {:ok, fingerprint}
-
-  defp decode_authoritative_fingerprint(_binary, dir),
-    do: warn_empty(dir, "unrecognized/incompatible authoritative fingerprint", :format)
 
   defp safe_binary_to_term(binary), do: :erlang.binary_to_term(binary, [:safe])
 

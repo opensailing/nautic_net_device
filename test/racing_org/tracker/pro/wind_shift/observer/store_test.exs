@@ -111,26 +111,25 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.StoreTest do
     refute File.exists?(Path.join(dir, "observer.wind_shift.tmp"))
   end
 
-  test "authoritative duplicate marker persists only a fixed closed fingerprint", %{dir: dir} do
-    fingerprint = :crypto.hash(:sha256, "accepted authoritative wind snapshot")
+  test "clear removes an ignored legacy split fingerprint sidecar", %{dir: dir} do
+    assert :ok = Store.save(dir, @snapshot)
+    legacy_path = Path.join(dir, "observer.wind_shift.authoritative")
+    File.write!(legacy_path, <<"WSAF", 1, 0::256>>)
 
-    assert :ok = Store.save_authoritative_fingerprint(dir, fingerprint)
-    assert {:ok, ^fingerprint} = Store.load_authoritative_fingerprint(dir)
-
-    assert <<"WSAF", 1, ^fingerprint::binary-size(32)>> =
-             File.read!(Path.join(dir, "observer.wind_shift.authoritative"))
-
-    refute File.exists?(Path.join(dir, "observer.wind_shift.authoritative.tmp"))
+    assert :ok = Store.clear(dir)
+    refute File.exists?(legacy_path)
+    assert :empty = Store.load(dir)
   end
 
-  test "corrupt or incompatible authoritative duplicate markers fail closed", %{dir: dir} do
-    File.mkdir_p!(dir)
-    path = Path.join(dir, "observer.wind_shift.authoritative")
+  test "post-rename uncertainty leaves the complete replacement record loadable", %{dir: dir} do
+    fault_injector = fn
+      :renamed -> {:error, :power_loss}
+      _stage -> :ok
+    end
 
-    File.write!(path, <<"WSAF", 2, 0::256>>)
-    assert :empty = Store.load_authoritative_fingerprint(dir)
+    assert {:error, {:durability_uncertain, _reason}} =
+             Store.save(dir, @snapshot, fault_injector: fault_injector)
 
-    File.write!(path, <<"WSAF", 1, 0::128>>)
-    assert :empty = Store.load_authoritative_fingerprint(dir)
+    assert {:ok, @snapshot} = Store.load(dir)
   end
 end

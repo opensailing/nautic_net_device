@@ -83,11 +83,16 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   ## Persistence / reboot semantics
 
-  Only the session identity + not-yet-synced batch persists (throttled to
-  `:persist_ms` + a terminate flush). The cores deliberately restart fresh
-  after a reboot: a mid-day reboot loses the ~20 min model warmup (the
-  classifier honestly reports `:insufficient_history` again) but session
-  continuity is preserved — see `Observer.Store`.
+  Ordinary local learning persists only the session identity + not-yet-synced
+  batch (throttled to `:persist_ms` + a terminate flush), so a normal reboot
+  restarts the cores fresh. Once an authoritative runtime has been accepted,
+  its complete learner state and duplicate fingerprint persist together in the
+  same durable atomic record; later throttled writes continue that exact learner
+  without allowing identical redelivery to rejuvenate older state. If a reboot
+  cannot safely rebase the bundled learner (for example, the wall clock moved
+  backward), the learner is refused but its validated fixed fingerprint remains
+  as a tombstone: identical redelivery cannot bypass the failed reconciliation,
+  and the next durable write binds that marker to the current safe runtime.
 
   ## Config reaction
 
@@ -126,6 +131,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   alias RacingOrg.Tracker.Pro.Calibration.Detect.Circular
   alias RacingOrg.Tracker.Pro.Compute.Engine
   alias RacingOrg.Tracker.Pro.Compute.PgnEncode
+  alias RacingOrg.Tracker.Pro.RuntimeSnapshot
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
   alias RacingOrg.Tracker.Pro.WindShift.Checkpoint
   alias RacingOrg.Tracker.Pro.WindShift.Classifier
@@ -210,7 +216,8 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
       sync (default `&ChannelClient.send_wind_shift_update/2`). Injectable.
     * `:now_fn` — 0-arity monotonic-ms clock (default `System.monotonic_time/1`).
     * `:utc_now_fn` — 0-arity wall clock (default `&DateTime.utc_now/0`); stamps
-      the session identity, timeline rows, and events.
+      the session identity, timeline rows, events, and durable runtime age anchor.
+    * `:store_opts` — options forwarded to atomic persistence (fault injection in tests).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -265,10 +272,13 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   shape is validated before mutation. Re-delivering the identical authoritative
   snapshot is a non-regressive no-op even after local learner progress.
   """
-  @spec restore(map()) :: :ok | {:error, :invalid_wind_shift_runtime_snapshot}
+  @type restore_error ::
+          :invalid_wind_shift_runtime_snapshot | {:persistence_failed, term()}
+
+  @spec restore(map()) :: :ok | {:error, restore_error()}
   def restore(snapshot) when is_map(snapshot), do: restore(__MODULE__, snapshot)
 
-  @spec restore(GenServer.server(), map()) :: :ok | {:error, :invalid_wind_shift_runtime_snapshot}
+  @spec restore(GenServer.server(), map()) :: :ok | {:error, restore_error()}
   def restore(server, snapshot), do: GenServer.call(server, {:restore, snapshot})
 
   @doc """
@@ -292,8 +302,8 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     # Anchor the throttle clocks at boot so the FIRST persist/sync/timeline row
     # must also wait a full interval (mirrors Polar.Observer).
     boot_ms = now_fn.()
-    persisted = restore_persisted(dir, utc_now_fn)
-    last_authoritative_fingerprint = restore_authoritative_fingerprint(dir)
+    boot_utc = utc_now_fn.()
+    persisted = restore_persisted(dir, boot_utc)
 
     state =
       %{
@@ -313,6 +323,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
         sender: Keyword.get(opts, :sender, &ChannelClient.send_wind_shift_update/2),
         now_fn: now_fn,
         utc_now_fn: utc_now_fn,
+        store_opts: Keyword.get(opts, :store_opts, []),
         # Policy (from WindShift.Config; safe defaults until readable).
         windows: @default_windows,
         alarms: @default_alarms,
@@ -329,11 +340,13 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
         last_timeline_ms: boot_ms,
         last_tx_ms: nil,
         dirty_persist: Map.get(persisted, :dirty_persist, false),
-        last_authoritative_fingerprint: last_authoritative_fingerprint,
+        last_authoritative_fingerprint: nil,
+        restore_durability_pending: false,
         stats: %{samples: 0, accepted: 0, rejected: 0, reject_reasons: %{}}
       }
       |> put_policy(fetch_policy(config))
       |> build_cores()
+      |> restore_persisted_authoritative_runtime(persisted, boot_ms, boot_utc)
 
     subscribe_config(config)
     schedule_tick(state)
@@ -359,6 +372,10 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   def handle_call({:restore, snapshot}, _from, state) do
     case authoritative_fingerprint(snapshot) do
+      {:ok, fingerprint}
+      when fingerprint == state.last_authoritative_fingerprint and state.restore_durability_pending ->
+        retry_uncertain_authoritative_restore(state)
+
       {:ok, fingerprint} when fingerprint == state.last_authoritative_fingerprint ->
         {:reply, :ok, state}
 
@@ -1006,7 +1023,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     :exit, _ -> :ok
   end
 
-  # --- Throttled persistence (session identity + unsynced batch ONLY) ---
+  # --- Throttled persistence -----------------------------------------------------
 
   defp maybe_persist(state) do
     if due?(state.last_persist_ms, state.persist_ms, state) and state.dirty_persist do
@@ -1020,7 +1037,19 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   defp persist(%{dirty_persist: false} = state), do: state
 
   defp persist(state) do
-    snapshot = %{
+    now_ms = state.now_fn.()
+    persisted_state = %{state | last_persist_ms: now_ms}
+
+    with {:ok, record} <- persisted_record(persisted_state, now_ms, state.utc_now_fn.()),
+         :ok <- Store.save(state.dir, record, state.store_opts) do
+      %{persisted_state | dirty_persist: false, restore_durability_pending: false}
+    else
+      _ -> state
+    end
+  end
+
+  defp persisted_record(state, now_ms, captured_at_utc) do
+    record = %{
       session: state.session,
       seq: state.seq,
       pending_timeline: state.pending_timeline,
@@ -1028,9 +1057,23 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
       last_summary: state.last_summary
     }
 
-    case Store.save(state.dir, snapshot) do
-      :ok -> %{state | dirty_persist: false, last_persist_ms: state.now_fn.()}
-      {:error, _reason} -> state
+    case state.last_authoritative_fingerprint do
+      nil ->
+        {:ok, record}
+
+      fingerprint ->
+        with true <- fixed_fingerprint?(fingerprint),
+             {:ok, snapshot} <- Checkpoint.snapshot_runtime(state, now_ms),
+             {:ok, captured_at_utc_ms} <- RuntimeSnapshot.utc_ms(captured_at_utc) do
+          {:ok,
+           Map.put(record, :authoritative_runtime, %{
+             captured_at_utc_ms: captured_at_utc_ms,
+             fingerprint: fingerprint,
+             snapshot: snapshot
+           })}
+        else
+          _ -> {:error, :invalid_wind_shift_runtime_snapshot}
+        end
     end
   end
 
@@ -1041,19 +1084,59 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
     with {:ok, learner_state} <- Checkpoint.restore_runtime(snapshot, now_ms, current_utc_ms),
          :ok <- runtime_compatible_with_policy(learner_state, state) do
-      restored =
+      candidate =
         if stale_runtime_session?(learner_state.session, current_utc) do
-          %{state | seq: max(state.seq, learner_state.seq), dirty_persist: true}
+          %{state | seq: max(state.seq, learner_state.seq)}
         else
           Map.merge(state, learner_state)
         end
         |> Map.put(:dirty_persist, true)
         |> Map.put(:last_authoritative_fingerprint, fingerprint)
+        |> Map.put(:restore_durability_pending, false)
 
-      persist_authoritative_fingerprint(state.dir, fingerprint)
-      {:reply, :ok, restored}
+      finish_authoritative_restore(state, candidate)
     else
       {:error, :invalid_wind_shift_runtime_snapshot} = error -> {:reply, error, state}
+    end
+  end
+
+  defp finish_authoritative_restore(previous, candidate) do
+    case persist_authoritative_candidate(candidate) do
+      {:ok, persisted} ->
+        {:reply, :ok, persisted}
+
+      {:error, {:durability_uncertain, _detail} = reason, uncertain} ->
+        reconciled = %{uncertain | restore_durability_pending: true}
+        {:reply, {:error, {:persistence_failed, reason}}, reconciled}
+
+      {:error, reason, _failed} ->
+        {:reply, {:error, {:persistence_failed, reason}}, previous}
+    end
+  end
+
+  defp retry_uncertain_authoritative_restore(state) do
+    case persist_authoritative_candidate(state) do
+      {:ok, persisted} ->
+        {:reply, :ok, persisted}
+
+      {:error, reason, failed} ->
+        reconciled = %{failed | restore_durability_pending: true}
+        {:reply, {:error, {:persistence_failed, reason}}, reconciled}
+    end
+  end
+
+  defp persist_authoritative_candidate(%{dir: nil} = candidate) do
+    {:ok, %{candidate | dirty_persist: false, restore_durability_pending: false}}
+  end
+
+  defp persist_authoritative_candidate(candidate) do
+    now_ms = candidate.now_fn.()
+
+    with {:ok, record} <- persisted_record(candidate, now_ms, candidate.utc_now_fn.()),
+         :ok <- Store.save(candidate.dir, record, candidate.store_opts) do
+      {:ok, %{candidate | dirty_persist: false, restore_durability_pending: false}}
+    else
+      {:error, reason} -> {:error, reason, candidate}
     end
   end
 
@@ -1067,37 +1150,83 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   defp authoritative_fingerprint(_snapshot), do: {:error, :invalid_wind_shift_runtime_snapshot}
 
-  defp restore_authoritative_fingerprint(nil), do: nil
-
-  defp restore_authoritative_fingerprint(dir) do
-    case Store.load_authoritative_fingerprint(dir) do
-      {:ok, fingerprint} -> fingerprint
-      :empty -> nil
-    end
-  end
-
-  defp persist_authoritative_fingerprint(nil, _fingerprint), do: :ok
-
-  defp persist_authoritative_fingerprint(dir, fingerprint),
-    do: Store.save_authoritative_fingerprint(dir, fingerprint)
+  defp fixed_fingerprint?(value), do: is_binary(value) and byte_size(value) == 32
 
   # A same-UTC-day persisted session is adopted whole (mid-day reboot keeps the
   # session + unsynced batch); an older one starts a fresh session but keeps the
-  # monotonic seq (the backend orders per boat by seq).
-  defp restore_persisted(nil, _utc_now_fn), do: %{}
+  # monotonic seq. A bundled authoritative runtime is retained for validated
+  # reconciliation even when its session must be rotated away.
+  defp restore_persisted(nil, _current_utc), do: %{}
 
-  defp restore_persisted(dir, utc_now_fn) do
+  defp restore_persisted(dir, current_utc) do
     case Store.load(dir) do
       {:ok, persisted} ->
-        if same_utc_day?(Map.get(persisted, :session), utc_now_fn.()) do
+        if same_utc_day?(Map.get(persisted, :session), current_utc) do
           normalize_restored_directions(persisted)
         else
           %{seq: Map.get(persisted, :seq, 0)}
+          |> maybe_retain_authoritative_runtime(persisted)
         end
 
       :empty ->
         %{}
     end
+  end
+
+  defp maybe_retain_authoritative_runtime(base, %{authoritative_runtime: runtime}),
+    do: Map.put(base, :authoritative_runtime, runtime)
+
+  defp maybe_retain_authoritative_runtime(base, _persisted), do: base
+
+  defp restore_persisted_authoritative_runtime(state, persisted, boot_ms, boot_utc) do
+    case Map.get(persisted, :authoritative_runtime) do
+      %{fingerprint: fingerprint} = envelope ->
+        with :ok <- RuntimeSnapshot.exact_keys(envelope, [:captured_at_utc_ms, :fingerprint, :snapshot]),
+             true <- fixed_fingerprint?(fingerprint) do
+          reconcile_persisted_authoritative_runtime(state, envelope, fingerprint, boot_ms, boot_utc)
+        else
+          _ -> %{state | dirty_persist: true}
+        end
+
+      _other ->
+        state
+    end
+  end
+
+  defp reconcile_persisted_authoritative_runtime(
+         state,
+         %{captured_at_utc_ms: captured_at_utc_ms, snapshot: snapshot},
+         fingerprint,
+         boot_ms,
+         boot_utc
+       ) do
+    with {:ok, captured_at_utc_ms} <- RuntimeSnapshot.utc_ms(captured_at_utc_ms),
+         {:ok, boot_utc_ms} <- RuntimeSnapshot.utc_ms(boot_utc),
+         {:ok, elapsed_ms} <- RuntimeSnapshot.elapsed_wall_ms(captured_at_utc_ms, boot_utc_ms),
+         {:ok, advanced_snapshot} <- Checkpoint.advance_runtime(snapshot, elapsed_ms),
+         {:ok, learner_state} <- Checkpoint.restore_runtime(advanced_snapshot, boot_ms, boot_utc_ms),
+         :ok <- runtime_compatible_with_policy(learner_state, state) do
+      if stale_runtime_session?(learner_state.session, boot_utc) do
+        state
+        |> Map.put(:seq, max(state.seq, learner_state.seq))
+        |> authoritative_tombstone(fingerprint)
+      else
+        state
+        |> Map.merge(learner_state)
+        |> Map.put(:last_authoritative_fingerprint, fingerprint)
+      end
+    else
+      _ -> authoritative_tombstone(state, fingerprint)
+    end
+  end
+
+  defp authoritative_tombstone(state, fingerprint) do
+    %{
+      state
+      | dirty_persist: true,
+        last_authoritative_fingerprint: fingerprint,
+        restore_durability_pending: true
+    }
   end
 
   defp normalize_restored_directions(persisted) do

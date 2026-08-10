@@ -9,6 +9,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Checkpoint do
   collaborators, functions, credentials, and open metadata.
   """
 
+  alias RacingOrg.Tracker.Pro.RuntimeSnapshot
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint, as: ContractCheckpoint
 
   alias RacingOrg.Tracker.Pro.WindShift.{Cycle, Envelope, Means, StepDetect}
@@ -258,6 +259,47 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Checkpoint do
 
   def restore_runtime(_snapshot, _now_ms, _current_utc_ms), do: @invalid_runtime
 
+  @doc false
+  @spec advance_runtime(map(), non_neg_integer()) ::
+          {:ok, map()} | {:error, :invalid_wind_shift_runtime_snapshot}
+  def advance_runtime(snapshot, elapsed_ms)
+      when is_map(snapshot) and is_integer(elapsed_ms) and elapsed_ms >= 0 do
+    with :ok <- exact_keys(snapshot, @runtime_keys),
+         {:ok, means} <- advance_means(snapshot.means, elapsed_ms),
+         {:ok, envelope} <- advance_envelope(snapshot.envelope, elapsed_ms),
+         {:ok, step} <- advance_step(snapshot.step, elapsed_ms),
+         {:ok, last_period_age_ms} <- advance_age(snapshot.last_period_age_ms, elapsed_ms),
+         {:ok, last_persist_age_ms} <- advance_age(snapshot.last_persist_age_ms, elapsed_ms),
+         {:ok, last_sync_age_ms} <- advance_age(snapshot.last_sync_age_ms, elapsed_ms),
+         {:ok, last_timeline_age_ms} <- advance_age(snapshot.last_timeline_age_ms, elapsed_ms),
+         {:ok, last_tx_age_ms} <- advance_age(snapshot.last_tx_age_ms, elapsed_ms),
+         {:ok, t0_age_ms} <- advance_age(snapshot.t0_age_ms, elapsed_ms),
+         {:ok, last_t_age_ms} <- advance_age(snapshot.last_t_age_ms, elapsed_ms) do
+      {:ok,
+       %{
+         snapshot
+         | means: means,
+           envelope: envelope,
+           step: step,
+           last_period_age_ms: last_period_age_ms,
+           last_persist_age_ms: last_persist_age_ms,
+           last_sync_age_ms: last_sync_age_ms,
+           last_timeline_age_ms: last_timeline_age_ms,
+           last_tx_age_ms: last_tx_age_ms,
+           t0_age_ms: t0_age_ms,
+           last_t_age_ms: last_t_age_ms
+       }}
+    else
+      _ -> @invalid_runtime
+    end
+  rescue
+    _ -> @invalid_runtime
+  catch
+    _, _ -> @invalid_runtime
+  end
+
+  def advance_runtime(_snapshot, _elapsed_ms), do: @invalid_runtime
+
   defp project_snapshot(snapshot) do
     with :ok <- exact_keys(snapshot, @snapshot_keys),
          {:ok, session} <- project_optional(snapshot.session, @session_fields),
@@ -367,6 +409,89 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Checkpoint do
   defp map_list(_values, _mapper), do: {:error, :invalid_shape}
 
   # --- Complete internal runtime learner shape ----------------------------------
+
+  defp advance_means(means, elapsed_ms) when is_map(means) do
+    [:fast, :mid, :slow, :sin, :cos]
+    |> Enum.reduce_while({:ok, means}, fn key, {:ok, advanced} ->
+      case advance_point(Map.get(means, key), elapsed_ms) do
+        {:ok, point} -> {:cont, {:ok, Map.put(advanced, key, point)}}
+        _ -> {:halt, @invalid_runtime}
+      end
+    end)
+  end
+
+  defp advance_means(_means, _elapsed_ms), do: @invalid_runtime
+
+  defp advance_envelope(envelope, elapsed_ms) when is_map(envelope) do
+    with {:ok, minq} <- advance_queue(envelope.minq, elapsed_ms),
+         {:ok, maxq} <- advance_queue(envelope.maxq, elapsed_ms),
+         {:ok, first_age_ms} <- advance_age(envelope.first_age_ms, elapsed_ms),
+         {:ok, last_alarm_age_ms} <- advance_age(envelope.last_alarm_age_ms, elapsed_ms) do
+      {:ok,
+       %{
+         envelope
+         | minq: minq,
+           maxq: maxq,
+           first_age_ms: first_age_ms,
+           last_alarm_age_ms: last_alarm_age_ms
+       }}
+    else
+      _ -> @invalid_runtime
+    end
+  rescue
+    _ -> @invalid_runtime
+  end
+
+  defp advance_envelope(_envelope, _elapsed_ms), do: @invalid_runtime
+
+  defp advance_step(step, elapsed_ms) when is_map(step) do
+    with {:ok, u_min_age_ms} <- advance_age(step.u_min_age_ms, elapsed_ms),
+         {:ok, d_max_age_ms} <- advance_age(step.d_max_age_ms, elapsed_ms),
+         {:ok, onset_age_ms} <- advance_age(step.onset_age_ms, elapsed_ms) do
+      {:ok,
+       %{
+         step
+         | u_min_age_ms: u_min_age_ms,
+           d_max_age_ms: d_max_age_ms,
+           onset_age_ms: onset_age_ms
+       }}
+    else
+      _ -> @invalid_runtime
+    end
+  rescue
+    _ -> @invalid_runtime
+  end
+
+  defp advance_step(_step, _elapsed_ms), do: @invalid_runtime
+
+  defp advance_queue(entries, elapsed_ms) when is_list(entries) do
+    map_list(entries, fn entry ->
+      with :ok <- exact_keys(entry, [:age_ms, :value]),
+           {:ok, age_ms} <- advance_age(entry.age_ms, elapsed_ms) do
+        {:ok, %{entry | age_ms: age_ms}}
+      else
+        _ -> @invalid_runtime
+      end
+    end)
+  end
+
+  defp advance_queue(_entries, _elapsed_ms), do: @invalid_runtime
+
+  defp advance_point(nil, _elapsed_ms), do: {:ok, nil}
+
+  defp advance_point(point, elapsed_ms) when is_map(point) do
+    with :ok <- exact_keys(point, [:value, :age_ms]),
+         {:ok, age_ms} <- advance_age(point.age_ms, elapsed_ms) do
+      {:ok, %{point | age_ms: age_ms}}
+    else
+      _ -> @invalid_runtime
+    end
+  end
+
+  defp advance_point(_point, _elapsed_ms), do: @invalid_runtime
+
+  defp advance_age(nil, _elapsed_ms), do: {:ok, nil}
+  defp advance_age(age_ms, elapsed_ms), do: RuntimeSnapshot.add_elapsed(age_ms, elapsed_ms)
 
   defp project_means(%Means{} = means, now_ms) do
     with {:ok, fast} <- project_point(means.fast, now_ms),
