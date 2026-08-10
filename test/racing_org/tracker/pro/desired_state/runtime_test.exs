@@ -92,6 +92,17 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.RuntimeTest do
              })
   end
 
+  test "production ACK sink enqueues asynchronously to ChannelClient" do
+    ack = %{status: :effective}
+    sink = Runtime.ack_sink(self())
+
+    assert :ok = sink.(ack)
+    assert_receive {:send_desired_state_ack, ^ack}
+
+    unavailable = Runtime.ack_sink(:missing_channel_client)
+    assert {:error, :control_plane_unavailable} = unavailable.(ack)
+  end
+
   test "runtime child specs retain the authoritative process IDs" do
     assert Supervisor.child_spec(Runtime.applier_child_spec(), []).id == Applier
     assert Supervisor.child_spec(Runtime.manager_child_spec(), []).id == Manager

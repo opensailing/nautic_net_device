@@ -57,6 +57,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   require Logger
 
+  alias RacingOrg.Tracker.Pro.DesiredState.{Manager, Runtime}
   alias RacingOrg.Tracker.Pro.SecureTransport.Backoff
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapState
@@ -66,7 +67,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
   alias RacingOrg.Tracker.Pro.SecureTransport.Session
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
-  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Negotiation
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{Control, Messages, Negotiation}
 
   @device_socket_path "/device_socket"
   @control_offer %{control_versions: [1], desired_state_versions: [1]}
@@ -109,6 +110,20 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       restart: :permanent,
       shutdown: 5_000
     }
+  end
+
+  @doc "Enqueue a durable desired-state ACK for authenticated control delivery."
+  @spec send_desired_state_ack(GenServer.server(), map()) ::
+          :ok | {:error, :control_plane_unavailable}
+  def send_desired_state_ack(server \\ __MODULE__, ack) when is_map(ack) do
+    case GenServer.whereis(server) do
+      pid when is_pid(pid) ->
+        send(pid, {:send_desired_state_ack, ack})
+        :ok
+
+      _unavailable ->
+        {:error, :control_plane_unavailable}
+    end
   end
 
   @doc """
@@ -303,6 +318,18 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       backoff_opts: Keyword.get(opts, :backoff, Backoff.defaults()),
       control_offer: control_offer,
       control_selection: control_selection,
+      desired_state_identity: Keyword.get(opts, :desired_state_identity, &Runtime.identity/0),
+      desired_state_compatibility: Keyword.get(opts, :desired_state_compatibility, &Runtime.compatibility/0),
+      desired_state_status:
+        Keyword.get(opts, :desired_state_status, fn ->
+          Manager.status(Keyword.get(opts, :desired_state_manager, Manager))
+        end),
+      desired_state_replay:
+        Keyword.get(opts, :desired_state_replay, fn generation ->
+          Manager.replay(Keyword.get(opts, :desired_state_manager, Manager), generation)
+        end),
+      control_topic: nil,
+      control_ready?: false,
       attempt: 0,
       session: nil,
       session_fence: nil,
@@ -428,6 +455,23 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   def handle_message(_topic, "handshake_error", payload, socket) do
     Logger.error("[ChannelClient] server handshake_error: #{inspect(payload)}")
     {:ok, fail_handshake(socket)}
+  end
+
+  # The backend uses one strict Base64 carrier for every authenticated control_v1
+  # message. Decode the carrier, authenticate/open it in the SessionHolder, then
+  # decode the expected typed payload. Every failure is fail-closed and side-effect
+  # free; a rekey boundary reconnects instead of leaving outbound control wedged.
+  def handle_message(topic, "control_v1", carrier, socket) do
+    case open_control_message(socket, carrier) do
+      {:ok, type, attrs} ->
+        handle_control_message(topic, type, attrs, socket)
+
+      {:error, :rekey_required} ->
+        {:ok, fail_handshake(socket)}
+
+      {:error, _malformed_replayed_or_stale} ->
+        {:ok, socket}
+    end
   end
 
   # Server pushes a command -> decode + apply + ack (idempotent).
@@ -625,9 +669,170 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     {:noreply, push_request_route_recalc(socket, position)}
   end
 
+  def handle_info({:send_desired_state_ack, ack}, socket) do
+    case push_ready_control(socket, :ack, ack) do
+      {:ok, socket} -> {:noreply, socket}
+      {:reconnect, socket} -> {:noreply, socket}
+      {:error, socket} -> {:noreply, socket}
+    end
+  end
+
+  def handle_info({:replay_desired_state_acks, generation}, socket) do
+    session = socket.assigns.session
+
+    if socket.assigns.control_ready? and match?(%Session{generation: ^generation}, session) do
+      _ = invoke_desired_state_replay(socket.assigns.desired_state_replay, generation)
+    end
+
+    {:noreply, socket}
+  end
+
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   # --- internal ---
+
+  defp open_control_message(%{assigns: %{session: %Session{generation: generation}}} = socket, carrier)
+       when is_integer(generation) do
+    with {:ok, frame} <- Control.decode_carrier(carrier),
+         {:ok, type, payload} <-
+           SessionHolder.open_control(socket.assigns.session_holder, generation, frame),
+         {:ok, attrs} <- Messages.decode(type, payload) do
+      {:ok, type, attrs}
+    end
+  rescue
+    _exception -> {:error, :control_unavailable}
+  catch
+    :exit, _reason -> {:error, :control_unavailable}
+  end
+
+  defp open_control_message(_socket, _carrier), do: {:error, :stale_session}
+
+  defp handle_control_message(_topic, :control_accept, _attrs, %{assigns: %{control_ready?: true}} = socket),
+    do: {:ok, socket}
+
+  defp handle_control_message(topic, :control_accept, attrs, socket) do
+    with {:ok, identity} <- invoke_zero_arity(socket.assigns.desired_state_identity),
+         :ok <- verify_control_accept(attrs, identity, socket.assigns.control_selection),
+         {:ok, readiness} <- readiness_attrs(socket, identity),
+         {:ok, socket} <- push_control(socket, topic, :readiness, readiness) do
+      generation = socket.assigns.session.generation
+
+      socket =
+        socket
+        |> assign(:control_topic, topic)
+        |> assign(:control_ready?, true)
+
+      send(self(), {:replay_desired_state_acks, generation})
+      {:ok, socket}
+    else
+      {:reconnect, socket} -> {:ok, socket}
+      {:error, _reason} -> {:ok, socket}
+    end
+  end
+
+  # Delivery dispatch begins in a later stage. Authenticated, well-formed message
+  # types outside control_accept are deliberately consumed and dropped here.
+  defp handle_control_message(_topic, _type, _attrs, socket), do: {:ok, socket}
+
+  defp verify_control_accept(_attrs, _identity, nil), do: {:error, :legacy_negotiation}
+
+  defp verify_control_accept(attrs, identity, selection) do
+    if attrs.device_id == identity.device_id and
+         attrs.credential_epoch == identity.credential_epoch and
+         attrs.selected_control_version == selection.selected_control_version and
+         attrs.selected_desired_version == selection.selected_desired_version and
+         attrs.offer_hash == selection.offer_hash do
+      :ok
+    else
+      {:error, :control_accept_mismatch}
+    end
+  end
+
+  defp readiness_attrs(socket, identity) do
+    with {:ok, compatibility} <- invoke_zero_arity(socket.assigns.desired_state_compatibility),
+         {:ok, status} <- invoke_zero_arity(socket.assigns.desired_state_status) do
+      selection = socket.assigns.control_selection
+
+      {:ok,
+       Map.merge(identity, %{
+         selected_control_version: selection.selected_control_version,
+         selected_desired_version: selection.selected_desired_version,
+         offer_hash: selection.offer_hash,
+         firmware_version: compatibility.firmware_version,
+         firmware_git_sha: compatibility.firmware_git_sha,
+         capabilities: compatibility.capabilities,
+         effective: readiness_effective(status)
+       })}
+    end
+  end
+
+  defp readiness_effective(%{active: active}) when is_map(active),
+    do: Map.take(active, [:credential_epoch, :generation, :manifest_hash])
+
+  defp readiness_effective(_status), do: nil
+
+  defp push_ready_control(
+         %{assigns: %{control_ready?: true, control_topic: topic}} = socket,
+         type,
+         attrs
+       )
+       when is_binary(topic),
+       do: push_control(socket, topic, type, attrs)
+
+  defp push_ready_control(socket, _type, _attrs), do: {:error, socket}
+
+  defp push_control(
+         %{assigns: %{session: %Session{generation: generation}}} = socket,
+         topic,
+         type,
+         attrs
+       )
+       when is_integer(generation) do
+    with {:ok, payload} <- Messages.encode(type, attrs),
+         {:ok, :pushed} <-
+           SessionHolder.with_control_send(
+             socket.assigns.session_holder,
+             generation,
+             type,
+             payload,
+             fn frame ->
+               push(socket, topic, "control_v1", Control.encode_carrier(frame))
+               :pushed
+             end
+           ) do
+      {:ok, socket}
+    else
+      {:error, :rekey_required} -> {:reconnect, fail_handshake(socket)}
+      {:error, _reason} -> {:error, socket}
+    end
+  rescue
+    _exception -> {:error, socket}
+  catch
+    :exit, _reason -> {:error, socket}
+  end
+
+  defp push_control(socket, _topic, _type, _attrs), do: {:error, socket}
+
+  defp invoke_zero_arity(fun) when is_function(fun, 0) do
+    case fun.() do
+      {:ok, value} -> {:ok, value}
+      value when is_map(value) -> {:ok, value}
+      {:error, _reason} = error -> error
+      _invalid -> {:error, :invalid_desired_state_runtime}
+    end
+  rescue
+    _exception -> {:error, :desired_state_runtime_unavailable}
+  catch
+    :exit, _reason -> {:error, :desired_state_runtime_unavailable}
+  end
+
+  defp invoke_desired_state_replay(fun, generation) when is_function(fun, 1) do
+    fun.(generation)
+  rescue
+    _exception -> {:error, :desired_state_manager_unavailable}
+  catch
+    :exit, _reason -> {:error, :desired_state_manager_unavailable}
+  end
 
   # Push the current WiFi status (no applied_version known) only while this
   # connection still owns the live secure session. Delayed VintageNet/report
@@ -1169,6 +1374,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     |> assign(:session_fence, nil)
     |> assign(:owned_session_generation, nil)
     |> assign(:enrollment_ref, nil)
+    |> assign(:control_topic, nil)
+    |> assign(:control_ready?, false)
   end
 
   defp clear_owned_session(socket, generation) do

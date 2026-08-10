@@ -11,6 +11,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Runtime do
   alias RacingOrg.Tracker.Pro.DesiredState.{Applier, Manager, OperationalGate, RuntimeIdentity, Store}
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapState
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
+  alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
 
@@ -79,7 +80,10 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Runtime do
         Keyword.get_lazy(opts, :applier_callbacks, fn ->
           applier_callbacks(applier, controller_capability)
         end),
-      ack_sink: Keyword.get(opts, :ack_sink, &control_plane_unavailable/1)
+      ack_sink:
+        Keyword.get_lazy(opts, :ack_sink, fn ->
+          ack_sink(Keyword.get(opts, :channel_client, ChannelClient))
+        end)
     )
   end
 
@@ -179,5 +183,9 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Runtime do
     }
   end
 
-  defp control_plane_unavailable(_ack), do: {:error, :control_plane_unavailable}
+  @doc false
+  @spec ack_sink(GenServer.server()) :: (map() -> :ok | {:error, :control_plane_unavailable})
+  def ack_sink(channel_client \\ ChannelClient) do
+    fn ack -> ChannelClient.send_desired_state_ack(channel_client, ack) end
+  end
 end

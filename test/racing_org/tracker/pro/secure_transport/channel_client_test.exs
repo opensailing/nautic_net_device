@@ -8,6 +8,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
   use Slipstream.SocketTest
 
   alias RacingOrg.Tracker.Pro.RecoveryV2TestSupport, as: RecoverySupport
+  alias RacingOrg.Tracker.Pro.SecureTransport, as: SecureTransport
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapState
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapStateMachine
@@ -20,9 +21,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
   alias RacingOrg.Tracker.Pro.SecureTransport.Session
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
-  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Negotiation
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: DesiredStateV1
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{Control, Messages, Negotiation}
 
   @serial "000000001234abcd"
+  @logical_device_id <<0xD1::128>>
+  @boot_id <<0xD2::128>>
+  @storage_epoch <<0xD3::128>>
+  @control_epoch 0
 
   # A per-test KeyStore in a temp dir + a pinned server keypair.
   setup do
@@ -240,6 +246,184 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       assert params == %{"fingerprint" => ctx.identity.fingerprint}
       assert socket.assigns.control_offer == :legacy
       assert socket.assigns.control_selection == nil
+    end
+  end
+
+  # --- authenticated control_v1 carrier ---
+
+  describe "control_v1 carrier (SocketTest)" do
+    test "verifies control_accept, sends readiness on its originating topic, and replays ACKs", ctx do
+      {client, holder, topic} = start_control_client(ctx)
+      server_session = complete_handshake(client, topic, ctx, @control_epoch)
+      assert_push(^topic, "wifi_status", _wifi_status)
+      assert eventually(fn -> SessionHolder.live?(holder) end)
+      assert {:ok, server_control} = Control.new(:server, server_session)
+
+      origin_topic = topic
+      {server_control, accept_frame} = push_control_accept(client, origin_topic, server_control)
+
+      assert_push(^origin_topic, "control_v1", readiness_carrier)
+      assert {:ok, readiness_frame} = Control.decode_carrier(readiness_carrier)
+      assert {:ok, :readiness, readiness_bytes, server_control} = Control.open(server_control, readiness_frame)
+      assert {:ok, readiness} = Messages.decode(:readiness, readiness_bytes)
+
+      assert readiness.device_id == @logical_device_id
+      assert readiness.credential_epoch == @control_epoch
+      assert readiness.boot_id == @boot_id
+      assert readiness.storage_epoch == @storage_epoch
+      assert readiness.selected_control_version == 1
+      assert readiness.selected_desired_version == 1
+      assert readiness.firmware_version == "0.7.0"
+      assert readiness.firmware_git_sha == "0123abc"
+      assert readiness.effective == nil
+      assert :sys.get_state(client).assigns.control_topic == origin_topic
+      assert_receive {:replay_desired_state_acks, generation}
+      assert generation == SessionHolder.generation(holder)
+
+      push(client, origin_topic, "control_v1", Control.encode_carrier(accept_frame))
+      refute_push(^origin_topic, "control_v1", _duplicate_readiness, 50)
+
+      ack =
+        control_identity(@control_epoch)
+        |> Map.merge(%{
+          generation: 11,
+          manifest_hash: :binary.copy(<<0xA5>>, 32),
+          status: :effective
+        })
+
+      assert :ok = ChannelClient.send_desired_state_ack(client, ack)
+      assert_push(^origin_topic, "control_v1", ack_carrier)
+      assert {:ok, ack_frame} = Control.decode_carrier(ack_carrier)
+      assert {:ok, :ack, ack_bytes, _server_control} = Control.open(server_control, ack_frame)
+      assert {:ok, ^ack} = Messages.decode(:ack, ack_bytes)
+    end
+
+    test "does not accept control or send readiness before session publication", ctx do
+      {client, _holder, topic} = start_control_client(ctx)
+
+      {:ok, hello_wire, responder_state} =
+        Handshake.responder_hello(
+          server_identity_private: ctx.srv_priv,
+          server_identity_public: ctx.srv_pub,
+          device_identity_public: ctx.identity.public_key,
+          epoch: @control_epoch
+        )
+
+      push(client, topic, "handshake_hello", %{"hello" => Base.encode64(hello_wire)})
+      assert_push(^topic, "handshake_init", %{"init" => init_b64})
+      {:ok, init_wire} = Base.decode64(init_b64)
+      {:ok, server_session} = Handshake.responder_finalize(responder_state, init_wire)
+      assert {:ok, server_control} = Control.new(:server, server_session)
+      {server_control, accept_frame} = push_control_accept(client, topic, server_control)
+
+      refute_push(^topic, "control_v1", _readiness, 50)
+      refute_receive {:replay_desired_state_acks, _generation}
+
+      push(client, topic, "handshake_ok", %{
+        "session_id" => Base.encode64(server_session.session_id)
+      })
+
+      assert_push(^topic, "wifi_status", _wifi_status)
+      push(client, topic, "control_v1", Control.encode_carrier(accept_frame))
+      assert_push(^topic, "control_v1", readiness_carrier)
+      assert {:ok, readiness_frame} = Control.decode_carrier(readiness_carrier)
+
+      assert {:ok, :readiness, _readiness_bytes, _server_control} =
+               Control.open(server_control, readiness_frame)
+    end
+
+    test "fails closed on accept binding mismatches, malformed carriers, and valid delivery messages", ctx do
+      {client, _holder, topic} = start_control_client(ctx)
+      server_session = complete_handshake(client, topic, ctx, @control_epoch)
+      assert_push(^topic, "wifi_status", _wifi_status)
+      assert {:ok, server_control} = Control.new(:server, server_session)
+
+      push(client, topic, "control_v1", %{"frame" => "not base64"})
+      refute_push(^topic, "control_v1", _readiness, 20)
+
+      mismatches = [
+        %{device_id: <<0xEE::128>>},
+        %{credential_epoch: 8},
+        %{offer_hash: :binary.copy(<<0xEE>>, 32)}
+      ]
+
+      server_control =
+        Enum.reduce(mismatches, server_control, fn mismatch, control ->
+          {control, _frame} = push_control_accept(client, topic, control, mismatch)
+          refute_push(^topic, "control_v1", _readiness, 20)
+          control
+        end)
+
+      secret_delivery =
+        control_identity(@control_epoch)
+        |> Map.merge(%{
+          generation: 1,
+          manifest_hash: :binary.copy(<<0x11>>, 32),
+          section: :wifi,
+          section_schema_version: 1,
+          section_hash: :binary.copy(<<0x12>>, 32),
+          secret_kind: :wifi_psk,
+          digest_key_id: 1,
+          secret_ref: :binary.copy(<<0x13>>, 16),
+          secret_digest: :binary.copy(<<0x14>>, 32),
+          secret: "synthetic-not-a-credential"
+        })
+
+      {:ok, secret_bytes} = Messages.encode(:secret_delivery, secret_delivery)
+      {:ok, secret_frame, _server_control} = Control.seal(server_control, :secret_delivery, secret_bytes)
+      push(client, topic, "control_v1", Control.encode_carrier(secret_frame))
+
+      refute_push(^topic, "control_v1", _response, 50)
+      refute_receive {:replay_desired_state_acks, _generation}
+      assert Process.alive?(client)
+    end
+
+    test "drops control frames fenced by a replacement session", ctx do
+      {client, holder, topic} = start_control_client(ctx)
+      server_session = complete_handshake(client, topic, ctx, @control_epoch)
+      assert_push(^topic, "wifi_status", _wifi_status)
+      assert {:ok, server_control} = Control.new(:server, server_session)
+      assert {:ok, current} = SessionHolder.get_current_session(holder)
+
+      replacement = %{current | session_id: <<0xF1::128>>, generation: nil}
+      assert {:ok, replacement} = SessionHolder.publish(holder, replacement, current.generation)
+      assert replacement.generation > current.generation
+
+      {_server_control, _accept_frame} = push_control_accept(client, topic, server_control)
+      refute_push(^topic, "control_v1", _readiness, 50)
+      refute_receive {:replay_desired_state_acks, _generation}
+      assert Process.alive?(client)
+    end
+
+    test "reconnects when outbound control requires rekey", ctx do
+      {client, holder, topic} = start_control_client(ctx)
+      server_session = complete_handshake(client, topic, ctx, @control_epoch)
+      assert_push(^topic, "wifi_status", _wifi_status)
+      assert eventually(fn -> SessionHolder.live?(holder) end)
+      assert {:ok, server_control} = Control.new(:server, server_session)
+      {server_control, _accept_frame} = push_control_accept(client, topic, server_control)
+
+      assert_push(^topic, "control_v1", readiness_carrier)
+      assert {:ok, readiness_frame} = Control.decode_carrier(readiness_carrier)
+
+      assert {:ok, :readiness, _readiness_bytes, _server_control} =
+               Control.open(server_control, readiness_frame)
+
+      :sys.replace_state(holder, fn state ->
+        %{state | control: %{state.control | send_counter: SecureTransport.rekey_after()}}
+      end)
+
+      ack =
+        control_identity(@control_epoch)
+        |> Map.merge(%{
+          generation: 11,
+          manifest_hash: :binary.copy(<<0xA5>>, 32),
+          status: :effective
+        })
+
+      assert :ok = ChannelClient.send_desired_state_ack(client, ack)
+      assert_disconnect()
+      assert eventually(fn -> not SessionHolder.live?(holder) end)
     end
   end
 
@@ -2583,6 +2767,75 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     test "no-ops safely when the target process is not running" do
       assert :ok = ChannelClient.send_wind_shift_update(:no_such_channel_client, wind_shift_update())
     end
+  end
+
+  defp start_control_client(ctx, extra_opts \\ []) do
+    test_pid = self()
+    {:ok, holder} = start_supervised({SessionHolder, name: nil})
+    topic = "device:" <> ctx.identity.fingerprint
+
+    opts =
+      Keyword.merge(
+        [
+          name: nil,
+          auto_connect?: true,
+          test_mode?: true,
+          url: "wss://test.local/device_socket/websocket",
+          session_holder: holder,
+          firmware_validator: fn -> :ok end,
+          desired_state_identity: fn -> {:ok, control_identity(@control_epoch)} end,
+          desired_state_compatibility: fn ->
+            %{
+              firmware_version: "0.7.0",
+              firmware_git_sha: "0123abc",
+              capabilities:
+                Enum.map(DesiredStateV1.capabilities(), fn {name, _id, version} ->
+                  {name, version}
+                end)
+            }
+          end,
+          desired_state_status: fn -> %{active: nil} end,
+          desired_state_replay: fn generation ->
+            send(test_pid, {:replay_desired_state_acks, generation})
+            :ok
+          end,
+          keystore_opts: [base_path: ctx.base]
+        ],
+        extra_opts
+      )
+
+    client = start_supervised!({ChannelClient, opts})
+    connect_and_assert_join(client, ^topic, %{}, :ok)
+    {client, holder, topic}
+  end
+
+  defp push_control_accept(client, topic, server_control, overrides \\ %{}) do
+    offer = %{control_versions: [1], desired_state_versions: [1]}
+    {:ok, selection} = Negotiation.select(offer)
+
+    attrs =
+      %{
+        device_id: @logical_device_id,
+        credential_epoch: @control_epoch,
+        selected_control_version: selection.selected_control_version,
+        selected_desired_version: selection.selected_desired_version,
+        offer_hash: selection.offer_hash
+      }
+      |> Map.merge(overrides)
+
+    {:ok, bytes} = Messages.encode(:control_accept, attrs)
+    {:ok, frame, server_control} = Control.seal(server_control, :control_accept, bytes)
+    push(client, topic, "control_v1", Control.encode_carrier(frame))
+    {server_control, frame}
+  end
+
+  defp control_identity(credential_epoch) do
+    %{
+      device_id: @logical_device_id,
+      credential_epoch: credential_epoch,
+      boot_id: @boot_id,
+      storage_epoch: @storage_epoch
+    }
   end
 
   defp eventually(fun, retries \\ 50) do
