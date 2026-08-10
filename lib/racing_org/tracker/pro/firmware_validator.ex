@@ -45,9 +45,16 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidator do
         :already_valid
 
       true ->
-        (validate_fun || (&default_validate/0)).()
-        Logger.info("[FirmwareValidator] firmware validated after RacingOrg connect")
-        :validated
+        case (validate_fun || (&default_validate/0)).() do
+          :ok ->
+            Logger.info("[FirmwareValidator] firmware validated after RacingOrg connect")
+            :validated
+
+          failure ->
+            Logger.warning("[FirmwareValidator] validation failed (will retry on next connect): #{inspect(failure)}")
+
+            :error
+        end
     end
   rescue
     e ->
