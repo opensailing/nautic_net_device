@@ -12,6 +12,37 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
   @manifest_hash :binary.copy(<<0xB2>>, 32)
   @other_manifest_hash :binary.copy(<<0xC3>>, 32)
 
+  defmodule ReclassifyingAdmissionAuthority do
+    alias RacingOrg.Tracker.Pro.Commands.Ledger
+
+    def authorize(plan, snapshot, limits, runtime_state) do
+      context =
+        runtime_state
+        |> Agent.get(& &1)
+        |> Map.merge(%{snapshot: snapshot, limits: limits})
+
+      expected =
+        case plan.action do
+          :execute -> {:execute, plan}
+          :terminal -> {:terminal, plan}
+          _other -> :invalid
+        end
+
+      if Ledger.classify(plan.delivery, context) == expected,
+        do: :ok,
+        else: {:error, :command_admission_not_authoritative}
+    end
+  end
+
+  defmodule PermissiveAdmissionAuthority do
+    def authorize(_plan, _snapshot, _limits, _context), do: :ok
+  end
+
+  defmodule DenyRecoveryVerifier do
+    def with_non_application_lease(_intent, _proof, _reason, _context, _transition),
+      do: {:error, :effect_non_application_unverified}
+  end
+
   setup do
     root = Path.join(System.tmp_dir!(), "command_ledger_classification_#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf(root) end)
@@ -51,7 +82,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
 
   test "checks command IDs within the current epoch and replays exact retained result bytes", %{store: store} do
     original = delivery(command_id: command_id(1), payload: <<0x00, 0xFF, "original">>)
-    assert {:ok, _intent, store} = Store.begin_intent(store, execution_plan(original, 32))
+    assert {:ok, _intent, store} = begin_intent(store, execution_plan(original, 32))
     result = <<0x00, 0xFF, "exact-result">>
     assert {:ok, _ack, store} = Store.complete_intent(store, result)
 
@@ -77,7 +108,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
     store: store
   } do
     original = delivery(command_id: command_id(1), payload: "already-applied")
-    assert {:ok, _intent, store} = Store.begin_intent(store, execution_plan(original, 16))
+    assert {:ok, _intent, store} = begin_intent(store, execution_plan(original, 16))
     assert {:ok, applied_ack, store} = Store.complete_intent(store, "effect-result")
 
     advanced_context =
@@ -197,8 +228,8 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
     assert plan.reserved_result_bytes == 16
   end
 
-  test "defers without a trusted clock and treats zero expiry as expired at positive trusted time", %{store: store} do
-    command = delivery(expires_at_ms: 0)
+  test "defers without a trusted clock and rejects at the exact expiry boundary", %{store: store} do
+    command = delivery(expires_at_ms: 1)
 
     assert {:defer, :trusted_clock_unavailable} =
              Ledger.classify(command, context(store, trusted_now_ms: :unavailable))
@@ -208,6 +239,50 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
     assert plan.status == :rejected
     assert plan.result == <<>>
     assert plan.reset_epoch? == false
+  end
+
+  test "durable admission reclassifies against the authority's fresh clock", %{path: path, store: initial} do
+    runtime =
+      initial
+      |> context(trusted_now_ms: 99)
+      |> Map.drop([:snapshot, :limits])
+
+    {:ok, runtime_state} = Agent.start_link(fn -> runtime end)
+
+    assert {:ok, store} =
+             open_store(path,
+               admission_authority: {ReclassifyingAdmissionAuthority, runtime_state}
+             )
+
+    command = delivery(expires_at_ms: 100)
+    assert {:execute, plan} = Ledger.classify(command, context(store, trusted_now_ms: 99))
+
+    Agent.update(runtime_state, &Map.put(&1, :trusted_now_ms, :unavailable))
+
+    assert {:error, :command_admission_not_authoritative} =
+             Store.begin_intent(store, plan)
+
+    assert {:ok, unavailable_reopened} =
+             open_store(path,
+               admission_authority: {ReclassifyingAdmissionAuthority, runtime_state}
+             )
+
+    assert Store.pending_intent(unavailable_reopened) == nil
+
+    Agent.update(runtime_state, &Map.put(&1, :trusted_now_ms, 100))
+
+    assert {:error, :command_admission_not_authoritative} =
+             Store.begin_intent(store, plan)
+
+    assert {:ok, expired_reopened} =
+             open_store(path,
+               admission_authority: {ReclassifyingAdmissionAuthority, runtime_state}
+             )
+
+    assert Store.pending_intent(expired_reopened) == nil
+
+    Agent.update(runtime_state, &Map.put(&1, :trusted_now_ms, 99))
+    assert {:ok, _intent, _pending} = Store.begin_intent(store, plan)
   end
 
   test "checks payload, type, and operational gate in order", %{store: store} do
@@ -281,6 +356,34 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
     assert plan.reserved_result_bytes == 16
   end
 
+  test "open operational gates require every exact identity and manifest binding", %{store: store} do
+    valid_binding = %{
+      credential_epoch: 7,
+      storage_epoch: @storage_epoch,
+      generation: 42,
+      manifest_hash: @manifest_hash
+    }
+
+    invalid_bindings = [
+      %{valid_binding | credential_epoch: 8},
+      %{valid_binding | storage_epoch: @other_storage_epoch},
+      %{valid_binding | generation: 43},
+      %{valid_binding | manifest_hash: @other_manifest_hash},
+      %{valid_binding | manifest_hash: <<0x01>>},
+      Map.delete(valid_binding, :credential_epoch),
+      Map.delete(valid_binding, :storage_epoch),
+      Map.delete(valid_binding, :generation),
+      Map.delete(valid_binding, :manifest_hash)
+    ]
+
+    for binding <- invalid_bindings do
+      assert_transient_reason(
+        Ledger.classify(delivery([]), context(store, gate: {:open, binding})),
+        :operational_gate_closed
+      )
+    end
+  end
+
   test "defers silently at count and aggregate-result-byte capacity but reset epochs reclaim history", %{path: path} do
     assert {:ok, count_store} = open_store(path <> ".count", max_outcomes: 1)
     first = delivery(command_id: command_id(1))
@@ -302,7 +405,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
 
     assert {:ok, byte_store} = open_store(path <> ".bytes", max_result_bytes: 5)
     applied = delivery(command_id: command_id(5))
-    assert {:ok, _intent, byte_store} = Store.begin_intent(byte_store, execution_plan(applied, 4))
+    assert {:ok, _intent, byte_store} = begin_intent(byte_store, execution_plan(applied, 4))
     assert {:ok, _ack, byte_store} = Store.complete_intent(byte_store, "1234")
 
     assert {:defer, {:capacity, :result_bytes}} =
@@ -313,10 +416,10 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
   end
 
   test "recovery never treats expiry as proof that a pending effect did not happen", %{store: store} do
-    command = delivery(command_id: command_id(1), expires_at_ms: 0)
-    assert {:ok, intent, store} = Store.begin_intent(store, execution_plan(command, 16))
+    command = delivery(command_id: command_id(1), expires_at_ms: 100)
+    assert {:ok, intent, store} = begin_intent(store, execution_plan(command, 16), 99)
 
-    assert intent.expires_at_ms == 0
+    assert intent.expires_at_ms == 100
     assert {:recover, ^intent} = Ledger.recover_pending(Store.snapshot(store))
 
     next = delivery(command_id: command_id(2))
@@ -367,13 +470,18 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
     Map.new(Keyword.merge(defaults, overrides))
   end
 
+  defp begin_intent(store, plan, _trusted_now_ms \\ 1_700_000_000_000),
+    do: Store.begin_intent(store, plan)
+
   defp open_store(path, overrides \\ []) do
     defaults = [
       device_id: @device_id,
       credential_epoch: 7,
       storage_epoch: @storage_epoch,
       max_outcomes: 8,
-      max_result_bytes: 1_024
+      max_result_bytes: 1_024,
+      admission_authority: {PermissiveAdmissionAuthority, nil},
+      recovery_verifiers: %{set_tracking: {DenyRecoveryVerifier, nil}}
     ]
 
     Store.open(path, Keyword.merge(defaults, overrides))
