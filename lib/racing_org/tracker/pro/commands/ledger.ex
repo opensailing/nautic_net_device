@@ -98,8 +98,8 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger do
 
   defp command_id_fence(delivery, snapshot) do
     case Map.fetch(snapshot.outcomes, delivery.command_id) do
-      {:ok, %{hash: hash, result: result}} when hash == delivery.command_hash ->
-        case Ack.build(delivery, :duplicate, :none, result) do
+      {:ok, %{hash: hash} = outcome} when hash == delivery.command_hash ->
+        case Ack.replay(delivery, outcome) do
           {:ok, ack} -> stop({:duplicate, ack})
           {:error, _reason} -> stop({:defer, :invalid_command_delivery})
         end

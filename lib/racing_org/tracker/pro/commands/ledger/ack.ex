@@ -42,4 +42,38 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Ack do
   end
 
   def build(_command, _status, _reason, _result), do: {:error, :invalid_command_ack_source}
+
+  @doc false
+  @spec replay(map(), map()) :: {:ok, map()} | {:error, term()}
+  def replay(command, %{status: :applied, reason: :none, result: result}) do
+    build(command, :duplicate, :none, result)
+  end
+
+  def replay(
+        command,
+        %{status: :rejected, reason: reason, result: result, result_hash: result_hash}
+      )
+      when is_map(command) and is_atom(reason) and is_binary(result) and is_binary(result_hash) do
+    with {:ok, command_hash} <- Map.fetch(command, :command_hash) do
+      ack =
+        command
+        |> Map.take(@fence_keys)
+        |> Map.merge(%{
+          command_hash: command_hash,
+          status: :rejected,
+          reason: reason,
+          result_hash: result_hash,
+          result: result
+        })
+
+      case Messages.encode(:command_ack, ack) do
+        {:ok, _bytes} -> {:ok, ack}
+        {:error, _reason} = error -> error
+      end
+    else
+      :error -> {:error, :invalid_command_ack_source}
+    end
+  end
+
+  def replay(_command, _outcome), do: {:error, :invalid_retained_command_outcome}
 end

@@ -74,6 +74,19 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
     assert conflict_ack.reason == :command_id_conflict
   end
 
+  test "replays retained rejected outcomes byte-for-byte instead of fabricating duplicate success", %{store: store} do
+    original = delivery(command_id: command_id(1), expires_at_ms: 0)
+    assert {:ok, original_ack, store} = Store.record_terminal(store, terminal_plan(original, :expired))
+    assert {:ok, original_bytes} = Messages.encode(:command_ack, original_ack)
+
+    assert {:duplicate, replayed_ack} = Ledger.classify(original, context(store, trusted_now_ms: 1))
+    assert replayed_ack == original_ack
+    assert replayed_ack.status == :rejected
+    assert replayed_ack.reason == :expired
+    assert replayed_ack.result_hash == original_ack.result_hash
+    assert {:ok, ^original_bytes} = Messages.encode(:command_ack, replayed_ack)
+  end
+
   test "classifies old epochs, replays, gaps, and valid higher-epoch reset candidates", %{store: store} do
     epoch_two = delivery(command_epoch: 2, command_sequence: 1, command_id: command_id(1))
 
