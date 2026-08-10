@@ -34,12 +34,28 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
   @p_square_fields ~w(buffer count dnp n np p q)
   @regimes ~w(insufficient_history calm oscillating persistent_ramp persistent_step mixed)
 
-  @doc "Encode one schema-valid checkpoint value into canonical non-JSON bytes."
-  def encode_content(kind, schema_version, content) do
+  @doc """
+  Canonical bytes for one schema-valid checkpoint value, WITHOUT the single-frame
+  capacity cap.
+
+  Content validity and transport capacity are separate verdicts. A checkpoint whose
+  closed schema is fully satisfied but whose canonical form exceeds one frame is
+  valid content that needs chunked carriage — never invalid content. Callers that
+  must place the value in a single frame use `encode_content/3`, which adds the cap
+  and reports `:checkpoint_too_large` distinctly.
+  """
+  def canonical_content(kind, schema_version, content) do
     with {:ok, _kind_code} <- checkpoint_identity(kind, schema_version),
          :ok <- reject_secret_capable(content),
          :ok <- validate_content(kind, content),
-         {:ok, bytes} <- Canonical.encode(content),
+         {:ok, bytes} <- Canonical.encode(content) do
+      {:ok, bytes}
+    end
+  end
+
+  @doc "Encode one schema-valid checkpoint value into canonical single-frame bytes."
+  def encode_content(kind, schema_version, content) do
+    with {:ok, bytes} <- canonical_content(kind, schema_version, content),
          :ok <- checkpoint_size(bytes) do
       {:ok, bytes}
     end
@@ -354,12 +370,36 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
     end
   end
 
-  # Polar checkpoint v1
+  # Polar checkpoint v2
+  #
+  # A polar cell key is a BARE `{tws_bin, twa_bin}` index pair. An index means
+  # nothing without the grid that minted it, so the content binds the exact
+  # producing geometry (`tws_width_mps`, `twa_width_deg`, `max_tws_mps`) and the
+  # ONE quantile probability every cell was accumulated at. Every cell key must
+  # fall inside that declared finite grid, and every per-cell field the grid or
+  # the cell count already determines is absent rather than repeated:
+  #
+  #   * `p`     — one global value; a per-cell copy could disagree with it.
+  #   * `count` — the cell's own count is the estimator's sample count.
+  #   * `dnp`   — exactly `[0, p/2, p, (1+p)/2, 1]`, a pure function of `p`.
+  #   * `n[0]`  — always 1; `n[4]` — always the cell count.
+  #
+  # `np` is NOT reconstructible (it depends on the whole update history), and
+  # neither is `q` or the warmup `buffer`, so all three are carried verbatim.
+
+  @polar_axis_fields ~w(max_tws_mps twa_width_deg tws_width_mps)
+  @polar_quantile_fields ~w(buffer n np q)
+  @polar_interior_markers 3
 
   defp validate_polar(content) do
-    with :ok <- exact_string_keys(content, ["cells"]),
+    with :ok <- exact_string_keys(content, ["cells", "p" | @polar_axis_fields]),
+         :ok <- between_float(content["p"], 0.0, 1.0, exclusive: true),
+         :ok <- positive_float(content["tws_width_mps"]),
+         :ok <- positive_float(content["twa_width_deg"]),
+         :ok <- positive_float(content["max_tws_mps"]),
+         {:ok, grid} <- polar_grid(content),
          :ok <- bounded_list(content["cells"], @max_pending_rows),
-         :ok <- validate_each(content["cells"], &validate_polar_cell/1),
+         :ok <- validate_each(content["cells"], &validate_polar_cell(&1, content["p"], grid)),
          :ok <- strictly_ordered_by(content["cells"], &{&1["tws_bin"], &1["twa_bin"]}) do
       :ok
     else
@@ -368,14 +408,73 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
     end
   end
 
-  defp validate_polar_cell(cell) do
+  # The inclusive upper index corner of the declared grid, mirroring
+  # `Polar.Observer.Bins.max_key/1` exactly. Both axes must stay inside u32 so
+  # every admissible key is representable on the wire — and the ratio is bounded
+  # BEFORE `trunc/1`, because a width small enough to overflow the division would
+  # otherwise raise out of a validator rather than fail closed.
+  defp polar_grid(content) do
+    with {:ok, max_tws_bin} <- polar_axis_bins(content["max_tws_mps"], content["tws_width_mps"]),
+         {:ok, max_twa_bin} <- polar_axis_bins(180.0, content["twa_width_deg"]) do
+      {:ok, {max_tws_bin, max_twa_bin}}
+    end
+  end
+
+  defp polar_axis_bins(extent, width) do
+    ratio = extent / width
+
+    with :ok <- ensure(ratio <= @u32_max) do
+      {:ok, max(trunc(:math.ceil(ratio)) - 1, 0)}
+    end
+  end
+
+  defp validate_polar_cell(cell, p, {max_tws_bin, max_twa_bin}) do
     with :ok <- exact_string_keys(cell, ~w(count quantile twa_bin tws_bin)),
          :ok <- positive_u64_value(cell["count"]),
          :ok <- u32_value(cell["twa_bin"]),
          :ok <- u32_value(cell["tws_bin"]),
-         :ok <- validate_p_square(cell["quantile"]),
-         :ok <- ensure(cell["quantile"]["count"] == cell["count"]),
+         :ok <- ensure(cell["tws_bin"] <= max_tws_bin),
+         :ok <- ensure(cell["twa_bin"] <= max_twa_bin),
+         :ok <- validate_polar_quantile(cell["quantile"], p, cell["count"]),
          :ok <- nonnegative_p_square_values(cell["quantile"]) do
+      :ok
+    end
+  end
+
+  # Warmup phase: fewer than five samples, so no markers exist yet and the whole
+  # estimator is its sorted buffer.
+  defp validate_polar_quantile(quantile, _p, count) when count < 5 do
+    with :ok <- exact_string_keys(quantile, @polar_quantile_fields),
+         :ok <- bounded_list(quantile["buffer"], 4),
+         :ok <- ensure(length(quantile["buffer"]) == count),
+         :ok <- validate_each(quantile["buffer"], &finite_float/1),
+         :ok <- nondecreasing(quantile["buffer"]),
+         :ok <- ensure(is_nil(quantile["q"])),
+         :ok <- ensure(is_nil(quantile["n"])),
+         :ok <- ensure(is_nil(quantile["np"])) do
+      :ok
+    end
+  end
+
+  # Marker phase. `n` carries ONLY the three interior actual positions; the two
+  # endpoints are re-derived here and the full five-marker invariants are checked
+  # against the reconstruction, so a compact encoding is accepted only when it
+  # decodes back to exactly one well-formed estimator.
+  defp validate_polar_quantile(quantile, p, count) do
+    with :ok <- exact_string_keys(quantile, @polar_quantile_fields),
+         :ok <- ensure(quantile["buffer"] == []),
+         :ok <- exact_length_list(quantile["q"], 5),
+         :ok <- validate_each(quantile["q"], &finite_float/1),
+         :ok <- nondecreasing(quantile["q"]),
+         :ok <- exact_length_list(quantile["n"], @polar_interior_markers),
+         :ok <- validate_each(quantile["n"], &positive_u64_value/1),
+         n = [1 | quantile["n"]] ++ [count],
+         :ok <- strictly_increasing(n),
+         :ok <- ensure(List.last(quantile["n"]) < count),
+         :ok <- exact_length_list(quantile["np"], 5),
+         :ok <- validate_each(quantile["np"], &finite_float/1),
+         :ok <- nondecreasing(quantile["np"]),
+         :ok <- approximate_vector(quantile["np"], expected_np(p, count)) do
       :ok
     end
   end
@@ -628,10 +727,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
     )
   end
 
-  defp validate_p_square(value, expected_p \\ nil) do
+  defp validate_p_square(value, expected_p) do
     with :ok <- exact_string_keys(value, @p_square_fields),
          :ok <- between_float(value["p"], 0.0, 1.0, exclusive: true),
-         :ok <- expected_probability(value["p"], expected_p),
+         :ok <- ensure(approx_equal?(value["p"], expected_p)),
          :ok <- nonnegative_u64(value["count"]),
          :ok <- validate_p_square_phase(value) do
       :ok
@@ -674,30 +773,41 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
   defp validate_p_square_positions(value) do
     p = value["p"]
     count = value["count"]
-    expected_dnp = [0.0, p / 2.0, p, (1.0 + p) / 2.0, 1.0]
 
-    expected_np = [
+    with :ok <- approximate_vector(value["dnp"], expected_dnp(p)),
+         :ok <- approximate_vector(value["np"], expected_np(p, count)),
+         :ok <- ensure(Enum.all?(value["n"], &(&1 <= count))) do
+      :ok
+    end
+  end
+
+  @doc """
+  The P-square desired-position increments `dnp` implied by quantile probability `p`.
+
+  A pure function of `p`, so a checkpoint that already binds `p` never needs to
+  carry it per cell — see the polar v2 schema.
+  """
+  def expected_dnp(p), do: [0.0, p / 2.0, p, (1.0 + p) / 2.0, 1.0]
+
+  @doc """
+  The P-square desired marker positions `np` implied by `p` after `count` samples.
+
+  Only the marker-phase (`count >= 5`) estimator has desired positions.
+  """
+  def expected_np(p, count) do
+    [
       1.0,
       1.0 + (count - 1) * p / 2.0,
       1.0 + (count - 1) * p,
       1.0 + (count - 1) * (1.0 + p) / 2.0,
       count / 1
     ]
-
-    with :ok <- approximate_vector(value["dnp"], expected_dnp),
-         :ok <- approximate_vector(value["np"], expected_np),
-         :ok <- ensure(Enum.all?(value["n"], &(&1 <= count))) do
-      :ok
-    end
   end
 
   defp nonnegative_p_square_values(%{"buffer" => buffer, "q" => q}) do
     values = if is_nil(q), do: buffer, else: q
     ensure(Enum.all?(values, &(&1 >= 0.0)))
   end
-
-  defp expected_probability(_actual, nil), do: :ok
-  defp expected_probability(actual, expected), do: ensure(approx_equal?(actual, expected))
 
   # Secret boundary and primitive validators
 

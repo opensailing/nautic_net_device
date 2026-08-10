@@ -16,6 +16,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
   @payload_hash :binary.copy(<<0xA1>>, 32)
   @parent_hash :binary.copy(<<0xB2>>, 32)
   @database_int_max 9_223_372_036_854_775_807
+  @polar_schema 2
 
   describe "closed durable-delivery registries" do
     test "freezes message codes, directions, streams, and checkpoint schemas" do
@@ -62,9 +63,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
         assert Contract.delivery_stream(code) == {:ok, stream}
       end
 
+      # Polar is at schema 2: its v1 content carried a bare cell index with no
+      # bin geometry to interpret it under. The kind CODE is unchanged, so the
+      # bump is visible only in the schema_version u16 that every checkpoint
+      # hash preimage binds.
       assert Contract.checkpoint_kinds() == [
                {:calibration, 0x01, 0x0001},
-               {:polar, 0x02, 0x0001},
+               {:polar, 0x02, 0x0002},
                {:wind_shift, 0x03, 0x0001}
              ]
 
@@ -190,17 +195,24 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
             polar: polar_checkpoint(),
             wind_shift: empty_wind_shift_checkpoint()
           ] do
-        assert {:ok, bytes} = Checkpoint.encode_content(kind, 1, content)
-        assert {:ok, ^content} = Checkpoint.decode_content(kind, 1, bytes)
-        assert {:ok, hash} = Checkpoint.content_hash(kind, 1, bytes)
-        assert {:ok, kind_code, 1} = Contract.checkpoint_kind(kind)
+        # Each kind carries its OWN frozen schema version; the hash preimage binds
+        # it, so a kind at schema 2 must not be encoded under a hardcoded 1.
+        assert {:ok, kind_code, schema_version} = Contract.checkpoint_kind(kind)
+
+        assert {:ok, bytes} = Checkpoint.encode_content(kind, schema_version, content)
+        assert {:ok, ^content} = Checkpoint.decode_content(kind, schema_version, bytes)
+        assert {:ok, hash} = Checkpoint.content_hash(kind, schema_version, bytes)
 
         assert hash ==
                  :crypto.hash(
                    :sha256,
                    Contract.checkpoint_content_hash_domain() <>
-                     <<Contract.version(), kind_code, 1::16, byte_size(bytes)::64, bytes::binary>>
+                     <<Contract.version(), kind_code, schema_version::16, byte_size(bytes)::64, bytes::binary>>
                  )
+
+        # The retired schema is refused rather than silently reinterpreted.
+        assert {:error, :unsupported_checkpoint_schema} =
+                 Checkpoint.encode_content(kind, schema_version + 1, content)
       end
     end
 
@@ -218,16 +230,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
         :crypto.hash(
           :sha256,
           Contract.checkpoint_hash_domain() <>
-            <<Contract.version(), @device_id::binary, 7::32, @storage_epoch::binary, 11::64, 0x02, 1::16, 42::64,
-              @parent_hash::binary, submission.content_hash::binary-size(32)>>
+            <<Contract.version(), @device_id::binary, 7::32, @storage_epoch::binary, 11::64, 0x02, @polar_schema::16,
+              42::64, @parent_hash::binary, submission.content_hash::binary-size(32)>>
         )
 
       assert submission.checkpoint_hash == expected_hash
 
       assert bytes ==
                Contract.payload_domain(:checkpoint_submission) <>
-                 <<Contract.version(), 0x31, @device_id::binary, 7::32, @storage_epoch::binary, 11::64, 0x02, 1::16,
-                   42::64, @parent_hash::binary, submission.content_hash::binary-size(32),
+                 <<Contract.version(), 0x31, @device_id::binary, 7::32, @storage_epoch::binary, 11::64, 0x02,
+                   @polar_schema::16, 42::64, @parent_hash::binary, submission.content_hash::binary-size(32),
                    expected_hash::binary-size(32), byte_size(submission.content)::32, submission.content::binary>>
     end
 
@@ -257,7 +269,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
       assert bytes ==
                Contract.payload_domain(:checkpoint_hydration) <>
                  <<Contract.version(), 0x32, @device_id::binary, 8::32, @replacement_storage_epoch::binary, 7::32,
-                   @storage_epoch::binary, 11::64, 0x02, 1::16, 42::64, @parent_hash::binary,
+                   @storage_epoch::binary, 11::64, 0x02, @polar_schema::16, 42::64, @parent_hash::binary,
                    hydration.content_hash::binary-size(32), hydration.checkpoint_hash::binary-size(32),
                    byte_size(hydration.content)::32, hydration.content::binary>>
     end
@@ -320,8 +332,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
       assert {:error, :invalid_parent_hash} =
                Messages.encode(:checkpoint_submission, %{submission | parent_hash: <<0>>})
 
+      # The RETIRED polar schema is rejected as firmly as an unreached future one:
+      # a v1 index pair has no bin geometry, so it must never be accepted again.
       assert {:error, :unsupported_checkpoint_schema} =
-               Messages.encode(:checkpoint_submission, %{submission | schema_version: 2})
+               Messages.encode(:checkpoint_submission, %{submission | schema_version: 1})
+
+      assert {:error, :unsupported_checkpoint_schema} =
+               Messages.encode(:checkpoint_submission, %{submission | schema_version: @polar_schema + 1})
 
       assert {:error, :unknown_checkpoint_kind} =
                Messages.encode(:checkpoint_submission, %{submission | kind: :arbitrary})
@@ -338,11 +355,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
         unsafe = put_in(safe, ["cells"], [Map.put(cell, forbidden, "synthetic-noncredential")])
 
         assert {:error, :checkpoint_secret_forbidden} =
-                 Checkpoint.encode_content(:polar, 1, unsafe)
+                 Checkpoint.encode_content(:polar, @polar_schema, unsafe)
       end
 
       assert {:error, :invalid_checkpoint_content} =
-               Checkpoint.encode_content(:polar, 1, %{
+               Checkpoint.encode_content(:polar, @polar_schema, %{
                  "cells" => [],
                  "arbitrary_numeric_tree" => [1, 2, 3]
                })
@@ -356,13 +373,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
       assert {:ok, content} = Canonical.encode(unsafe)
 
       assert {:error, :checkpoint_secret_forbidden} =
-               Checkpoint.decode_content(:polar, 1, content)
+               Checkpoint.decode_content(:polar, @polar_schema, content)
 
       content_hash =
         :crypto.hash(
           :sha256,
           Contract.checkpoint_content_hash_domain() <>
-            <<Contract.version(), 0x02, 1::16, byte_size(content)::64, content::binary>>
+            <<Contract.version(), 0x02, @polar_schema::16, byte_size(content)::64, content::binary>>
         )
 
       attrs =
@@ -379,10 +396,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
                Messages.encode(:checkpoint_submission, forged)
 
       assert {:error, _} =
-               Checkpoint.decode_content(:polar, 1, :erlang.term_to_binary(safe))
+               Checkpoint.decode_content(:polar, @polar_schema, :erlang.term_to_binary(safe))
 
       assert {:error, _} =
-               Checkpoint.decode_content(:polar, 1, submission.content <> <<0>>)
+               Checkpoint.decode_content(:polar, @polar_schema, submission.content <> <<0>>)
     end
 
     test "rejects wrong domains, versions, type substitution, truncation, and trailing bytes" do
@@ -419,14 +436,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
   end
 
   defp checkpoint_submission_attrs do
-    assert {:ok, content} = Checkpoint.encode_content(:polar, 1, polar_checkpoint())
-    assert {:ok, content_hash} = Checkpoint.content_hash(:polar, 1, content)
+    assert {:ok, content} = Checkpoint.encode_content(:polar, @polar_schema, polar_checkpoint())
+    assert {:ok, content_hash} = Checkpoint.content_hash(:polar, @polar_schema, content)
 
     attrs =
       durable_identity(%{
         sequence: 11,
         kind: :polar,
-        schema_version: 1,
+        schema_version: @polar_schema,
         source_generation: 42,
         parent_hash: @parent_hash,
         content_hash: content_hash
@@ -460,6 +477,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
     }
   end
 
+  # Polar schema 2: one global `p` plus the exact bin geometry that gives the
+  # bare `{tws_bin, twa_bin}` indices meaning. Per cell, `dnp`, `p`, the
+  # quantile's own count, and the two derivable `n` endpoints are all absent —
+  # only the three interior marker positions ship.
   defp polar_checkpoint do
     %{
       "cells" => [
@@ -467,17 +488,18 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
           "count" => 5,
           "quantile" => %{
             "buffer" => [],
-            "count" => 5,
-            "dnp" => [0.0, 0.45, 0.9, 0.95, 1.0],
-            "n" => [1, 2, 3, 4, 5],
+            "n" => [2, 3, 4],
             "np" => [1.0, 2.8, 4.6, 4.8, 5.0],
-            "p" => 0.9,
             "q" => [1.0, 2.0, 3.0, 4.0, 5.0]
           },
-          "twa_bin" => 45,
+          "twa_bin" => 35,
           "tws_bin" => 3
         }
-      ]
+      ],
+      "max_tws_mps" => 51.4444,
+      "p" => 0.9,
+      "twa_width_deg" => 5.0,
+      "tws_width_mps" => 0.514444
     }
   end
 

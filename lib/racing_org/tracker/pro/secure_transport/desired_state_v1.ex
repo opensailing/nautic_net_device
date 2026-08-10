@@ -54,9 +54,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   @delivery_stream_by_name Map.new(@delivery_streams)
   @delivery_stream_by_code Map.new(@delivery_streams, fn {name, code} -> {code, name} end)
 
+  # Polar is at schema 2: v1 carried a bare cell index with a per-cell quantile
+  # probability and fully redundant P-square state, so the indices could not be
+  # interpreted without the producer's bin geometry. v2 binds one global `p` and
+  # the exact grid, and drops every per-cell field that grid + count determine.
+  # No runtime producer ever emitted v1, so v1 is retired rather than supported.
   @checkpoint_kinds [
     {:calibration, 0x01, 0x0001},
-    {:polar, 0x02, 0x0001},
+    {:polar, 0x02, 0x0002},
     {:wind_shift, 0x03, 0x0001}
   ]
   @checkpoint_kind_by_name Map.new(@checkpoint_kinds, fn {name, code, schema_version} ->

@@ -5,6 +5,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Canonical
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint
 
+  @polar_schema 2
+
   describe "closed checkpoint content schemas" do
     test "caps canonical content at the single-frame hydration boundary" do
       assert Contract.max_checkpoint_size() == 65_327
@@ -12,7 +14,37 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
       oversized = :binary.copy(<<0>>, Contract.max_checkpoint_size() + 1)
 
       assert {:error, :checkpoint_too_large} =
-               Checkpoint.decode_content(:polar, 1, oversized)
+               Checkpoint.decode_content(:polar, @polar_schema, oversized)
+    end
+
+    test "reports capacity separately from content validity" do
+      # A schema-VALID polar checkpoint whose canonical form overflows one frame
+      # is content awaiting chunked carriage, not malformed content. Laundering
+      # capacity into :invalid_checkpoint_content would tell a caller to discard
+      # learned state that is in fact perfectly well formed.
+      oversized = polar_checkpoint_over_one_frame()
+
+      assert {:ok, bytes} = Checkpoint.canonical_content(:polar, @polar_schema, oversized)
+      assert byte_size(bytes) > Contract.max_checkpoint_size()
+
+      assert {:error, :checkpoint_too_large} =
+               Checkpoint.encode_content(:polar, @polar_schema, oversized)
+
+      # Invalid content still fails as invalid even when it is also oversized,
+      # and the secret boundary keeps its own verdict ahead of both.
+      [cell | rest] = oversized["cells"]
+
+      assert {:error, :invalid_checkpoint_content} =
+               Checkpoint.encode_content(:polar, @polar_schema, %{
+                 oversized
+                 | "cells" => [Map.update!(cell, "count", &(&1 + 1)) | rest]
+               })
+
+      assert {:error, :checkpoint_secret_forbidden} =
+               Checkpoint.encode_content(:polar, @polar_schema, %{
+                 oversized
+                 | "cells" => [Map.put(cell, "psk", "synthetic-noncredential") | rest]
+               })
     end
 
     test "rejects finite calibration timestamps whose span overflows" do
@@ -101,10 +133,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
       content = polar_checkpoint()
       [cell] = content["cells"]
 
+      # A count change also moves the derived n[4] endpoint and the expected np,
+      # so the compact encoding no longer reconstructs a consistent estimator.
       assert {:error, :invalid_checkpoint_content} =
                Checkpoint.encode_content(
                  :polar,
-                 1,
+                 @polar_schema,
                  put_in(content, ["cells"], [%{cell | "count" => 6}])
                )
 
@@ -113,14 +147,61 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
       assert {:error, :invalid_checkpoint_content} =
                Checkpoint.encode_content(
                  :polar,
-                 1,
+                 @polar_schema,
                  put_in(content, ["cells"], [invalid_quantile])
                )
 
-      duplicate = %{cell | "twa_bin" => 46}
+      # Cells are strictly ordered by key, so neither a descending pair nor a
+      # repeated key may be encoded.
+      earlier = %{cell | "twa_bin" => cell["twa_bin"] - 1}
 
       assert {:error, :invalid_checkpoint_content} =
-               Checkpoint.encode_content(:polar, 1, %{"cells" => [duplicate, cell]})
+               Checkpoint.encode_content(:polar, @polar_schema, %{content | "cells" => [cell, earlier]})
+
+      assert {:error, :invalid_checkpoint_content} =
+               Checkpoint.encode_content(:polar, @polar_schema, %{content | "cells" => [cell, cell]})
+    end
+
+    test "refuses polar content that reinterprets or omits the declared grid" do
+      content = polar_checkpoint()
+      [cell] = content["cells"]
+      assert {:ok, _bytes} = Checkpoint.encode_content(:polar, @polar_schema, content)
+
+      # Every geometry field is load-bearing: without one, the bare index pair
+      # cannot be mapped back to a wind speed/angle at all.
+      for field <- ~w(max_tws_mps p twa_width_deg tws_width_mps) do
+        assert {:error, :invalid_checkpoint_content} =
+                 Checkpoint.encode_content(:polar, @polar_schema, Map.delete(content, field))
+      end
+
+      # A key must lie inside the grid the content itself declares. Halving the
+      # TWA axis orphans the existing top-of-axis index rather than silently
+      # re-binning it to some other angle.
+      assert {:error, :invalid_checkpoint_content} =
+               Checkpoint.encode_content(:polar, @polar_schema, %{content | "twa_width_deg" => 10.0})
+
+      assert {:error, :invalid_checkpoint_content} =
+               Checkpoint.encode_content(:polar, @polar_schema, %{content | "max_tws_mps" => 1.0})
+
+      # Per-cell fields the global p and the cell count already determine must be
+      # absent, not merely consistent.
+      for {field, value} <- [
+            {"p", content["p"]},
+            {"count", cell["count"]},
+            {"dnp", [0.0, 0.45, 0.9, 0.95, 1.0]}
+          ] do
+        redundant = put_in(cell, ["quantile", field], value)
+
+        assert {:error, :invalid_checkpoint_content} =
+                 Checkpoint.encode_content(:polar, @polar_schema, %{content | "cells" => [redundant]})
+      end
+
+      # n carries exactly the three interior positions; a full five-marker list
+      # (the retired v1 shape) is refused rather than accepted as a superset.
+      full_n = put_in(cell, ["quantile", "n"], [1 | cell["quantile"]["n"]] ++ [cell["count"]])
+
+      assert {:error, :invalid_checkpoint_content} =
+               Checkpoint.encode_content(:polar, @polar_schema, %{content | "cells" => [full_n]})
     end
 
     test "rejects impossible calibration counters and open wind-shift event details" do
@@ -221,18 +302,22 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
 
     test "fails closed on malformed containers and noncanonical sensor identities" do
       assert {:error, :invalid_checkpoint_content} =
-               Checkpoint.encode_content(:polar, 1, %{<<0xFF>> => []})
+               Checkpoint.encode_content(:polar, @polar_schema, %{<<0xFF>> => []})
 
-      [cell] = polar_checkpoint()["cells"]
+      content = polar_checkpoint()
+      [cell] = content["cells"]
 
       assert {:error, :invalid_checkpoint_content} =
-               Checkpoint.encode_content(:polar, 1, %{"cells" => [cell | :improper]})
+               Checkpoint.encode_content(:polar, @polar_schema, %{content | "cells" => [cell | :improper]})
 
       assert {:error, :checkpoint_secret_forbidden} =
-               Checkpoint.encode_content(:polar, 1, %{
-                 "cells" => [cell | :improper],
-                 "payload" => "synthetic-noncredential"
-               })
+               Checkpoint.encode_content(
+                 :polar,
+                 @polar_schema,
+                 content
+                 |> Map.put("cells", [cell | :improper])
+                 |> Map.put("payload", "synthetic-noncredential")
+               )
 
       calibration = calibration_checkpoint()
       [awa] = calibration["awa_estimators"]
@@ -430,17 +515,51 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
     }
   end
 
+  # Polar schema 2. Unlike a calibration estimator, a polar cell's quantile is
+  # COMPACT: the global `p`, the cell count, `dnp`, and the two derivable `n`
+  # endpoints are all omitted, and the content instead binds the bin geometry
+  # that makes the bare `{tws_bin, twa_bin}` pair interpretable.
   defp polar_checkpoint do
     %{
-      "cells" => [
-        %{
-          "count" => 5,
-          "quantile" => p_square(0.9),
-          "twa_bin" => 45,
-          "tws_bin" => 3
-        }
-      ]
+      "cells" => [polar_cell(3, 35, 5)],
+      "max_tws_mps" => 51.4444,
+      "p" => 0.9,
+      "twa_width_deg" => 5.0,
+      "tws_width_mps" => 0.514444
     }
+  end
+
+  defp polar_cell(tws_bin, twa_bin, count) do
+    p = 0.9
+
+    %{
+      "count" => count,
+      "quantile" => %{
+        "buffer" => [],
+        "n" => [2, 3, 4],
+        "np" => [
+          1.0,
+          1.0 + (count - 1) * p / 2.0,
+          1.0 + (count - 1) * p,
+          1.0 + (count - 1) * (1.0 + p) / 2.0,
+          count / 1
+        ],
+        "q" => [1.0, 2.0, 3.0, 4.0, 5.0]
+      },
+      "twa_bin" => twa_bin,
+      "tws_bin" => tws_bin
+    }
+  end
+
+  # A saturated slice of the bounded 3600-cell domain, large enough that its
+  # canonical form cannot fit one un-chunked frame.
+  defp polar_checkpoint_over_one_frame do
+    cells =
+      for tws_bin <- 0..29, twa_bin <- 0..35 do
+        polar_cell(tws_bin, twa_bin, 5)
+      end
+
+    %{polar_checkpoint() | "cells" => cells}
   end
 
   defp estimate_tracker(opts) do
