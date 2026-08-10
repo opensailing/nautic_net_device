@@ -14,6 +14,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   resulting map to `acknowledge/2`. This module intentionally does not depend on
   a wire receipt implementation; it revalidates the exact durable identity at
   the storage boundary.
+
+  Durable identity is `device_id + credential_epoch + storage_epoch + stream +
+  sequence + payload_hash`. The transient boot ID is deliberately excluded, so
+  identity survives a reboot on unchanged storage. Reopening a root under a
+  different device ID or credential epoch fails closed rather than adopting the
+  persisted origin.
   """
 
   alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.{Entry, FileSystem, Record, Snapshot}
@@ -21,9 +27,18 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   @dir_mode 0o700
   @file_mode 0o600
   @segment_pattern ~r/^segment-(\d{20})\.log$/
+  @u32_max 0xFFFF_FFFF
+  @zero_device_id <<0::128>>
+
+  # A root recorded under a different origin identity is intact data belonging to
+  # another incarnation, not corruption. Fail closed and leave it untouched
+  # rather than quarantining (and thereby destroying) it.
+  @origin_mismatch_reasons [:device_id_mismatch, :credential_epoch_mismatch, :storage_epoch_mismatch]
 
   @enforce_keys [
     :root_path,
+    :device_id,
+    :credential_epoch,
     :storage_epoch,
     :stream_names,
     :streams_by_name,
@@ -55,6 +70,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
   @type t :: %__MODULE__{
           root_path: Path.t(),
+          device_id: <<_::128>>,
+          credential_epoch: non_neg_integer(),
           storage_epoch: <<_::128>>,
           stream_names: %{required(atom()) => binary()},
           streams_by_name: %{required(binary()) => atom()},
@@ -119,6 +136,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
            Record.encode(%{
              kind: :entry,
              stream: stream_name,
+             device_id: store.device_id,
+             credential_epoch: store.credential_epoch,
              storage_epoch: store.storage_epoch,
              sequence: sequence,
              entry_id: entry_id,
@@ -129,6 +148,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          :ok <- capacity_available(store, byte_size(encoded)),
          entry = %Entry{
            stream: stream,
+           device_id: store.device_id,
+           credential_epoch: store.credential_epoch,
            storage_epoch: store.storage_epoch,
            sequence: sequence,
            entry_id: entry_id,
@@ -197,6 +218,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
            Record.encode(%{
              kind: :acknowledgement,
              stream: stream_name,
+             device_id: normalized.device_id,
+             credential_epoch: normalized.credential_epoch,
              storage_epoch: normalized.storage_epoch,
              sequence: normalized.sequence,
              payload_hash: normalized.payload_hash,
@@ -229,6 +252,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
            Record.encode(%{
              kind: :loss_authorization,
              stream: stream_name,
+             device_id: entry.device_id,
+             credential_epoch: entry.credential_epoch,
              storage_epoch: entry.storage_epoch,
              sequence: entry.sequence,
              entry_id: entry.entry_id,
@@ -262,7 +287,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   end
 
   defp new_store(root_path, opts) do
-    with {:ok, storage_epoch} <- option_storage_epoch(opts),
+    with {:ok, device_id} <- option_device_id(opts),
+         {:ok, credential_epoch} <- option_credential_epoch(opts),
+         {:ok, storage_epoch} <- option_storage_epoch(opts),
          {:ok, stream_names, streams_by_name} <- option_streams(opts),
          {:ok, max_entries} <- positive_option(opts, :max_entries),
          {:ok, max_bytes} <- positive_option(opts, :max_bytes),
@@ -273,6 +300,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       {:ok,
        %__MODULE__{
          root_path: Path.expand(root_path),
+         device_id: device_id,
+         credential_epoch: credential_epoch,
          storage_epoch: storage_epoch,
          stream_names: stream_names,
          streams_by_name: streams_by_name,
@@ -291,6 +320,21 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     case Keyword.fetch(opts, :storage_epoch) do
       {:ok, <<_::128>> = epoch} -> {:ok, epoch}
       _other -> {:error, :invalid_storage_epoch}
+    end
+  end
+
+  defp option_device_id(opts) do
+    case Keyword.fetch(opts, :device_id) do
+      {:ok, @zero_device_id} -> {:error, :invalid_device_id}
+      {:ok, <<_::128>> = device_id} -> {:ok, device_id}
+      _other -> {:error, :invalid_device_id}
+    end
+  end
+
+  defp option_credential_epoch(opts) do
+    case Keyword.fetch(opts, :credential_epoch) do
+      {:ok, epoch} when is_integer(epoch) and epoch >= 0 and epoch <= @u32_max -> {:ok, epoch}
+      _other -> {:error, :invalid_credential_epoch}
     end
   end
 
@@ -378,6 +422,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
              {:ok, hydrated} <- hydrate_snapshot(store, snapshot, size) do
           {:ok, %{hydrated | snapshot_hash: :crypto.hash(:sha256, bytes)}}
         else
+          {:error, reason} when reason in @origin_mismatch_reasons -> {:error, reason}
           {:error, reason} -> quarantine_segment(store, path, reason)
         end
 
@@ -399,6 +444,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          store,
          %{
            "covered_segment_id" => covered_segment_id,
+           "device_id" => device_id,
+           "credential_epoch" => credential_epoch,
            "storage_epoch" => storage_epoch,
            "next_sequences" => next_sequences,
            "entries" => entries,
@@ -407,6 +454,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          snapshot_bytes
        ) do
     with true <- is_integer(covered_segment_id) and covered_segment_id >= 0,
+         :ok <- exact_device_id(store, device_id),
+         :ok <- exact_credential_epoch(store, credential_epoch),
          :ok <- exact_storage_epoch(store, storage_epoch),
          {:ok, next_sequences} <- hydrate_next_sequences(store, next_sequences),
          {:ok, entries, live_bytes, seen_entry_ids} <-
@@ -502,6 +551,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          store,
          %{
            "stream" => stream_name,
+           "device_id" => device_id,
+           "credential_epoch" => credential_epoch,
            "storage_epoch" => storage_epoch,
            "sequence" => sequence,
            "entry_id" => entry_id,
@@ -513,6 +564,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          ordinal
        ) do
     with {:ok, stream} <- configured_stream(store, stream_name),
+         :ok <- exact_device_id(store, device_id),
+         :ok <- exact_credential_epoch(store, credential_epoch),
          :ok <- exact_storage_epoch(store, storage_epoch),
          true <- is_integer(sequence) and sequence > 0 and sequence < Map.fetch!(next_sequences, stream),
          true <- is_binary(entry_id) and byte_size(entry_id) > 0 and byte_size(entry_id) <= 65_535,
@@ -523,6 +576,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
            Record.encode(%{
              kind: :entry,
              stream: stream_name,
+             device_id: device_id,
+             credential_epoch: credential_epoch,
              storage_epoch: storage_epoch,
              sequence: sequence,
              entry_id: entry_id,
@@ -532,6 +587,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
            }) do
       entry = %Entry{
         stream: stream,
+        device_id: device_id,
+        credential_epoch: credential_epoch,
         storage_epoch: storage_epoch,
         sequence: sequence,
         entry_id: entry_id,
@@ -566,6 +623,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          store,
          %{
            "stream" => stream_name,
+           "device_id" => device_id,
+           "credential_epoch" => credential_epoch,
            "storage_epoch" => storage_epoch,
            "sequence" => sequence,
            "entry_id" => entry_id,
@@ -574,6 +633,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          }
        ) do
     with {:ok, stream} <- configured_stream(store, stream_name),
+         :ok <- exact_device_id(store, device_id),
+         :ok <- exact_credential_epoch(store, credential_epoch),
          :ok <- exact_storage_epoch(store, storage_epoch),
          true <- is_integer(sequence) and sequence > 0,
          true <- is_binary(entry_id) and byte_size(entry_id) > 0,
@@ -582,6 +643,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       {:ok,
        %{
          stream: stream,
+         device_id: device_id,
+         credential_epoch: credential_epoch,
          storage_epoch: storage_epoch,
          sequence: sequence,
          entry_id: entry_id,
@@ -724,8 +787,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     case Record.decode_next(bytes) do
       {:ok, record, trailing, consumed} ->
         case replay_record(store, record, consumed) do
-          {:ok, store} -> scan_segment(store, path, trailing, offset + consumed, final?)
-          {:error, reason} -> {:corrupt, reason}
+          {:ok, store} ->
+            scan_segment(store, path, trailing, offset + consumed, final?)
+
+          {:error, reason} when reason in @origin_mismatch_reasons ->
+            {:error, reason}
+
+          {:error, reason} ->
+            {:corrupt, reason}
         end
 
       {:incomplete, _expected_size} when final? ->
@@ -743,12 +812,16 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   end
 
   defp replay_record(store, %{kind: :entry} = record, encoded_size) do
-    with :ok <- exact_storage_epoch(store, record.storage_epoch),
+    with :ok <- exact_device_id(store, record.device_id),
+         :ok <- exact_credential_epoch(store, record.credential_epoch),
+         :ok <- exact_storage_epoch(store, record.storage_epoch),
          {:ok, stream} <- configured_stream(store, record.stream),
          :ok <- expected_sequence(store, stream, record.sequence),
          :ok <- unique_entry_id(store, record.entry_id) do
       entry = %Entry{
         stream: stream,
+        device_id: record.device_id,
+        credential_epoch: record.credential_epoch,
         storage_epoch: record.storage_epoch,
         sequence: record.sequence,
         entry_id: record.entry_id,
@@ -764,7 +837,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   end
 
   defp replay_record(store, %{kind: :acknowledgement} = record, _encoded_size) do
-    with :ok <- exact_storage_epoch(store, record.storage_epoch),
+    with :ok <- exact_device_id(store, record.device_id),
+         :ok <- exact_credential_epoch(store, record.credential_epoch),
+         :ok <- exact_storage_epoch(store, record.storage_epoch),
          {:ok, stream} <- configured_stream(store, record.stream),
          normalized = %{record | stream: stream},
          {:ok, removed} <- acknowledged_entries(store, normalized) do
@@ -773,7 +848,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   end
 
   defp replay_record(store, %{kind: :loss_authorization} = record, _encoded_size) do
-    with :ok <- exact_storage_epoch(store, record.storage_epoch),
+    with :ok <- exact_device_id(store, record.device_id),
+         :ok <- exact_credential_epoch(store, record.credential_epoch),
+         :ok <- exact_storage_epoch(store, record.storage_epoch),
          {:ok, stream} <- configured_stream(store, record.stream),
          normalized = %{record | stream: stream},
          {:ok, entry} <- matching_entry(store, normalized),
@@ -1081,6 +1158,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp encode_snapshot(store, covered_segment_id) do
     Snapshot.encode(%{
       "covered_segment_id" => covered_segment_id,
+      "device_id" => store.device_id,
+      "credential_epoch" => store.credential_epoch,
       "storage_epoch" => store.storage_epoch,
       "next_sequences" =>
         store.next_sequences
@@ -1094,6 +1173,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp snapshot_entry(store, entry) do
     %{
       "stream" => Map.fetch!(store.stream_names, entry.stream),
+      "device_id" => entry.device_id,
+      "credential_epoch" => entry.credential_epoch,
       "storage_epoch" => entry.storage_epoch,
       "sequence" => entry.sequence,
       "entry_id" => entry.entry_id,
@@ -1106,6 +1187,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp snapshot_loss_authorization(store, authorization) do
     %{
       "stream" => Map.fetch!(store.stream_names, authorization.stream),
+      "device_id" => authorization.device_id,
+      "credential_epoch" => authorization.credential_epoch,
       "storage_epoch" => authorization.storage_epoch,
       "sequence" => authorization.sequence,
       "entry_id" => authorization.entry_id,
@@ -1246,6 +1329,10 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
   defp validate_identity(store, identity) do
     with {:ok, stream} <- map_stream(store, identity),
+         {:ok, device_id} <- map_device_id(identity),
+         :ok <- exact_device_id(store, device_id),
+         {:ok, credential_epoch} <- map_credential_epoch(identity),
+         :ok <- exact_credential_epoch(store, credential_epoch),
          {:ok, storage_epoch} <- map_storage_epoch(identity),
          :ok <- exact_storage_epoch(store, storage_epoch),
          {:ok, sequence} <- map_positive_integer(identity, :sequence),
@@ -1253,6 +1340,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       {:ok,
        %{
          stream: stream,
+         device_id: device_id,
+         credential_epoch: credential_epoch,
          storage_epoch: storage_epoch,
          sequence: sequence,
          payload_hash: payload_hash
@@ -1280,6 +1369,21 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     end
   end
 
+  defp map_device_id(map) do
+    case Map.fetch(map, :device_id) do
+      {:ok, @zero_device_id} -> {:error, :invalid_device_id}
+      {:ok, <<_::128>> = device_id} -> {:ok, device_id}
+      _other -> {:error, :invalid_device_id}
+    end
+  end
+
+  defp map_credential_epoch(map) do
+    case Map.fetch(map, :credential_epoch) do
+      {:ok, epoch} when is_integer(epoch) and epoch >= 0 and epoch <= @u32_max -> {:ok, epoch}
+      _other -> {:error, :invalid_credential_epoch}
+    end
+  end
+
   defp map_positive_integer(map, field) do
     case Map.fetch(map, field) do
       {:ok, value} when is_integer(value) and value > 0 -> {:ok, value}
@@ -1304,6 +1408,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp exact_storage_epoch(%__MODULE__{storage_epoch: epoch}, epoch), do: :ok
   defp exact_storage_epoch(_store, _epoch), do: {:error, :storage_epoch_mismatch}
 
+  defp exact_device_id(%__MODULE__{device_id: device_id}, device_id), do: :ok
+  defp exact_device_id(_store, _device_id), do: {:error, :device_id_mismatch}
+
+  defp exact_credential_epoch(%__MODULE__{credential_epoch: epoch}, epoch), do: :ok
+  defp exact_credential_epoch(_store, _epoch), do: {:error, :credential_epoch_mismatch}
+
   defp matching_entry(store, identity) do
     case Enum.find(store.entries, &(&1.stream == identity.stream and &1.sequence == identity.sequence)) do
       nil ->
@@ -1311,6 +1421,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
       entry ->
         cond do
+          entry.device_id != identity.device_id -> {:error, :device_id_mismatch}
+          entry.credential_epoch != identity.credential_epoch -> {:error, :credential_epoch_mismatch}
           entry.storage_epoch != identity.storage_epoch -> {:error, :storage_epoch_mismatch}
           entry.payload_hash != identity.payload_hash -> {:error, :payload_hash_mismatch}
           true -> {:ok, entry}
@@ -1361,6 +1473,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp authorization_from_entry(entry, reason) do
     %{
       stream: entry.stream,
+      device_id: entry.device_id,
+      credential_epoch: entry.credential_epoch,
       storage_epoch: entry.storage_epoch,
       sequence: entry.sequence,
       entry_id: entry.entry_id,
@@ -1376,7 +1490,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
   defp validate_loss_reason(_reason), do: {:error, :invalid_loss_reason}
 
-  defp entry_identity(entry), do: {entry.stream, entry.storage_epoch, entry.sequence, entry.payload_hash}
+  defp entry_identity(entry) do
+    {entry.stream, entry.device_id, entry.credential_epoch, entry.storage_epoch, entry.sequence, entry.payload_hash}
+  end
 
   defp segment_path(store, id) do
     Path.join(store.root_path, "segment-" <> String.pad_leading(Integer.to_string(id), 20, "0") <> ".log")

@@ -4,6 +4,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
   alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.{FileSystem, Store}
 
   @storage_epoch Base.decode16!("00112233445566778899aabbccddeeff", case: :lower)
+  @device_id Base.decode16!("0f1e2d3c4b5a69788796a5b4c3d2e1f0", case: :lower)
+  @other_device_id Base.decode16!("aabbccddeeff00112233445566778899", case: :lower)
+  @credential_epoch 7
 
   defmodule TracingFileSystem do
     @behaviour FileSystem
@@ -391,6 +394,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
              RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record.encode(%{
                kind: :entry,
                stream: "not_configured",
+               device_id: @device_id,
+               credential_epoch: @credential_epoch,
                storage_epoch: @storage_epoch,
                sequence: 1,
                entry_id: entry_id(9),
@@ -432,16 +437,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert {:ok, store} = open_store(root)
     assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
 
-    base_receipt = %{
-      stream: entry.stream,
-      storage_epoch: entry.storage_epoch,
-      sequence: entry.sequence,
-      payload_hash: entry.payload_hash,
-      cumulative_sequence: 0,
-      device_id: <<1::128>>,
-      credential_epoch: 7,
-      receipt_hash: <<2::256>>
-    }
+    base_receipt = Map.put(receipt_for(entry), :receipt_hash, <<2::256>>)
 
     assert {:error, :storage_epoch_mismatch} =
              Store.acknowledge(store, %{base_receipt | storage_epoch: <<9::128>>})
@@ -471,13 +467,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
     [first, second, third, fourth] = entries
 
-    receipt = %{
-      stream: third.stream,
-      storage_epoch: third.storage_epoch,
-      sequence: third.sequence,
-      payload_hash: third.payload_hash,
-      cumulative_sequence: 2
-    }
+    receipt = %{receipt_for(third) | cumulative_sequence: 2}
 
     assert {:ok, [^first, ^second, ^third], store} = Store.acknowledge(store, receipt)
     assert Store.pending(store) == [fourth]
@@ -492,32 +482,75 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
         {entry, acc}
       end)
 
-    assert {:ok, [^gap_second], gap_store} =
-             Store.acknowledge(gap_store, %{
-               stream: gap_second.stream,
-               storage_epoch: gap_second.storage_epoch,
-               sequence: 2,
-               payload_hash: gap_second.payload_hash,
-               cumulative_sequence: 0
-             })
+    assert {:ok, [^gap_second], gap_store} = Store.acknowledge(gap_store, receipt_for(gap_second))
 
     assert {:error, :non_contiguous_cumulative_prefix} =
-             Store.acknowledge(gap_store, %{
-               stream: gap_third.stream,
-               storage_epoch: gap_third.storage_epoch,
-               sequence: 3,
-               payload_hash: gap_third.payload_hash,
-               cumulative_sequence: 3
-             })
+             Store.acknowledge(gap_store, %{receipt_for(gap_third) | cumulative_sequence: 3})
 
     assert Store.pending(gap_store) == [gap_first, gap_third]
+  end
+
+  test "binds device id and credential epoch into durable identity and fails closed on mismatch", %{root: root} do
+    assert {:ok, store} = open_store(root)
+    assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
+
+    assert entry.device_id == @device_id
+    assert entry.credential_epoch == @credential_epoch
+
+    base_receipt = receipt_for(entry)
+
+    assert {:error, :device_id_mismatch} =
+             Store.acknowledge(store, %{base_receipt | device_id: @other_device_id})
+
+    assert {:error, :credential_epoch_mismatch} =
+             Store.acknowledge(store, %{base_receipt | credential_epoch: @credential_epoch + 1})
+
+    assert {:error, :invalid_device_id} =
+             Store.acknowledge(store, Map.delete(base_receipt, :device_id))
+
+    assert {:error, :invalid_credential_epoch} =
+             Store.acknowledge(store, Map.delete(base_receipt, :credential_epoch))
+
+    identity = Map.take(entry, [:stream, :device_id, :credential_epoch, :storage_epoch, :sequence, :payload_hash])
+
+    assert {:error, :device_id_mismatch} =
+             Store.authorize_loss(store, %{identity | device_id: @other_device_id}, "operator approved")
+
+    assert {:error, :credential_epoch_mismatch} =
+             Store.authorize_loss(
+               store,
+               %{identity | credential_epoch: @credential_epoch + 1},
+               "operator approved"
+             )
+
+    assert Store.pending(store) == [entry]
+    assert {:ok, [^entry], empty} = Store.acknowledge(store, base_receipt)
+    assert Store.pending(empty) == []
+  end
+
+  test "refuses to reopen a root recorded under a different device or credential epoch", %{root: root} do
+    assert {:ok, store} = open_store(root)
+    assert {:ok, _entry, _store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
+
+    assert {:error, :device_id_mismatch} = open_store(root, device_id: @other_device_id)
+
+    assert {:error, :credential_epoch_mismatch} =
+             open_store(root, credential_epoch: @credential_epoch + 1)
+
+    assert {:error, :invalid_device_id} = open_store(root, device_id: <<0::128>>)
+    assert {:error, :invalid_device_id} = open_store(root, device_id: <<0::120>>)
+    assert {:error, :invalid_credential_epoch} = open_store(root, credential_epoch: -1)
+
+    assert {:ok, recovered} = open_store(root)
+    assert Enum.map(Store.pending(recovered), & &1.sequence) == [1]
   end
 
   test "explicit loss authorization durably records the exact entry and auditable reason", %{root: root} do
     assert {:ok, store} = open_store(root)
     assert {:ok, entry, store} = Store.enqueue(store, :health, "health", entry_id: entry_id(1))
 
-    identity = Map.take(entry, [:stream, :storage_epoch, :sequence, :payload_hash])
+    identity =
+      Map.take(entry, [:stream, :device_id, :credential_epoch, :storage_epoch, :sequence, :payload_hash])
 
     assert {:error, :invalid_loss_reason} = Store.authorize_loss(store, identity, "")
 
@@ -531,6 +564,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert Store.loss_authorizations(empty) == [
              %{
                stream: entry.stream,
+               device_id: entry.device_id,
+               credential_epoch: entry.credential_epoch,
                storage_epoch: entry.storage_epoch,
                sequence: entry.sequence,
                entry_id: entry.entry_id,
@@ -547,6 +582,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
   defp receipt_for(entry) do
     %{
       stream: entry.stream,
+      device_id: entry.device_id,
+      credential_epoch: entry.credential_epoch,
       storage_epoch: entry.storage_epoch,
       sequence: entry.sequence,
       payload_hash: entry.payload_hash,
@@ -564,6 +601,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
   defp open_store(root, overrides \\ []) do
     defaults = [
+      device_id: @device_id,
+      credential_epoch: @credential_epoch,
       storage_epoch: @storage_epoch,
       streams: [:telemetry, :health],
       max_entries: 10,

@@ -6,12 +6,21 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
   than a fixed-width machine integer. A guarded outer length distinguishes an
   incomplete final append from a corrupt framing header. Every complete record
   carries a SHA-256 checksum over its semantic fields.
+
+  Version 2 binds the full durable origin identity — device ID and credential
+  epoch alongside the storage epoch — into every record kind and into the
+  checksum preimage. Version 1 records carried no origin identity and cannot be
+  migrated unambiguously, so they are rejected rather than defaulted to the
+  current origin.
   """
 
   import Bitwise
 
   @magic "RODO"
-  @version 1
+  @version 2
+  @device_id_size 16
+  @u32_max 0xFFFF_FFFF
+  @zero_device_id <<0::128>>
   @header_size 14
   @checksum_size 32
   @max_body_size 64 * 1_024 * 1_024
@@ -24,6 +33,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
   @type entry_record :: %{
           required(:kind) => :entry,
           required(:stream) => binary(),
+          required(:device_id) => <<_::128>>,
+          required(:credential_epoch) => non_neg_integer(),
           required(:storage_epoch) => <<_::128>>,
           required(:sequence) => pos_integer(),
           required(:entry_id) => binary(),
@@ -35,6 +46,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
   @type acknowledgement_record :: %{
           required(:kind) => :acknowledgement,
           required(:stream) => binary(),
+          required(:device_id) => <<_::128>>,
+          required(:credential_epoch) => non_neg_integer(),
           required(:storage_epoch) => <<_::128>>,
           required(:sequence) => pos_integer(),
           required(:payload_hash) => <<_::256>>,
@@ -44,6 +57,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
   @type loss_authorization_record :: %{
           required(:kind) => :loss_authorization,
           required(:stream) => binary(),
+          required(:device_id) => <<_::128>>,
+          required(:credential_epoch) => non_neg_integer(),
           required(:storage_epoch) => <<_::128>>,
           required(:sequence) => pos_integer(),
           required(:entry_id) => binary(),
@@ -100,6 +115,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
 
   defp encode_entry(record) do
     with {:ok, stream} <- required_stream(record),
+         {:ok, device_id} <- required_device_id(record),
+         {:ok, credential_epoch} <- required_credential_epoch(record),
          {:ok, storage_epoch} <- required_storage_epoch(record),
          {:ok, sequence_bytes} <- required_positive_sequence(record),
          {:ok, entry_id} <- required_entry_id(record),
@@ -109,6 +126,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
          {:ok, priority} <- required_priority(record) do
       prefix =
         encode_sized(stream) <>
+          device_id <>
+          <<credential_epoch::32>> <>
           storage_epoch <>
           encode_sized(sequence_bytes) <>
           encode_sized(entry_id) <>
@@ -123,12 +142,16 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
 
   defp encode_acknowledgement(record) do
     with {:ok, stream} <- required_stream(record),
+         {:ok, device_id} <- required_device_id(record),
+         {:ok, credential_epoch} <- required_credential_epoch(record),
          {:ok, storage_epoch} <- required_storage_epoch(record),
          {:ok, sequence_bytes} <- required_positive_sequence(record),
          {:ok, payload_hash} <- required_hash(record),
          {:ok, cumulative_bytes} <- required_nonnegative_sequence(record, :cumulative_sequence) do
       prefix =
         encode_sized(stream) <>
+          device_id <>
+          <<credential_epoch::32>> <>
           storage_epoch <>
           encode_sized(sequence_bytes) <>
           payload_hash <>
@@ -141,6 +164,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
 
   defp encode_loss_authorization(record) do
     with {:ok, stream} <- required_stream(record),
+         {:ok, device_id} <- required_device_id(record),
+         {:ok, credential_epoch} <- required_credential_epoch(record),
          {:ok, storage_epoch} <- required_storage_epoch(record),
          {:ok, sequence_bytes} <- required_positive_sequence(record),
          {:ok, entry_id} <- required_entry_id(record),
@@ -148,6 +173,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
          {:ok, reason} <- required_reason(record) do
       prefix =
         encode_sized(stream) <>
+          device_id <>
+          <<credential_epoch::32>> <>
           storage_epoch <>
           encode_sized(sequence_bytes) <>
           encode_sized(entry_id) <>
@@ -174,6 +201,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
   defp decode_body(:entry, kind_code, body) do
     with {:ok, stream, rest} <- take_sized(body),
          :ok <- validate_stream(stream),
+         {:ok, device_id, rest} <- take_fixed(rest, @device_id_size),
+         :ok <- validate_device_id(device_id),
+         {:ok, credential_epoch, rest} <- take_u32(rest),
          {:ok, storage_epoch, rest} <- take_fixed(rest, 16),
          :ok <- validate_storage_epoch(storage_epoch),
          {:ok, sequence_bytes, rest} <- take_sized(rest),
@@ -187,6 +217,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
          :ok <- validate_priority(priority) do
       prefix =
         encode_sized(stream) <>
+          device_id <>
+          <<credential_epoch::32>> <>
           storage_epoch <>
           encode_sized(sequence_bytes) <>
           encode_sized(entry_id) <>
@@ -199,6 +231,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
          %{
            kind: :entry,
            stream: stream,
+           device_id: device_id,
+           credential_epoch: credential_epoch,
            storage_epoch: storage_epoch,
            sequence: sequence,
            entry_id: entry_id,
@@ -213,6 +247,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
   defp decode_body(:acknowledgement, kind_code, body) do
     with {:ok, stream, rest} <- take_sized(body),
          :ok <- validate_stream(stream),
+         {:ok, device_id, rest} <- take_fixed(rest, @device_id_size),
+         :ok <- validate_device_id(device_id),
+         {:ok, credential_epoch, rest} <- take_u32(rest),
          {:ok, storage_epoch, rest} <- take_fixed(rest, 16),
          :ok <- validate_storage_epoch(storage_epoch),
          {:ok, sequence_bytes, rest} <- take_sized(rest),
@@ -223,6 +260,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
          {:ok, stored_checksum, <<>>} <- take_fixed(rest, @checksum_size) do
       prefix =
         encode_sized(stream) <>
+          device_id <>
+          <<credential_epoch::32>> <>
           storage_epoch <>
           encode_sized(sequence_bytes) <>
           payload_hash <>
@@ -233,6 +272,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
          %{
            kind: :acknowledgement,
            stream: stream,
+           device_id: device_id,
+           credential_epoch: credential_epoch,
            storage_epoch: storage_epoch,
            sequence: sequence,
            payload_hash: payload_hash,
@@ -248,6 +289,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
   defp decode_body(:loss_authorization, kind_code, body) do
     with {:ok, stream, rest} <- take_sized(body),
          :ok <- validate_stream(stream),
+         {:ok, device_id, rest} <- take_fixed(rest, @device_id_size),
+         :ok <- validate_device_id(device_id),
+         {:ok, credential_epoch, rest} <- take_u32(rest),
          {:ok, storage_epoch, rest} <- take_fixed(rest, 16),
          :ok <- validate_storage_epoch(storage_epoch),
          {:ok, sequence_bytes, rest} <- take_sized(rest),
@@ -262,6 +306,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
          :ok <- validate_reason(reason) do
       prefix =
         encode_sized(stream) <>
+          device_id <>
+          <<credential_epoch::32>> <>
           storage_epoch <>
           encode_sized(sequence_bytes) <>
           encode_sized(entry_id) <>
@@ -273,6 +319,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
          %{
            kind: :loss_authorization,
            stream: stream,
+           device_id: device_id,
+           credential_epoch: credential_epoch,
            storage_epoch: storage_epoch,
            sequence: sequence,
            entry_id: entry_id,
@@ -290,6 +338,20 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
     with {:ok, stream} <- fetch(record, :stream, :invalid_stream),
          :ok <- validate_stream(stream) do
       {:ok, stream}
+    end
+  end
+
+  defp required_device_id(record) do
+    with {:ok, device_id} <- fetch(record, :device_id, :invalid_device_id),
+         :ok <- validate_device_id(device_id) do
+      {:ok, device_id}
+    end
+  end
+
+  defp required_credential_epoch(record) do
+    with {:ok, credential_epoch} <- fetch(record, :credential_epoch, :invalid_credential_epoch),
+         :ok <- validate_credential_epoch(credential_epoch) do
+      {:ok, credential_epoch}
     end
   end
 
@@ -447,6 +509,15 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
   defp validate_storage_epoch(<<_::128>>), do: :ok
   defp validate_storage_epoch(_storage_epoch), do: {:error, :invalid_storage_epoch}
 
+  defp validate_device_id(@zero_device_id), do: {:error, :invalid_device_id}
+  defp validate_device_id(<<_::128>>), do: :ok
+  defp validate_device_id(_device_id), do: {:error, :invalid_device_id}
+
+  defp validate_credential_epoch(epoch) when is_integer(epoch) and epoch >= 0 and epoch <= @u32_max,
+    do: :ok
+
+  defp validate_credential_epoch(_epoch), do: {:error, :invalid_credential_epoch}
+
   defp validate_entry_id(entry_id)
        when is_binary(entry_id) and byte_size(entry_id) > 0 and byte_size(entry_id) <= 65_535,
        do: :ok
@@ -533,6 +604,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
 
   defp take_u16(<<value::16, rest::binary>>), do: {:ok, value, rest}
   defp take_u16(_binary), do: {:error, :invalid_record_body}
+
+  defp take_u32(<<value::32, rest::binary>>), do: {:ok, value, rest}
+  defp take_u32(_binary), do: {:error, :invalid_record_body}
 
   defp take_u64(<<value::64, rest::binary>>), do: {:ok, value, rest}
   defp take_u64(_binary), do: {:error, :invalid_record_body}

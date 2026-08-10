@@ -3,6 +3,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Entry do
 
   @enforce_keys [
     :stream,
+    :device_id,
+    :credential_epoch,
     :storage_epoch,
     :sequence,
     :entry_id,
@@ -16,6 +18,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Entry do
 
   @type t :: %__MODULE__{
           stream: atom(),
+          device_id: <<_::128>>,
+          credential_epoch: non_neg_integer(),
           storage_epoch: <<_::128>>,
           sequence: pos_integer(),
           entry_id: binary(),
