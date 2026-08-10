@@ -42,14 +42,25 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   When there is no live session, the take/get functions return
   `{:error, :no_session}` — callers must not seal.
 
+  ## Independent control_v1 state
+
+  Each published authenticated session also gets a complete
+  `RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Control` state. Its send
+  counter and receive replay window are independent from the UDP telemetry
+  `Session` fields. `with_control_send/5` seals and consumes a control counter
+  before serialized transport work runs; `open_control/3` authenticates and
+  commits the control replay window. Both require the same session generation
+  fence used by the UDP APIs.
+
   ## Lifecycle
 
     * `put/1`        — ChannelClient publishes a freshly-established session
-                       (resets the counter base to the session's `send_counter`).
-    * `take_send_counter/1`, `take_send_counters/2` — reserve counter(s) to seal.
-    * `get_current_session/0` — read-only snapshot (counter NOT advanced); for
-                       inspection/telemetry. Sealers MUST use the take functions.
-    * `clear/0`      — ChannelClient drops the session on disconnect/eviction.
+                       (resets UDP and control state for the new session).
+    * `take_send_counter/1`, `take_send_counters/2` — reserve UDP counter(s) to seal.
+    * `with_control_send/5`, `open_control/3` — own fenced control sealing/replay.
+    * `get_current_session/0` — read-only UDP snapshot (counter NOT advanced); for
+                       inspection/telemetry. UDP sealers MUST use the take functions.
+    * `clear/0`      — ChannelClient drops both states on disconnect/eviction.
 
   The holder is a plain `GenServer` (no ETS/`:persistent_term`): a single writer
   is the simplest correct way to guarantee counter monotonicity, and the session
@@ -60,6 +71,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   use GenServer
 
   alias RacingOrg.Tracker.Pro.SecureTransport.Session
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Control
 
   @type generation :: non_neg_integer()
 
@@ -238,6 +250,47 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     GenServer.call(server, {:with_send_counter, expected_generation, fun})
   end
 
+  @doc """
+  Seal one device-to-server `control_v1` payload and run transport work while the
+  authenticated session generation remains current.
+
+  The holder owns the complete independent control state. It consumes the control
+  counter before invoking `fun`, so a callback failure can skip a nonce but can
+  never cause nonce reuse. Session replacement and clear remain serialized behind
+  the callback.
+  """
+  @spec with_control_send(
+          GenServer.server(),
+          generation(),
+          atom(),
+          binary(),
+          (binary() -> result)
+        ) :: {:ok, result} | {:error, atom()}
+        when result: term()
+  def with_control_send(server, expected_generation, type, encoded_payload, fun)
+      when is_integer(expected_generation) and expected_generation >= 0 and is_atom(type) and
+             is_binary(encoded_payload) and is_function(fun, 1) do
+    GenServer.call(
+      server,
+      {:with_control_send, expected_generation, type, encoded_payload, fun}
+    )
+  end
+
+  @doc """
+  Authenticate and open one server-to-device `control_v1` frame under the current
+  session generation.
+
+  The holder commits the independent control replay window after successful AEAD
+  authentication, including authenticated frames whose canonical payload later
+  fails validation. UDP telemetry replay state is never read or advanced.
+  """
+  @spec open_control(GenServer.server(), generation(), binary()) ::
+          {:ok, atom(), binary()} | {:error, atom()}
+  def open_control(server, expected_generation, frame)
+      when is_integer(expected_generation) and expected_generation >= 0 and is_binary(frame) do
+    GenServer.call(server, {:open_control, expected_generation, frame})
+  end
+
   defp take_one_send_counter(server, expected_generation) do
     case GenServer.call(server, {:take_send_counters, 1, expected_generation}) do
       {:ok, [grant]} -> {:ok, grant}
@@ -249,7 +302,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   @impl true
   def init(_opts) do
-    {:ok, %{session: nil, generation: 0, credential_epoch: nil}}
+    {:ok, %{session: nil, control: nil, generation: 0, credential_epoch: nil}}
   end
 
   @impl true
@@ -264,6 +317,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
        %{
          state
          | session: published,
+           control: new_control_state(published),
            generation: generation,
            credential_epoch: session.credential_epoch
        }}
@@ -302,7 +356,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     generation = state.generation + 1
 
     {:reply, {:ok, generation, :evicted},
-     %{state | session: nil, generation: generation, credential_epoch: credential_epoch}}
+     %{
+       state
+       | session: nil,
+         control: nil,
+         generation: generation,
+         credential_epoch: credential_epoch
+     }}
   end
 
   def handle_call({:fence_for_credential_epoch, _credential_epoch}, _from, state) do
@@ -313,7 +373,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     case check_generation(state, expected_generation) do
       :ok ->
         generation = state.generation + 1
-        {:reply, :ok, %{state | session: nil, generation: generation}}
+        {:reply, :ok, %{state | session: nil, control: nil, generation: generation}}
 
       {:error, :stale_session} = error ->
         {:reply, error, state}
@@ -359,6 +419,39 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     end
   end
 
+  def handle_call(
+        {:with_control_send, expected_generation, type, encoded_payload, fun},
+        _from,
+        state
+      ) do
+    with :ok <- check_generation(state, expected_generation),
+         {:ok, control} <- current_control(state),
+         {:ok, frame, next_control} <- Control.seal(control, type, encoded_payload) do
+      next_state = %{state | control: next_control}
+      {:reply, invoke_callback(fun, frame, :control_send_failed), next_state}
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:open_control, expected_generation, frame}, _from, state) do
+    with :ok <- check_generation(state, expected_generation),
+         {:ok, control} <- current_control(state) do
+      case Control.open(control, frame) do
+        {:ok, type, encoded_payload, next_control} ->
+          {:reply, {:ok, type, encoded_payload}, %{state | control: next_control}}
+
+        {:error, reason, next_control} ->
+          {:reply, {:error, reason}, %{state | control: next_control}}
+
+        {:error, reason} ->
+          {:reply, {:error, reason}, state}
+      end
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
   defp reserve_counters(state, count, expected_generation) do
     with :ok <- check_generation(state, expected_generation),
          %Session{} = session <- state.session do
@@ -382,6 +475,17 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     else
       nil -> {:error, :no_session}
       {:error, :stale_session} = error -> error
+    end
+  end
+
+  defp current_control(%{session: nil}), do: {:error, :no_session}
+  defp current_control(%{control: %Control{} = control}), do: {:ok, control}
+  defp current_control(%{control: {:error, reason}}), do: {:error, reason}
+
+  defp new_control_state(%Session{} = session) do
+    case Control.new(:device, session) do
+      {:ok, %Control{} = control} -> control
+      {:error, reason} -> {:error, reason}
     end
   end
 

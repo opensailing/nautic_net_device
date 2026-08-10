@@ -1,8 +1,11 @@
 defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
   use ExUnit.Case, async: true
 
-  alias RacingOrg.Tracker.Pro.SecureTransport.Session
-  alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
+  alias RacingOrg.Tracker.Pro.SecureTransport, as: SecureTransport
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.{ReplayWindow, Session, SessionHolder}
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Control
 
   setup do
     {:ok, pid} = start_supervised({SessionHolder, name: nil})
@@ -17,7 +20,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
           session_id: <<0::128>>,
           epoch: 0,
           out_key: :binary.copy(<<0xAA>>, 32),
-          in_key: :binary.copy(<<0xBB>>, 32)
+          in_key: :binary.copy(<<0xBB>>, 32),
+          prk: :binary.copy(<<0xCC>>, 32),
+          identity_fingerprint: :binary.copy(<<0xDD>>, 32),
+          transcript_hash: :binary.copy(<<0xEE>>, 32)
         ],
         opts
       )
@@ -310,5 +316,418 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
     next_generation = SessionHolder.generation(h)
     assert :ok = SessionHolder.clear(h)
     assert SessionHolder.generation(h) == next_generation + 1
+  end
+
+  describe "control_v1 state" do
+    test "requires a live session under the current generation fence", %{holder: h} do
+      payload = control_payload(:readiness)
+
+      assert {:error, :no_session} =
+               SessionHolder.with_control_send(h, 0, :readiness, payload, fn _frame ->
+                 flunk("idle control callback ran")
+               end)
+
+      assert {:error, :no_session} = SessionHolder.open_control(h, 0, <<>>)
+
+      assert {:ok, published} = SessionHolder.publish(h, session(session_id: <<1::128>>))
+      assert {:ok, replacement} = SessionHolder.publish(h, session(session_id: <<2::128>>))
+      parent = self()
+
+      assert {:error, :stale_session} =
+               SessionHolder.with_control_send(
+                 h,
+                 published.generation,
+                 :readiness,
+                 payload,
+                 fn _frame -> send(parent, :stale_control_callback_ran) end
+               )
+
+      assert {:error, :stale_session} =
+               SessionHolder.open_control(h, published.generation, <<>>)
+
+      refute_receive :stale_control_callback_ran
+
+      assert {:ok, 0} =
+               SessionHolder.with_control_send(
+                 h,
+                 replacement.generation,
+                 :readiness,
+                 payload,
+                 &control_counter/1
+               )
+    end
+
+    test "seals with control counters independently from UDP telemetry state", %{holder: h} do
+      udp_window = accepted_window(41)
+
+      device =
+        session(
+          session_id: <<3::128>>,
+          epoch: 7,
+          send_counter: 41,
+          replay_window: udp_window
+        )
+
+      assert {:ok, published} = SessionHolder.publish(h, device)
+      payload = control_payload(:readiness)
+
+      assert {:ok, frame0} =
+               SessionHolder.with_control_send(
+                 h,
+                 published.generation,
+                 :readiness,
+                 payload,
+                 & &1
+               )
+
+      assert control_counter(frame0) == 0
+      assert control_session_id(frame0) == published.session_id
+      assert control_credential_epoch(frame0) == 7
+
+      assert {:ok, server_control} = Control.new(:server, peer_session(device))
+      assert {:ok, :readiness, ^payload, _server_control} = Control.open(server_control, frame0)
+
+      assert {:ok, udp} = SessionHolder.take_send_counter(h, published.generation)
+      assert udp.counter == 41
+
+      assert {:ok, 1} =
+               SessionHolder.with_control_send(
+                 h,
+                 published.generation,
+                 :readiness,
+                 payload,
+                 &control_counter/1
+               )
+
+      assert {:ok, stored} = SessionHolder.get_current_session(h)
+      assert stored.send_counter == 42
+      assert stored.replay_window == udp_window
+    end
+
+    test "owns an independent authenticated receive replay window", %{holder: h} do
+      udp_window = accepted_window(12)
+      device = session(session_id: <<4::128>>, epoch: 7, replay_window: udp_window)
+      assert {:ok, published} = SessionHolder.publish(h, device)
+      malformed_payload = Contract.payload_domain(:readiness) <> <<Contract.version(), 0x01, 0>>
+
+      malformed_frame =
+        control_frame(
+          peer_session(device),
+          :control_accept,
+          0,
+          malformed_payload,
+          validate_payload_domain: false
+        )
+
+      assert {:error, :payload_domain_mismatch} =
+               SessionHolder.open_control(h, published.generation, malformed_frame)
+
+      assert {:error, :replayed} =
+               SessionHolder.open_control(h, published.generation, malformed_frame)
+
+      frame = control_frame(peer_session(device), :control_accept, 1)
+
+      assert {:ok, :control_accept, payload} =
+               SessionHolder.open_control(h, published.generation, frame)
+
+      assert payload == control_payload(:control_accept)
+
+      assert {:error, :replayed} =
+               SessionHolder.open_control(h, published.generation, frame)
+
+      assert {:ok, stored} = SessionHolder.get_current_session(h)
+      assert stored.replay_window == udp_window
+    end
+
+    test "concurrent control allocations are serialized without collisions", %{holder: h} do
+      assert {:ok, published} = SessionHolder.publish(h, session(session_id: <<5::128>>))
+      count = 200
+      payload = control_payload(:readiness)
+
+      counters =
+        1..count
+        |> Task.async_stream(
+          fn _ ->
+            {:ok, counter} =
+              SessionHolder.with_control_send(
+                h,
+                published.generation,
+                :readiness,
+                payload,
+                &control_counter/1
+              )
+
+            counter
+          end,
+          max_concurrency: 50,
+          ordered: false
+        )
+        |> Enum.map(fn {:ok, counter} -> counter end)
+
+      assert Enum.sort(counters) == Enum.to_list(0..(count - 1))
+      assert length(Enum.uniq(counters)) == count
+
+      assert {:ok, ^count} =
+               SessionHolder.with_control_send(
+                 h,
+                 published.generation,
+                 :readiness,
+                 payload,
+                 &control_counter/1
+               )
+    end
+
+    test "consumes a sealed counter even when the transport callback fails", %{holder: h} do
+      assert {:ok, published} = SessionHolder.publish(h, session(session_id: <<6::128>>))
+      payload = control_payload(:readiness)
+
+      assert {:error, :control_send_failed} =
+               SessionHolder.with_control_send(
+                 h,
+                 published.generation,
+                 :readiness,
+                 payload,
+                 fn _frame -> raise "transport down" end
+               )
+
+      assert {:ok, 1} =
+               SessionHolder.with_control_send(
+                 h,
+                 published.generation,
+                 :readiness,
+                 payload,
+                 &control_counter/1
+               )
+    end
+
+    test "serializes control transport work with session replacement", %{holder: h} do
+      parent = self()
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<7::128>>))
+      payload = control_payload(:readiness)
+
+      send_task =
+        Task.async(fn ->
+          SessionHolder.with_control_send(
+            h,
+            first.generation,
+            :readiness,
+            payload,
+            fn frame ->
+              send(parent, {:control_send_started, self(), control_counter(frame)})
+
+              receive do
+                :finish_control_send -> :sent
+              end
+            end
+          )
+        end)
+
+      assert_receive {:control_send_started, holder_pid, 0}
+      assert holder_pid == h
+
+      replacement_task =
+        Task.async(fn ->
+          SessionHolder.publish(h, session(session_id: <<8::128>>), first.generation)
+        end)
+
+      assert Task.yield(replacement_task, 20) == nil
+      send(h, :finish_control_send)
+
+      assert {:ok, :sent} = Task.await(send_task)
+      assert {:ok, replacement} = Task.await(replacement_task)
+      assert replacement.generation > first.generation
+    end
+
+    test "contract failures do not consume a control send counter", %{holder: h} do
+      assert {:ok, published} = SessionHolder.publish(h, session(session_id: <<9::128>>))
+
+      assert {:error, :wrong_message_direction} =
+               SessionHolder.with_control_send(
+                 h,
+                 published.generation,
+                 :control_accept,
+                 control_payload(:control_accept),
+                 fn _frame -> flunk("invalid-direction callback ran") end
+               )
+
+      assert {:ok, 0} =
+               SessionHolder.with_control_send(
+                 h,
+                 published.generation,
+                 :readiness,
+                 control_payload(:readiness),
+                 &control_counter/1
+               )
+    end
+
+    test "replacement, clear/reconnect, and epoch eviction reset all control state", %{holder: h} do
+      first_session = session(session_id: <<10::128>>, epoch: 7)
+      assert {:ok, first} = SessionHolder.publish(h, first_session)
+      assert_control_counter(h, first.generation, 0)
+
+      first_frame = control_frame(peer_session(first_session), :control_accept, 0)
+
+      assert {:ok, :control_accept, _payload} =
+               SessionHolder.open_control(h, first.generation, first_frame)
+
+      replacement_session = session(session_id: <<11::128>>, epoch: 7)
+      assert {:ok, replacement} = SessionHolder.publish(h, replacement_session, first.generation)
+      assert_control_counter(h, replacement.generation, 0)
+
+      replacement_frame = control_frame(peer_session(replacement_session), :control_accept, 0)
+
+      assert {:ok, :control_accept, _payload} =
+               SessionHolder.open_control(h, replacement.generation, replacement_frame)
+
+      assert :ok = SessionHolder.clear(h, replacement.generation)
+      cleared_generation = SessionHolder.generation(h)
+
+      assert {:error, :stale_session} =
+               SessionHolder.open_control(h, replacement.generation, replacement_frame)
+
+      reconnect_session = session(session_id: <<12::128>>, epoch: 7)
+
+      assert {:ok, reconnect} =
+               SessionHolder.publish(h, reconnect_session, cleared_generation)
+
+      assert_control_counter(h, reconnect.generation, 0)
+      reconnect_frame = control_frame(peer_session(reconnect_session), :control_accept, 0)
+
+      assert {:ok, :control_accept, _payload} =
+               SessionHolder.open_control(h, reconnect.generation, reconnect_frame)
+
+      assert {:ok, epoch_generation, :evicted} =
+               SessionHolder.fence_for_credential_epoch(h, 8)
+
+      assert {:error, :stale_session} =
+               SessionHolder.open_control(h, reconnect.generation, reconnect_frame)
+
+      epoch_session = session(session_id: <<13::128>>, epoch: 8)
+
+      assert {:ok, epoch_replacement} =
+               SessionHolder.publish(h, epoch_session, epoch_generation)
+
+      assert_control_counter(h, epoch_replacement.generation, 0)
+      epoch_frame = control_frame(peer_session(epoch_session), :control_accept, 0)
+
+      assert {:ok, :control_accept, _payload} =
+               SessionHolder.open_control(h, epoch_replacement.generation, epoch_frame)
+    end
+
+    test "reports control counter rekey and exhaustion without advancing state", %{holder: h} do
+      assert {:ok, published} = SessionHolder.publish(h, session(session_id: <<14::128>>))
+      payload = control_payload(:readiness)
+      assert_control_counter(h, published.generation, 0)
+
+      set_control_counter(h, SecureTransport.rekey_after())
+
+      assert {:error, :rekey_required} =
+               SessionHolder.with_control_send(
+                 h,
+                 published.generation,
+                 :readiness,
+                 payload,
+                 fn _frame -> flunk("rekey callback ran") end
+               )
+
+      set_control_counter(h, SecureTransport.counter_max())
+
+      assert {:error, :counter_exhausted} =
+               SessionHolder.with_control_send(
+                 h,
+                 published.generation,
+                 :readiness,
+                 payload,
+                 fn _frame -> flunk("exhausted callback ran") end
+               )
+    end
+
+    test "sessions without a purpose-key PRK retain backward-compatible UDP behavior", %{holder: h} do
+      udp_only = session(session_id: <<15::128>>, prk: nil)
+      assert {:ok, published} = SessionHolder.publish(h, udp_only)
+
+      assert {:error, :session_missing_prk} =
+               SessionHolder.with_control_send(
+                 h,
+                 published.generation,
+                 :readiness,
+                 control_payload(:readiness),
+                 fn _frame -> flunk("unavailable control callback ran") end
+               )
+
+      assert {:ok, %{counter: 0}} =
+               SessionHolder.take_send_counter(h, published.generation)
+
+      assert {:ok, stored} = SessionHolder.get_current_session(h)
+      assert stored.send_counter == 1
+    end
+  end
+
+  defp peer_session(%Session{} = device) do
+    %{device | role: :responder, out_key: device.in_key, in_key: device.out_key, generation: nil}
+  end
+
+  defp control_frame(%Session{} = peer, type, counter) do
+    control_frame(peer, type, counter, control_payload(type), [])
+  end
+
+  defp control_frame(%Session{} = peer, type, counter, payload, opts) do
+    assert {:ok, control} = Control.new(:server, peer)
+
+    assert {:ok, frame} =
+             Control.seal_with(
+               control.send_key,
+               control.session_id,
+               control.credential_epoch,
+               control.send_direction,
+               type,
+               counter,
+               payload,
+               opts
+             )
+
+    frame
+  end
+
+  defp control_counter(
+         <<"ROC1", _version, _aead, _direction, _type, _session_id::binary-size(16), _credential_epoch::32, counter::64,
+           _rest::binary>>
+       ),
+       do: counter
+
+  defp control_session_id(<<"ROC1", _version, _aead, _direction, _type, session_id::binary-size(16), _rest::binary>>),
+    do: session_id
+
+  defp control_credential_epoch(
+         <<"ROC1", _version, _aead, _direction, _type, _session_id::binary-size(16), credential_epoch::32,
+           _rest::binary>>
+       ),
+       do: credential_epoch
+
+  defp assert_control_counter(holder, generation, expected) do
+    assert {:ok, ^expected} =
+             SessionHolder.with_control_send(
+               holder,
+               generation,
+               :readiness,
+               control_payload(:readiness),
+               &control_counter/1
+             )
+  end
+
+  defp control_payload(type) do
+    assert {:ok, type_code, _direction} = Contract.message_type(type)
+    Contract.payload_domain(type) <> <<Contract.version(), type_code, 0>>
+  end
+
+  defp accepted_window(counter) do
+    assert {:ok, window} = ReplayWindow.check_and_commit(ReplayWindow.new(), counter)
+    window
+  end
+
+  defp set_control_counter(holder, counter) do
+    :sys.replace_state(holder, fn state ->
+      put_in(state.control.send_counter, counter)
+    end)
   end
 end
