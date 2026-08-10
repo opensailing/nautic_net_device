@@ -400,6 +400,54 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       assert Process.alive?(client)
     end
 
+    # A TRANSIENT desired-state status/compatibility failure during control_accept
+    # must not wedge the client. The server sends control_accept exactly once per
+    # session and the accept frame's control counter is consumed on receipt, so the
+    # identical frame can never be replayed (the replay window rejects it). If the
+    # client just swallows the error and leaves `control_ready?` false, the control
+    # plane is dead for the whole session with no path back: no readiness was sent,
+    # no ACK replay was scheduled, and no reconnect was triggered. The client must
+    # therefore fail CLOSED and reconnect, so a fresh session re-runs negotiation.
+    @tag :control_accept_transient_failure
+    test "a transient readiness failure reconnects instead of wedging the control plane", ctx do
+      counter = :counters.new(1, [])
+
+      {client, _holder, topic} =
+        start_control_client(ctx,
+          # Fails the FIRST readiness attempt only — the transient case.
+          desired_state_status: fn ->
+            :counters.add(counter, 1, 1)
+
+            if :counters.get(counter, 1) == 1 do
+              {:error, :desired_state_manager_unavailable}
+            else
+              %{active: nil}
+            end
+          end,
+          backoff: [base_ms: 10, cap_ms: 10, jitter: 0]
+        )
+
+      server_session = complete_handshake(client, topic, ctx, @control_epoch)
+      assert_push(^topic, "wifi_status", _wifi_status)
+      assert {:ok, server_control} = Control.new(:server, server_session)
+
+      {_server_control, _accept_frame} = push_control_accept(client, topic, server_control)
+
+      # No readiness could be produced for this accept.
+      refute_push(^topic, "control_v1", _readiness, 50)
+      refute_receive {:replay_desired_state_acks, _generation}
+
+      # The client must NOT sit wedged with a dead control plane. It has to drop the
+      # unusable session and reconnect so negotiation can run again.
+      assert eventually(fn ->
+               state = :sys.get_state(client)
+               state.assigns.control_ready? == false and is_nil(state.assigns.session)
+             end),
+             "client stayed wedged after a transient readiness failure"
+
+      assert Process.alive?(client)
+    end
+
     test "reconnects when outbound control requires rekey", ctx do
       {client, holder, topic} = start_control_client(ctx)
       server_session = complete_handshake(client, topic, ctx, @control_epoch)

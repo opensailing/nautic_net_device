@@ -311,7 +311,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
           SessionHolder.publish(h, session(session_id: <<2::128>>), first.generation)
         end)
 
+      # Park the replacement FIRST, deterministically, so the replay order below is
+      # arrival order and not a scheduling race between the two mutations.
+      assert eventually(fn -> deferred_count(h) == 1 end)
+
       clear_task = Task.async(fn -> SessionHolder.clear(h) end)
+      assert eventually(fn -> deferred_count(h) == 2 end)
 
       # Neither mutation may land while the authorized send is still in flight.
       assert Task.yield(replace_task, 50) == nil
@@ -320,9 +325,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
 
       assert :ok = SessionHolder.release_send_lease(h, lease)
 
+      # Replayed in arrival order: the fenced publish lands, then the clear.
       assert {:ok, replacement} = Task.await(replace_task)
       assert replacement.generation > first.generation
       assert :ok = Task.await(clear_task)
+      refute SessionHolder.live?(h)
     end
 
     test "a lease cannot be acquired against a stale generation or an idle holder", %{holder: h} do
@@ -1023,5 +1030,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
     :sys.replace_state(holder, fn state ->
       put_in(state.control.send_counter, counter)
     end)
+  end
+
+  # How many session mutations are currently parked behind open send leases. Used
+  # to sequence deferrals deterministically instead of racing two Task spawns.
+  defp deferred_count(holder) do
+    holder |> :sys.get_state() |> Map.fetch!(:deferred) |> :queue.len()
+  end
+
+  defp eventually(fun, retries \\ 100) do
+    cond do
+      fun.() -> true
+      retries <= 0 -> false
+      true -> Process.sleep(5) && eventually(fun, retries - 1)
+    end
   end
 end

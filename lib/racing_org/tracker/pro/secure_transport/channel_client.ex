@@ -727,8 +727,29 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       send(self(), {:replay_desired_state_acks, generation})
       {:ok, socket}
     else
-      {:reconnect, socket} -> {:ok, socket}
-      {:error, _reason} -> {:ok, socket}
+      {:reconnect, socket} ->
+        {:ok, socket}
+
+      # A binding mismatch is a REJECTION: the accept did not describe this device
+      # or this negotiation, so staying on the session is correct and no readiness
+      # is owed. Nothing is wedged — a legitimate accept can still arrive.
+      {:error, reason} when reason in [:control_accept_mismatch, :legacy_negotiation] ->
+        Logger.warning("[ChannelClient] control_accept rejected: #{inspect(reason)}")
+        {:ok, socket}
+
+      # Anything else means we accepted the frame but could not answer it. The
+      # accept's control counter is already consumed, so the server's frame can
+      # never be replayed to us and no further accept is coming for this session:
+      # swallowing the error would leave the control plane permanently dead with
+      # `control_ready?` false. Fail closed and reconnect so a fresh session
+      # re-runs negotiation from the top.
+      {:error, reason} ->
+        Logger.error(
+          "[ChannelClient] control readiness unavailable (#{inspect(reason)}); reconnecting " <>
+            "rather than leaving the control plane wedged"
+        )
+
+        {:ok, fail_handshake(socket)}
     end
   end
 
