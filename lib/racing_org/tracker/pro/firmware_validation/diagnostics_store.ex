@@ -65,7 +65,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.DiagnosticsStore do
   def save(dir, record, opts \\ []) do
     with {:ok, record} <- validate_record(record),
          {:ok, contents} <- encode(record) do
-      write_authoritative(dir, record, contents, opts)
+      write_authoritative(dir, contents, opts)
     end
   rescue
     _exception -> {:error, :invalid_record}
@@ -98,17 +98,8 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.DiagnosticsStore do
   @spec path(Path.t()) :: Path.t()
   def path(dir), do: Path.join(dir, @filename)
 
-  defp write_authoritative(dir, record, contents, opts) do
-    case AtomicFile.write(path(dir), contents, atomic_opts(dir, opts)) do
-      :ok ->
-        :ok
-
-      {:error, _reason} = error ->
-        case load(dir, opts) do
-          {:ok, ^record} -> :ok
-          _other -> error
-        end
-    end
+  defp write_authoritative(dir, contents, opts) do
+    AtomicFile.write(path(dir), contents, atomic_opts(dir, opts))
   end
 
   defp encode(record) do

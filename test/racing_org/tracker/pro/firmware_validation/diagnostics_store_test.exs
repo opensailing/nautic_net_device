@@ -76,20 +76,28 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.DiagnosticsStoreTest do
              DiagnosticsStore.load(dir, file_system: __MODULE__.UnreadableFileSystem)
   end
 
-  test "reconciles post-rename durability ambiguity by reading back the exact record", %{dir: dir} do
+  test "never treats post-rename visibility as durable diagnostic persistence", %{dir: dir} do
     for stage <- @fault_stages do
       File.rm_rf!(dir)
 
       opts = [fault_injector: fail_at(stage), temp_suffix: fn -> Atom.to_string(stage) end]
       result = DiagnosticsStore.save(dir, pending_record(), opts)
 
-      if stage in [:renamed, :parent_synced] do
-        assert :ok = result
-        assert {:ok, record} = DiagnosticsStore.load(dir)
-        assert record == pending_record()
-      else
-        assert {:error, {:fault_injected, ^stage, :simulated_power_loss}} = result
-        assert :empty = DiagnosticsStore.load(dir)
+      case stage do
+        :renamed ->
+          assert {:error, {:durability_uncertain, {:fault_injected, :renamed, :simulated_power_loss}}} = result
+          assert {:ok, record} = DiagnosticsStore.load(dir)
+          assert record == pending_record()
+
+        :parent_synced ->
+          assert :ok = result
+          assert {:ok, record} = DiagnosticsStore.load(dir)
+          assert record == pending_record()
+
+        pre_rename_stage ->
+          assert {:error, {:pre_rename, {:fault_injected, ^pre_rename_stage, :simulated_power_loss}}} = result
+
+          assert :empty = DiagnosticsStore.load(dir)
       end
     end
   end

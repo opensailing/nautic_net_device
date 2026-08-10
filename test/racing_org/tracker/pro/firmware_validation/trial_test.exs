@@ -159,6 +159,54 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     assert {:ok, %{phase: :rollback_decided}} = DiagnosticsStore.load(dir)
   end
 
+  test "directory-sync uncertainty stops before rollback or reboot effects", %{dir: dir} do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+    on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+
+    clock = agent(0)
+    armed = agent(false)
+    parent = self()
+
+    fault_injector = fn
+      :renamed ->
+        Agent.get_and_update(armed, fn
+          true -> {{:error, :simulated_power_loss}, false}
+          false -> {:ok, false}
+        end)
+
+      _other ->
+        :ok
+    end
+
+    pid =
+      start_trial(dir,
+        clock: fn -> Agent.get(clock, & &1) end,
+        snapshot_opts: healthy_snapshot_opts(),
+        status_fun: fn -> false end,
+        validate_fun: fn -> {:ok, :not_exact} end,
+        revert_fun: fn ->
+          send(parent, :unexpected_revert)
+          :ok
+        end,
+        reboot_fun: fn ->
+          send(parent, :unexpected_reboot)
+          :ok
+        end,
+        store_opts: [fault_injector: fault_injector],
+        target: target(deadline_at_ms: 100, soak_period_ms: 10)
+      )
+
+    Agent.update(armed, fn _ -> true end)
+    Agent.update(clock, fn _ -> 100 end)
+
+    assert {{:diagnostics_persist_failed, {:durability_uncertain, {:fault_injected, :renamed, :simulated_power_loss}}},
+            {GenServer, :call, [^pid, :check_now, :infinity]}} =
+             catch_exit(Trial.check_now(pid))
+
+    refute_receive :unexpected_revert
+    refute_receive :unexpected_reboot
+  end
+
   test "restart recovers a conservative remaining budget and resets soak continuity", %{dir: dir} do
     clock = agent(0)
     parent = self()
