@@ -60,8 +60,19 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidatorTest do
     assert :validated = FirmwareValidator.validate_on_connect(runtime_module: __MODULE__.RuntimeModule)
   end
 
+  test "already-valid runtime does not require a validation function" do
+    refute function_exported?(__MODULE__.AlreadyValidRuntime, :validate_firmware, 0)
+
+    assert :already_valid =
+             FirmwareValidator.validate_on_connect(runtime_module: __MODULE__.AlreadyValidRuntime)
+  end
+
   test "no-op on host where Nerves.Runtime is unavailable and nothing injected" do
     assert :unavailable = FirmwareValidator.validate_on_connect()
+  end
+
+  defmodule AlreadyValidRuntime do
+    def firmware_valid?, do: true
   end
 
   defmodule RuntimeModule do

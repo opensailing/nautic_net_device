@@ -41,11 +41,14 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidator do
     validate_fun = Keyword.get(opts, :validate)
 
     cond do
-      not validation_available?(opts) ->
+      not callable?(valid_fun, runtime_module, :firmware_valid?) ->
         :unavailable
 
-      (valid_fun || fn -> default_valid?(runtime_module) end).() ->
+      firmware_valid?(valid_fun, runtime_module) ->
         :already_valid
+
+      not callable?(validate_fun, runtime_module, :validate_firmware) ->
+        :unavailable
 
       true ->
         case (validate_fun || fn -> default_validate(runtime_module) end).() do
@@ -70,8 +73,12 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidator do
   def validation_available?(opts \\ []) do
     runtime_module = Keyword.get(opts, :runtime_module, Nerves.Runtime)
 
-    callable?(Keyword.get(opts, :firmware_valid?), runtime_module, :firmware_valid?) and
-      callable?(Keyword.get(opts, :validate), runtime_module, :validate_firmware)
+    valid_fun = Keyword.get(opts, :firmware_valid?)
+    validate_fun = Keyword.get(opts, :validate)
+
+    callable?(valid_fun, runtime_module, :firmware_valid?) and
+      (callable?(validate_fun, runtime_module, :validate_firmware) or
+         firmware_valid?(valid_fun, runtime_module))
   rescue
     _exception -> false
   catch
@@ -85,6 +92,9 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidator do
   end
 
   defp callable?(_invalid, _runtime_module, _function), do: false
+
+  defp firmware_valid?(fun, _runtime_module) when is_function(fun, 0), do: fun.() == true
+  defp firmware_valid?(nil, runtime_module), do: default_valid?(runtime_module) == true
 
   defp default_valid?(runtime_module), do: apply(runtime_module, :firmware_valid?, [])
   defp default_validate(runtime_module), do: apply(runtime_module, :validate_firmware, [])

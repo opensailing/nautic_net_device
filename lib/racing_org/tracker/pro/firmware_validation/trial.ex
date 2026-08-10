@@ -339,9 +339,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
         decide_rollback(state, {:rollback_required, @invalid_snapshot})
 
       :uncertain ->
-        state
-        |> Map.put(:effect_status, :validation_uncertain)
-        |> schedule(:validation_effect, state.retry_ms)
+        persist_validation_uncertainty_and_schedule(state)
     end
   end
 
@@ -352,7 +350,8 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
     end
   end
 
-  defp run_validation_effect(%{effect_status: :validation_failed} = state) do
+  defp run_validation_effect(%{effect_status: effect_status} = state)
+       when effect_status in [:validation_failed, :validation_uncertain] do
     case read_clock(state.clock) do
       {:ok, now_ms} when now_ms >= state.last_now_ms ->
         elapsed_ms = now_ms - state.last_now_ms
@@ -394,6 +393,28 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
       end
     else
       decide_rollback(state, {:rollback_required, @invalid_snapshot})
+    end
+  end
+
+  defp persist_validation_uncertainty_and_schedule(state) do
+    state =
+      state
+      |> Map.put(:effect_status, :validation_uncertain)
+      |> anchor_validation_retry_clock()
+
+    if state.remaining_deadline_ms > 0 do
+      delay_ms = min(state.retry_ms, state.remaining_deadline_ms)
+      recoverable_remaining_ms = max(state.remaining_deadline_ms - delay_ms, 0)
+
+      case persist_record(state, :validation_decided, :ready, recoverable_remaining_ms) do
+        :ok -> schedule(state, :validation_effect, delay_ms)
+        {:error, reason} -> {:stop, {:diagnostics_persist_failed, reason}, state}
+      end
+    else
+      case persist_record(state, :validation_decided, :ready, 0) do
+        :ok -> {:ok, cancel_timer(state)}
+        {:error, reason} -> {:stop, {:diagnostics_persist_failed, reason}, state}
+      end
     end
   end
 
@@ -440,7 +461,9 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
         end
 
       {:error, :nerves_runtime_unavailable} ->
-        {:ok, %{state | effect_status: :runtime_unavailable}}
+        state
+        |> Map.put(:effect_status, :runtime_unavailable)
+        |> schedule(:rollback_effect, state.retry_ms)
 
       {:error, :effect_failed} ->
         state
@@ -455,7 +478,9 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
         {:ok, %{state | effect_status: :reboot_requested}}
 
       {:error, :nerves_runtime_unavailable} ->
-        {:ok, %{state | effect_status: :runtime_unavailable}}
+        state
+        |> Map.put(:effect_status, :runtime_unavailable)
+        |> schedule(:rollback_effect, state.retry_ms)
 
       {:error, :effect_failed} ->
         state
