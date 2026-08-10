@@ -17,6 +17,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   @max_section_size 16_777_216
   @max_generation_size 33_554_432
   @max_secret_size 1_024
+  @max_command_payload_size 65_326
+  @max_command_result_size 65_337
   @max_checkpoint_size 65_327
   @max_capability_versions 8
   @max_capabilities 64
@@ -93,6 +95,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
     resume: {0x05, :device_to_server},
     secret_delivery: {0x06, :server_to_device},
     ack: {0x07, :device_to_server},
+    command_delivery: {0x20, :server_to_device},
+    command_ack: {0x21, :device_to_server},
     delivery_receipt: {0x30, :server_to_device},
     checkpoint_submission: {0x31, :device_to_server},
     checkpoint_hydration: {0x32, :server_to_device}
@@ -109,6 +113,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
     resume: "RacingOrg-DesiredStateResume-v1",
     secret_delivery: "RacingOrg-DesiredStateSecret-v1",
     ack: "RacingOrg-DesiredStateAck-v1",
+    command_delivery: "RacingOrg-CommandDelivery-v1",
+    command_ack: "RacingOrg-CommandAck-v1",
     delivery_receipt: "RacingOrg-DurableDeliveryReceipt-v1",
     checkpoint_submission: "RacingOrg-CheckpointSubmission-v1",
     checkpoint_hydration: "RacingOrg-CheckpointHydration-v1"
@@ -118,6 +124,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   @manifest_domain "RacingOrg-DesiredStateManifest-v1"
   @section_domain "RacingOrg-DesiredStateSection-v1"
   @secret_digest_domain "RacingOrg-DesiredStateSecretDigest-v1"
+  @command_record_hash_domain "RacingOrg-CommandRecordHash-v1"
+  @command_result_hash_domain "RacingOrg-CommandResultHash-v1"
   @delivery_receipt_hash_domain "RacingOrg-DurableDeliveryReceiptHash-v1"
   @checkpoint_content_hash_domain "RacingOrg-CheckpointContentHash-v1"
   @checkpoint_hash_domain "RacingOrg-CheckpointRecordHash-v1"
@@ -127,6 +135,27 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
 
   @ack_statuses %{staged: 0x01, effective: 0x02, rejected: 0x03}
   @ack_status_by_code Map.new(@ack_statuses, fn {name, code} -> {code, name} end)
+
+  @command_statuses [applied: 0x01, duplicate: 0x02, rejected: 0x03]
+  @command_status_by_name Map.new(@command_statuses)
+  @command_status_by_code Map.new(@command_statuses, fn {name, code} -> {code, name} end)
+
+  @command_reasons [
+    none: 0x00,
+    stale_credential_epoch: 0x01,
+    storage_epoch_mismatch: 0x02,
+    generation_mismatch: 0x03,
+    manifest_hash_mismatch: 0x04,
+    expired: 0x05,
+    sequence_replay: 0x06,
+    sequence_gap: 0x07,
+    command_id_conflict: 0x08,
+    unsupported_command: 0x09,
+    invalid_payload: 0x0A,
+    operational_gate_closed: 0x0B
+  ]
+  @command_reason_by_name Map.new(@command_reasons)
+  @command_reason_by_code Map.new(@command_reasons, fn {name, code} -> {code, name} end)
 
   @rejection_phases %{
     manifest: 0x01,
@@ -188,6 +217,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   def max_section_size, do: @max_section_size
   def max_generation_size, do: @max_generation_size
   def max_secret_size, do: @max_secret_size
+  def max_command_payload_size, do: @max_command_payload_size
+  def max_command_result_size, do: @max_command_result_size
   def max_checkpoint_size, do: @max_checkpoint_size
   def max_capability_versions, do: @max_capability_versions
   def max_capabilities, do: @max_capabilities
@@ -308,6 +339,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   def manifest_domain, do: @manifest_domain
   def section_domain, do: @section_domain
   def secret_digest_domain, do: @secret_digest_domain
+  def command_record_hash_domain, do: @command_record_hash_domain
+  def command_result_hash_domain, do: @command_result_hash_domain
   def delivery_receipt_hash_domain, do: @delivery_receipt_hash_domain
   def checkpoint_content_hash_domain, do: @checkpoint_content_hash_domain
   def checkpoint_hash_domain, do: @checkpoint_hash_domain
@@ -343,6 +376,42 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   end
 
   def ack_status(_), do: {:error, :unknown_ack_status}
+
+  def command_statuses, do: @command_statuses
+
+  def command_status(status) when is_atom(status) do
+    case Map.fetch(@command_status_by_name, status) do
+      {:ok, code} -> {:ok, code}
+      :error -> {:error, :unknown_command_status}
+    end
+  end
+
+  def command_status(code) when is_integer(code) do
+    case Map.fetch(@command_status_by_code, code) do
+      {:ok, status} -> {:ok, status}
+      :error -> {:error, :unknown_command_status}
+    end
+  end
+
+  def command_status(_), do: {:error, :unknown_command_status}
+
+  def command_reasons, do: @command_reasons
+
+  def command_reason(reason) when is_atom(reason) do
+    case Map.fetch(@command_reason_by_name, reason) do
+      {:ok, code} -> {:ok, code}
+      :error -> {:error, :unknown_command_reason}
+    end
+  end
+
+  def command_reason(code) when is_integer(code) do
+    case Map.fetch(@command_reason_by_code, code) do
+      {:ok, reason} -> {:ok, reason}
+      :error -> {:error, :unknown_command_reason}
+    end
+  end
+
+  def command_reason(_), do: {:error, :unknown_command_reason}
 
   def rejection_phase(phase) when is_atom(phase) do
     case Map.fetch(@rejection_phases, phase) do

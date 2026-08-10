@@ -54,6 +54,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1ContractTest do
                resume: {0x05, :device_to_server},
                secret_delivery: {0x06, :server_to_device},
                ack: {0x07, :device_to_server},
+               command_delivery: {0x20, :server_to_device},
+               command_ack: {0x21, :device_to_server},
                delivery_receipt: {0x30, :server_to_device},
                checkpoint_submission: {0x31, :device_to_server},
                checkpoint_hydration: {0x32, :server_to_device}
@@ -68,7 +70,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1ContractTest do
                {0x80..0xFF, :unassigned_private}
              ]
 
-      assert {:error, :unsupported_message_type} = Contract.message_type(0x20)
+      assert Contract.message_type(0x20) == {:ok, :command_delivery, :server_to_device}
+      assert Contract.message_type(0x21) == {:ok, :command_ack, :device_to_server}
+      assert {:error, :unsupported_message_type} = Contract.message_type(0x22)
       assert {:error, :unsupported_message_type} = Contract.message_type(0x80)
     end
   end

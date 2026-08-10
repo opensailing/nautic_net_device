@@ -134,7 +134,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1ControlTest do
       assert {:error, :wrong_direction} = Control.open(server, frame)
       assert {:error, :wrong_session} = Control.open(device, replace_bytes(frame, 8, :binary.copy(<<0>>, 16)))
       assert {:error, :stale_credential_epoch} = Control.open(device, replace_bytes(frame, 24, <<8::32>>))
-      assert {:error, :unsupported_message_type} = Control.open(device, replace_bytes(frame, 7, <<0x20>>))
+      assert {:error, :unsupported_message_type} = Control.open(device, replace_bytes(frame, 7, <<0x22>>))
       assert {:error, :wrong_message_direction} = Control.open(device, replace_bytes(frame, 7, <<0x02>>))
       assert {:error, :invalid_frame_length} = Control.open(device, replace_bytes(frame, 36, <<1::32>>))
       assert {:error, :invalid_frame_length} = Control.open(device, binary_part(frame, 0, byte_size(frame) - 1))

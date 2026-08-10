@@ -8,7 +8,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   """
 
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
-  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{Checkpoint, Manifest, Receipt}
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{
+    Checkpoint,
+    Command,
+    Manifest,
+    Receipt
+  }
 
   @device_id_size 16
   @incarnation_id_size 16
@@ -22,6 +28,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
 
   @identity_keys [:device_id, :credential_epoch, :boot_id, :storage_epoch]
   @durable_identity_keys [:device_id, :credential_epoch, :storage_epoch]
+  @command_fence_keys [
+    :device_id,
+    :credential_epoch,
+    :storage_epoch,
+    :required_generation,
+    :required_manifest_hash,
+    :command_epoch,
+    :command_sequence,
+    :command_id
+  ]
 
   @doc "Encode one registered authenticated payload."
   def encode(type, attrs) when is_atom(type) and is_map(attrs) do
@@ -70,6 +86,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   defp encode_body(:resume, attrs), do: encode_resume(attrs)
   defp encode_body(:secret_delivery, attrs), do: encode_secret_delivery(attrs)
   defp encode_body(:ack, attrs), do: encode_ack(attrs)
+  defp encode_body(:command_delivery, attrs), do: encode_command_delivery(attrs)
+  defp encode_body(:command_ack, attrs), do: encode_command_ack(attrs)
   defp encode_body(:delivery_receipt, attrs), do: encode_delivery_receipt(attrs)
   defp encode_body(:checkpoint_submission, attrs), do: encode_checkpoint_submission(attrs)
   defp encode_body(:checkpoint_hydration, attrs), do: encode_checkpoint_hydration(attrs)
@@ -82,6 +100,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   defp decode_body(:resume, bytes), do: decode_resume(bytes)
   defp decode_body(:secret_delivery, bytes), do: decode_secret_delivery(bytes)
   defp decode_body(:ack, bytes), do: decode_ack(bytes)
+  defp decode_body(:command_delivery, bytes), do: decode_command_delivery(bytes)
+  defp decode_body(:command_ack, bytes), do: decode_command_ack(bytes)
   defp decode_body(:delivery_receipt, bytes), do: decode_delivery_receipt(bytes)
   defp decode_body(:checkpoint_submission, bytes), do: decode_checkpoint_submission(bytes)
   defp decode_body(:checkpoint_hydration, bytes), do: decode_checkpoint_hydration(bytes)
@@ -519,6 +539,142 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
     end
   end
 
+  # command_delivery
+
+  defp encode_command_delivery(attrs) do
+    expected =
+      @command_fence_keys ++
+        [:expires_at_ms, :payload_hash, :command_hash, :payload]
+
+    with :ok <- exact_keys(attrs, expected, :invalid_command_delivery),
+         {:ok, fence} <- normalize_command_fence(attrs),
+         :ok <- database_int(attrs.expires_at_ms, :invalid_expires_at_ms),
+         :ok <- fixed_binary(attrs.payload_hash, @hash_size, :invalid_payload_hash),
+         :ok <- fixed_binary(attrs.command_hash, @hash_size, :invalid_command_hash),
+         {:ok, expected_payload_hash} <- Command.payload_hash(attrs.payload),
+         :ok <-
+           ensure(
+             secure_equal(expected_payload_hash, attrs.payload_hash),
+             :payload_hash_mismatch
+           ),
+         command_record =
+           Map.merge(fence, %{
+             expires_at_ms: attrs.expires_at_ms,
+             payload_hash: attrs.payload_hash
+           }),
+         {:ok, expected_command_hash} <- Command.hash(command_record),
+         :ok <-
+           ensure(
+             secure_equal(expected_command_hash, attrs.command_hash),
+             :command_hash_mismatch
+           ) do
+      {:ok,
+       encode_command_fence(fence) <>
+         <<attrs.expires_at_ms::64, attrs.payload_hash::binary-size(@hash_size),
+           attrs.command_hash::binary-size(@hash_size), byte_size(attrs.payload)::32, attrs.payload::binary>>}
+    end
+  end
+
+  defp decode_command_delivery(
+         <<device_id::binary-size(@device_id_size), credential_epoch::32,
+           storage_epoch::binary-size(@incarnation_id_size), required_generation::64,
+           required_manifest_hash::binary-size(@hash_size), command_epoch::32, command_sequence::64,
+           command_id::binary-size(@device_id_size), expires_at_ms::64, payload_hash::binary-size(@hash_size),
+           command_hash::binary-size(@hash_size), payload_length::32, rest::binary>>
+       ) do
+    with true <- byte_size(rest) >= payload_length || {:error, :truncated},
+         <<payload::binary-size(payload_length), trailing::binary>> <- rest,
+         attrs = %{
+           device_id: device_id,
+           credential_epoch: credential_epoch,
+           storage_epoch: storage_epoch,
+           required_generation: required_generation,
+           required_manifest_hash: required_manifest_hash,
+           command_epoch: command_epoch,
+           command_sequence: command_sequence,
+           command_id: command_id,
+           expires_at_ms: expires_at_ms,
+           payload_hash: payload_hash,
+           command_hash: command_hash,
+           payload: payload
+         },
+         {:ok, _encoded} <- encode_body(:command_delivery, attrs) do
+      {:ok, attrs, trailing}
+    else
+      false -> {:error, :truncated}
+      {:error, _reason} = error -> error
+      _ -> {:error, :truncated}
+    end
+  end
+
+  defp decode_command_delivery(_), do: {:error, :truncated}
+
+  # command_ack
+
+  defp encode_command_ack(attrs) do
+    expected = @command_fence_keys ++ [:command_hash, :status, :reason, :result_hash, :result]
+
+    with :ok <- exact_keys(attrs, expected, :invalid_command_ack),
+         {:ok, fence} <- normalize_command_fence(attrs),
+         :ok <- fixed_binary(attrs.command_hash, @hash_size, :invalid_command_hash),
+         {:ok, status_code} <- command_status_code(attrs.status),
+         {:ok, reason_code} <- command_reason_code(attrs.reason),
+         :ok <- fixed_binary(attrs.result_hash, @hash_size, :invalid_result_hash),
+         {:ok, expected_result_hash} <-
+           Command.result_hash(%{
+             status: attrs.status,
+             reason: attrs.reason,
+             result: attrs.result
+           }),
+         :ok <-
+           ensure(
+             secure_equal(expected_result_hash, attrs.result_hash),
+             :result_hash_mismatch
+           ) do
+      {:ok,
+       encode_command_fence(fence) <>
+         <<attrs.command_hash::binary-size(@hash_size), status_code, reason_code,
+           attrs.result_hash::binary-size(@hash_size), byte_size(attrs.result)::32, attrs.result::binary>>}
+    end
+  end
+
+  defp decode_command_ack(
+         <<device_id::binary-size(@device_id_size), credential_epoch::32,
+           storage_epoch::binary-size(@incarnation_id_size), required_generation::64,
+           required_manifest_hash::binary-size(@hash_size), command_epoch::32, command_sequence::64,
+           command_id::binary-size(@device_id_size), command_hash::binary-size(@hash_size), status_code, reason_code,
+           result_hash::binary-size(@hash_size), result_length::32, rest::binary>>
+       ) do
+    with {:ok, status} <- Contract.command_status(status_code),
+         {:ok, reason} <- Contract.command_reason(reason_code),
+         true <- byte_size(rest) >= result_length || {:error, :truncated},
+         <<result::binary-size(result_length), trailing::binary>> <- rest,
+         attrs = %{
+           device_id: device_id,
+           credential_epoch: credential_epoch,
+           storage_epoch: storage_epoch,
+           required_generation: required_generation,
+           required_manifest_hash: required_manifest_hash,
+           command_epoch: command_epoch,
+           command_sequence: command_sequence,
+           command_id: command_id,
+           command_hash: command_hash,
+           status: status,
+           reason: reason,
+           result_hash: result_hash,
+           result: result
+         },
+         {:ok, _encoded} <- encode_body(:command_ack, attrs) do
+      {:ok, attrs, trailing}
+    else
+      false -> {:error, :truncated}
+      {:error, _reason} = error -> error
+      _ -> {:error, :truncated}
+    end
+  end
+
+  defp decode_command_ack(_), do: {:error, :truncated}
+
   # delivery_receipt
 
   defp encode_delivery_receipt(attrs) do
@@ -790,6 +946,64 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
       {:error, _reason} = error -> error
     end
   end
+
+  defp normalize_command_fence(attrs) do
+    with {:ok, device_id} <- Command.normalize_uuid(attrs.device_id, :invalid_device_id),
+         :ok <- u32(attrs.credential_epoch, :invalid_credential_epoch),
+         :ok <-
+           nonzero_binary(
+             attrs.storage_epoch,
+             @incarnation_id_size,
+             :invalid_storage_epoch
+           ),
+         :ok <- positive_database_int(attrs.required_generation, :invalid_required_generation),
+         :ok <-
+           fixed_binary(
+             attrs.required_manifest_hash,
+             @hash_size,
+             :invalid_required_manifest_hash
+           ),
+         :ok <- u32(attrs.command_epoch, :invalid_command_epoch),
+         :ok <- positive_database_int(attrs.command_sequence, :invalid_command_sequence),
+         {:ok, command_id} <- Command.normalize_uuid(attrs.command_id, :invalid_command_id) do
+      {:ok,
+       %{
+         device_id: device_id,
+         credential_epoch: attrs.credential_epoch,
+         storage_epoch: attrs.storage_epoch,
+         required_generation: attrs.required_generation,
+         required_manifest_hash: attrs.required_manifest_hash,
+         command_epoch: attrs.command_epoch,
+         command_sequence: attrs.command_sequence,
+         command_id: command_id
+       }}
+    end
+  end
+
+  defp encode_command_fence(fence) do
+    <<fence.device_id::binary-size(@device_id_size), fence.credential_epoch::32,
+      fence.storage_epoch::binary-size(@incarnation_id_size), fence.required_generation::64,
+      fence.required_manifest_hash::binary-size(@hash_size), fence.command_epoch::32, fence.command_sequence::64,
+      fence.command_id::binary-size(@device_id_size)>>
+  end
+
+  defp command_status_code(status) when is_atom(status) do
+    case Contract.command_status(status) do
+      {:ok, code} when is_integer(code) -> {:ok, code}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp command_status_code(_status), do: {:error, :unknown_command_status}
+
+  defp command_reason_code(reason) when is_atom(reason) do
+    case Contract.command_reason(reason) do
+      {:ok, code} when is_integer(code) -> {:ok, code}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp command_reason_code(_reason), do: {:error, :unknown_command_reason}
 
   # Shared identity and compatibility encodings
 
