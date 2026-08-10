@@ -411,10 +411,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
         {:error, reason} -> {:stop, {:diagnostics_persist_failed, reason}, state}
       end
     else
-      case persist_record(state, :validation_decided, :ready, 0) do
-        :ok -> {:ok, cancel_timer(state)}
-        {:error, reason} -> {:stop, {:diagnostics_persist_failed, reason}, state}
-      end
+      decide_rollback(state, {:rollback_required, @invalid_snapshot})
     end
   end
 

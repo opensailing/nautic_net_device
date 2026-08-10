@@ -104,9 +104,10 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     assert %{phase: :reboot_pending} = Trial.status(pid)
   end
 
-  test "uncertain validation outcome never rolls back and later validity completes without revalidation", %{
-    dir: dir
-  } do
+  test "uncertain validation within the deadline never rolls back and later validity completes without revalidation",
+       %{
+         dir: dir
+       } do
     clock = agent(0)
     statuses = agent([false, :unavailable, true])
     validation_count = agent(0)
@@ -134,7 +135,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
           send(parent, :unexpected_reboot)
           :ok
         end,
-        target: target(deadline_at_ms: 1, soak_period_ms: 1)
+        target: target(deadline_at_ms: 11, soak_period_ms: 1)
       )
 
     Agent.update(clock, fn _ -> 1 end)
@@ -150,7 +151,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     assert {:ok, %{phase: :validated}} = DiagnosticsStore.load(dir)
   end
 
-  test "uncertain validation retries consume their deadline and stop scheduling when exhausted", %{dir: dir} do
+  test "perpetual validation uncertainty durably rolls back when its retry deadline expires", %{dir: dir} do
     clock = agent(0)
     status_calls = agent(0)
     validation_count = agent(0)
@@ -175,11 +176,11 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
           {:ok, :not_exact}
         end,
         revert_fun: fn ->
-          send(parent, :unexpected_revert)
+          send(parent, {:uncertain_expiry_revert, DiagnosticsStore.load(dir)})
           :ok
         end,
         reboot_fun: fn ->
-          send(parent, :unexpected_reboot)
+          send(parent, {:uncertain_expiry_reboot, DiagnosticsStore.load(dir)})
           :ok
         end,
         target: target(deadline_at_ms: 20, soak_period_ms: 1)
@@ -201,17 +202,29 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     Agent.update(clock, fn _ -> 20 end)
     send(pid, {:validation_effect, last_retry})
 
-    assert %{phase: :validation_decided, effect_status: :validation_uncertain, remaining_deadline_ms: 0} =
+    assert_receive {:uncertain_expiry_revert,
+                    {:ok,
+                     %{
+                       phase: :rollback_decided,
+                       result: {:rollback_required, [%{criterion: :input, diagnostic_code: :invalid_snapshot}]}
+                     }}}
+
+    assert_receive {:uncertain_expiry_reboot,
+                    {:ok,
+                     %{
+                       phase: :reboot_pending,
+                       result: {:rollback_required, [%{criterion: :input, diagnostic_code: :invalid_snapshot}]}
+                     }}}
+
+    assert %{phase: :reboot_pending, effect_status: :reboot_requested, remaining_deadline_ms: 0} =
              Trial.status(pid)
 
     assert %{last_now_ms: 20, timer_ref: nil, timer_token: nil} = :sys.get_state(pid)
 
-    assert {:ok, %{phase: :validation_decided, timing: %{remaining_deadline_ms: 0}}} =
+    assert {:ok, %{phase: :reboot_pending, timing: %{remaining_deadline_ms: 0}}} =
              DiagnosticsStore.load(dir)
 
     refute_receive {:scheduled, {:validation_effect, _token}, _delay_ms}
-    refute_receive :unexpected_revert
-    refute_receive :unexpected_reboot
     assert Agent.get(validation_count, & &1) == 5
   end
 
