@@ -296,6 +296,18 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.BinsTest do
       assert_in_delta twa_c, 47.5, 1.0e-9
     end
 
+    test "truncated closed top bins report an in-domain midpoint" do
+      b = Bins.new(twa_width_deg: 140.0, tws_width_mps: 7.0, max_tws_mps: 10.0)
+      assert Bins.max_key(b) == {1, 1}
+
+      {tws_c, twa_c} = Bins.center(b, {1, 1})
+      assert_in_delta tws_c, 8.5, 1.0e-9
+      assert_in_delta twa_c, 160.0, 1.0e-9
+      assert tws_c <= b.max_tws_mps
+      assert twa_c <= 180.0
+      assert Bins.cell(b, tws_c, twa_c) == {1, 1}
+    end
+
     test "cell -> center -> cell is a fixed point" do
       b = Bins.new(twa_width_deg: 5.0, tws_width_mps: 1.0)
       key = Bins.cell(b, 7.3, 121.0)

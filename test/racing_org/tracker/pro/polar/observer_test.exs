@@ -314,7 +314,7 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverTest do
 
       good_key = {9, 10}
       junk = %{{1_943_846_171, 18} => {50, PSquare.add(PSquare.new(0.9), 4.0)}}
-      cells = Map.put(junk, good_key, {3, PSquare.add(PSquare.new(0.9), 4.0)})
+      cells = Map.put(junk, good_key, {1, PSquare.add(PSquare.new(0.9), 4.0)})
       :ok = Store.save(dir, cells)
 
       pid = start_observer(signals_fn: fn -> signals(0) end, dir: dir)
@@ -428,12 +428,16 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverTest do
       assert count2 > restored
     end
 
-    test "a corrupt persisted file starts empty without crashing", %{dir: dir} do
+    test "a corrupt persisted file starts empty, is scrubbed, and remains functional", %{dir: dir} do
       File.mkdir_p!(dir)
       File.write!(Path.join(dir, "sailed.polar"), "garbage")
 
       pid = start_observer(signals_fn: fn -> signals(0) end, dir: dir)
       assert Observer.cells(pid) == []
+      assert :sys.get_state(pid).force_persist
+      assert :ok = Observer.persist_now(pid)
+      assert {:ok, %{cells: %{}}} = Store.load_runtime(dir)
+
       # Still functional: it accumulates fresh.
       for _ <- 0..14, do: Observer.tick(pid)
       assert [{@cell_a, _, _}] = Observer.cells(pid)

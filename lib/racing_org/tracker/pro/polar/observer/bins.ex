@@ -216,13 +216,20 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Bins do
   def valid_key?(%__MODULE__{}, _other), do: false
 
   @doc """
-  Representative wind values `{tws_mps, twa_deg}` for a cell — the bin midpoint
-  `(idx + 0.5) · width`. This is the value reported for the cell downstream.
+  Representative wind values `{tws_mps, twa_deg}` for a cell.
+
+  Full bins use `(idx + 0.5) · width`. A final bin truncated by the closed TWS
+  ceiling or 180° TWA edge instead uses the midpoint of its actual in-domain
+  interval, so a reported center can never lie outside the geometry that minted
+  the key.
   """
   @spec center(t(), key()) :: {float(), float()}
-  def center(%__MODULE__{tws_width_mps: tw, twa_width_deg: aw}, {tws_idx, twa_idx})
+  def center(
+        %__MODULE__{tws_width_mps: tw, twa_width_deg: aw, max_tws_mps: max_tws},
+        {tws_idx, twa_idx}
+      )
       when is_integer(tws_idx) and is_integer(twa_idx) do
-    {(tws_idx + 0.5) * tw, (twa_idx + 0.5) * aw}
+    {bounded_midpoint(tws_idx, tw, max_tws), bounded_midpoint(twa_idx, aw, 180.0)}
   end
 
   @doc """
@@ -273,6 +280,12 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Bins do
     do: min(max(trunc(:math.ceil(extent / width)) - 1, 0), @max_axis_index)
 
   defp floor_div(v, width), do: trunc(:math.floor(v / width))
+
+  defp bounded_midpoint(index, width, extent) do
+    lower = index * width
+    upper = min((index + 1) * width, extent)
+    lower + (upper - lower) / 2.0
+  end
 
   # An axis must divide into an index space that fits u32, because every index is
   # a persisted, wire-visible cell key. The width is bounded BEFORE `extent /

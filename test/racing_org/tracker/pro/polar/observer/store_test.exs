@@ -1,6 +1,7 @@
 defmodule RacingOrg.Tracker.Pro.Polar.Observer.StoreTest do
   use ExUnit.Case, async: true
 
+  alias RacingOrg.Tracker.Pro.Polar.Observer.Bins
   alias RacingOrg.Tracker.Pro.Polar.Observer.PSquare
   alias RacingOrg.Tracker.Pro.Polar.Observer.Store
 
@@ -23,6 +24,40 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.StoreTest do
     assert {3, %PSquare{}} = loaded[{6, 18}]
   end
 
+  test "runtime persistence binds revision, accepted fingerprint, probability, and geometry", %{dir: dir} do
+    runtime = %{
+      authority: "boat-test",
+      policy_hash: :binary.copy(<<0xCD>>, 32),
+      source_generation: 77,
+      last_restore_fingerprint: :binary.copy(<<0xAB>>, 32),
+      p: 0.9,
+      bins: Bins.new(twa_width_deg: 2.5, tws_width_mps: 1.0, max_tws_mps: 30.0),
+      cells: cells()
+    }
+
+    assert :ok = Store.save_runtime(dir, runtime)
+    assert {:ok, ^runtime} = Store.load_runtime(dir)
+    assert {:ok, runtime.cells} == Store.load(dir)
+  end
+
+  test "legacy cell-only persistence loads as an upgrade requiring canonical rewrite", %{dir: dir} do
+    assert :ok = Store.save(dir, cells())
+
+    assert {:ok,
+            %{
+              authority: nil,
+              policy_hash: nil,
+              source_generation: 9,
+              last_restore_fingerprint: nil,
+              p: nil,
+              bins: nil,
+              cells: loaded,
+              legacy?: true
+            }} = Store.load_runtime(dir)
+
+    assert loaded == cells()
+  end
+
   test "the persisted term is term_to_binary/:safe round-trippable (plain floats/ints/tuples)", %{dir: dir} do
     assert :ok = Store.save(dir, cells())
     binary = File.read!(Path.join(dir, "sailed.polar"))
@@ -40,15 +75,17 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.StoreTest do
     assert File.exists?(Path.join(dir, "sailed.polar"))
   end
 
-  test "load recovers from a corrupt file by returning :empty", %{dir: dir} do
+  test "load recovers from a corrupt file while the runtime loader marks it for scrub", %{dir: dir} do
     File.mkdir_p!(dir)
     File.write!(Path.join(dir, "sailed.polar"), "not a term")
+    assert :invalid = Store.load_runtime(dir)
     assert :empty = Store.load(dir)
   end
 
-  test "load ignores an unknown format version", %{dir: dir} do
+  test "load ignores an unknown format while the runtime loader marks it for scrub", %{dir: dir} do
     File.mkdir_p!(dir)
     File.write!(Path.join(dir, "sailed.polar"), :erlang.term_to_binary({999, %{}}))
+    assert :invalid = Store.load_runtime(dir)
     assert :empty = Store.load(dir)
   end
 
