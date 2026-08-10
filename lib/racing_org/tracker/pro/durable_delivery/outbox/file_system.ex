@@ -11,6 +11,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.FileSystem do
   @type modes :: [atom()]
 
   @callback read(Path.t()) :: {:ok, binary()} | {:error, File.posix()}
+  @callback stat(Path.t()) :: {:ok, File.Stat.t()} | {:error, File.posix()}
   @callback list_dir(Path.t()) :: {:ok, [binary()]} | {:error, File.posix()}
   @callback mkdir_p(Path.t()) :: :ok | {:error, File.posix()}
   @callback chmod(Path.t(), non_neg_integer()) :: :ok | {:error, File.posix()}
@@ -26,6 +27,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.FileSystem do
 
   @doc false
   def read(path), do: File.read(path)
+
+  @doc false
+  def stat(path), do: File.stat(path)
 
   @doc false
   def list_dir(path), do: File.ls(path)

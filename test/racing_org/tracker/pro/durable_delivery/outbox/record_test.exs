@@ -81,6 +81,24 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.RecordTest do
     assert {:error, :invalid_priority} = Record.encode(%{valid | priority: 256})
   end
 
+  test "truncation accepts only a plausible canonical header prefix" do
+    assert {:incomplete, 14} = Record.decode_next("RO")
+    assert {:error, :invalid_partial_header} = Record.decode_next("RX")
+    assert {:error, :invalid_partial_header} = Record.decode_next(<<"RODO", 2>>)
+    assert {:error, :invalid_partial_header} = Record.decode_next(<<"RODO", 1, 99>>)
+    assert {:error, :invalid_partial_header} = Record.decode_next(<<"RODO", 1, 1, 0xFF>>)
+
+    body_length = 100
+    guard = Bitwise.bxor(body_length, 0xFFFFFFFF)
+    <<first_guard_byte, _rest::binary>> = <<guard::32>>
+
+    assert {:incomplete, 114} =
+             Record.decode_next(<<"RODO", 1, 1, body_length::32, first_guard_byte>>)
+
+    assert {:error, :invalid_partial_header} =
+             Record.decode_next(<<"RODO", 1, 1, body_length::32, Bitwise.bxor(first_guard_byte, 1)>>)
+  end
+
   test "distinguishes a torn record from checksum and framing corruption" do
     payload = "payload"
 

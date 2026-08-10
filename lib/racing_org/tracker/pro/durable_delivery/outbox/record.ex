@@ -65,8 +65,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
           {:ok, t(), binary(), pos_integer()}
           | {:incomplete, pos_integer()}
           | {:error, atom()}
-  def decode_next(binary) when is_binary(binary) and byte_size(binary) < @header_size,
-    do: {:incomplete, @header_size}
+  def decode_next(binary) when is_binary(binary) and byte_size(binary) < @header_size do
+    case partial_header_expected_size(binary) do
+      {:ok, expected_size} -> {:incomplete, expected_size}
+      :error -> {:error, :invalid_partial_header}
+    end
+  end
 
   def decode_next(<<magic::binary-size(4), version, kind_code, body_length::32, length_guard::32, rest::binary>>) do
     with :ok <- validate_magic(magic),
@@ -358,6 +362,57 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
       {:ok, value} -> {:ok, value}
       :error -> {:error, error}
     end
+  end
+
+  defp partial_header_expected_size(binary) when byte_size(binary) <= 4 do
+    expected_prefix = binary_part(@magic, 0, byte_size(binary))
+    if binary == expected_prefix, do: {:ok, @header_size}, else: :error
+  end
+
+  defp partial_header_expected_size(<<@magic, version, rest::binary>>) do
+    cond do
+      version != @version ->
+        :error
+
+      byte_size(rest) == 0 ->
+        {:ok, @header_size}
+
+      true ->
+        partial_header_after_version(rest)
+    end
+  end
+
+  defp partial_header_expected_size(_binary), do: :error
+
+  defp partial_header_after_version(<<kind_code, rest::binary>>) do
+    if Map.has_key?(@code_kinds, kind_code) do
+      partial_header_after_kind(rest)
+    else
+      :error
+    end
+  end
+
+  defp partial_header_after_kind(rest) when byte_size(rest) < 4 do
+    if partial_length_possible?(rest), do: {:ok, @header_size}, else: :error
+  end
+
+  defp partial_header_after_kind(<<body_length::32, partial_guard::binary>>) do
+    with :ok <- validate_body_length(body_length),
+         true <- byte_size(partial_guard) <= 4,
+         expected_guard = <<bxor(body_length, 0xFFFFFFFF)::32>>,
+         true <-
+           partial_guard == binary_part(expected_guard, 0, byte_size(partial_guard)) do
+      {:ok, @header_size + body_length}
+    else
+      _error -> :error
+    end
+  end
+
+  defp partial_length_possible?(partial) do
+    missing_bytes = 4 - byte_size(partial)
+    prefix = if partial == <<>>, do: 0, else: :binary.decode_unsigned(partial)
+    minimum = prefix <<< (missing_bytes * 8)
+    minimum <= @max_body_size
   end
 
   defp validate_magic(@magic), do: :ok

@@ -10,9 +10,17 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
     def attach(owner), do: Process.put({__MODULE__, :owner}, owner)
     def fail_segment_sync, do: Process.put({__MODULE__, :fail_segment_sync}, true)
+    def fail_segment_append_open, do: Process.put({__MODULE__, :fail_segment_append_open}, true)
+    def fail_segment_chmod, do: Process.put({__MODULE__, :fail_segment_chmod}, true)
 
     @impl true
-    def read(path), do: FileSystem.read(path)
+    def read(path) do
+      report({:read, path})
+      FileSystem.read(path)
+    end
+
+    @impl true
+    def stat(path), do: FileSystem.stat(path)
 
     @impl true
     def list_dir(path), do: FileSystem.list_dir(path)
@@ -21,13 +29,29 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     def mkdir_p(path), do: FileSystem.mkdir_p(path)
 
     @impl true
-    def chmod(path, mode), do: FileSystem.chmod(path, mode)
+    def chmod(path, mode) do
+      if Process.get({__MODULE__, :fail_segment_chmod}, false) and segment_path?(path) do
+        Process.delete({__MODULE__, :fail_segment_chmod})
+        {:error, :simulated_chmod_failure}
+      else
+        FileSystem.chmod(path, mode)
+      end
+    end
 
     @impl true
     def open(path, modes) do
       report({:open, path, modes})
 
-      case FileSystem.open(path, modes) do
+      result =
+        if Process.get({__MODULE__, :fail_segment_append_open}, false) and
+             segment_path?(path) and :append in modes do
+          Process.delete({__MODULE__, :fail_segment_append_open})
+          {:error, :simulated_open_failure}
+        else
+          FileSystem.open(path, modes)
+        end
+
+      case result do
         {:ok, device} = result ->
           Process.put({__MODULE__, :path, device}, path)
           result
@@ -152,6 +176,134 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert Store.next_sequence(recovered, :telemetry) == {:ok, 3}
   end
 
+  test "compacts resolved history so repeated delivery has no finite write lifetime", %{root: root} do
+    assert {:ok, store} =
+             open_store(root,
+               segment_max_bytes: 300,
+               max_disk_bytes: 1_200
+             )
+
+    store =
+      Enum.reduce(1..20, store, fn sequence, acc ->
+        assert {:ok, entry, acc} =
+                 Store.enqueue(acc, :telemetry, "payload-#{sequence}", entry_id: entry_id(sequence))
+
+        assert {:ok, [^entry], acc} = Store.acknowledge(acc, receipt_for(entry))
+        assert Store.pending(acc) == []
+        assert %{disk_bytes: disk_bytes} = Store.usage(acc)
+        assert disk_bytes <= 1_200
+        assert disk_bytes == disk_bytes_on_disk(root)
+        acc
+      end)
+
+    assert Store.next_sequence(store, :telemetry) == {:ok, 21}
+
+    assert {:ok, recovered} =
+             open_store(root,
+               segment_max_bytes: 300,
+               max_disk_bytes: 1_200
+             )
+
+    assert Store.pending(recovered) == []
+    assert Store.next_sequence(recovered, :telemetry) == {:ok, 21}
+  end
+
+  test "cleans a newly created segment when append-open or chmod fails", %{root: root} do
+    TracingFileSystem.attach(self())
+
+    assert {:ok, store} =
+             open_store(root,
+               file_system: TracingFileSystem,
+               segment_max_bytes: 260
+             )
+
+    assert {:ok, _first, store} =
+             Store.enqueue(store, :telemetry, String.duplicate("a", 40), entry_id: entry_id(1))
+
+    TracingFileSystem.fail_segment_append_open()
+
+    assert {:error, {:append_open, :simulated_open_failure}} =
+             Store.enqueue(store, :telemetry, String.duplicate("b", 40), entry_id: entry_id(2))
+
+    assert length(segment_paths(root)) == 1
+
+    assert {:ok, _second, _store} =
+             Store.enqueue(store, :telemetry, String.duplicate("b", 40), entry_id: entry_id(2))
+
+    chmod_root = root <> "_chmod"
+    on_exit(fn -> File.rm_rf(chmod_root) end)
+
+    assert {:ok, chmod_store} =
+             open_store(chmod_root,
+               file_system: TracingFileSystem,
+               segment_max_bytes: 260
+             )
+
+    TracingFileSystem.fail_segment_chmod()
+
+    assert {:error, {:chmod_segment, :simulated_chmod_failure}} =
+             Store.enqueue(chmod_store, :telemetry, "payload", entry_id: entry_id(3))
+
+    assert segment_paths(chmod_root) == []
+    assert {:ok, _entry, _store} = Store.enqueue(chmod_store, :telemetry, "payload", entry_id: entry_id(3))
+  end
+
+  test "rejects a stale second handle before it can append a duplicate sequence", %{root: root} do
+    assert {:ok, first_handle} = open_store(root)
+    assert {:ok, stale_handle} = open_store(root)
+
+    assert {:ok, _first, _first_handle} =
+             Store.enqueue(first_handle, :telemetry, "first", entry_id: entry_id(1))
+
+    assert {:error, :stale_store} =
+             Store.enqueue(stale_handle, :telemetry, "duplicate-sequence", entry_id: entry_id(2))
+
+    assert {:ok, second_handle} = open_store(root)
+    assert {:ok, stale_existing_handle} = open_store(root)
+
+    assert {:ok, _second, _second_handle} =
+             Store.enqueue(second_handle, :telemetry, "second", entry_id: entry_id(2))
+
+    assert {:error, :stale_store} =
+             Store.enqueue(stale_existing_handle, :telemetry, "duplicate-second", entry_id: entry_id(3))
+
+    assert {:ok, recovered} = open_store(root)
+    assert Enum.map(Store.pending(recovered), & &1.sequence) == [1, 2]
+  end
+
+  test "serializes simultaneous handles so only one sequence append succeeds", %{root: root} do
+    assert {:ok, first_handle} = open_store(root)
+    assert {:ok, second_handle} = open_store(root)
+    owner = self()
+
+    tasks =
+      for {handle, id} <- [{first_handle, 1}, {second_handle, 2}] do
+        Task.async(fn ->
+          send(owner, {:ready, self()})
+
+          receive do
+            :go -> Store.enqueue(handle, :telemetry, "payload-#{id}", entry_id: entry_id(id))
+          end
+        end)
+      end
+
+    pids =
+      for _task <- tasks do
+        assert_receive {:ready, pid}
+        pid
+      end
+
+    Enum.each(pids, &send(&1, :go))
+    results = Enum.map(tasks, &Task.await(&1, 5_000))
+
+    assert Enum.count(results, &match?({:ok, _entry, _store}, &1)) == 1
+    assert Enum.count(results, &(&1 == {:error, :stale_store})) == 1
+
+    assert {:ok, recovered} = open_store(root)
+    assert Enum.map(Store.pending(recovered), & &1.sequence) == [1]
+    assert Store.next_sequence(recovered, :telemetry) == {:ok, 2}
+  end
+
   test "rotates bounded segments and truncates only a torn final record", %{root: root} do
     assert {:ok, store} = open_store(root, segment_max_bytes: 260)
     assert {:ok, _first, store} = Store.enqueue(store, :telemetry, String.duplicate("a", 40), entry_id: entry_id(1))
@@ -172,6 +324,27 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert File.stat!(second_segment).size == 0
   end
 
+  test "rejects an oversized segment before reading it into memory", %{root: root} do
+    File.mkdir_p!(root)
+    segment = Path.join(root, "segment-00000000000000000001.log")
+    File.write!(segment, :binary.copy(<<0>>, 301))
+    TracingFileSystem.attach(self())
+
+    assert {:error, {:quarantined, :segment_too_large, quarantine_path}} =
+             open_store(root,
+               file_system: TracingFileSystem,
+               segment_max_bytes: 300,
+               max_disk_bytes: 1_000
+             )
+
+    assert File.exists?(quarantine_path)
+
+    refute Enum.any?(drain_file_events([]), fn
+             {:read, ^segment} -> true
+             _event -> false
+           end)
+  end
+
   test "refuses to truncate an incomplete record in a non-final segment and quarantines it", %{root: root} do
     assert {:ok, store} = open_store(root, segment_max_bytes: 260)
     assert {:ok, _first, store} = Store.enqueue(store, :telemetry, String.duplicate("a", 40), entry_id: entry_id(1))
@@ -185,6 +358,16 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert File.exists?(quarantine_path)
     refute File.exists?(first_segment)
     assert {:error, {:quarantined, _files}} = open_store(root, segment_max_bytes: 260)
+  end
+
+  test "quarantines an implausible short suffix in the final segment", %{root: root} do
+    assert {:ok, store} = open_store(root)
+    assert {:ok, _entry, _store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
+    [segment] = segment_paths(root)
+    File.write!(segment, "XX", [:append])
+
+    assert {:error, {:quarantined, :invalid_partial_header, quarantine_path}} = open_store(root)
+    assert File.exists?(quarantine_path)
   end
 
   test "quarantines checksum and semantic corruption instead of skipping entries", %{root: root} do
@@ -359,6 +542,24 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert {:ok, recovered} = open_store(root)
     assert Store.pending(recovered) == []
     assert Store.loss_authorizations(recovered) == Store.loss_authorizations(empty)
+  end
+
+  defp receipt_for(entry) do
+    %{
+      stream: entry.stream,
+      storage_epoch: entry.storage_epoch,
+      sequence: entry.sequence,
+      payload_hash: entry.payload_hash,
+      cumulative_sequence: 0
+    }
+  end
+
+  defp disk_bytes_on_disk(root) do
+    root
+    |> File.ls!()
+    |> Enum.filter(&(&1 == "snapshot.bin" or String.match?(&1, ~r/^segment-\d{20}\.log$/)))
+    |> Enum.map(&Path.join(root, &1))
+    |> Enum.reduce(0, fn path, total -> File.stat!(path).size + total end)
   end
 
   defp open_store(root, overrides \\ []) do
