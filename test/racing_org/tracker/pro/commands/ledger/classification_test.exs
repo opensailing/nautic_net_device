@@ -49,7 +49,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
     end
   end
 
-  test "checks command ID before epoch and sequence, replaying exact retained result bytes", %{store: store} do
+  test "checks command IDs within the current epoch and replays exact retained result bytes", %{store: store} do
     original = delivery(command_id: command_id(1), payload: <<0x00, 0xFF, "original">>)
     assert {:ok, _intent, store} = Store.begin_intent(store, execution_plan(original, 32))
     result = <<0x00, 0xFF, "exact-result">>
@@ -65,13 +65,45 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
     conflict =
       delivery(
         command_id: original.command_id,
-        command_epoch: 1,
-        command_sequence: 1,
+        command_sequence: 2,
         payload: "different"
       )
 
     assert {:transient, conflict_ack} = Ledger.classify(conflict, context(store))
     assert conflict_ack.reason == :command_id_conflict
+  end
+
+  test "higher epoch resets may reuse command IDs while same-epoch conflicts fail closed", %{store: store} do
+    original = delivery(command_id: command_id(1), expires_at_ms: 0)
+    assert {:ok, _ack, store} = Store.record_terminal(store, terminal_plan(original, :expired))
+
+    reset =
+      delivery(
+        command_id: original.command_id,
+        command_epoch: 1,
+        command_sequence: 1,
+        payload: "new-epoch-command"
+      )
+
+    assert {:execute, plan} = Ledger.classify(reset, context(store))
+    assert plan.reset_epoch? == true
+    assert plan.delivery == reset
+  end
+
+  test "rejects tampered command hashes and out-of-range higher epochs before execution", %{store: store} do
+    valid = delivery(command_id: command_id(1))
+    invalid_hash = %{valid | command_hash: :binary.copy(<<0xFE>>, 32)}
+
+    invalid_epoch = %{
+      valid
+      | command_epoch: 0x1_0000_0000,
+        command_hash: valid.command_hash
+    }
+
+    guarded_context = context(store, decode_payload: forbidden_callback(), resolve_type: forbidden_callback())
+
+    assert {:defer, :invalid_command_delivery} = Ledger.classify(invalid_hash, guarded_context)
+    assert {:defer, :invalid_command_delivery} = Ledger.classify(invalid_epoch, guarded_context)
   end
 
   test "replays retained rejected outcomes byte-for-byte instead of fabricating duplicate success", %{store: store} do

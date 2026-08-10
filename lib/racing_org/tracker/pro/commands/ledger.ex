@@ -10,6 +10,18 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger do
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Command
 
+  @command_hash_keys [
+    :device_id,
+    :credential_epoch,
+    :storage_epoch,
+    :required_generation,
+    :required_manifest_hash,
+    :command_epoch,
+    :command_sequence,
+    :command_id,
+    :expires_at_ms,
+    :payload_hash
+  ]
   @max_command_result_size Contract.max_command_result_size()
 
   @type classification ::
@@ -31,8 +43,9 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger do
          :ok <- storage_fence(delivery, snapshot),
          :ok <- generation_fence(delivery, context),
          :ok <- manifest_fence(delivery, context),
-         :ok <- command_id_fence(delivery, snapshot),
+         :ok <- command_hash_fence(delivery),
          {:ok, reset_epoch?} <- epoch_fence(delivery, snapshot),
+         :ok <- command_id_fence(delivery, snapshot, reset_epoch?),
          :ok <- sequence_fence(delivery, snapshot, reset_epoch?),
          :ok <- expiry_fence(delivery, context, reset_epoch?),
          {:ok, decoded} <- payload_fence(delivery, context, reset_epoch?),
@@ -96,12 +109,28 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger do
       else: transient(delivery, :manifest_hash_mismatch)
   end
 
-  defp command_id_fence(delivery, snapshot) do
+  defp command_hash_fence(delivery) do
+    with {:ok, claimed_hash} <- Map.fetch(delivery, :command_hash),
+         true <- is_binary(claimed_hash) and byte_size(claimed_hash) == 32,
+         {:ok, expected_hash} <- Command.hash(Map.take(delivery, @command_hash_keys)),
+         true <- :crypto.hash_equals(expected_hash, claimed_hash) do
+      :ok
+    else
+      _other -> stop({:defer, :invalid_command_delivery})
+    end
+  end
+
+  defp command_id_fence(_delivery, _snapshot, true), do: :ok
+
+  defp command_id_fence(delivery, snapshot, false) do
     case Map.fetch(snapshot.outcomes, delivery.command_id) do
       {:ok, %{hash: hash} = outcome} when hash == delivery.command_hash ->
-        case Ack.replay(delivery, outcome) do
-          {:ok, ack} -> stop({:duplicate, ack})
-          {:error, _reason} -> stop({:defer, :invalid_command_delivery})
+        with {:ok, payload_hash} <- Command.payload_hash(delivery.payload),
+             true <- :crypto.hash_equals(payload_hash, delivery.payload_hash),
+             {:ok, ack} <- Ack.replay(delivery, outcome) do
+          stop({:duplicate, ack})
+        else
+          _other -> stop({:defer, :invalid_command_delivery})
         end
 
       {:ok, _outcome} ->
