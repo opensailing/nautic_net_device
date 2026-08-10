@@ -266,7 +266,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
 
   test "validation decision fences every terminal persistence crash point", %{dir: dir} do
     parent = self()
-    early_faults = @fault_stages -- [:renamed, :parent_synced]
+    pre_rename_faults = @fault_stages -- [:renamed, :parent_synced]
 
     for stage <- @fault_stages do
       stage_dir = Path.join(dir, Atom.to_string(stage))
@@ -316,14 +316,25 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
 
       assert_receive {:validation_observed_record, ^stage, {:ok, %{phase: :validation_decided, result: :ready}}}
 
-      if stage in early_faults do
-        assert {:error, {:diagnostics_persist_failed, {:fault_injected, ^stage, :simulated_power_loss}}} = result
+      cond do
+        stage in pre_rename_faults ->
+          assert {:error,
+                  {:diagnostics_persist_failed, {:pre_rename, {:fault_injected, ^stage, :simulated_power_loss}}}} =
+                   result
 
-        assert {:ok, %{phase: :validation_decided}} =
-                 DiagnosticsStore.load(stage_dir, store_opts)
-      else
-        assert :ok = result
-        assert {:ok, %{phase: :validated}} = DiagnosticsStore.load(stage_dir, store_opts)
+          assert {:ok, %{phase: :validation_decided}} =
+                   DiagnosticsStore.load(stage_dir, store_opts)
+
+        stage == :renamed ->
+          assert {:error,
+                  {:diagnostics_persist_failed,
+                   {:durability_uncertain, {:fault_injected, :renamed, :simulated_power_loss}}}} = result
+
+          assert {:ok, %{phase: :validated}} = DiagnosticsStore.load(stage_dir, store_opts)
+
+        stage == :parent_synced ->
+          assert :ok = result
+          assert {:ok, %{phase: :validated}} = DiagnosticsStore.load(stage_dir, store_opts)
       end
 
       if Process.alive?(first), do: GenServer.stop(first)
