@@ -455,9 +455,26 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
 
   defp validate_events(events) do
     with :ok <- bounded_list(events, @max_pending_rows),
-         :ok <- validate_each(events, &validate_event/1) do
+         :ok <- validate_each(events, &validate_event/1),
+         :ok <- nondecreasing_non_extreme_events(events) do
       :ok
     end
+  end
+
+  defp nondecreasing_non_extreme_events(events), do: nondecreasing_non_extreme_events(events, nil)
+  defp nondecreasing_non_extreme_events([], _previous_t_ms), do: :ok
+
+  defp nondecreasing_non_extreme_events([%{"kind" => kind} | rest], previous_t_ms)
+       when kind in ["header_extreme", "lift_extreme"],
+       do: nondecreasing_non_extreme_events(rest, previous_t_ms)
+
+  defp nondecreasing_non_extreme_events([event | rest], nil),
+    do: nondecreasing_non_extreme_events(rest, event["t_ms"])
+
+  defp nondecreasing_non_extreme_events([event | rest], previous_t_ms) do
+    if previous_t_ms <= event["t_ms"],
+      do: nondecreasing_non_extreme_events(rest, event["t_ms"]),
+      else: {:error, :invalid_checkpoint_content}
   end
 
   defp validate_event(event) do

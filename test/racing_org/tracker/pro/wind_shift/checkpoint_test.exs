@@ -67,7 +67,12 @@ defmodule RacingOrg.Tracker.Pro.WindShift.CheckpointTest do
     end
   end
 
-  test "rejects malformed, out-of-order timeline, and session-unbound Observer.Store snapshots" do
+  test "rejects malformed, regressed non-extreme events, out-of-order timeline, and session-unbound snapshots" do
+    [first_event, second_event | remaining_events] = snapshot().pending_events
+
+    regressed_non_extreme_events =
+      put_in(snapshot(), [:pending_events], [second_event, first_event | remaining_events])
+
     [first_row, second_row] = snapshot().pending_timeline
     out_of_order_timeline = put_in(snapshot(), [:pending_timeline], [second_row, first_row])
 
@@ -82,6 +87,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.CheckpointTest do
 
     for malformed <- [
           %{snapshot() | seq: -1},
+          regressed_non_extreme_events,
           out_of_order_timeline,
           onset_before_session,
           no_bound_session

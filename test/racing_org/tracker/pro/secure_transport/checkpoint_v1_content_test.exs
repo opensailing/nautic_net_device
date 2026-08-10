@@ -45,24 +45,56 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
       end
     end
 
-    test "preserves durable wind-shift event list order when a delayed extreme is older" do
+    test "preserves exact event order while extrema do not affect the append watermark" do
       content = wind_shift_checkpoint()
-      newer_current = Enum.find(content["pending_events"], &(&1["kind"] == "regime_change"))
+      events = content["pending_events"]
+      newer_current = Enum.find(events, &(&1["kind"] == "regime_change"))
 
       delayed_extreme =
-        content["pending_events"]
+        events
         |> Enum.find(&(&1["kind"] == "lift_extreme"))
         |> Map.put("t_ms", content["session"]["started_at_ms"] + 20_000)
 
-      content = %{content | "pending_events" => [newer_current, delayed_extreme]}
+      future_extreme = Enum.find(events, &(&1["kind"] == "header_extreme"))
 
-      assert Enum.map(content["pending_events"], & &1["t_ms"]) == [
+      next_current =
+        events
+        |> Enum.find(&(&1["kind"] == "new_high"))
+        |> Map.put("t_ms", content["session"]["started_at_ms"] + 40_000)
+
+      ordered_events = [newer_current, delayed_extreme, future_extreme, next_current]
+      content = %{content | "pending_events" => ordered_events}
+
+      assert Enum.map(ordered_events, & &1["t_ms"]) == [
                content["session"]["started_at_ms"] + 30_000,
-               content["session"]["started_at_ms"] + 20_000
+               content["session"]["started_at_ms"] + 20_000,
+               content["session"]["started_at_ms"] + 50_000,
+               content["session"]["started_at_ms"] + 40_000
              ]
 
       assert {:ok, bytes} = Checkpoint.encode_content(:wind_shift, 1, content)
       assert {:ok, ^content} = Checkpoint.decode_content(:wind_shift, 1, bytes)
+    end
+
+    test "rejects a non-extreme event that regresses behind the append watermark" do
+      content = wind_shift_checkpoint()
+      events = content["pending_events"]
+
+      newer_current =
+        events
+        |> Enum.find(&(&1["kind"] == "new_high"))
+        |> Map.put("t_ms", content["session"]["started_at_ms"] + 40_000)
+
+      delayed_extreme =
+        events
+        |> Enum.find(&(&1["kind"] == "lift_extreme"))
+        |> Map.put("t_ms", content["session"]["started_at_ms"] + 20_000)
+
+      older_current = Enum.find(events, &(&1["kind"] == "regime_change"))
+      invalid = %{content | "pending_events" => [newer_current, delayed_extreme, older_current]}
+
+      assert {:error, :invalid_checkpoint_content} =
+               Checkpoint.encode_content(:wind_shift, 1, invalid)
     end
 
     test "rejects structurally impossible P-square and polar cell state" do
