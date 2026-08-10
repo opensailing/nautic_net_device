@@ -461,7 +461,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   # message. Decode the carrier, authenticate/open it in the SessionHolder, then
   # decode the expected typed payload. Every failure is fail-closed and side-effect
   # free; a rekey boundary reconnects instead of leaving outbound control wedged.
-  def handle_message(topic, "control_v1", carrier, socket) do
+  def handle_message(topic, "control_v1", carrier, %{assigns: %{topic: topic}} = socket) do
     case open_control_message(socket, carrier) do
       {:ok, type, attrs} ->
         handle_control_message(topic, type, attrs, socket)
@@ -473,6 +473,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
         {:ok, socket}
     end
   end
+
+  def handle_message(_other_topic, "control_v1", _carrier, socket), do: {:ok, socket}
 
   # Server pushes a command -> decode + apply + ack (idempotent).
   def handle_message(topic, "command", payload, socket) do

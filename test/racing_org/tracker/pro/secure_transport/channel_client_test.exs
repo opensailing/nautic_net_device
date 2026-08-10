@@ -260,8 +260,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       assert {:ok, server_control} = Control.new(:server, server_session)
 
       origin_topic = topic
-      {server_control, accept_frame} = push_control_accept(client, origin_topic, server_control)
+      wrong_topic = topic <> ":wrong"
+      {server_control, accept_frame} = push_control_accept(client, wrong_topic, server_control)
 
+      refute_push(^wrong_topic, "control_v1", _readiness, 50)
+      refute_receive {:replay_desired_state_acks, _generation}
+
+      push(client, origin_topic, "control_v1", Control.encode_carrier(accept_frame))
       assert_push(^origin_topic, "control_v1", readiness_carrier)
       assert {:ok, readiness_frame} = Control.decode_carrier(readiness_carrier)
       assert {:ok, :readiness, readiness_bytes, server_control} = Control.open(server_control, readiness_frame)
