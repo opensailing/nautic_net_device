@@ -83,16 +83,18 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
   def handle_continue(:resume, %{phase: :validated} = state), do: {:noreply, state}
 
   def handle_continue(:resume, %{phase: :validation_decided} = state) do
-    state
-    |> run_validation_effect()
-    |> noreply_result()
+    case reestablish_recovered_record(state) do
+      {:ok, state} -> state |> run_validation_effect() |> noreply_result()
+      {:stop, reason, state} -> {:stop, reason, state}
+    end
   end
 
   def handle_continue(:resume, %{phase: phase} = state)
       when phase in [:rollback_decided, :reboot_pending] do
-    state
-    |> enforce_rollback()
-    |> noreply_result()
+    case reestablish_recovered_record(state) do
+      {:ok, state} -> state |> enforce_rollback() |> noreply_result()
+      {:stop, reason, state} -> {:stop, reason, state}
+    end
   end
 
   def handle_continue(:resume, state) do
@@ -190,7 +192,8 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
       cancel_timer_fun: Keyword.get(opts, :cancel_timer_fun, &default_cancel_timer/1),
       timer_ref: nil,
       timer_token: nil,
-      effect_status: nil
+      effect_status: nil,
+      recovery_record: nil
     }
 
     case DiagnosticsStore.load(store_dir, store_opts) do
@@ -209,14 +212,29 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
   end
 
   defp recover_record(state, record) do
+    recovery_record =
+      if record.phase in [:validation_decided, :rollback_decided, :reboot_pending],
+        do: record,
+        else: nil
+
     %{
       state
       | phase: record.phase,
         result: record.result,
         remaining_deadline_ms: record.timing.remaining_deadline_ms,
         healthy_since_ms: nil,
-        healthy_for_ms: 0
+        healthy_for_ms: 0,
+        recovery_record: recovery_record
     }
+  end
+
+  defp reestablish_recovered_record(%{recovery_record: nil} = state), do: {:ok, state}
+
+  defp reestablish_recovered_record(%{recovery_record: record} = state) do
+    case DiagnosticsStore.save(state.store_dir, record, state.store_opts) do
+      :ok -> {:ok, %{state | recovery_record: nil}}
+      {:error, reason} -> {:stop, {:diagnostics_persist_failed, reason}, state}
+    end
   end
 
   defp run_check(%{phase: :monitoring} = state) do

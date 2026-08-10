@@ -264,6 +264,91 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     refute_receive :unexpected_reboot
   end
 
+  test "supervisor restart re-establishes a visible rollback decision before effects", %{dir: dir} do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+    on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+
+    clock = agent(100)
+    fault_state = agent(:idle)
+    parent = self()
+
+    {_supervisor, first} =
+      start_supervised_trial(dir,
+        clock: fn -> Agent.get(clock, & &1) end,
+        snapshot_opts: healthy_snapshot_opts(),
+        status_fun: fn -> false end,
+        validate_fun: fn -> {:ok, :not_exact} end,
+        revert_fun: fn ->
+          send(parent, :restart_revert)
+          :ok
+        end,
+        reboot_fun: fn ->
+          send(parent, :restart_reboot)
+          :ok
+        end,
+        store_opts: [fault_injector: reestablishment_fault(fault_state, parent)],
+        target: target(deadline_at_ms: 200, soak_period_ms: 50)
+      )
+
+    Agent.update(fault_state, fn _ -> {:countdown, 0} end)
+    Agent.update(clock, fn _ -> 90 end)
+
+    assert {:error,
+            {:diagnostics_persist_failed, {:durability_uncertain, {:fault_injected, :renamed, :simulated_power_loss}}}} =
+             Trial.check_now(first)
+
+    assert_receive {:decision_reestablishment, restarted}, 1_000
+    refute_receive :restart_revert
+    refute_receive :restart_reboot
+
+    send(restarted, :allow_decision_reestablishment)
+    assert_receive :restart_revert
+    assert_receive :restart_reboot
+  end
+
+  test "supervisor restart re-establishes visible reboot-pending state before reboot", %{dir: dir} do
+    previous_trap_exit = Process.flag(:trap_exit, true)
+    on_exit(fn -> Process.flag(:trap_exit, previous_trap_exit) end)
+
+    clock = agent(100)
+    fault_state = agent(:idle)
+    parent = self()
+
+    {_supervisor, first} =
+      start_supervised_trial(dir,
+        clock: fn -> Agent.get(clock, & &1) end,
+        snapshot_opts: healthy_snapshot_opts(),
+        status_fun: fn -> false end,
+        validate_fun: fn -> {:ok, :not_exact} end,
+        revert_fun: fn ->
+          send(parent, :restart_revert)
+          :ok
+        end,
+        reboot_fun: fn ->
+          send(parent, :restart_reboot)
+          :ok
+        end,
+        store_opts: [fault_injector: reestablishment_fault(fault_state, parent)],
+        target: target(deadline_at_ms: 200, soak_period_ms: 50)
+      )
+
+    Agent.update(fault_state, fn _ -> {:countdown, 1} end)
+    Agent.update(clock, fn _ -> 90 end)
+
+    assert {:error,
+            {:diagnostics_persist_failed, {:durability_uncertain, {:fault_injected, :renamed, :simulated_power_loss}}}} =
+             Trial.check_now(first)
+
+    assert_receive :restart_revert
+    assert_receive {:decision_reestablishment, restarted}, 1_000
+    refute_receive :restart_revert
+    refute_receive :restart_reboot
+
+    send(restarted, :allow_decision_reestablishment)
+    assert_receive :restart_reboot
+    refute_receive :restart_revert
+  end
+
   test "validation decision fences every terminal persistence crash point", %{dir: dir} do
     parent = self()
     pre_rename_faults = @fault_stages -- [:renamed, :parent_synced]
@@ -714,6 +799,83 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     end
 
     assert rendered =~ "monitoring"
+  end
+
+  defp start_supervised_trial(dir, opts) do
+    parent = self()
+
+    scheduler = fn message, delay ->
+      send(parent, {:scheduled, message, delay})
+      make_ref()
+    end
+
+    defaults = [
+      name: nil,
+      store_dir: dir,
+      target: target(),
+      retry_ms: 10,
+      schedule_fun: scheduler,
+      cancel_timer_fun: fn _timer_ref -> :ok end
+    ]
+
+    {:ok, supervisor} =
+      Supervisor.start_link(
+        [{Trial, Keyword.merge(defaults, opts)}],
+        strategy: :one_for_one,
+        max_restarts: 3,
+        max_seconds: 5
+      )
+
+    on_exit(fn ->
+      if Process.alive?(supervisor), do: Supervisor.stop(supervisor)
+    end)
+
+    [{Trial, pid, :worker, [Trial]}] = Supervisor.which_children(supervisor)
+    _initial_status = Trial.status(pid)
+    {supervisor, pid}
+  end
+
+  defp reestablishment_fault(state, parent) do
+    fn
+      :renamed ->
+        action =
+          Agent.get_and_update(state, fn
+            :idle ->
+              {:pass, :idle}
+
+            {:countdown, 0} ->
+              {:fail, :block_next}
+
+            {:countdown, remaining} when remaining > 0 ->
+              {:pass, {:countdown, remaining - 1}}
+
+            :block_next ->
+              {:block, :done}
+
+            :done ->
+              {:pass, :done}
+          end)
+
+        case action do
+          :pass ->
+            :ok
+
+          :fail ->
+            {:error, :simulated_power_loss}
+
+          :block ->
+            send(parent, {:decision_reestablishment, self()})
+
+            receive do
+              :allow_decision_reestablishment -> :ok
+            after
+              5_000 -> {:error, :reestablishment_timeout}
+            end
+        end
+
+      _other ->
+        :ok
+    end
   end
 
   defp start_trial(dir, opts) do
