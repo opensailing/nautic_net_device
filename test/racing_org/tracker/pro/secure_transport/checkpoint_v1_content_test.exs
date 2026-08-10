@@ -191,6 +191,34 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
                Checkpoint.encode_content(:wind_shift, 1, invalid)
     end
 
+    test "rejects wind-shift rows and events outside the session UTC date" do
+      content = wind_shift_checkpoint()
+      next_day_ms = content["session"]["started_at_ms"] + 24 * 60 * 60 * 1_000
+      [timeline] = content["pending_timeline"]
+      timeline_next_day = %{content | "pending_timeline" => [%{timeline | "t_ms" => next_day_ms}]}
+
+      assert {:error, :invalid_checkpoint_content} =
+               Checkpoint.encode_content(:wind_shift, 1, timeline_next_day)
+
+      [event | _rest] = content["pending_events"]
+      event_next_day = %{content | "pending_events" => [%{event | "t_ms" => next_day_ms}]}
+
+      assert {:error, :invalid_checkpoint_content} =
+               Checkpoint.encode_content(:wind_shift, 1, event_next_day)
+
+      step_index = Enum.find_index(content["pending_events"], &(&1["kind"] == "step"))
+
+      onset_next_day =
+        update_in(
+          content,
+          ["pending_events", Access.at(step_index), "detail", "onset_t_ms"],
+          fn _onset_t_ms -> next_day_ms end
+        )
+
+      assert {:error, :invalid_checkpoint_content} =
+               Checkpoint.encode_content(:wind_shift, 1, onset_next_day)
+    end
+
     test "fails closed on malformed containers and noncanonical sensor identities" do
       assert {:error, :invalid_checkpoint_content} =
                Checkpoint.encode_content(:polar, 1, %{<<0xFF>> => []})

@@ -22,6 +22,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
   @max_prev_applied 512
   @max_regime_legs 256
   @max_pending_rows 65_535
+  @ms_per_utc_day 86_400_000
 
   @estimate_tracker_fields ~w(
     clamp_max clamp_min count max_drift max_slew max_spread min_samples
@@ -564,7 +565,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
       Enum.map(content["pending_timeline"], & &1["t_ms"]) ++
         Enum.flat_map(content["pending_events"], &bound_event_timestamps/1)
 
-    ensure(Enum.all?(timestamps, &(&1 >= started_at_ms)))
+    session_utc_day = div(started_at_ms, @ms_per_utc_day)
+
+    ensure(
+      Enum.all?(timestamps, fn timestamp ->
+        timestamp >= started_at_ms and div(timestamp, @ms_per_utc_day) == session_utc_day
+      end)
+    )
   end
 
   defp bound_event_timestamps(%{"kind" => "step"} = event),

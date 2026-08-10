@@ -124,6 +124,30 @@ defmodule RacingOrg.Tracker.Pro.WindShift.CheckpointTest do
     assert {:error, :invalid_checkpoint_content} = Checkpoint.hydrate(pre_session_onset)
   end
 
+  test "rejects hydration rows and events outside the session UTC date" do
+    next_day_ms = @started_at_ms + 24 * 60 * 60 * 1_000
+    [timeline | _rest] = content()["pending_timeline"]
+    timeline_next_day = %{content() | "pending_timeline" => [%{timeline | "t_ms" => next_day_ms}]}
+
+    assert {:error, :invalid_checkpoint_content} = Checkpoint.hydrate(timeline_next_day)
+
+    [event | _rest] = content()["pending_events"]
+    event_next_day = %{content() | "pending_events" => [%{event | "t_ms" => next_day_ms}]}
+
+    assert {:error, :invalid_checkpoint_content} = Checkpoint.hydrate(event_next_day)
+
+    step_index = Enum.find_index(content()["pending_events"], &(&1["kind"] == "step"))
+
+    onset_next_day =
+      update_in(
+        content(),
+        ["pending_events", Access.at(step_index), "detail", "onset_t_ms"],
+        fn _onset_t_ms -> next_day_ms end
+      )
+
+    assert {:error, :invalid_checkpoint_content} = Checkpoint.hydrate(onset_next_day)
+  end
+
   defp snapshot do
     %{
       session: %{
