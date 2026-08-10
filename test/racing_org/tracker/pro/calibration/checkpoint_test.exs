@@ -29,6 +29,24 @@ defmodule RacingOrg.Tracker.Pro.Calibration.CheckpointTest do
       assert {:ok, _bytes} = ContractCheckpoint.encode_content(:calibration, 1, content)
     end
 
+    test "normalizes supported integer-valued estimator options into canonical floats" do
+      snapshot =
+        put_in(
+          observer_snapshot(),
+          [:awa_estimators, "A0B1"],
+          AwaOffset.new(clamp_min: -10, clamp_max: 10, max_slew: 1)
+        )
+
+      assert {:ok, content} = CalibrationCheckpoint.project(snapshot)
+      estimator = Enum.find(content["awa_estimators"], &(&1["hardware_identifier"] == "A0B1"))
+
+      assert estimator["rotation"]["clamp_min"] === -10.0
+      assert estimator["rotation"]["clamp_max"] === 10.0
+      assert estimator["rotation"]["max_slew"] === 1.0
+      assert estimator["bands"]["clamp_min"] === -10.0
+      assert estimator["bands"]["clamp_max"] === 10.0
+    end
+
     test "rejects noncanonical sensor identities and open snapshot metadata" do
       snapshot = observer_snapshot()
       awa = snapshot.awa_estimators["1A2B"]

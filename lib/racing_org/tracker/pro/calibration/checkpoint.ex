@@ -153,7 +153,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
          "min_legs" => estimator.min_legs,
          "ratio" => ratio,
          "regimes" => regimes,
-         "window_s" => estimator.window_s
+         "window_s" => as_float(estimator.window_s)
        }}
     end
   end
@@ -167,9 +167,9 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
        %{
          "band_tracker_options" => band_tracker_options,
          "bands" => projected_bands,
-         "clamp_max" => bands.clamp_max,
-         "clamp_min" => bands.clamp_min,
-         "classic_max_spread" => bands.classic_max_spread,
+         "clamp_max" => as_nullable_float(bands.clamp_max),
+         "clamp_min" => as_nullable_float(bands.clamp_min),
+         "classic_max_spread" => as_float(bands.classic_max_spread),
          "classic_min_samples" => bands.classic_min_samples,
          "excluded_light" => bands.excluded_light,
          "light_band_tracker_options" => light_band_tracker_options,
@@ -202,8 +202,8 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
         value = %{
           "center_mps" => center,
           "estimate" => estimate,
-          "p" => band.p,
-          "theta" => band.theta
+          "p" => as_float(band.p),
+          "theta" => as_float(band.theta)
         }
 
         {:cont, {:ok, [value | projected]}}
@@ -239,7 +239,8 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
     legs
     |> Enum.reduce_while({:ok, []}, fn
       {t_end_s, tws_mps}, {:ok, projected} ->
-        {:cont, {:ok, [%{"t_end_s" => t_end_s, "tws_mps" => tws_mps} | projected]}}
+        leg = %{"t_end_s" => as_float(t_end_s), "tws_mps" => as_float(tws_mps)}
+        {:cont, {:ok, [leg | projected]}}
 
       _leg, _projected ->
         {:halt, @error}
@@ -261,7 +262,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
           entry = %{
             "hardware_identifier" => hardware_identifier,
             "parameter" => parameter,
-            "value" => value
+            "value" => as_float(value)
           }
 
           {:cont, {:ok, [entry | projected]}}
@@ -307,11 +308,11 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
   defp project_tracker_options(%Tracker{} = tracker) do
     {:ok,
      %{
-       "clamp_max" => tracker.clamp_max,
-       "clamp_min" => tracker.clamp_min,
-       "max_drift" => tracker.max_drift,
-       "max_slew" => tracker.max_slew,
-       "max_spread" => tracker.max_spread,
+       "clamp_max" => as_nullable_float(tracker.clamp_max),
+       "clamp_min" => as_nullable_float(tracker.clamp_min),
+       "max_drift" => as_float(tracker.max_drift),
+       "max_slew" => as_nullable_float(tracker.max_slew),
+       "max_spread" => as_float(tracker.max_spread),
        "min_samples" => tracker.min_samples,
        "stability_window" => tracker.stability_window
      }}
@@ -325,17 +326,17 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
          true <- is_list(tracker.recent) do
       {:ok,
        %{
-         "clamp_max" => tracker.clamp_max,
-         "clamp_min" => tracker.clamp_min,
+         "clamp_max" => as_nullable_float(tracker.clamp_max),
+         "clamp_min" => as_nullable_float(tracker.clamp_min),
          "count" => tracker.count,
-         "max_drift" => tracker.max_drift,
-         "max_slew" => tracker.max_slew,
-         "max_spread" => tracker.max_spread,
+         "max_drift" => as_float(tracker.max_drift),
+         "max_slew" => as_nullable_float(tracker.max_slew),
+         "max_spread" => as_float(tracker.max_spread),
          "min_samples" => tracker.min_samples,
          "p25" => p25,
          "p50" => p50,
          "p75" => p75,
-         "recent" => tracker.recent,
+         "recent" => Enum.map(tracker.recent, &as_float/1),
          "stability_window" => tracker.stability_window
        }}
     else
@@ -346,18 +347,18 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
   defp project_p_square(quantile) do
     with :ok <- exact_struct(quantile, PSquare, @p_square_fields),
          true <- is_list(quantile.buffer),
-         {:ok, q} <- project_optional_tuple(quantile.q),
+         {:ok, q} <- project_optional_float_tuple(quantile.q),
          {:ok, n} <- project_optional_tuple(quantile.n),
-         {:ok, np} <- project_optional_tuple(quantile.np),
-         {:ok, dnp} <- project_optional_tuple(quantile.dnp) do
+         {:ok, np} <- project_optional_float_tuple(quantile.np),
+         {:ok, dnp} <- project_optional_float_tuple(quantile.dnp) do
       {:ok,
        %{
-         "buffer" => quantile.buffer,
+         "buffer" => Enum.map(quantile.buffer, &as_float/1),
          "count" => quantile.count,
          "dnp" => dnp,
          "n" => n,
          "np" => np,
-         "p" => quantile.p,
+         "p" => as_float(quantile.p),
          "q" => q
        }}
     else
@@ -368,6 +369,13 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
   defp project_optional_tuple(nil), do: {:ok, nil}
   defp project_optional_tuple(value) when is_tuple(value) and tuple_size(value) == 5, do: {:ok, Tuple.to_list(value)}
   defp project_optional_tuple(_value), do: @error
+
+  defp project_optional_float_tuple(nil), do: {:ok, nil}
+
+  defp project_optional_float_tuple(value) when is_tuple(value) and tuple_size(value) == 5,
+    do: {:ok, value |> Tuple.to_list() |> Enum.map(&as_float/1)}
+
+  defp project_optional_float_tuple(_value), do: @error
 
   defp hydrate_content(content) do
     {:ok,
@@ -506,6 +514,12 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
   defp hydrate_options(options) do
     Enum.map(@estimate_option_order, fn key -> {key, options[Atom.to_string(key)]} end)
   end
+
+  defp as_float(value) when is_number(value), do: value / 1
+  defp as_float(_value), do: raise(ArgumentError, "expected numeric calibration state")
+
+  defp as_nullable_float(nil), do: nil
+  defp as_nullable_float(value), do: as_float(value)
 
   defp canonical_hardware_identifier(value) when is_binary(value) do
     if byte_size(value) in 1..16 and Regex.match?(~r/\A[0-9A-F]+\z/, value), do: :ok, else: @error
