@@ -630,8 +630,8 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
             twd_deg: twd,
             magnitude_deg: env_snap.range_deg,
             detail: %{
-              min_deg: normalize_direction(env_snap.min_deg),
-              max_deg: normalize_direction(env_snap.max_deg)
+              min_deg: Circular.normalize(env_snap.min_deg),
+              max_deg: Circular.normalize(env_snap.max_deg)
             }
           }
           | events
@@ -910,7 +910,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   end
 
   defp round_direction2(nil), do: nil
-  defp round_direction2(value), do: value |> round2() |> normalize_direction()
+  defp round_direction2(value), do: value |> round2() |> Circular.normalize()
 
   defp round2(nil), do: nil
   defp round2(value), do: Float.round(value / 1, 2)
@@ -1073,7 +1073,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     case Map.get(signals, "true_wind_direction") do
       {value, mono_ms} when is_number(value) and is_integer(mono_ms) ->
         if now - mono_ms <= staleness_ms,
-          do: {:ok, normalize_direction(value)},
+          do: {:ok, Circular.normalize(value)},
           else: {:error, :stale_twd}
 
       _ ->
@@ -1115,14 +1115,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   end
 
   defp normalize_optional_direction(nil), do: nil
-  defp normalize_optional_direction(value), do: normalize_direction(value)
-
-  defp normalize_direction(value) do
-    case Circular.normalize(value) do
-      zero when zero == 0.0 -> 0.0
-      normalized -> normalized
-    end
-  end
+  defp normalize_optional_direction(value), do: Circular.normalize(value)
 
   # Signed wrap to (-180, 180] — Compute.Library.wrap180 semantics, so the
   # derived TWA resolves dead astern to starboard exactly like resolve_twa.

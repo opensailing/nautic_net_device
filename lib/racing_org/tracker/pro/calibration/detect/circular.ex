@@ -42,8 +42,10 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.Circular do
   """
   @spec normalize(number()) :: float()
   def normalize(deg) do
-    d = :math.fmod(deg + 0.0, 360.0)
-    if d < 0.0, do: d + 360.0, else: d
+    remainder = :math.fmod(deg + 0.0, 360.0)
+    normalized = if remainder < 0.0, do: remainder + 360.0, else: remainder
+
+    if normalized == 0.0 or normalized >= 360.0, do: 0.0, else: normalized
   end
 
   @doc """
