@@ -66,8 +66,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
   alias RacingOrg.Tracker.Pro.SecureTransport.Session
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Negotiation
 
   @device_socket_path "/device_socket"
+  @control_offer %{control_versions: [1], desired_state_versions: [1]}
 
   # --- Public API / child spec ---
 
@@ -247,6 +249,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   @impl Slipstream
   def init(opts) do
+    {control_offer, control_selection} = control_negotiation!(opts)
+
     state = %{
       opts: opts,
       commands: Keyword.get(opts, :commands, RacingOrg.Tracker.Pro.Commands),
@@ -297,6 +301,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       firmware_validator:
         Keyword.get(opts, :firmware_validator, &RacingOrg.Tracker.Pro.FirmwareValidator.validate_on_connect/0),
       backoff_opts: Keyword.get(opts, :backoff, Backoff.defaults()),
+      control_offer: control_offer,
+      control_selection: control_selection,
       attempt: 0,
       session: nil,
       session_fence: nil,
@@ -327,7 +333,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   @impl Slipstream
   def handle_continue(:connect, socket) do
-    case connect_opts(socket.assigns.opts) do
+    case connect_opts(socket.assigns.opts, socket.assigns.control_offer) do
       {:ok, opts, topic} ->
         Logger.info("[ChannelClient] connecting to #{inspect(opts[:uri])}")
         {:noreply, socket |> assign(:topic, topic) |> connect!(opts)}
@@ -1198,9 +1204,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   # --- connect option construction ---
 
-  defp connect_opts(opts) do
+  defp connect_opts(opts, control_offer) do
     with {:ok, fingerprint} <- fingerprint(opts),
-         {:ok, uri} <- ws_uri(opts, fingerprint) do
+         {:ok, uri} <- ws_uri(opts, fingerprint, control_offer) do
       base = [
         uri: uri,
         mint_opts: mint_opts(uri),
@@ -1215,18 +1221,49 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     end
   end
 
-  # Append the fingerprint connect param to the /device_socket websocket URL.
-  defp ws_uri(opts, fingerprint) do
+  # Append the routing fingerprint and complete control capability offer to the
+  # /device_socket websocket URL. Explicit legacy mode intentionally omits both
+  # capability parameters while retaining the existing fingerprint behavior.
+  defp ws_uri(opts, fingerprint, control_offer) do
     case base_ws_url(opts) do
       {:ok, base} ->
         uri = URI.parse(base)
-        query = URI.encode_query(%{"fingerprint" => fingerprint})
-        {:ok, %{uri | query: query} |> URI.to_string()}
+
+        params =
+          uri.query
+          |> decode_query()
+          |> Map.put("fingerprint", fingerprint)
+          |> Map.merge(control_offer_params(control_offer))
+
+        {:ok, %{uri | query: URI.encode_query(params)} |> URI.to_string()}
 
       {:error, _} = err ->
         err
     end
   end
+
+  defp control_negotiation!(opts) do
+    case Keyword.get(opts, :control_offer, @control_offer) do
+      :legacy ->
+        {:legacy, nil}
+
+      offer when is_map(offer) ->
+        {:ok, selection} = Negotiation.select(offer)
+        {offer, selection}
+    end
+  end
+
+  defp control_offer_params(:legacy), do: %{}
+
+  defp control_offer_params(offer) do
+    %{
+      "control_versions" => Enum.join(offer.control_versions, ","),
+      "desired_state_versions" => Enum.join(offer.desired_state_versions, ",")
+    }
+  end
+
+  defp decode_query(nil), do: %{}
+  defp decode_query(query), do: URI.decode_query(query)
 
   # URL precedence: explicit :url opt, then SECURE_TRANSPORT_WS_URL env, then
   # derived from the configured HTTP :api_endpoint (http->ws, https->wss) with the

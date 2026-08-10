@@ -7,6 +7,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Runtime do
   from this boundary.
   """
 
+  alias RacingOrg.Tracker.Pro
   alias RacingOrg.Tracker.Pro.DesiredState.{Applier, Manager, OperationalGate, RuntimeIdentity, Store}
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapState
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
@@ -125,12 +126,18 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Runtime do
         |> to_string()
       end)
 
+    firmware_git_sha = Keyword.get_lazy(opts, :firmware_git_sha, &Pro.git_commit/0)
+
     capabilities =
       Enum.map(Contract.capabilities(), fn {name, _id, version} ->
         {name, version}
       end)
 
-    %{firmware_version: firmware_version, capabilities: capabilities}
+    %{
+      firmware_version: firmware_version,
+      firmware_git_sha: firmware_git_sha,
+      capabilities: capabilities
+    }
   end
 
   defp store(opts) do

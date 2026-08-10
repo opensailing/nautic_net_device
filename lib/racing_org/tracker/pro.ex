@@ -12,8 +12,16 @@ defmodule RacingOrg.Tracker.Pro do
     to_string(charlist)
   end
 
+  @doc "Return the canonical lowercase Git SHA baked into this firmware, or `nil` if invalid."
+  @spec git_commit() :: String.t() | nil
   def git_commit do
-    Application.get_env(:racing_org_tracker_pro, :git_commit)
+    case Application.get_env(:racing_org_tracker_pro, :git_commit) do
+      sha when is_binary(sha) and byte_size(sha) >= 7 and byte_size(sha) <= 40 ->
+        if Regex.match?(~r/\A[0-9a-f]+\z/, sha), do: sha
+
+      _invalid ->
+        nil
+    end
   end
 
   @doc "The running NMEA 2000 VirtualDevice pid (set at boot), or `nil`."

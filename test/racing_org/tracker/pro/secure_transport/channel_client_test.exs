@@ -20,6 +20,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
   alias RacingOrg.Tracker.Pro.SecureTransport.Session
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Negotiation
 
   @serial "000000001234abcd"
 
@@ -189,6 +190,56 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       )
 
       refute ChannelClient.connectable?(channel_opts)
+    end
+  end
+
+  # --- control_v1 capability offer ---
+
+  describe "control_v1 connection offer" do
+    test "advertises the complete offer and retains its exact canonical selection", ctx do
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      assert eventually(fn -> not is_nil(:sys.get_state(client).channel_config) end)
+      socket = :sys.get_state(client)
+      params = socket.channel_config.uri.query |> URI.decode_query()
+
+      assert params["control_versions"] == "1"
+      assert params["desired_state_versions"] == "1"
+      assert params["fingerprint"] == ctx.identity.fingerprint
+
+      offer = %{control_versions: [1], desired_state_versions: [1]}
+      assert {:ok, expected_selection} = Negotiation.select(offer)
+      assert socket.assigns.control_offer == offer
+      assert socket.assigns.control_selection == expected_selection
+    end
+
+    test "supports explicit legacy negotiation without either capability parameter", ctx do
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           control_offer: :legacy,
+           url: "wss://test.local/device_socket/websocket",
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      assert eventually(fn -> not is_nil(:sys.get_state(client).channel_config) end)
+      socket = :sys.get_state(client)
+      params = socket.channel_config.uri.query |> URI.decode_query()
+
+      assert params == %{"fingerprint" => ctx.identity.fingerprint}
+      assert socket.assigns.control_offer == :legacy
+      assert socket.assigns.control_selection == nil
     end
   end
 

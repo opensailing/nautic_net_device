@@ -1,10 +1,12 @@
 defmodule RacingOrg.Tracker.Pro.DesiredState.RuntimeTest do
   use ExUnit.Case, async: true
 
+  alias RacingOrg.Tracker.Pro
   alias RacingOrg.Tracker.Pro.DesiredState.{Applier, Manager, OperationalGate, Runtime, RuntimeIdentity}
   alias RacingOrg.Tracker.Pro.DesiredState.OperationalGate.AuthorityRequest
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapState
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages
 
   defmodule ResetApplier do
     use GenServer
@@ -60,13 +62,34 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.RuntimeTest do
              })
   end
 
-  test "advertises the application version and every implemented desired-state capability" do
+  test "advertises canonical firmware metadata and every desired-state capability" do
+    git_sha = Pro.git_commit()
+    assert is_binary(git_sha)
+    assert byte_size(git_sha) in 7..40
+    assert Regex.match?(~r/\A[0-9a-f]+\z/, git_sha)
+
     assert %{
              firmware_version: "0.7.0",
+             firmware_git_sha: ^git_sha,
              capabilities: capabilities
            } = Runtime.compatibility(firmware_version: "0.7.0")
 
     assert capabilities == Enum.map(Contract.capabilities(), fn {name, _id, version} -> {name, version} end)
+
+    assert {:ok, _bytes} =
+             Messages.encode(:readiness, %{
+               device_id: <<1::128>>,
+               credential_epoch: 1,
+               boot_id: <<2::128>>,
+               storage_epoch: <<3::128>>,
+               selected_control_version: 1,
+               selected_desired_version: 1,
+               offer_hash: :binary.copy(<<4>>, 32),
+               firmware_version: "0.7.0",
+               firmware_git_sha: git_sha,
+               capabilities: capabilities,
+               effective: nil
+             })
   end
 
   test "runtime child specs retain the authoritative process IDs" do
