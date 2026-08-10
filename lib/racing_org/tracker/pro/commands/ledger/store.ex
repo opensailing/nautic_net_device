@@ -396,14 +396,14 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   end
 
   defp within_capacity(store, snapshot) do
-    reserved_result_bytes =
+    {reserved_outcomes, reserved_result_bytes} =
       case snapshot.pending_intent do
-        nil -> 0
-        intent -> intent.reserved_result_bytes
+        nil -> {0, 0}
+        intent -> {1, intent.reserved_result_bytes}
       end
 
     cond do
-      map_size(snapshot.outcomes) > store.max_outcomes ->
+      map_size(snapshot.outcomes) + reserved_outcomes > store.max_outcomes ->
         {:error, :command_ledger_capacity_exceeded}
 
       Snapshot.result_bytes(snapshot) + reserved_result_bytes > store.max_result_bytes ->
@@ -424,7 +424,8 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   end
 
   defp persist_snapshot(store, snapshot) do
-    with {:ok, bytes} <- Snapshot.encode(snapshot) do
+    with :ok <- within_capacity(store, snapshot),
+         {:ok, bytes} <- Snapshot.encode(snapshot) do
       case AtomicFile.write(store.path, bytes, store.atomic_opts) do
         :ok ->
           {:ok, %{store | snapshot: snapshot}}

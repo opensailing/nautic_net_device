@@ -262,6 +262,22 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
     assert Store.pending_intent(pending) != nil
   end
 
+  test "reduced max_outcomes counts the pending intent's reserved outcome slot", %{root: root} do
+    path = Path.join(root, "reduced-count.snapshot")
+    assert {:ok, store} = open_store(path, max_outcomes: 2)
+    first = delivery(command_id: command_id(1), expires_at_ms: 0)
+    assert {:ok, _ack, store} = Store.record_terminal(store, terminal_plan(first, :expired))
+
+    second = delivery(command_id: command_id(2), command_sequence: 2)
+    assert {:ok, _intent, _store} = Store.begin_intent(store, execution_plan(second, :set_tracking, 1))
+
+    assert {:error, :command_ledger_capacity_exceeded} = open_store(path, max_outcomes: 1)
+    assert {:ok, reopened} = open_store(path, max_outcomes: 2)
+    assert {:ok, _ack, completed} = Store.abort_intent(reopened, :operational_gate_closed)
+    assert {:ok, reopened_completed} = open_store(path, max_outcomes: 2)
+    assert Store.snapshot(reopened_completed) == Store.snapshot(completed)
+  end
+
   test "all transition fault stages resolve from the authoritative snapshot", %{root: root} do
     for stage <- @pre_rename_faults do
       path = Path.join([root, "pre", Atom.to_string(stage), "ledger.snapshot"])
