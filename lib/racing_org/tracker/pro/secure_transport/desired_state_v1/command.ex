@@ -10,6 +10,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Command do
   @hash_size 32
   @u32_max 0xFFFF_FFFF
   @database_int_max 9_223_372_036_854_775_807
+  @canonical_uuid ~r/\A[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/
 
   @command_hash_keys [
     :device_id,
@@ -81,14 +82,17 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Command do
   @doc false
   def normalize_uuid(<<uuid::binary-size(@uuid_size)>>, _error), do: {:ok, uuid}
 
-  def normalize_uuid(
-        <<a::binary-size(8), "-", b::binary-size(4), "-", c::binary-size(4), "-", d::binary-size(4), "-",
-          e::binary-size(12)>>,
-        error
-      ) do
-    case Base.decode16(a <> b <> c <> d <> e, case: :mixed) do
-      {:ok, <<uuid::binary-size(@uuid_size)>>} -> {:ok, uuid}
-      :error -> {:error, error}
+  def normalize_uuid(value, error) when is_binary(value) do
+    if Regex.match?(@canonical_uuid, value) do
+      value
+      |> String.replace("-", "")
+      |> Base.decode16(case: :lower)
+      |> case do
+        {:ok, <<uuid::binary-size(@uuid_size)>>} -> {:ok, uuid}
+        :error -> {:error, error}
+      end
+    else
+      {:error, error}
     end
   end
 

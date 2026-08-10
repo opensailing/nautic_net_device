@@ -5,10 +5,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CommandV1ContractTest do
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{Command, Messages}
 
   @device_id Base.decode16!("00112233445566778899aabbccddeeff", case: :lower)
-  @device_uuid "00112233-4455-6677-8899-AABBCCDDEEFF"
+  @device_uuid "00112233-4455-6677-8899-aabbccddeeff"
   @storage_epoch Base.decode16!("ffeeddccbbaa99887766554433221100", case: :lower)
   @command_id Base.decode16!("0123456789abcdeffedcba9876543210", case: :lower)
-  @command_uuid "01234567-89AB-CDEF-FEDC-BA9876543210"
+  @command_uuid "01234567-89ab-cdef-fedc-ba9876543210"
   @manifest_hash :binary.copy(<<0xB2>>, 32)
   @database_int_max 9_223_372_036_854_775_807
   @payload <<0x00, 0xFF, "synthetic-command">>
@@ -124,6 +124,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CommandV1ContractTest do
       assert {:ok, ^raw} = Messages.decode(:command_delivery, raw_bytes)
 
       assert {:error, :invalid_device_id} =
+               Messages.encode(:command_delivery, %{raw | device_id: String.upcase(@device_uuid)})
+
+      assert {:error, :invalid_command_id} =
+               Messages.encode(:command_delivery, %{raw | command_id: String.upcase(@command_uuid)})
+
+      assert {:error, :invalid_device_id} =
                Messages.encode(:command_delivery, %{raw | device_id: "00112233445566778899aabbccddeeff"})
 
       assert {:error, :invalid_command_id} =
@@ -159,6 +165,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CommandV1ContractTest do
         assert {:error, ^error} =
                  Messages.encode(:command_delivery, Map.put(delivery, field, value))
       end
+    end
+
+    test "accepts zero as an ordinary nonnegative expiry timestamp" do
+      delivery = delivery_attrs()
+      record = delivery |> Map.drop([:command_hash, :payload]) |> Map.put(:expires_at_ms, 0)
+      assert {:ok, command_hash} = Command.hash(record)
+      zero_expiry = %{delivery | expires_at_ms: 0, command_hash: command_hash}
+
+      assert {:ok, bytes} = Messages.encode(:command_delivery, zero_expiry)
+      assert {:ok, ^zero_expiry} = Messages.decode(:command_delivery, bytes)
     end
 
     test "enforces the exact maximum payload against the control plaintext ceiling" do
@@ -231,6 +247,27 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CommandV1ContractTest do
 
       assert {:error, :invalid_command_status_reason} =
                Messages.encode(:command_ack, ack_attrs(:rejected, :none))
+    end
+
+    test "duplicates preserve the exact persisted result while binding the delivery command hash" do
+      duplicate = ack_attrs(:duplicate, :none)
+      expected_result_hash = raw_result_hash(0x02, 0x00, @result)
+
+      assert duplicate.result == @result
+      assert duplicate.result_hash == expected_result_hash
+      assert {:ok, bytes} = Messages.encode(:command_ack, duplicate)
+      assert {:ok, decoded} = Messages.decode(:command_ack, bytes)
+      assert decoded.status == :duplicate
+      assert decoded.reason == :none
+      assert decoded.result == duplicate.result
+      assert decoded.result_hash == duplicate.result_hash
+      assert decoded.command_hash == duplicate.command_hash
+      assert {:ok, ^bytes} = Messages.encode(:command_ack, decoded)
+
+      rebound = %{duplicate | command_hash: :binary.copy(<<0xC7>>, 32)}
+      assert {:ok, rebound_bytes} = Messages.encode(:command_ack, rebound)
+      refute rebound_bytes == bytes
+      assert rebound.result_hash == duplicate.result_hash
     end
 
     test "binds the command hash and exact result-hash preimage in exact wire bytes" do
