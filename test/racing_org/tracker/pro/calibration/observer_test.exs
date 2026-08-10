@@ -165,7 +165,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverTest do
   # Drive `legs` alternating-tack legs of `leg_s` samples each at 1 Hz. Leg k's
   # first sample breaks leg k-1 (90 deg heading jump + AWA side flip), so pair N
   # completes at the first sample of leg 2N (0-based).
-  defp drive_beat(pid, clock, opts \\ []) do
+  defp drive_beat(pid, clock, opts) do
     legs = Keyword.get(opts, :legs, 21)
     leg_s = Keyword.get(opts, :leg_s, 40)
     rotation = Keyword.get(opts, :rotation, 3.0)
@@ -193,7 +193,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverTest do
     %{awa: awa, aws: aws, stw: 2.0 / gain, heading: heading, cog: heading, sog: 2.0}
   end
 
-  defp drive_reciprocals(pid, clock, opts \\ []) do
+  defp drive_reciprocals(pid, clock, opts) do
     legs = Keyword.get(opts, :legs, 15)
     leg_s = Keyword.get(opts, :leg_s, 40)
     gain = Keyword.get(opts, :gain, 1.1)
@@ -746,6 +746,26 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverTest do
 
       drive_beat(pid2, clock2, legs: 3, rotation: 3.0)
       assert_in_delta Config.corrections(config2)[@wind_hex].awa_offset_deg, 2.0, 1.0e-9
+    end
+
+    test "AWS regime times are rebased across a reboot with a lower monotonic clock", %{dir: dir} do
+      utc = ~U[2026-08-10 12:00:00Z]
+      clock = start_clock()
+      pid = start_observer(clock, dir: dir, utc_now_fn: fn -> utc end)
+
+      drive_beat(pid, clock, legs: 2, t0_ms: 10_000_000)
+      :ok = Observer.persist_now(pid)
+      :ok = GenServer.stop(pid)
+
+      lower_clock = start_clock()
+      restarted = start_observer(lower_clock, dir: dir, utc_now_fn: fn -> utc end)
+      drive_beat(restarted, lower_clock, legs: 2, t0_ms: 0)
+
+      assert {:ok, _runtime_snapshot} = Observer.snapshot(restarted)
+      state = :sys.get_state(restarted)
+      assert %{@wind_hex => aws} = state.aws_estimators
+      newest_t_end_s = aws.regimes |> Map.values() |> List.flatten() |> Enum.map(&elem(&1, 0)) |> Enum.max()
+      assert newest_t_end_s <= Agent.get(lower_clock, & &1) / 1000
     end
 
     test "the persist throttle holds; terminate flushes the final state", %{dir: dir} do

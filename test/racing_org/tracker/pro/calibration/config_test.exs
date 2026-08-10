@@ -350,6 +350,51 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ConfigTest do
            }
   end
 
+  test "reconcile_learned validates a whole batch before mutation" do
+    pid = start_config()
+
+    valid = %{
+      hardware_identifier: "1A2B",
+      parameter: "awa_offset",
+      entry: learned_entry(%{value: 2.0})
+    }
+
+    assert :ok = Config.reconcile_learned(pid, [valid])
+    assert Config.corrections(pid) == %{"1A2B" => %{awa_offset_deg: 2.0}}
+
+    invalid = %{valid | hardware_identifier: "3C4D", parameter: "bogus"}
+
+    assert {:error, :bad_learned_batch} =
+             Config.reconcile_learned(pid, [%{valid | entry: learned_entry(%{value: 9.0})}, invalid])
+
+    assert Config.corrections(pid) == %{"1A2B" => %{awa_offset_deg: 2.0}}
+  end
+
+  test "reconcile_learned replaces stale observer-owned rows while preserving current rows" do
+    pid = start_config()
+
+    offset = %{
+      hardware_identifier: "1A2B",
+      parameter: "awa_offset",
+      entry: learned_entry(%{value: 2.0})
+    }
+
+    upwash = %{
+      hardware_identifier: "1A2B",
+      parameter: "awa_upwash",
+      entry: learned_entry(%{value: 1.5})
+    }
+
+    assert :ok = Config.reconcile_learned(pid, [offset, upwash])
+
+    assert Config.corrections(pid) == %{
+             "1A2B" => %{awa_offset_deg: 2.0, awa_upwash: [{0.0, 1.5}]}
+           }
+
+    assert :ok = Config.reconcile_learned(pid, [%{offset | entry: learned_entry(%{value: 2.5})}])
+    assert Config.corrections(pid) == %{"1A2B" => %{awa_offset_deg: 2.5}}
+  end
+
   test "put_learned rejects unknown parameters and malformed entries" do
     pid = start_config()
     assert {:error, :bad_parameter} = Config.put_learned(pid, "1A2B", "bogus", learned_entry())

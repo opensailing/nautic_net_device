@@ -287,4 +287,109 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.LegsTest do
       end
     end
   end
+
+  describe "runtime snapshot/restore" do
+    test "round-trips an open segment and pending reciprocal candidates with rebased monotonic time" do
+      samples =
+        StreamGen.generate([
+          {:steady, 90, @beam},
+          {:gap, 10},
+          {:steady, 15, @beam}
+        ])
+
+      state =
+        Enum.reduce(samples, Legs.new(), fn sample, state ->
+          {state, _events} = Legs.step(state, sample)
+          state
+        end)
+
+      assert %Leg{} = hd(state.pending)
+      assert is_map(state.seg)
+
+      captured_at_ms = List.last(samples).t_ms
+      assert {:ok, snapshot} = Legs.snapshot(state, captured_at_ms)
+      assert Map.keys(snapshot) |> Enum.sort() == [:config, :pending, :segment]
+
+      assert Map.keys(Map.from_struct(state)) |> Enum.sort() ==
+               Map.keys(snapshot.config) |> Kernel.++([:pending, :seg]) |> Enum.sort()
+
+      [pending_leg | _] = state.pending
+      [pending_snapshot | _] = snapshot.pending
+
+      refute Map.has_key?(pending_snapshot, :duration_s)
+      refute Map.has_key?(pending_snapshot, :side)
+
+      assert Map.keys(Map.from_struct(pending_leg)) |> Enum.sort() ==
+               pending_snapshot
+               |> Map.keys()
+               |> Enum.map(fn
+                 :started_age_ms -> :started_ms
+                 :ended_age_ms -> :ended_ms
+                 field -> field
+               end)
+               |> Kernel.++([:duration_s, :side])
+               |> Enum.sort()
+
+      assert {:ok, restored} = Legs.restore(snapshot, captured_at_ms + 1_000_000)
+      assert {:ok, ^snapshot} = Legs.snapshot(restored, captured_at_ms + 1_000_000)
+    end
+
+    test "rejects open metadata and invalid ages without returning partial state" do
+      sample = hd(StreamGen.generate([{:steady, 1, @beam}]))
+      {state, []} = Legs.step(Legs.new(), sample)
+      assert {:ok, snapshot} = Legs.snapshot(state, sample.t_ms)
+
+      assert {:error, :invalid_legs_snapshot} =
+               snapshot
+               |> Map.put(:metadata, %{secret: "must-not-restore"})
+               |> Legs.restore(sample.t_ms + 1_000)
+
+      invalid_age = put_in(snapshot, [:segment, :last_age_ms], -1)
+      assert {:error, :invalid_legs_snapshot} = Legs.restore(invalid_age, sample.t_ms + 1_000)
+      assert {:ok, ^snapshot} = Legs.snapshot(state, sample.t_ms)
+    end
+
+    test "rejects an impossible open-segment gap and a dispersed zero resultant" do
+      samples = StreamGen.generate([{:steady, 2, @beam}])
+
+      state =
+        Enum.reduce(samples, Legs.new(), fn sample, state ->
+          {state, []} = Legs.step(state, sample)
+          state
+        end)
+
+      captured_at_ms = List.last(samples).t_ms
+      assert {:ok, snapshot} = Legs.snapshot(state, captured_at_ms)
+      assert snapshot.segment.n == 2
+
+      impossible_gap = put_in(snapshot, [:segment, :started_age_ms], 60_000)
+
+      assert {:error, :invalid_legs_snapshot} =
+               Legs.restore(impossible_gap, captured_at_ms + 1_000)
+
+      zero_resultant =
+        snapshot
+        |> put_in([:segment, :hdg_sin], 0.0)
+        |> put_in([:segment, :hdg_cos], 0.0)
+
+      assert {:error, :invalid_legs_snapshot} =
+               Legs.restore(zero_resultant, captured_at_ms + 1_000)
+
+      zero_cog_resultant =
+        snapshot
+        |> put_in([:segment, :cog_sin], 0.0)
+        |> put_in([:segment, :cog_cos], 0.0)
+
+      assert {:error, :invalid_legs_snapshot} =
+               Legs.restore(zero_cog_resultant, captured_at_ms + 1_000)
+
+      impossible_moments =
+        snapshot
+        |> put_in([:segment, :stw_sum], 0.1)
+        |> put_in([:segment, :stw_sq], 100.0)
+
+      assert {:error, :invalid_legs_snapshot} =
+               Legs.restore(impossible_moments, captured_at_ms + 1_000)
+    end
+  end
 end

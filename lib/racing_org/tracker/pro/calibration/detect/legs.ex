@@ -92,6 +92,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.Legs do
 
   alias RacingOrg.Tracker.Pro.Calibration.Detect.Circular
   alias RacingOrg.Tracker.Pro.Calibration.Detect.Leg
+  alias RacingOrg.Tracker.Pro.RuntimeSnapshot
 
   @default_min_duration_s 60.0
   # 4°/s admits ordinary wave-induced heading oscillation (±4° at an 8 s period
@@ -195,6 +196,264 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.Legs do
   """
   @spec flush(t()) :: {t(), [event()]}
   def flush(%__MODULE__{} = t), do: close(t)
+
+  @config_fields ~w(
+    awa_side_min_deg max_gap_ms max_heading_rate_dps max_heading_sd_deg
+    max_stw_accel_mps2 min_duration_s pair_window_ms reciprocal_tol_deg
+    speed_match_frac
+  )a
+  @segment_fields ~w(
+    awa_abs_sum awa_sum aws_sum cog_cos cog_n cog_sin hdg_cos hdg_sin
+    heel_n heel_sum last_age_ms last_heading last_stw n side sog_n sog_sum
+    started_age_ms stw_sq stw_sum tws_n tws_sq tws_sum
+  )a
+  @snapshot_fields [:config, :pending, :segment]
+  @max_pending_legs 256
+  @max_samples 2_592_000_001
+  @max_speed_mps 655.32
+  @max_tws_mps 1_310.64
+  @max_heel_deg 188.0
+  @epsilon 1.0e-6
+  @snapshot_error {:error, :invalid_legs_snapshot}
+
+  @typedoc "Closed, atom-keyed detector state with all monotonic times stored as bounded ages."
+  @type snapshot :: %{
+          required(:config) => map(),
+          required(:segment) => map() | nil,
+          required(:pending) => [Leg.snapshot()]
+        }
+
+  @doc "Return the detector's effective closed configuration (never transient state)."
+  @spec configuration(t()) :: map()
+  def configuration(%__MODULE__{} = t) do
+    Map.take(t, @config_fields)
+  end
+
+  @doc """
+  Project the complete detector state into a closed runtime snapshot.
+
+  The open segment and every pending leg are preserved. Absolute BEAM monotonic
+  timestamps are never exposed: they become ages relative to `captured_at_ms`.
+  """
+  @spec snapshot(t(), integer()) :: {:ok, snapshot()} | {:error, :invalid_legs_snapshot}
+  def snapshot(%__MODULE__{} = t, captured_at_ms) when is_integer(captured_at_ms) do
+    with {:ok, segment} <- snapshot_segment(t.seg, captured_at_ms),
+         {:ok, pending} <- snapshot_pending(t.pending, captured_at_ms) do
+      snapshot = %{config: configuration(t), segment: segment, pending: pending}
+
+      case restore(snapshot, captured_at_ms) do
+        {:ok, _detector} -> {:ok, snapshot}
+        _ -> @snapshot_error
+      end
+    else
+      _ -> @snapshot_error
+    end
+  rescue
+    _ -> @snapshot_error
+  end
+
+  def snapshot(_detector, _captured_at_ms), do: @snapshot_error
+
+  @doc """
+  Rehydrate a complete detector snapshot against `restored_at_ms`.
+
+  `elapsed_ms` is wall time since capture and is added to every monotonic age
+  before rebasing. The whole closed shape is validated before the new detector
+  struct is built; invalid input returns an error and no partial detector state.
+  """
+  @spec restore(snapshot(), integer(), non_neg_integer()) ::
+          {:ok, t()} | {:error, :invalid_legs_snapshot}
+  def restore(snapshot, restored_at_ms, elapsed_ms \\ 0)
+
+  def restore(snapshot, restored_at_ms, elapsed_ms)
+      when is_map(snapshot) and is_integer(restored_at_ms) and is_integer(elapsed_ms) do
+    with :ok <- RuntimeSnapshot.exact_keys(snapshot, @snapshot_fields),
+         :ok <- validate_config(snapshot.config),
+         {:ok, segment} <- restore_segment(snapshot.segment, snapshot.config, restored_at_ms, elapsed_ms),
+         {:ok, pending} <- restore_pending(snapshot.pending, restored_at_ms, elapsed_ms) do
+      {:ok, struct!(__MODULE__, Map.merge(snapshot.config, %{seg: segment, pending: pending}))}
+    else
+      _ -> @snapshot_error
+    end
+  rescue
+    _ -> @snapshot_error
+  end
+
+  def restore(_snapshot, _restored_at_ms, _elapsed_ms), do: @snapshot_error
+
+  defp snapshot_segment(nil, _captured_at_ms), do: {:ok, nil}
+
+  defp snapshot_segment(segment, captured_at_ms) when is_map(segment) and not is_struct(segment) do
+    with {:ok, started_age_ms} <- RuntimeSnapshot.timestamp_age(segment.started_ms, captured_at_ms),
+         {:ok, last_age_ms} <- RuntimeSnapshot.timestamp_age(segment.last_ms, captured_at_ms) do
+      {:ok,
+       segment
+       |> Map.drop([:started_ms, :last_ms])
+       |> Map.put(:started_age_ms, started_age_ms)
+       |> Map.put(:last_age_ms, last_age_ms)}
+    end
+  end
+
+  defp snapshot_segment(_segment, _captured_at_ms), do: @snapshot_error
+
+  defp restore_segment(nil, _config, _restored_at_ms, _elapsed_ms), do: {:ok, nil}
+
+  defp restore_segment(segment, config, restored_at_ms, elapsed_ms)
+       when is_map(segment) and not is_struct(segment) do
+    with :ok <- validate_segment(segment, config),
+         {:ok, started_ms} <-
+           RuntimeSnapshot.restore_timestamp(segment.started_age_ms, restored_at_ms, elapsed_ms),
+         {:ok, last_ms} <-
+           RuntimeSnapshot.restore_timestamp(segment.last_age_ms, restored_at_ms, elapsed_ms) do
+      {:ok,
+       segment
+       |> Map.drop([:started_age_ms, :last_age_ms])
+       |> Map.put(:started_ms, started_ms)
+       |> Map.put(:last_ms, last_ms)}
+    end
+  end
+
+  defp restore_segment(_segment, _config, _restored_at_ms, _elapsed_ms), do: @snapshot_error
+
+  defp snapshot_pending(pending, captured_at_ms) when is_list(pending) do
+    with :ok <- RuntimeSnapshot.bounded_list(pending, @max_pending_legs) do
+      pending
+      |> Enum.reduce_while({:ok, []}, fn leg, {:ok, snapshots} ->
+        case Leg.snapshot(leg, captured_at_ms) do
+          {:ok, snapshot} -> {:cont, {:ok, [snapshot | snapshots]}}
+          _ -> {:halt, @snapshot_error}
+        end
+      end)
+      |> case do
+        {:ok, snapshots} -> {:ok, Enum.reverse(snapshots)}
+        error -> error
+      end
+    else
+      _ -> @snapshot_error
+    end
+  end
+
+  defp snapshot_pending(_pending, _captured_at_ms), do: @snapshot_error
+
+  defp restore_pending(pending, restored_at_ms, elapsed_ms) when is_list(pending) do
+    with :ok <- RuntimeSnapshot.bounded_list(pending, @max_pending_legs) do
+      pending
+      |> Enum.reduce_while({:ok, []}, fn leg_snapshot, {:ok, legs} ->
+        case Leg.restore(leg_snapshot, restored_at_ms, elapsed_ms) do
+          {:ok, leg} -> {:cont, {:ok, [leg | legs]}}
+          _ -> {:halt, @snapshot_error}
+        end
+      end)
+      |> case do
+        {:ok, legs} -> {:ok, Enum.reverse(legs)}
+        error -> error
+      end
+    else
+      _ -> @snapshot_error
+    end
+  end
+
+  defp restore_pending(_pending, _restored_at_ms, _elapsed_ms), do: @snapshot_error
+
+  defp validate_config(config) do
+    max_s = RuntimeSnapshot.max_age_ms() / 1000
+
+    with :ok <- RuntimeSnapshot.exact_keys(config, @config_fields),
+         true <- RuntimeSnapshot.finite_between?(config.min_duration_s, 0.0, max_s),
+         true <- RuntimeSnapshot.finite_between?(config.max_heading_rate_dps, 0.000_000_1, 360.0),
+         true <- RuntimeSnapshot.finite_between?(config.max_heading_sd_deg, 0.0, 180.0),
+         true <- RuntimeSnapshot.finite_between?(config.max_stw_accel_mps2, 0.0, @max_speed_mps),
+         true <- RuntimeSnapshot.finite_between?(config.awa_side_min_deg, 0.0, 180.0),
+         true <- bounded_positive_integer(config.max_gap_ms),
+         true <- bounded_positive_integer(config.pair_window_ms),
+         true <- RuntimeSnapshot.finite_between?(config.reciprocal_tol_deg, 0.0, 180.0),
+         true <- RuntimeSnapshot.finite_between?(config.speed_match_frac, 0.0, 1.0) do
+      :ok
+    else
+      _ -> :error
+    end
+  end
+
+  defp validate_segment(segment, config) do
+    with :ok <- RuntimeSnapshot.exact_keys(segment, @segment_fields),
+         {:ok, _started_age_ms} <- RuntimeSnapshot.validate_age(segment.started_age_ms),
+         {:ok, _last_age_ms} <- RuntimeSnapshot.validate_age(segment.last_age_ms),
+         true <- segment.started_age_ms >= segment.last_age_ms,
+         span_ms = segment.started_age_ms - segment.last_age_ms,
+         true <- positive_integer(segment.n) and segment.n <= @max_samples,
+         true <- span_ms <= (segment.n - 1) * config.max_gap_ms,
+         true <- segment.n <= span_ms + 1,
+         true <- segment.side in [nil, :starboard, :port],
+         true <- angle?(segment.last_heading),
+         true <- speed?(segment.last_stw),
+         true <- trig_sums?(segment.hdg_sin, segment.hdg_cos, segment.n),
+         true <- Circular.sd_from_sums(segment.hdg_sin, segment.hdg_cos, segment.n) <= config.max_heading_sd_deg,
+         true <- moments?(segment.stw_sum, segment.stw_sq, segment.n, @max_speed_mps),
+         true <- RuntimeSnapshot.finite_between?(segment.awa_sum, -180.0 * segment.n, 180.0 * segment.n),
+         true <- RuntimeSnapshot.finite_between?(segment.awa_abs_sum, 0.0, 180.0 * segment.n),
+         true <- abs(segment.awa_sum) <= segment.awa_abs_sum + @epsilon,
+         true <- RuntimeSnapshot.finite_between?(segment.aws_sum, 0.0, @max_speed_mps * segment.n),
+         :ok <- sample_count(segment.cog_n, segment.n),
+         :ok <- sample_count(segment.sog_n, segment.n),
+         true <- segment.cog_n == segment.sog_n,
+         true <- direction_sums?(segment.cog_sin, segment.cog_cos, segment.cog_n),
+         true <- optional_sum?(segment.sog_sum, segment.sog_n, @max_speed_mps),
+         :ok <- sample_count(segment.tws_n, segment.n),
+         true <- moments?(segment.tws_sum, segment.tws_sq, segment.tws_n, @max_tws_mps),
+         :ok <- sample_count(segment.heel_n, segment.n),
+         true <- signed_sum?(segment.heel_sum, segment.heel_n, @max_heel_deg) do
+      :ok
+    else
+      _ -> :error
+    end
+  rescue
+    _ -> :error
+  end
+
+  defp trig_sums?(sin_sum, cos_sum, count) do
+    RuntimeSnapshot.finite_between?(sin_sum, -count, count) and
+      RuntimeSnapshot.finite_between?(cos_sum, -count, count) and
+      sin_sum * sin_sum + cos_sum * cos_sum <= count * count + @epsilon and
+      (count > 0 or (sin_sum == 0 and cos_sum == 0))
+  end
+
+  defp direction_sums?(sin_sum, cos_sum, 0), do: sin_sum == 0 and cos_sum == 0
+
+  defp direction_sums?(sin_sum, cos_sum, count) do
+    trig_sums?(sin_sum, cos_sum, count) and
+      sin_sum * sin_sum + cos_sum * cos_sum > @epsilon
+  end
+
+  defp moments?(sum, square_sum, 0, _maximum), do: sum == 0 and square_sum == 0
+
+  defp moments?(sum, square_sum, count, maximum) do
+    RuntimeSnapshot.finite_between?(sum, 0.0, maximum * count) and
+      RuntimeSnapshot.finite_between?(square_sum, 0.0, maximum * maximum * count) and
+      square_sum + @epsilon >= sum * sum / count and
+      square_sum <= maximum * sum + @epsilon
+  end
+
+  defp optional_sum?(sum, 0, _maximum), do: sum == 0
+
+  defp optional_sum?(sum, count, maximum),
+    do: RuntimeSnapshot.finite_between?(sum, 0.0, maximum * count)
+
+  defp signed_sum?(sum, 0, _maximum), do: sum == 0
+
+  defp signed_sum?(sum, count, maximum),
+    do: RuntimeSnapshot.finite_between?(sum, -maximum * count, maximum * count)
+
+  defp sample_count(count, total)
+       when is_integer(count) and count >= 0 and count <= total,
+       do: :ok
+
+  defp sample_count(_count, _total), do: :error
+  defp angle?(value), do: RuntimeSnapshot.finite_between?(value, 0.0, 359.999_999_999)
+  defp speed?(value), do: RuntimeSnapshot.finite_between?(value, 0.0, @max_speed_mps)
+  defp positive_integer(value), do: is_integer(value) and value > 0
+
+  defp bounded_positive_integer(value),
+    do: positive_integer(value) and value <= RuntimeSnapshot.max_age_ms()
 
   # =====================================================================
   # Segmentation

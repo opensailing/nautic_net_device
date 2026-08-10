@@ -274,4 +274,41 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.TackTest do
       assert pair.port.started_ms < pair.starboard.started_ms
     end
   end
+
+  describe "runtime snapshot/restore" do
+    test "round-trips the pending leg with monotonic timestamps rebased to the restore clock" do
+      {state, []} = Tack.step(Tack.new(), stbd_leg())
+      assert {:ok, snapshot} = Tack.snapshot(state, 80_000)
+      assert Map.keys(snapshot) |> Enum.sort() == [:config, :pending]
+      refute Map.has_key?(snapshot.pending, :duration_s)
+      refute Map.has_key?(snapshot.pending, :side)
+
+      assert Map.keys(Map.from_struct(state)) |> Enum.sort() ==
+               Map.keys(snapshot.config) |> Kernel.++([:pending]) |> Enum.sort()
+
+      assert {:ok, restored} = Tack.restore(snapshot, 1_080_000)
+      assert {:ok, ^snapshot} = Tack.snapshot(restored, 1_080_000)
+    end
+
+    test "rejects generic metadata and future timestamp ages fail closed" do
+      {state, []} = Tack.step(Tack.new(), stbd_leg())
+      assert {:ok, snapshot} = Tack.snapshot(state, 80_000)
+
+      assert {:error, :invalid_tack_snapshot} =
+               snapshot
+               |> Map.put(:metadata, %{token: "must-not-restore"})
+               |> Tack.restore(90_000)
+
+      invalid_age = put_in(snapshot, [:pending, :ended_age_ms], -1)
+      assert {:error, :invalid_tack_snapshot} = Tack.restore(invalid_age, 90_000)
+
+      forged_duration =
+        snapshot
+        |> put_in([:pending, :started_age_ms], snapshot.pending.ended_age_ms + 1_000)
+        |> put_in([:pending, :duration_s], 120.0)
+
+      assert {:error, :invalid_tack_snapshot} = Tack.restore(forged_duration, 90_000)
+      assert {:ok, ^snapshot} = Tack.snapshot(state, 80_000)
+    end
+  end
 end

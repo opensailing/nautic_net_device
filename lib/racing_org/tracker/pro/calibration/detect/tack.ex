@@ -72,6 +72,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.Tack do
   alias RacingOrg.Tracker.Pro.Calibration.Detect.Circular
   alias RacingOrg.Tracker.Pro.Calibration.Detect.Leg
   alias RacingOrg.Tracker.Pro.Calibration.Detect.Legs
+  alias RacingOrg.Tracker.Pro.RuntimeSnapshot
 
   @default_close_hauled_max_deg 60.0
   @default_gybe_min_awa_deg 120.0
@@ -141,6 +142,99 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Detect.Tack do
   end
 
   def step(%__MODULE__{} = t, {tag, _payload}) when is_atom(tag), do: {t, []}
+
+  @config_fields ~w(
+    close_hauled_max_deg gybe_min_awa_deg max_pair_span_s max_transition_s
+    min_leg_s min_swing_deg tws_match_mps
+  )a
+  @snapshot_fields [:config, :pending]
+  @snapshot_error {:error, :invalid_tack_snapshot}
+
+  @typedoc "Closed, atom-keyed tack-detector state with pending-leg times stored as bounded ages."
+  @type snapshot :: %{
+          required(:config) => map(),
+          required(:pending) => Leg.snapshot() | nil
+        }
+
+  @doc "Return the detector's effective closed configuration (never transient state)."
+  @spec configuration(t()) :: map()
+  def configuration(%__MODULE__{} = t), do: Map.take(t, @config_fields)
+
+  @doc """
+  Project the complete detector state into a closed runtime snapshot.
+
+  A pending leg is retained with its monotonic timestamps represented as ages
+  relative to `captured_at_ms`.
+  """
+  @spec snapshot(t(), integer()) :: {:ok, snapshot()} | {:error, :invalid_tack_snapshot}
+  def snapshot(%__MODULE__{} = t, captured_at_ms) when is_integer(captured_at_ms) do
+    with {:ok, pending} <- snapshot_pending(t.pending, captured_at_ms) do
+      snapshot = %{config: configuration(t), pending: pending}
+
+      case restore(snapshot, captured_at_ms) do
+        {:ok, _detector} -> {:ok, snapshot}
+        _ -> @snapshot_error
+      end
+    else
+      _ -> @snapshot_error
+    end
+  rescue
+    _ -> @snapshot_error
+  end
+
+  def snapshot(_detector, _captured_at_ms), do: @snapshot_error
+
+  @doc """
+  Rehydrate a complete detector snapshot against `restored_at_ms`.
+
+  `elapsed_ms` is wall time since capture and is added to the pending leg's
+  monotonic ages before rebasing. Validation completes before the detector
+  struct is built.
+  """
+  @spec restore(snapshot(), integer(), non_neg_integer()) ::
+          {:ok, t()} | {:error, :invalid_tack_snapshot}
+  def restore(snapshot, restored_at_ms, elapsed_ms \\ 0)
+
+  def restore(snapshot, restored_at_ms, elapsed_ms)
+      when is_map(snapshot) and is_integer(restored_at_ms) and is_integer(elapsed_ms) do
+    with :ok <- RuntimeSnapshot.exact_keys(snapshot, @snapshot_fields),
+         :ok <- validate_config(snapshot.config),
+         {:ok, pending} <- restore_pending(snapshot.pending, restored_at_ms, elapsed_ms) do
+      {:ok, struct!(__MODULE__, Map.put(snapshot.config, :pending, pending))}
+    else
+      _ -> @snapshot_error
+    end
+  rescue
+    _ -> @snapshot_error
+  end
+
+  def restore(_snapshot, _restored_at_ms, _elapsed_ms), do: @snapshot_error
+
+  defp snapshot_pending(nil, _captured_at_ms), do: {:ok, nil}
+  defp snapshot_pending(%Leg{} = leg, captured_at_ms), do: Leg.snapshot(leg, captured_at_ms)
+  defp snapshot_pending(_pending, _captured_at_ms), do: @snapshot_error
+
+  defp restore_pending(nil, _restored_at_ms, _elapsed_ms), do: {:ok, nil}
+  defp restore_pending(snapshot, restored_at_ms, elapsed_ms), do: Leg.restore(snapshot, restored_at_ms, elapsed_ms)
+
+  defp validate_config(config) do
+    max_s = RuntimeSnapshot.max_age_ms() / 1000
+
+    with :ok <- RuntimeSnapshot.exact_keys(config, @config_fields),
+         true <- RuntimeSnapshot.finite_between?(config.close_hauled_max_deg, 0.0, 180.0),
+         true <- RuntimeSnapshot.finite_between?(config.gybe_min_awa_deg, 0.0, 180.0),
+         true <- config.close_hauled_max_deg < config.gybe_min_awa_deg,
+         true <- RuntimeSnapshot.finite_between?(config.max_transition_s, 0.0, max_s),
+         true <- RuntimeSnapshot.finite_between?(config.min_swing_deg, 0.0, 180.0),
+         true <- RuntimeSnapshot.finite_between?(config.min_leg_s, 0.0, max_s),
+         true <- RuntimeSnapshot.finite_between?(config.tws_match_mps, 0.0, 1_310.64),
+         true <- RuntimeSnapshot.finite_between?(config.max_pair_span_s, 0.0, max_s),
+         true <- config.max_pair_span_s >= config.min_leg_s do
+      :ok
+    else
+      _ -> :error
+    end
+  end
 
   # =====================================================================
   # Pair classification

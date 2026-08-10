@@ -1,7 +1,9 @@
 defmodule RacingOrg.Tracker.Pro.Calibration.Observer.StoreTest do
   use ExUnit.Case, async: true
 
+  alias RacingOrg.Tracker.Pro.Calibration.Checkpoint
   alias RacingOrg.Tracker.Pro.Calibration.Estimator.AwaOffset
+  alias RacingOrg.Tracker.Pro.Calibration.Estimator.AwsScale
   alias RacingOrg.Tracker.Pro.Calibration.Estimator.StwScale
   alias RacingOrg.Tracker.Pro.Calibration.Observer.Store
 
@@ -18,7 +20,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.StoreTest do
     }
   end
 
-  defp snapshot do
+  defp learner do
     awa = AwaOffset.observe_pair(AwaOffset.new(), pair())
 
     stw =
@@ -33,20 +35,51 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.StoreTest do
     }
   end
 
-  test "save then load round-trips the estimator states, prev_applied and seq", %{dir: dir} do
-    assert :ok = Store.save(dir, snapshot())
-    assert {:ok, loaded} = Store.load(dir)
+  defp snapshot do
+    {:ok, canonical} = Checkpoint.project(learner())
 
-    assert %AwaOffset{pairs_seen: 1} = loaded.awa_estimators["1A2B"]
-    assert %StwScale{pairs_seen: 1} = loaded.stw_estimators["3C4D"]
-    assert loaded.prev_applied == %{{"1A2B", "awa_offset"} => 1.5}
-    assert loaded.seq == 7
+    %{
+      captured_at_utc_ms: 1_786_363_200_000,
+      learner: canonical,
+      learner_time_basis: [],
+      last_restore_captured_at_utc_ms: nil,
+      last_restore_digest: nil
+    }
   end
 
-  test "the persisted term is term_to_binary/:safe round-trippable", %{dir: dir} do
+  test "save then load round-trips the closed canonical learner envelope", %{dir: dir} do
+    assert :ok = Store.save(dir, snapshot())
+    assert {:ok, loaded} = Store.load(dir)
+    assert loaded == snapshot()
+    assert {:ok, hydrated} = Checkpoint.hydrate(loaded.learner)
+    assert %AwaOffset{pairs_seen: 1} = hydrated.awa_estimators["1A2B"]
+    assert %StwScale{pairs_seen: 1} = hydrated.stw_estimators["3C4D"]
+    assert hydrated.seq == 7
+  end
+
+  test "the persisted term is a version-3 closed envelope and :safe round-trippable", %{dir: dir} do
     assert :ok = Store.save(dir, snapshot())
     binary = File.read!(Path.join(dir, "observer.calibration"))
-    assert {2, %{}} = :erlang.binary_to_term(binary, [:safe])
+
+    assert {3, %{captured_at_utc_ms: _, learner: %{}, learner_time_basis: []}} =
+             :erlang.binary_to_term(binary, [:safe])
+  end
+
+  test "staging never replaces the active envelope until commit", %{dir: dir} do
+    first = snapshot()
+    second = %{first | captured_at_utc_ms: first.captured_at_utc_ms + 1_000}
+
+    assert :ok = Store.save(dir, first)
+    assert :ok = Store.stage(dir, second)
+    assert Store.pending?(dir)
+    assert {:ok, ^first} = Store.load(dir)
+    assert :ok = Store.discard(dir)
+    refute Store.pending?(dir)
+    assert {:ok, ^first} = Store.load(dir)
+
+    assert :ok = Store.stage(dir, second)
+    assert :ok = Store.commit(dir)
+    assert {:ok, ^second} = Store.load(dir)
   end
 
   test "load returns :empty when nothing is persisted", %{dir: dir} do
@@ -65,10 +98,36 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.StoreTest do
     assert :empty = Store.load(dir)
   end
 
+  test "load rejects an oversized sparse file before decoding", %{dir: dir} do
+    File.mkdir_p!(dir)
+    path = Path.join(dir, "observer.calibration")
+    {:ok, file} = File.open(path, [:write, :binary])
+    {:ok, _offset} = :file.position(file, 8_388_608)
+    :ok = IO.binwrite(file, <<0>>)
+    :ok = File.close(file)
+
+    assert :empty = Store.load(dir)
+  end
+
   test "load ignores an unknown format version", %{dir: dir} do
     File.mkdir_p!(dir)
     File.write!(Path.join(dir, "observer.calibration"), :erlang.term_to_binary({999, %{}}))
     assert :empty = Store.load(dir)
+  end
+
+  test "load migrates format-2 non-time learner state but discards absolute AWS regimes", %{dir: dir} do
+    legacy_aws =
+      AwsScale.new()
+      |> AwsScale.observe_leg(%{t_end_s: 9_999.0, tws_mean: 6.0, awa_abs_mean: 30.0})
+
+    legacy = put_in(learner(), [:aws_estimators], %{"1A2B" => legacy_aws})
+    File.mkdir_p!(dir)
+    File.write!(Path.join(dir, "observer.calibration"), :erlang.term_to_binary({2, legacy}))
+
+    assert {:ok, %{legacy_learner: migrated}} = Store.load(dir)
+    assert migrated.seq == 7
+    assert migrated.awa_estimators != %{}
+    assert migrated.aws_estimators == %{}
   end
 
   test "load ignores a format-1 snapshot (pre-banded-upwash estimators) — clean start", %{dir: dir} do
@@ -88,7 +147,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.StoreTest do
     assert :ok = Store.save(dir, snapshot())
 
     assert {:ok, %{applied_version: 1}} = RacingOrg.Tracker.Pro.Calibration.Store.load(dir)
-    assert {:ok, %{seq: 7}} = Store.load(dir)
+    assert {:ok, %{learner: %{"seq" => 7}}} = Store.load(dir)
   end
 
   test "clear removes the persisted file", %{dir: dir} do

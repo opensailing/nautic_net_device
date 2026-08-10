@@ -174,6 +174,19 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
   end
 
   @doc """
+  Atomically reconcile a complete batch of observer-learned entries.
+
+  Every row is validated before a candidate state is persisted. Persistence
+  failure or one invalid row leaves the Config process unchanged. The batch is
+  complete observer authority, so stale learned rows absent from it are removed;
+  operator-owned modes and locks are preserved.
+  """
+  @spec reconcile_learned(GenServer.server(), [map()]) :: :ok | {:error, atom() | term()}
+  def reconcile_learned(server \\ __MODULE__, entries) when is_list(entries) do
+    GenServer.call(server, {:reconcile_learned, entries})
+  end
+
+  @doc """
   The compiled per-sensor corrections map the compute engine caches — see the
   module doc for the inclusion rules. `%{}` when nothing is applied.
   """
@@ -257,6 +270,11 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
 
   def handle_call({:put_learned, sensor_id, parameter, entry}, _from, state) do
     {result, state} = do_put_learned(sensor_id, parameter, entry, state)
+    {:reply, result, state}
+  end
+
+  def handle_call({:reconcile_learned, entries}, _from, state) do
+    {result, state} = do_reconcile_learned(entries, state)
     {:reply, result, state}
   end
 
@@ -361,6 +379,52 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Config do
     else
       {:error, reason} -> {{:error, reason}, state}
     end
+  end
+
+  defp do_reconcile_learned(entries, state) do
+    with {:ok, normalized} <- normalize_learned_batch(entries) do
+      before = compile_corrections(state)
+
+      learned =
+        Enum.reduce(normalized, %{}, fn {hex, parameter, entry}, learned ->
+          Map.update(learned, hex, %{parameter => entry}, &Map.put(&1, parameter, entry))
+        end)
+
+      candidate = %{state | learned: learned}
+
+      case maybe_persist(candidate) do
+        :ok ->
+          if compile_corrections(candidate) != before, do: notify(candidate)
+          {:ok, candidate}
+
+        {:error, reason} ->
+          {{:error, reason}, state}
+      end
+    else
+      {:error, reason} -> {{:error, reason}, state}
+    end
+  end
+
+  defp normalize_learned_batch(entries) do
+    Enum.reduce_while(entries, {:ok, [], MapSet.new()}, fn row, {:ok, normalized, seen} ->
+      with %{hardware_identifier: sensor_id, parameter: raw_parameter, entry: raw_entry} <- row,
+           true <- map_size(row) == 3,
+           {:ok, parameter} <- validate_parameter(raw_parameter),
+           {:ok, entry} <- validate_entry(parameter, raw_entry),
+           hex when is_binary(hex) and hex != "" <- NmeaIdentity.canonical_hardware_id(sensor_id),
+           key = {hex, parameter},
+           false <- MapSet.member?(seen, key) do
+        {:cont, {:ok, [{hex, parameter, entry} | normalized], MapSet.put(seen, key)}}
+      else
+        _ -> {:halt, {:error, :bad_learned_batch}}
+      end
+    end)
+    |> case do
+      {:ok, normalized, _seen} -> {:ok, Enum.reverse(normalized)}
+      error -> error
+    end
+  rescue
+    _ -> {:error, :bad_learned_batch}
   end
 
   defp validate_parameter(parameter) do

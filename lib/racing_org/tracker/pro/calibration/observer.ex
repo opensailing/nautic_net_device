@@ -96,6 +96,34 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
   `current.calibration`), throttled to `:persist_ms` (default 60 s) and only
   when dirty, with a final flush on terminate. A missing/corrupt file starts
   clean; `dir: nil` (host/test) disables persistence entirely.
+
+  ## Stateless runtime snapshot/restore
+
+  `snapshot/1` and `restore/2` are call-time GenServer APIs: supervision starts
+  this observer before authenticated checkpoint hydration is available, so an
+  init-only restore cannot satisfy recovery ordering. The owning GenServer is
+  still the sole writer. `Observer.Snapshot` validates the complete closed
+  runtime shape before `restore/2` swaps any state, and the learner subdocument
+  is always the existing canonical `Calibration.Checkpoint` representation.
+
+  Restore preserves local collaborators and policy authority, rejects a
+  different `boat_identifier`, incompatible detector/estimator policy, and a
+  lower learner sync sequence. An identical retry is an idempotent no-op even
+  after live progress. For the same learner sequence and identity, a genuinely
+  newer capture may advance runtime-only state; different content at the last
+  accepted capture conflicts, and an older capture is stale. A larger sequence
+  may add and prune AWS observations, but retained regime rows cannot move onto
+  a younger monotonic timeline. Only the bounded capture coordinate and digest
+  are retained. No secret, callback, process, raw NMEA metadata, or generic
+  extension map is snapshotted. Absolute monotonic timestamps are represented
+  as bounded ages. A versioned UTC capture anchor adds powered-off/delivery
+  elapsed time before those ages are rebased on restore; excessive elapsed time
+  or backward wall-clock skew fails closed.
+
+  Target-local learner durability is staged before Config reconciliation and
+  committed before runtime installation. A failed commit rolls Config back; if
+  that rollback also fails, the Observer stops rather than continue with split
+  authority, leaving the staged file as boot-healing evidence for supervision.
   """
 
   use GenServer
@@ -110,6 +138,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
   alias RacingOrg.Tracker.Pro.Calibration.Estimator.AwsScale
   alias RacingOrg.Tracker.Pro.Calibration.Estimator.StwScale
   alias RacingOrg.Tracker.Pro.Calibration.Estimator.WindTriangle
+  alias RacingOrg.Tracker.Pro.Calibration.Observer.Snapshot
   alias RacingOrg.Tracker.Pro.Calibration.Observer.Store
   alias RacingOrg.Tracker.Pro.NmeaIdentity
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
@@ -164,6 +193,8 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
     * `:sender` — 2-arity fn `(channel_client_module, update) -> :ok` used to emit
       a sync (default `&ChannelClient.send_calibration_update/2`). Injectable.
     * `:now_fn` — 0-arity monotonic-ms clock (default `System.monotonic_time/1`).
+    * `:utc_now_fn` — 0-arity UTC clock used only to account for elapsed time
+      across restore (default `DateTime.utc_now/0`).
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -185,6 +216,39 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
   @doc "Emit a sync of changed estimates now (throttling is bypassed); returns `:ok`."
   @spec sync_now(GenServer.server()) :: :ok
   def sync_now(server \\ __MODULE__), do: GenServer.call(server, :sync_now)
+
+  @doc """
+  Capture the complete closed runtime state owned by this Observer.
+
+  The learner subdocument is canonical calibration checkpoint content. Runtime
+  detector and monotonic-clock state is closed atom-keyed data with an explicit
+  version and UTC capture anchor, validated by `Observer.Snapshot`.
+  """
+  @spec snapshot(GenServer.server()) :: {:ok, Snapshot.t()} | {:error, :invalid_runtime_snapshot}
+  def snapshot(server \\ __MODULE__), do: GenServer.call(server, :snapshot)
+
+  @doc """
+  Atomically restore one validated runtime snapshot through the owning GenServer.
+
+  Returns `:ok` for an accepted snapshot and for an identical retry. Fails with
+  `:invalid_runtime_snapshot`, `:authority_mismatch`, `:policy_mismatch`,
+  `:stale_snapshot`, `:restore_conflict`, collaborator reconciliation, or local
+  persistence errors. Rejected input never installs partial Observer state. If a
+  Store commit and the compensating Config rollback both fail, the call returns
+  `:config_reconciliation_failed` and the writer terminates for supervised boot
+  healing instead of continuing with split collaborator state.
+  """
+  @spec restore(GenServer.server(), Snapshot.t()) ::
+          :ok
+          | {:error,
+             :invalid_runtime_snapshot
+             | :authority_mismatch
+             | :policy_mismatch
+             | :stale_snapshot
+             | :restore_conflict
+             | :config_reconciliation_failed
+             | :persistence_failed}
+  def restore(server \\ __MODULE__, snapshot), do: GenServer.call(server, {:restore, snapshot})
 
   @doc """
   The latest raw per-channel intake: `%{awa | aws | stw | heading | cog | sog |
@@ -221,12 +285,12 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
 
     dir = Keyword.get(opts, :dir)
     now_fn = Keyword.get(opts, :now_fn, fn -> System.monotonic_time(:millisecond) end)
+    utc_now_fn = Keyword.get(opts, :utc_now_fn, &DateTime.utc_now/0)
     legs_opts = Keyword.get(opts, :legs, [])
     tack_opts = Keyword.get(opts, :tack, [])
     # Anchor both throttle clocks at boot so the FIRST persist/sync must also
     # wait a full interval (mirrors Polar.Observer).
     boot_ms = now_fn.()
-    persisted = restore(dir)
 
     state = %{
       dir: dir,
@@ -239,38 +303,34 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
       min_stw_mps: Keyword.get(opts, :min_stw_mps, @default_min_stw_mps),
       sender: Keyword.get(opts, :sender, &ChannelClient.send_calibration_update/2),
       now_fn: now_fn,
+      utc_now_fn: utc_now_fn,
       legs_opts: legs_opts,
       tack_opts: tack_opts,
       awa_opts: Keyword.get(opts, :awa_estimator, []),
       stw_opts: Keyword.get(opts, :stw_estimator, []),
       aws_opts: Keyword.get(opts, :aws_estimator, []),
-      # Raw intake: channel => {value, sensor_hex, mono_ms}.
       latest: %{},
-      # NAME -> canonical hex cache (bus populations are small and stable).
       hex_cache: %{},
-      # Detection state + the current window's {awa_hex, stw_hex} source stamp.
       legs: build_legs(legs_opts),
       tack: build_tack(tack_opts),
       window_sources: nil,
-      # Per-sensor estimator instances (restored across reboots).
-      awa_estimators: Map.get(persisted, :awa_estimators, %{}),
-      stw_estimators: Map.get(persisted, :stw_estimators, %{}),
-      aws_estimators: Map.get(persisted, :aws_estimators, %{}),
-      # The previously APPLIED value per {hex, parameter} the slew limiter
-      # continues from (restored so corrections keep creeping, never jump).
-      prev_applied: Map.get(persisted, :prev_applied, %{}),
-      # Parameter modes cached from Calibration.Config, refreshed on
-      # {:racing_org_calibration, :updated}.
+      awa_estimators: %{},
+      stw_estimators: %{},
+      aws_estimators: %{},
+      prev_applied: %{},
       modes: @default_modes,
-      # Upstream sync bookkeeping: last-sent entry per {hex, parameter}
-      # (changed-only), the batch pending since the last sync, and a monotonic seq.
       synced: %{},
       pending_sync: %{},
-      seq: Map.get(persisted, :seq, 0),
-      # Throttle clocks (anchored at boot) + the persist dirty flag.
+      seq: 0,
       last_persist_ms: boot_ms,
       last_sync_ms: boot_ms,
       dirty_persist: false,
+      last_restore_captured_at_utc_ms: nil,
+      last_restore_digest: nil,
+      restore_runtime_installed: false,
+      next_tick_ms: nil,
+      tick_timer_ref: nil,
+      tick_token: make_ref(),
       stats: %{
         samples: 0,
         accepted: 0,
@@ -286,17 +346,69 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
 
     subscribe_calibration(state)
     state = %{state | modes: fetch_modes(state)}
+    interrupted_restore = not is_nil(dir) and Store.pending?(dir)
+    if interrupted_restore, do: Store.discard(dir)
+    {state, recovered?} = restore_persisted(state, boot_ms, utc_now_fn.())
 
-    schedule_tick(state)
-    {:ok, state}
+    if recovered? or interrupted_restore do
+      with {:ok, entries} <- Snapshot.learned_entries(state),
+           :ok <- reconcile_restored_config(state, entries) do
+        {:ok, schedule_tick(state)}
+      else
+        _ -> {:stop, :config_reconciliation_failed}
+      end
+    else
+      {:ok, schedule_tick(state)}
+    end
   end
 
   @impl true
-  def handle_call(:tick, _from, state), do: {:reply, :ok, do_tick(state)}
+  def handle_call(:tick, _from, state) do
+    next_state = do_tick(state)
+    {:reply, :ok, mark_learner_progress(state, next_state)}
+  end
 
-  def handle_call(:persist_now, _from, state), do: {:reply, :ok, persist(state)}
+  def handle_call(:persist_now, _from, state) do
+    next_state = persist(state)
+    {:reply, :ok, mark_learner_progress(state, next_state)}
+  end
 
-  def handle_call(:sync_now, _from, state), do: {:reply, :ok, sync(state)}
+  def handle_call(:sync_now, _from, state) do
+    next_state = sync(state)
+    {:reply, :ok, mark_learner_progress(state, next_state)}
+  end
+
+  def handle_call(:snapshot, _from, state) do
+    {:reply, Snapshot.project(state, state.now_fn.(), state.utc_now_fn.()), state}
+  end
+
+  def handle_call({:restore, snapshot}, _from, state) do
+    now_ms = state.now_fn.()
+
+    reply =
+      with :ok <- Snapshot.preflight(snapshot),
+           {:ok, digest} <- Snapshot.digest(snapshot) do
+        exact_retry = digest == state.last_restore_digest
+
+        if exact_retry and state.restore_runtime_installed do
+          # Once this process has installed the complete runtime, exact accepted
+          # redelivery is a no-op before UTC/skew/elapsed validation.
+          {:ok, state}
+        else
+          # Local Store recovery carries only learner durability. After a process
+          # restart the same digest must replay the full externally owned runtime.
+          restore_new_snapshot(state, snapshot, digest, now_ms, exact_retry)
+        end
+      else
+        _ -> {:error, :invalid_runtime_snapshot}
+      end
+
+    case reply do
+      {:ok, next_state} -> {:reply, :ok, next_state}
+      {:error, _reason} = error -> {:reply, error, state}
+      {:fatal, reason} -> {:stop, reason, {:error, reason}, state}
+    end
+  end
 
   def handle_call(:latest, _from, state), do: {:reply, state.latest, state}
 
@@ -334,7 +446,8 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
     {hex, state} = hex_for(state, name)
     awa_deg = WindTriangle.wrap180(awa * @deg_per_rad)
     latest = state.latest |> Map.put(:awa, {awa_deg, hex, mono}) |> Map.put(:aws, {aws / 1, hex, mono})
-    {:noreply, %{state | latest: latest}}
+    next_state = %{state | latest: latest}
+    {:noreply, mark_learner_progress(state, next_state)}
   end
 
   def handle_info(
@@ -353,7 +466,8 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
     {hex, state} = hex_for(state, name)
     cog_deg = WindTriangle.wrap360(course * @deg_per_rad)
     latest = state.latest |> Map.put(:cog, {cog_deg, hex, mono}) |> Map.put(:sog, {sog / 1, hex, mono})
-    {:noreply, %{state | latest: latest}}
+    next_state = %{state | latest: latest}
+    {:noreply, mark_learner_progress(state, next_state)}
   end
 
   def handle_info(
@@ -367,7 +481,8 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
       )
       when is_number(stw) and is_integer(mono) do
     {hex, state} = hex_for(state, name)
-    {:noreply, %{state | latest: Map.put(state.latest, :stw, {stw / 1, hex, mono})}}
+    next_state = %{state | latest: Map.put(state.latest, :stw, {stw / 1, hex, mono})}
+    {:noreply, mark_learner_progress(state, next_state)}
   end
 
   def handle_info(
@@ -382,7 +497,8 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
       when is_number(heading) and is_integer(mono) do
     {hex, state} = hex_for(state, name)
     heading_deg = WindTriangle.wrap360(heading * @deg_per_rad)
-    {:noreply, %{state | latest: Map.put(state.latest, :heading, {heading_deg, hex, mono})}}
+    next_state = %{state | latest: Map.put(state.latest, :heading, {heading_deg, hex, mono})}
+    {:noreply, mark_learner_progress(state, next_state)}
   end
 
   def handle_info(
@@ -396,16 +512,20 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
       )
       when is_number(roll) and is_integer(mono) do
     {hex, state} = hex_for(state, name)
-    {:noreply, %{state | latest: Map.put(state.latest, :heel, {roll * @deg_per_rad, hex, mono})}}
+    next_state = %{state | latest: Map.put(state.latest, :heel, {roll * @deg_per_rad, hex, mono})}
+    {:noreply, mark_learner_progress(state, next_state)}
   end
 
   def handle_info({:data, _data}, state), do: {:noreply, state}
 
-  def handle_info(:tick, state) do
-    state = do_tick(state)
-    schedule_tick(state)
-    {:noreply, state}
+  def handle_info({:tick, token}, %{tick_token: token} = state) do
+    next_state = state |> do_tick() |> schedule_tick()
+    {:noreply, mark_learner_progress(state, next_state)}
   end
+
+  # A canceled timer can already have delivered its message. Restore rotates the
+  # token, so stale pre-restore cadence messages are ignored safely.
+  def handle_info({:tick, _stale_token}, state), do: {:noreply, state}
 
   # The calibration policy changed -> refresh the cached parameter modes ONCE.
   def handle_info({:racing_org_calibration, :updated}, state) do
@@ -415,6 +535,18 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
   def handle_info(_msg, state), do: {:noreply, state}
 
   @impl true
+  def terminate(:config_reconciliation_failed, %{dir: dir} = state) do
+    # A failed Store commit followed by a failed Config rollback leaves the staged
+    # envelope as the boot-healing marker. A normal final flush would stage the
+    # previous dirty learner over it and may discard the marker on the same commit
+    # failure, so preserve the marker until init consumes it after supervision.
+    if is_nil(dir) or not Store.pending?(dir) do
+      _ = persist(state)
+    end
+
+    :ok
+  end
+
   def terminate(_reason, state) do
     # Final flush so accumulated learning is not lost on shutdown.
     _ = persist(state)
@@ -855,28 +987,46 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
     end
   end
 
-  defp persist(%{dir: nil} = state), do: %{state | dirty_persist: false}
+  # With local persistence disabled, dirty state stays receiver-local and due;
+  # source cleanliness is never copied by runtime hydration.
+  defp persist(%{dir: nil} = state), do: state
   defp persist(%{dirty_persist: false} = state), do: state
 
   defp persist(state) do
-    _ =
-      Store.save(state.dir, %{
-        awa_estimators: state.awa_estimators,
-        stw_estimators: state.stw_estimators,
-        aws_estimators: state.aws_estimators,
-        prev_applied: state.prev_applied,
-        seq: state.seq
-      })
+    now_ms = state.now_fn.()
 
-    %{state | dirty_persist: false, last_persist_ms: state.now_fn.()}
+    with {:ok, envelope} <-
+           Snapshot.project_persisted(
+             state,
+             now_ms,
+             state.utc_now_fn.(),
+             state.last_restore_digest
+           ),
+         :ok <- Store.save(state.dir, envelope) do
+      %{state | dirty_persist: false, last_persist_ms: now_ms}
+    else
+      _ -> state
+    end
   end
 
-  defp restore(nil), do: %{}
+  defp restore_persisted(%{dir: nil} = state, _boot_ms, _boot_utc), do: {state, false}
 
-  defp restore(dir) do
-    case Store.load(dir) do
-      {:ok, persisted} -> persisted
-      :empty -> %{}
+  defp restore_persisted(state, boot_ms, boot_utc) do
+    case Store.load(state.dir) do
+      {:ok, %{legacy_learner: legacy}} ->
+        case Snapshot.restore_legacy_learner(legacy, state) do
+          {:ok, restored} -> {Map.merge(state, restored), true}
+          _ -> {state, false}
+        end
+
+      {:ok, envelope} ->
+        case Snapshot.restore_persisted(envelope, state, boot_ms, boot_utc) do
+          {:ok, restored} -> {Map.merge(state, restored), true}
+          _ -> {state, false}
+        end
+
+      :empty ->
+        {state, false}
     end
   end
 
@@ -908,6 +1058,287 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
   catch
     :exit, _ -> @default_modes
   end
+
+  # --- Runtime restore fencing/helpers ---
+
+  defp restore_new_snapshot(state, snapshot, digest, now_ms, exact_retry) do
+    with {:ok, authority} <- Snapshot.authority(state),
+         {:ok, policy} <- Snapshot.policy(state),
+         :ok <- match_authority(snapshot.authority, authority),
+         :ok <- match_policy(snapshot.policy, policy),
+         :ok <- match_detector_policy(snapshot, state),
+         {:ok, restored} <- Snapshot.restore(snapshot, now_ms, state.utc_now_fn.()),
+         :ok <- sequence_fence(state, restored, snapshot.captured_at_utc_ms, exact_retry),
+         {:ok, previous_entries} <- Snapshot.learned_entries(state),
+         candidate <- apply_restore(state, restored, digest, snapshot.captured_at_utc_ms),
+         {:ok, candidate} <- stage_restored_candidate(candidate, now_ms) do
+      finish_restored_candidate(state, candidate, restored, previous_entries, now_ms)
+    else
+      {:error, _reason} = error -> error
+      _ -> {:error, :invalid_runtime_snapshot}
+    end
+  end
+
+  defp match_authority(authority, authority), do: :ok
+  defp match_authority(_incoming, _local), do: {:error, :authority_mismatch}
+  defp match_policy(policy, policy), do: :ok
+  defp match_policy(_incoming, _local), do: {:error, :policy_mismatch}
+
+  defp match_detector_policy(snapshot, state) do
+    case Snapshot.detector_policy(snapshot, state) do
+      :ok -> :ok
+      _ -> {:error, :policy_mismatch}
+    end
+  end
+
+  defp sequence_fence(state, restored, captured_at_utc_ms, exact_retry) do
+    cond do
+      not is_nil(state.last_restore_captured_at_utc_ms) and
+          captured_at_utc_ms < state.last_restore_captured_at_utc_ms ->
+        {:error, :stale_snapshot}
+
+      restored.seq < state.seq ->
+        {:error, :stale_snapshot}
+
+      restored.seq > state.seq ->
+        if aws_progression_safe?(state.aws_estimators, restored.aws_estimators),
+          do: :ok,
+          else: {:error, :restore_conflict}
+
+      exact_retry ->
+        case Snapshot.learner_identity(state) do
+          {:ok, identity} when identity == restored.learner_identity -> :ok
+          _ -> {:error, :restore_conflict}
+        end
+
+      Snapshot.learner_blank?(state) and is_nil(state.last_restore_captured_at_utc_ms) ->
+        :ok
+
+      true ->
+        same_sequence_fence(state, restored, captured_at_utc_ms)
+    end
+  end
+
+  defp same_sequence_fence(state, restored, captured_at_utc_ms) do
+    with {:ok, identity} <- Snapshot.learner_identity(state),
+         true <- identity == restored.learner_identity do
+      case state.last_restore_captured_at_utc_ms do
+        nil ->
+          :ok
+
+        previous when captured_at_utc_ms > previous ->
+          if aws_not_rejuvenated?(state.aws_estimators, restored.aws_estimators),
+            do: :ok,
+            else: {:error, :restore_conflict}
+
+        previous when captured_at_utc_ms < previous ->
+          {:error, :stale_snapshot}
+
+        _same_capture ->
+          {:error, :restore_conflict}
+      end
+    else
+      _ -> {:error, :restore_conflict}
+    end
+  end
+
+  defp aws_not_rejuvenated?(current, incoming) do
+    Enum.sort(Map.keys(current)) == Enum.sort(Map.keys(incoming)) and
+      Enum.all?(current, fn {hardware_identifier, estimator} ->
+        incoming_estimator = Map.fetch!(incoming, hardware_identifier)
+
+        Enum.all?([:upwind, :reach, :downwind], fn regime ->
+          current_legs = estimator.regimes[regime]
+          incoming_legs = incoming_estimator.regimes[regime]
+
+          length(current_legs) == length(incoming_legs) and
+            unchanged_aws_rows?(incoming_legs, current_legs)
+        end)
+      end)
+  rescue
+    _ -> false
+  end
+
+  # A larger learner sequence may legitimately add AWS legs and prune old tails,
+  # but it may not rewrite retained rows onto a younger monotonic timeline. Every
+  # pre-existing sensor must remain present, its observation counters may only
+  # advance, and each regime must be `new rows ++ retained current prefix`.
+  defp aws_progression_safe?(current, incoming) do
+    Enum.all?(current, fn {hardware_identifier, %AwsScale{} = current_estimator} ->
+      case Map.get(incoming, hardware_identifier) do
+        %AwsScale{} = incoming_estimator ->
+          aws_estimator_progression_safe?(current_estimator, incoming_estimator)
+
+        _ ->
+          false
+      end
+    end)
+  rescue
+    _ -> false
+  end
+
+  defp aws_estimator_progression_safe?(current, incoming) do
+    with true <- incoming.legs_seen >= current.legs_seen,
+         true <- incoming.legs_skipped >= current.legs_skipped,
+         added_legs = incoming.legs_seen - current.legs_seen,
+         {:ok, retained_new_rows} <- aws_regime_progression(current.regimes, incoming.regimes, added_legs),
+         true <- retained_new_rows <= added_legs do
+      true
+    else
+      _ -> false
+    end
+  end
+
+  defp aws_regime_progression(current, incoming, added_legs) do
+    Enum.reduce_while([:upwind, :reach, :downwind], {:ok, 0}, fn regime, {:ok, new_rows} ->
+      remaining_new_rows = added_legs - new_rows
+
+      case aws_regime_new_rows(current[regime], incoming[regime], remaining_new_rows, added_legs > 0) do
+        {:ok, count} -> {:cont, {:ok, new_rows + count}}
+        :error -> {:halt, :error}
+      end
+    end)
+  end
+
+  defp aws_regime_new_rows(current, incoming, maximum_new_rows, pruning_allowed?)
+       when is_list(current) and is_list(incoming) and maximum_new_rows >= 0 do
+    maximum = min(length(incoming), maximum_new_rows)
+
+    Enum.reduce_while(0..maximum, :error, fn new_rows, :error ->
+      retained = Enum.drop(incoming, new_rows)
+
+      cond do
+        length(retained) > length(current) ->
+          {:cont, :error}
+
+        not pruning_allowed? and length(retained) != length(current) ->
+          {:cont, :error}
+
+        unchanged_aws_rows?(retained, Enum.take(current, length(retained))) ->
+          {:halt, {:ok, new_rows}}
+
+        true ->
+          {:cont, :error}
+      end
+    end)
+  end
+
+  defp aws_regime_new_rows(_current, _incoming, _maximum_new_rows, _pruning_allowed?), do: :error
+
+  defp unchanged_aws_rows?(incoming, current) do
+    Enum.zip(incoming, current)
+    |> Enum.all?(fn {{incoming_t_end_s, incoming_tws}, {current_t_end_s, current_tws}} ->
+      incoming_tws == current_tws and incoming_t_end_s <= current_t_end_s + 1.0e-6
+    end)
+  end
+
+  defp reconcile_restored_config(%{calibration: nil}, _entries), do: :ok
+
+  defp reconcile_restored_config(%{calibration: {module, server}}, entries) do
+    if function_exported?(module, :reconcile_learned, 2) do
+      case module.reconcile_learned(server, entries) do
+        :ok -> :ok
+        _ -> {:error, :config_reconciliation_failed}
+      end
+    else
+      {:error, :config_reconciliation_failed}
+    end
+  rescue
+    _ -> {:error, :config_reconciliation_failed}
+  catch
+    :exit, _ -> {:error, :config_reconciliation_failed}
+  end
+
+  defp apply_restore(state, restored, digest, captured_at_utc_ms) do
+    restored = Map.drop(restored, [:learned_entries, :learner_identity, :tick_delay_ms])
+
+    state
+    |> Map.merge(restored)
+    |> Map.merge(%{
+      # Raw NMEA NAMEs are intake metadata, not runtime checkpoint content. The
+      # canonical hardware identifiers carried by :latest are sufficient and
+      # the cache repopulates on the next bus frame.
+      hex_cache: %{},
+      last_restore_captured_at_utc_ms: captured_at_utc_ms,
+      last_restore_digest: digest,
+      restore_runtime_installed: true
+    })
+  end
+
+  defp stage_restored_candidate(%{dir: nil} = candidate, _now_ms), do: {:ok, candidate}
+
+  defp stage_restored_candidate(candidate, now_ms) do
+    with {:ok, envelope} <-
+           Snapshot.project_persisted(
+             candidate,
+             now_ms,
+             candidate.utc_now_fn.(),
+             candidate.last_restore_digest
+           ),
+         :ok <- Store.stage(candidate.dir, envelope) do
+      {:ok, candidate}
+    else
+      _ -> {:error, :persistence_failed}
+    end
+  end
+
+  defp finish_restored_candidate(state, candidate, restored, previous_entries, now_ms) do
+    case reconcile_restored_config(state, restored.learned_entries) do
+      :ok ->
+        commit_restored_candidate(state, candidate, restored.tick_delay_ms, previous_entries, now_ms)
+
+      {:error, _reason} = error ->
+        _ = discard_restored_candidate(candidate)
+        error
+    end
+  end
+
+  defp commit_restored_candidate(previous, %{dir: nil} = candidate, delay_ms, _previous_entries, now_ms) do
+    {:ok, install_restored_timer(previous, candidate, delay_ms, now_ms)}
+  end
+
+  defp commit_restored_candidate(previous, candidate, delay_ms, previous_entries, now_ms) do
+    case Store.commit(candidate.dir) do
+      :ok ->
+        candidate = %{candidate | dirty_persist: false, last_persist_ms: now_ms}
+        {:ok, install_restored_timer(previous, candidate, delay_ms, now_ms)}
+
+      {:error, _reason} ->
+        case reconcile_restored_config(previous, previous_entries) do
+          :ok ->
+            _ = Store.discard(candidate.dir)
+            {:error, :persistence_failed}
+
+          {:error, _reason} ->
+            # Keep the staged envelope as an interrupted-restore marker. Continuing
+            # this writer would expose candidate Config state beside old Observer
+            # state; stopping lets supervision restart and init reconcile Config
+            # from the still-active local learner before accepting more work.
+            {:fatal, :config_reconciliation_failed}
+        end
+    end
+  end
+
+  defp discard_restored_candidate(%{dir: nil}), do: :ok
+  defp discard_restored_candidate(candidate), do: Store.discard(candidate.dir)
+
+  defp install_restored_timer(previous, candidate, delay_ms, now_ms) do
+    if is_reference(previous.tick_timer_ref), do: Process.cancel_timer(previous.tick_timer_ref)
+    token = make_ref()
+
+    case delay_ms do
+      nil ->
+        %{candidate | tick_token: token, tick_timer_ref: nil, next_tick_ms: nil}
+
+      delay when is_integer(delay) and delay >= 0 ->
+        ref = Process.send_after(self(), {:tick, token}, delay)
+        %{candidate | tick_token: token, tick_timer_ref: ref, next_tick_ms: now_ms + delay}
+    end
+  end
+
+  # The digest and structural learner identity make a separate mutation flag
+  # unnecessary; leave existing call sites as a cheap identity function.
+  defp mark_learner_progress(_state, next_state), do: next_state
 
   # --- helpers ---
 
@@ -953,8 +1384,14 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
   # clocks are anchored at boot, so even the first fire waits a full interval).
   defp due?(last_ms, interval, state), do: state.now_fn.() - last_ms >= interval
 
-  defp schedule_tick(%{sample_ms: ms}) when ms > 0, do: Process.send_after(self(), :tick, ms)
-  defp schedule_tick(_state), do: :ok
+  defp schedule_tick(%{sample_ms: ms} = state) when ms > 0 do
+    token = make_ref()
+    ref = Process.send_after(self(), {:tick, token}, ms)
+    %{state | tick_token: token, tick_timer_ref: ref, next_tick_ms: state.now_fn.() + ms}
+  end
+
+  defp schedule_tick(state),
+    do: %{state | tick_token: make_ref(), tick_timer_ref: nil, next_tick_ms: nil}
 
   defp build_legs(%Legs{} = legs), do: legs
   defp build_legs(opts) when is_list(opts), do: Legs.new(opts)
