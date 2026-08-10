@@ -185,6 +185,50 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     refute_receive :unexpected_revert
   end
 
+  test "default clock remains VM-boot-relative across fresh and recovered Trial processes", %{dir: dir} do
+    initial_boot_ms = vm_boot_ms()
+    deadline_at_ms = initial_boot_ms + 2_000
+
+    first =
+      start_trial(dir,
+        snapshot_opts: healthy_snapshot_opts(),
+        retry_ms: 100,
+        target: target(deadline_at_ms: deadline_at_ms)
+      )
+
+    assert %{remaining_deadline_ms: first_remaining_ms} = Trial.status(first)
+    assert first_remaining_ms in 0..2_000
+    assert {:ok, %{timing: %{remaining_deadline_ms: recoverable_ms}}} = DiagnosticsStore.load(dir)
+    assert recoverable_ms <= first_remaining_ms
+    GenServer.stop(first)
+
+    Process.sleep(25)
+
+    recovered =
+      start_trial(dir,
+        snapshot_opts: healthy_snapshot_opts(),
+        retry_ms: 100,
+        target: target(deadline_at_ms: deadline_at_ms)
+      )
+
+    assert %{remaining_deadline_ms: recovered_ms} = Trial.status(recovered)
+    assert recovered_ms <= recoverable_ms
+    GenServer.stop(recovered)
+
+    fresh_dir = dir <> "_fresh"
+    on_exit(fn -> File.rm_rf(fresh_dir) end)
+
+    fresh =
+      start_trial(fresh_dir,
+        snapshot_opts: healthy_snapshot_opts(),
+        retry_ms: 100,
+        target: target(deadline_at_ms: deadline_at_ms)
+      )
+
+    assert %{remaining_deadline_ms: fresh_remaining_ms} = Trial.status(fresh)
+    assert fresh_remaining_ms < first_remaining_ms
+  end
+
   test "host runtime unavailability is terminal but non-destructive", %{dir: dir} do
     clock = agent(0)
 
@@ -377,6 +421,12 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
       desired_generation: 12,
       soak_period_ms: 100
     }
+  end
+
+  defp vm_boot_ms do
+    System.monotonic_time()
+    |> Kernel.-(:erlang.system_info(:start_time))
+    |> System.convert_time_unit(:native, :millisecond)
   end
 
   defp agent(initial) do

@@ -486,8 +486,14 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
   defp read_clock(_clock), do: {:error, :invalid_clock}
 
   defp boot_relative_clock do
-    origin_ms = System.monotonic_time(:millisecond)
-    fn -> max(System.monotonic_time(:millisecond) - origin_ms, 0) end
+    boot_origin_native = :erlang.system_info(:start_time)
+
+    fn ->
+      System.monotonic_time()
+      |> Kernel.-(boot_origin_native)
+      |> System.convert_time_unit(:native, :millisecond)
+      |> max(0)
+    end
   end
 
   defp saturating_add(left, right) when left > @max_u64 - right, do: @max_u64
