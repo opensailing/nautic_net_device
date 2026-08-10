@@ -809,6 +809,112 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
                SessionHolder.take_send_counter(holder, published.generation)
     end
 
+    # A Slipstream push BLOCKS until the server (here, the test process) answers the
+    # transport `GenServer.call`. The SessionHolder is the single writer that
+    # serializes nonce allocation for every subsystem, so it must never be the
+    # process parked on that reply. When the fenced streamback push runs INSIDE a
+    # holder callback the holder sits in `:gen.do_call` for the whole push timeout,
+    # and every other holder API — `live?/1`, `take_send_counter/1`, `clear/1` —
+    # queues behind unrelated channel transport. Generation fencing happens before
+    # the push, so authorization, not the socket write, is what the holder owns.
+    @tag :holder_block_regression
+    test "a pending streamback push never blocks the session holder", ctx do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           firmware_validator: fn -> :ok end,
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      complete_handshake(client, topic, ctx)
+
+      # Park the client mid-push: the post-handshake wifi_status push is left
+      # deliberately UNANSWERED, exactly as it is whenever a test asserts on
+      # anything else first.
+      assert eventually(fn ->
+               match?(
+                 {:current_function, {:gen, :do_call, 4}},
+                 Process.info(client, :current_function)
+               )
+             end)
+
+      # The holder must answer PROMPTLY while that push is still outstanding.
+      # Pre-fix the holder is itself blocked inside the push and only recovers when
+      # the 5s transport timeout fires, so a bounded probe fails deterministically
+      # rather than racing two 5s deadlines against each other.
+      probe = Task.async(fn -> SessionHolder.live?(holder) end)
+      probed = Task.yield(probe, 500)
+      _ = Task.shutdown(probe, :brutal_kill)
+
+      assert probed == {:ok, true},
+             "SessionHolder blocked behind an in-flight channel push"
+
+      # The parked push is still pending and must still reach the wire.
+      assert_push(^topic, "wifi_status", _status)
+    end
+
+    # The liveness fix must NOT weaken the 881ae91 guarantee: a replacement may not
+    # overtake a send this client already authorized. The holder keeps the two
+    # mutually exclusive with a send lease, so `publish` blocks for as long as the
+    # authorized push is in flight — it just no longer blocks unrelated readers.
+    @tag :holder_block_regression
+    test "a replacement cannot overtake an authorized in-flight push", ctx do
+      {:ok, holder} = start_supervised({SessionHolder, name: nil})
+      topic = "device:" <> ctx.identity.fingerprint
+
+      client =
+        start_supervised!(
+          {ChannelClient,
+           name: nil,
+           auto_connect?: true,
+           test_mode?: true,
+           url: "wss://test.local/device_socket/websocket",
+           session_holder: holder,
+           firmware_validator: fn -> :ok end,
+           keystore_opts: [base_path: ctx.base]}
+        )
+
+      connect_and_assert_join(client, ^topic, %{}, :ok)
+      complete_handshake(client, topic, ctx)
+
+      # Park the client inside its authorized wifi_status push.
+      assert eventually(fn ->
+               match?(
+                 {:current_function, {:gen, :do_call, 4}},
+                 Process.info(client, :current_function)
+               )
+             end)
+
+      assert {:ok, current} = SessionHolder.get_current_session(holder)
+
+      replacement = %{current | session_id: <<0xF7::128>>, generation: nil}
+
+      replace_task =
+        Task.async(fn -> SessionHolder.publish(holder, replacement, current.generation) end)
+
+      # The replacement MUST NOT land while the authorized push is still in flight.
+      assert Task.yield(replace_task, 200) == nil
+
+      assert {:ok, still_current} = SessionHolder.get_current_session(holder)
+      assert still_current.session_id == current.session_id
+
+      # Draining the push releases the lease and lets the replacement proceed.
+      assert_push(^topic, "wifi_status", _status)
+
+      assert {:ok, published} = Task.await(replace_task)
+      assert published.generation > current.generation
+      assert published.session_id == replacement.session_id
+    end
+
     test "uses the verified recovery epoch for the signed HELLO, INIT, and published session", ctx do
       {:ok, challenge} = RecoverySupport.challenge_result(ctx.identity, @serial)
       {:ok, lifecycle} = RecoverySupport.lifecycle_result(ctx.identity, challenge.receipt, credential_epoch: 4)

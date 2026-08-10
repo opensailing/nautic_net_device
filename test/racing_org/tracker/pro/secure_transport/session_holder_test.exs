@@ -288,6 +288,158 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
     assert {:error, :stale_session} = SessionHolder.take_send_counter(h, generation)
   end
 
+  describe "send leases" do
+    # A lease keeps the 881ae91 guarantee — replacement/clear cannot overtake an
+    # approved send — WITHOUT parking the holder inside caller transport work.
+    # The holder authorizes, records the lease, and replies immediately; publish and
+    # clear then block until the lease is released. This is the same mutual exclusion
+    # as running the callback in the holder, minus the head-of-line blocking.
+    test "an open lease defers replacement and clear until it is released", %{holder: h} do
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<1::128>>))
+
+      assert {:ok, lease} = SessionHolder.acquire_send_lease(h, first.generation)
+      assert lease.session_id == first.session_id
+      assert lease.generation == first.generation
+
+      # The holder stays responsive to every other API while the lease is open.
+      assert SessionHolder.live?(h)
+      assert SessionHolder.generation(h) == first.generation
+      assert {:ok, ^first} = SessionHolder.get_current_session(h)
+
+      replace_task =
+        Task.async(fn ->
+          SessionHolder.publish(h, session(session_id: <<2::128>>), first.generation)
+        end)
+
+      clear_task = Task.async(fn -> SessionHolder.clear(h) end)
+
+      # Neither mutation may land while the authorized send is still in flight.
+      assert Task.yield(replace_task, 50) == nil
+      assert Task.yield(clear_task, 50) == nil
+      assert {:ok, ^first} = SessionHolder.get_current_session(h)
+
+      assert :ok = SessionHolder.release_send_lease(h, lease)
+
+      assert {:ok, replacement} = Task.await(replace_task)
+      assert replacement.generation > first.generation
+      assert :ok = Task.await(clear_task)
+    end
+
+    test "a lease cannot be acquired against a stale generation or an idle holder", %{holder: h} do
+      assert {:error, :no_session} = SessionHolder.acquire_send_lease(h, 0)
+
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<3::128>>))
+      assert {:ok, second} = SessionHolder.publish(h, session(session_id: <<4::128>>), first.generation)
+
+      assert {:error, :stale_session} = SessionHolder.acquire_send_lease(h, first.generation)
+      assert {:ok, _lease} = SessionHolder.acquire_send_lease(h, second.generation)
+    end
+
+    # The holder must never be wedged by a caller that dies mid-send. It monitors
+    # every lease holder and releases the lease on DOWN.
+    test "a crashed lease holder releases its lease automatically", %{holder: h} do
+      parent = self()
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<5::128>>))
+
+      leaser =
+        spawn(fn ->
+          {:ok, lease} = SessionHolder.acquire_send_lease(h, first.generation)
+          send(parent, {:leased, lease})
+
+          receive do
+            :never -> :ok
+          end
+        end)
+
+      assert_receive {:leased, _lease}
+
+      replace_task =
+        Task.async(fn ->
+          SessionHolder.publish(h, session(session_id: <<6::128>>), first.generation)
+        end)
+
+      assert Task.yield(replace_task, 50) == nil
+
+      Process.exit(leaser, :kill)
+
+      assert {:ok, replacement} = Task.await(replace_task)
+      assert replacement.generation > first.generation
+    end
+
+    # The control path DOES allocate a nonce, so the seal must stay inside the
+    # holder. Only the transport write moves out, under the same lease: the counter
+    # is consumed atomically, the frame is handed back, and replacement is deferred
+    # until the caller releases — so a sealed frame can never be transmitted after
+    # its session was replaced, and the holder never waits on caller transport.
+    test "seal_control_send consumes a counter in the holder and leases the transport", %{holder: h} do
+      assert {:ok, published} = SessionHolder.publish(h, session(session_id: <<20::128>>))
+
+      assert {:ok, frame, lease} =
+               SessionHolder.seal_control_send(
+                 h,
+                 published.generation,
+                 :readiness,
+                 control_payload(:readiness)
+               )
+
+      assert control_counter(frame) == 0
+      assert lease.generation == published.generation
+
+      # Holder is responsive while the caller is still transmitting.
+      assert SessionHolder.live?(h)
+
+      # ...but a replacement cannot overtake the sealed, in-flight frame.
+      replace_task =
+        Task.async(fn -> SessionHolder.publish(h, session(session_id: <<21::128>>), published.generation) end)
+
+      assert Task.yield(replace_task, 50) == nil
+      assert :ok = SessionHolder.release_send_lease(h, lease)
+      assert {:ok, _replacement} = Task.await(replace_task)
+    end
+
+    test "a failed contract encode consumes no control counter and takes no lease", %{holder: h} do
+      assert {:ok, published} = SessionHolder.publish(h, session(session_id: <<22::128>>))
+
+      assert {:error, :wrong_message_direction} =
+               SessionHolder.seal_control_send(
+                 h,
+                 published.generation,
+                 :control_accept,
+                 control_payload(:control_accept)
+               )
+
+      # No lease was taken, so a replacement proceeds immediately.
+      assert {:ok, replacement} =
+               SessionHolder.publish(h, session(session_id: <<23::128>>), published.generation)
+
+      # And the counter was never consumed for the new session's control state.
+      assert {:ok, frame, lease} =
+               SessionHolder.seal_control_send(
+                 h,
+                 replacement.generation,
+                 :readiness,
+                 control_payload(:readiness)
+               )
+
+      assert control_counter(frame) == 0
+      assert :ok = SessionHolder.release_send_lease(h, lease)
+    end
+
+    # A stale lease must never gate the holder after its generation is gone.
+    test "releasing a lease twice or after replacement is inert", %{holder: h} do
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<7::128>>))
+      assert {:ok, lease} = SessionHolder.acquire_send_lease(h, first.generation)
+
+      assert :ok = SessionHolder.release_send_lease(h, lease)
+      assert :ok = SessionHolder.release_send_lease(h, lease)
+
+      assert {:ok, replacement} = SessionHolder.publish(h, session(session_id: <<8::128>>), first.generation)
+      assert :ok = SessionHolder.release_send_lease(h, lease)
+      assert {:ok, current} = SessionHolder.get_current_session(h)
+      assert current.generation == replacement.generation
+    end
+  end
+
   test "put resets the counter base to the new session's send_counter", %{holder: h} do
     :ok = SessionHolder.put(h, session())
     {:ok, _} = SessionHolder.take_send_counter(h)

@@ -783,6 +783,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   defp push_ready_control(socket, _type, _attrs), do: {:error, socket}
 
+  # Seal in the holder (the control counter is a real AEAD nonce, so its allocation
+  # must stay atomic and single-writer), then transmit from THIS process under the
+  # returned lease. The lease keeps replacement/clear from overtaking the sealed
+  # frame while the holder stays responsive to every other caller — see
+  # `push_if_session_live/3` for why the write must not run inside the holder.
   defp push_control(
          %{assigns: %{session: %Session{generation: generation}}} = socket,
          topic,
@@ -790,19 +795,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
          attrs
        )
        when is_integer(generation) do
+    holder = socket.assigns.session_holder
+
     with {:ok, payload} <- Messages.encode(type, attrs),
-         {:ok, :pushed} <-
-           SessionHolder.with_control_send(
-             socket.assigns.session_holder,
-             generation,
-             type,
-             payload,
-             fn frame ->
-               push(socket, topic, "control_v1", Control.encode_carrier(frame))
-               :pushed
-             end
-           ) do
-      {:ok, socket}
+         {:ok, frame, lease} <- SessionHolder.seal_control_send(holder, generation, type, payload) do
+      try do
+        push(socket, topic, "control_v1", Control.encode_carrier(frame))
+        {:ok, socket}
+      after
+        SessionHolder.release_send_lease(holder, lease)
+      end
     else
       {:error, :rekey_required} -> {:reconnect, fail_handshake(socket)}
       {:error, _reason} -> {:error, socket}
@@ -903,27 +905,39 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   defp recalc_payload(_), do: %{}
 
-  # Execute the final push while the holder serializes replacement/clear behind
-  # this session generation. A stale client therefore cannot emit over a session
-  # published by another connection, and a clear cannot overtake an approved push.
+  # Emit the final push under a holder SEND LEASE. The lease keeps the original
+  # guarantee — replacement/clear cannot overtake a send this connection already
+  # authorized — while moving the transport write out of the holder process.
+  #
+  # It must not run inside a `with_session/3` callback: `Slipstream.push/5` is a
+  # synchronous call into the connection process, so executing it in the holder
+  # parks the single writer that serializes nonce allocation for every subsystem,
+  # and an unanswered or slow channel push stalls `take_send_counter/1`, `clear/1`,
+  # and even `live?/1` for unrelated callers. A bare check-then-push would instead
+  # leave a TOCTOU window where a replacement lands between authorization and the
+  # write. The lease closes both: the holder authorizes and replies immediately,
+  # stays responsive to reads, and defers publish/clear until the lease is released
+  # (or the leaseholder dies).
   defp push_if_session_live(%{assigns: %{session: nil}} = socket, _event, _payload), do: socket
 
   defp push_if_session_live(socket, event, payload) do
     session = socket.assigns.session
+    holder = socket.assigns.session_holder
 
     if is_integer(session.generation) do
-      _ =
-        SessionHolder.with_session(
-          socket.assigns.session_holder,
-          session.generation,
-          fn current ->
-            if current.session_id == session.session_id do
+      case SessionHolder.acquire_send_lease(holder, session.generation) do
+        {:ok, lease} ->
+          try do
+            if lease.session_id == session.session_id do
               push(socket, socket.assigns.topic, event, payload)
-            else
-              {:error, :stale_session}
             end
+          after
+            SessionHolder.release_send_lease(holder, lease)
           end
-        )
+
+        {:error, _stale_or_missing_session} ->
+          :ok
+      end
     end
 
     socket
