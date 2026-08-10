@@ -110,4 +110,27 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.StoreTest do
     :ok = Store.save(dir, @snapshot)
     refute File.exists?(Path.join(dir, "observer.wind_shift.tmp"))
   end
+
+  test "authoritative duplicate marker persists only a fixed closed fingerprint", %{dir: dir} do
+    fingerprint = :crypto.hash(:sha256, "accepted authoritative wind snapshot")
+
+    assert :ok = Store.save_authoritative_fingerprint(dir, fingerprint)
+    assert {:ok, ^fingerprint} = Store.load_authoritative_fingerprint(dir)
+
+    assert <<"WSAF", 1, ^fingerprint::binary-size(32)>> =
+             File.read!(Path.join(dir, "observer.wind_shift.authoritative"))
+
+    refute File.exists?(Path.join(dir, "observer.wind_shift.authoritative.tmp"))
+  end
+
+  test "corrupt or incompatible authoritative duplicate markers fail closed", %{dir: dir} do
+    File.mkdir_p!(dir)
+    path = Path.join(dir, "observer.wind_shift.authoritative")
+
+    File.write!(path, <<"WSAF", 2, 0::256>>)
+    assert :empty = Store.load_authoritative_fingerprint(dir)
+
+    File.write!(path, <<"WSAF", 1, 0::128>>)
+    assert :empty = Store.load_authoritative_fingerprint(dir)
+  end
 end

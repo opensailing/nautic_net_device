@@ -161,6 +161,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     assert is_number(status.wind_lift_deg)
     assert is_number(status.twd_range_deg)
     assert status.status == "ok"
+    assert {:ok, _complete_runtime} = Observer.snapshot(observer)
 
     # Zero-crossing extrema flow as header/lift events once the oscillation is live.
     events = collect_syncs() |> Enum.flat_map(& &1.events)
@@ -710,6 +711,11 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
 
       assert state.last_summary == %{legacy.last_summary | mean_twd_deg: 0.0}
 
+      assert {:ok, runtime} = Observer.snapshot(observer)
+      assert Enum.map(runtime.pending_timeline, & &1.mean_twd_deg) == [359.0, 0.0]
+      assert Enum.map(runtime.pending_events, & &1.twd_deg) == [359.0, 0.0, 1.0]
+      assert runtime.last_summary.mean_twd_deg == 0.0
+
       :ok = Observer.persist_now(observer)
       assert {:ok, migrated} = Store.load(dir)
       assert migrated.seq == 9
@@ -1069,6 +1075,602 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     assert extreme_ms >= started_at_ms
   end
 
+  # --- authoritative runtime snapshot / restore -----------------------------------------
+
+  describe "authoritative runtime snapshot / restore" do
+    test "round-trips every learner field exactly across monotonic clock origins" do
+      source_ctx = new_script()
+
+      source =
+        start_observer(source_ctx,
+          sync_ms: 3_600_000_000,
+          timeline_ms: 3_600_000_000,
+          persist_ms: 3_600_000_000
+        )
+
+      samples =
+        for i <- 0..9,
+            do: %{t_ms: i * 1_000, twd_deg: 200.0 + i, tws_mps: 6.0}
+
+      drive(source, source_ctx, samples, %{twa: 40.0, lat: 41.0, lon: -71.0})
+      source_now = 9_000
+
+      :sys.replace_state(source, fn state ->
+        %{
+          state
+          | period: %{period_s: 480.0, confidence: 0.8},
+            last_period_ms: source_now,
+            step: StepDetect.put_period_hint(state.step, 480.0),
+            prev_regime: :oscillating,
+            xing: %{side: :pos, extreme: {5.0, 209.0, @wall_base + source_now}},
+            last_verdict: oscillating_verdict()
+        }
+      end)
+
+      assert {:ok, snapshot} = Observer.snapshot(source)
+
+      assert Map.keys(snapshot) |> Enum.sort() ==
+               [
+                 :absorb_count,
+                 :cycle,
+                 :envelope,
+                 :last_lift,
+                 :last_period_age_ms,
+                 :last_persist_age_ms,
+                 :last_summary,
+                 :last_sync_age_ms,
+                 :last_t_age_ms,
+                 :last_tack,
+                 :last_timeline_age_ms,
+                 :last_tx_age_ms,
+                 :last_verdict,
+                 :means,
+                 :pending_events,
+                 :pending_timeline,
+                 :period,
+                 :prev_regime,
+                 :prev_step_status,
+                 :residuals,
+                 :seq,
+                 :session,
+                 :step,
+                 :t0_age_ms,
+                 :unwrap,
+                 :xing
+               ]
+
+      store_snapshot =
+        Map.take(snapshot, [:session, :seq, :pending_timeline, :pending_events, :last_summary])
+
+      assert {:ok, _canonical_content} = WindCheckpoint.project(store_snapshot)
+
+      assert Map.keys(snapshot.means) |> Enum.sort() ==
+               [:cos, :fast, :mid, :sin, :slow, :tau_fast_s, :tau_mid_s, :tau_slow_s]
+
+      assert Map.keys(snapshot.envelope) |> Enum.sort() ==
+               [
+                 :debounce_ms,
+                 :first_age_ms,
+                 :last_alarm_age_ms,
+                 :last_input_deg,
+                 :last_unwrapped,
+                 :margin_deg,
+                 :maxq,
+                 :minq,
+                 :new_extreme,
+                 :warmup_ms,
+                 :window_ms
+               ]
+
+      assert Map.keys(snapshot.cycle) |> Enum.sort() ==
+               [
+                 :cycle_var,
+                 :innovation_tau_s,
+                 :innovation_var,
+                 :obs_var,
+                 :omega,
+                 :p,
+                 :q_level_per_s,
+                 :q_slope_per_s,
+                 :rho_per_s,
+                 :x
+               ]
+
+      assert Map.keys(snapshot.step) |> Enum.sort() ==
+               [
+                 :band_deg,
+                 :cand_n,
+                 :cand_sum,
+                 :d,
+                 :d_max,
+                 :d_max_age_ms,
+                 :d_max_t_ms,
+                 :d_n,
+                 :d_sum,
+                 :delta_deg,
+                 :dir,
+                 :fast_confirm_deg,
+                 :fast_confirm_s,
+                 :magnitude,
+                 :max_confirm_s,
+                 :min_magnitude_deg,
+                 :onset_age_ms,
+                 :onset_t_ms,
+                 :period_hint_s,
+                 :settle_s,
+                 :status,
+                 :threshold_deg,
+                 :u,
+                 :u_min,
+                 :u_min_age_ms,
+                 :u_min_t_ms,
+                 :u_n,
+                 :u_sum
+               ]
+
+      assert_closed_runtime_value(snapshot)
+      refute Map.has_key?(snapshot, :metadata)
+
+      target_ctx = new_script()
+      target_now = 50_000
+
+      Agent.update(target_ctx.script, fn script ->
+        %{script | t_ms: target_now, wall_offset_ms: source_now - target_now}
+      end)
+
+      target =
+        start_observer(target_ctx,
+          sync_ms: 3_600_000_000,
+          timeline_ms: 3_600_000_000,
+          persist_ms: 3_600_000_000
+        )
+
+      assert :ok = Observer.restore(target, snapshot)
+      assert Observer.snapshot(target) == {:ok, snapshot}
+      assert Observer.status(target) == Observer.status(source)
+
+      next_twd = 211.0
+
+      Agent.update(source_ctx.script, fn script ->
+        %{script | t_ms: source_now + 1_000, twd: next_twd, tws: 6.0, twa: 40.0, lat: 41.0, lon: -71.0}
+      end)
+
+      Agent.update(target_ctx.script, fn script ->
+        %{
+          script
+          | t_ms: target_now + 1_000,
+            wall_offset_ms: source_now - target_now,
+            twd: next_twd,
+            tws: 6.0,
+            twa: 40.0,
+            lat: 41.0,
+            lon: -71.0
+        }
+      end)
+
+      assert :ok = Observer.tick(source)
+      assert :ok = Observer.tick(target)
+      assert Observer.snapshot(target) == Observer.snapshot(source)
+      assert Observer.status(target) == Observer.status(source)
+    end
+
+    test "preserves the canonical partial order for a delayed older extreme event" do
+      source_ctx = new_script()
+      source = start_observer(source_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+
+      drive(
+        source,
+        source_ctx,
+        [
+          %{t_ms: 0, twd_deg: 200.0, tws_mps: 6.0},
+          %{t_ms: 3_000, twd_deg: 205.0, tws_mps: 6.0}
+        ],
+        %{twa: 40.0}
+      )
+
+      newer_current = %{
+        t_ms: @wall_base + 3_000,
+        kind: "regime_change",
+        twd_deg: 205.0,
+        magnitude_deg: nil,
+        detail: %{from: "calm", to: "oscillating", confidence: 0.8}
+      }
+
+      delayed_extreme = %{
+        t_ms: @wall_base + 1_000,
+        kind: "lift_extreme",
+        twd_deg: 203.0,
+        magnitude_deg: 4.0,
+        detail: %{phase_deg: 4.0}
+      }
+
+      :sys.replace_state(source, &%{&1 | pending_events: [newer_current, delayed_extreme]})
+      assert {:ok, authoritative} = Observer.snapshot(source)
+
+      target_ctx = new_script()
+      Agent.update(target_ctx.script, &%{&1 | t_ms: 3_000})
+      target = start_observer(target_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+
+      assert :ok = Observer.restore(target, authoritative)
+      assert :sys.get_state(target).pending_events == [newer_current, delayed_extreme]
+    end
+
+    test "continues timeline cadence across a different monotonic clock origin" do
+      source_ctx = new_script()
+      source = start_observer(source_ctx, timeline_ms: 10_000, sync_ms: 10_000)
+
+      drive(source, source_ctx, [%{t_ms: 9_000, twd_deg: 200.0, tws_mps: 6.0}])
+      assert {:ok, authoritative} = Observer.snapshot(source)
+
+      target_ctx = new_script()
+      Agent.update(target_ctx.script, &%{&1 | t_ms: 50_000, wall_offset_ms: -41_000})
+      target = start_observer(target_ctx, timeline_ms: 10_000, sync_ms: 10_000)
+
+      assert :ok = Observer.restore(target, authoritative)
+
+      drive(source, source_ctx, [%{t_ms: 10_000, twd_deg: 201.0, tws_mps: 6.0}])
+      drive(target, target_ctx, [%{t_ms: 51_000, twd_deg: 201.0, tws_mps: 6.0}], %{wall_offset_ms: -41_000})
+
+      assert Observer.snapshot(target) == Observer.snapshot(source)
+    end
+
+    test "continues persistence and broadcast throttles across restore" do
+      suffix = System.unique_integer([:positive])
+      source_dir = Path.join(System.tmp_dir!(), "wind_shift_runtime_source_#{suffix}")
+      target_dir = Path.join(System.tmp_dir!(), "wind_shift_runtime_target_#{suffix}")
+
+      on_exit(fn ->
+        File.rm_rf(source_dir)
+        File.rm_rf(target_dir)
+      end)
+
+      parent = self()
+
+      source_ctx = new_script()
+
+      source =
+        start_observer(source_ctx,
+          dir: source_dir,
+          persist_ms: 10_000,
+          sync_ms: 3_600_000_000,
+          timeline_ms: 3_600_000_000,
+          broadcast_enabled: true,
+          transmit_fn: fn _priority, _pgn, _payload -> send(parent, :source_tx) end
+        )
+
+      drive(source, source_ctx, [%{t_ms: 0, twd_deg: 200.0, tws_mps: 6.0}])
+      assert_receive :source_tx
+      assert_receive :source_tx
+      refute_receive :source_tx
+      Agent.update(source_ctx.script, &%{&1 | t_ms: 500})
+      assert {:ok, authoritative} = Observer.snapshot(source)
+
+      target_ctx = new_script()
+      Agent.update(target_ctx.script, &%{&1 | t_ms: 50_000, wall_offset_ms: -49_500})
+
+      target =
+        start_observer(target_ctx,
+          dir: target_dir,
+          persist_ms: 10_000,
+          sync_ms: 3_600_000_000,
+          timeline_ms: 3_600_000_000,
+          broadcast_enabled: true,
+          transmit_fn: fn _priority, _pgn, _payload -> send(parent, :target_tx) end
+        )
+
+      assert :ok = Observer.restore(target, authoritative)
+
+      drive(source, source_ctx, [%{t_ms: 501, twd_deg: 201.0, tws_mps: 6.0}])
+      drive(target, target_ctx, [%{t_ms: 50_001, twd_deg: 201.0, tws_mps: 6.0}], %{wall_offset_ms: -49_500})
+      refute_receive :source_tx
+      refute_receive :target_tx
+
+      drive(source, source_ctx, [%{t_ms: 10_000, twd_deg: 202.0, tws_mps: 6.0}])
+      drive(target, target_ctx, [%{t_ms: 59_500, twd_deg: 202.0, tws_mps: 6.0}], %{wall_offset_ms: -49_500})
+      assert_receive :source_tx
+      assert_receive :target_tx
+      assert {:ok, _persisted} = Store.load(target_dir)
+      assert Observer.snapshot(target) == Observer.snapshot(source)
+    end
+
+    test "validates the complete snapshot before mutation and fails closed" do
+      source_ctx = new_script()
+      source = start_observer(source_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      drive(source, source_ctx, for(i <- 0..3, do: %{t_ms: i * 1_000, twd_deg: 200.0 + i, tws_mps: 6.0}))
+      assert {:ok, snapshot} = Observer.snapshot(source)
+
+      target_ctx = new_script()
+      Agent.update(target_ctx.script, &%{&1 | t_ms: 3_000})
+      target = start_observer(target_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      assert {:ok, before} = Observer.snapshot(target)
+
+      invalid_learner =
+        snapshot
+        |> put_in([:seq], 999)
+        |> put_in([:cycle, :p, Access.at(0), Access.at(0)], "not-a-number")
+
+      invalid_crossing_date =
+        put_in(
+          snapshot,
+          [:xing],
+          %{side: :pos, extreme: %{phase_deg: 5.0, twd_deg: 203.0, t_ms: @wall_base + 24 * 60 * 60 * 1_000}}
+        )
+
+      future_crossing =
+        put_in(
+          snapshot,
+          [:xing],
+          %{side: :pos, extreme: %{phase_deg: 5.0, twd_deg: 203.0, t_ms: @wall_base + 60_000}}
+        )
+
+      invalid_crossing_sign =
+        put_in(
+          snapshot,
+          [:xing],
+          %{side: :pos, extreme: %{phase_deg: -5.0, twd_deg: 203.0, t_ms: @wall_base + 2_000}}
+        )
+
+      invalid_crossing_domain =
+        put_in(
+          snapshot,
+          [:xing],
+          %{side: :pos, extreme: %{phase_deg: 500.0, twd_deg: 203.0, t_ms: @wall_base + 2_000}}
+        )
+
+      invalid_step_transition =
+        put_in(
+          snapshot,
+          [:step],
+          %{
+            snapshot.step
+            | status: :confirmed,
+              dir: :up,
+              onset_age_ms: 1_000,
+              onset_t_ms: @wall_base + 2_000,
+              cand_sum: 20.0,
+              cand_n: 1,
+              magnitude: 20.0
+          }
+        )
+
+      invalid_covariance =
+        snapshot
+        |> put_in([:cycle, :p, Access.at(0), Access.at(0)], 1.0)
+        |> put_in([:cycle, :p, Access.at(1), Access.at(1)], 1.0)
+        |> put_in([:cycle, :p, Access.at(0), Access.at(1)], 2.0)
+        |> put_in([:cycle, :p, Access.at(1), Access.at(0)], 2.0)
+
+      for invalid <- [
+            nil,
+            invalid_learner,
+            invalid_crossing_date,
+            future_crossing,
+            invalid_crossing_sign,
+            invalid_crossing_domain,
+            invalid_step_transition,
+            invalid_covariance,
+            Map.put(snapshot, :metadata, %{arbitrary: true})
+          ] do
+        assert {:error, :invalid_wind_shift_runtime_snapshot} = Observer.restore(target, invalid)
+        assert Observer.snapshot(target) == {:ok, before}
+      end
+    end
+
+    test "does not install prior-day live state and preserves only the monotonic sequence" do
+      source_ctx = new_script()
+      source = start_observer(source_ctx, timeline_ms: 1, sync_ms: 3_600_000_000)
+
+      drive(
+        source,
+        source_ctx,
+        [
+          %{t_ms: 0, twd_deg: 200.0, tws_mps: 6.0},
+          %{t_ms: 1_000, twd_deg: 210.0, tws_mps: 6.0}
+        ],
+        %{wall_offset_ms: -86_400_000, twa: 40.0}
+      )
+
+      assert {:ok, authoritative} = Observer.snapshot(source)
+      authoritative = %{authoritative | seq: 7}
+      assert authoritative.session != nil
+      assert authoritative.pending_timeline != []
+
+      target_ctx = new_script()
+      Agent.update(target_ctx.script, &%{&1 | t_ms: 1_000})
+      target = start_observer(target_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+
+      assert :ok = Observer.restore(target, authoritative)
+      assert {:ok, restored} = Observer.snapshot(target)
+      assert restored.seq == 7
+      assert restored.session == nil
+      assert restored.pending_timeline == []
+      assert restored.pending_events == []
+      assert restored.last_summary == nil
+      assert restored.means.fast == nil
+      assert restored.last_verdict == nil
+    end
+
+    test "rejects runtime tunables that do not match the current wind policy" do
+      source_ctx = new_script()
+      source = start_observer(source_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      drive(source, source_ctx, [%{t_ms: 0, twd_deg: 200.0, tws_mps: 6.0}])
+      assert {:ok, authoritative} = Observer.snapshot(source)
+
+      config = start_supervised!({Config, name: nil, store_dir: nil}, id: make_ref())
+      {:ok, _} = Config.apply_config(config, %{"version" => 1, "windows" => %{"fast_s" => 10}})
+      target_ctx = new_script()
+      target = start_observer(target_ctx, config: {Config, config})
+      assert {:ok, before} = Observer.snapshot(target)
+
+      assert {:error, :invalid_wind_shift_runtime_snapshot} = Observer.restore(target, authoritative)
+      assert Observer.snapshot(target) == {:ok, before}
+    end
+
+    test "duplicate authoritative restore remains non-regressive across progress, core rebuild, and restart" do
+      dir = Path.join(System.tmp_dir!(), "wind_shift_runtime_head_#{System.unique_integer([:positive])}")
+      on_exit(fn -> File.rm_rf(dir) end)
+      source_ctx = new_script()
+      source = start_observer(source_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      drive(source, source_ctx, for(i <- 0..3, do: %{t_ms: i * 1_000, twd_deg: 200.0 + i, tws_mps: 6.0}))
+      assert {:ok, authoritative} = Observer.snapshot(source)
+
+      config = start_supervised!({Config, name: nil, store_dir: nil}, id: make_ref())
+      target_ctx = new_script()
+      Agent.update(target_ctx.script, &%{&1 | t_ms: 3_000})
+
+      {:ok, target} =
+        Observer.start_link(
+          observer_opts(target_ctx,
+            dir: dir,
+            config: {Config, config},
+            sync_ms: 3_600_000_000,
+            timeline_ms: 3_600_000_000
+          )
+        )
+
+      assert :ok = Observer.restore(target, authoritative)
+
+      Agent.update(target_ctx.script, &%{&1 | t_ms: 4_000, twd: 220.0, tws: 6.0})
+      assert :ok = Observer.tick(target)
+      assert {:ok, progressed} = Observer.snapshot(target)
+      refute progressed == authoritative
+
+      assert :ok = Observer.restore(target, authoritative)
+      assert Observer.snapshot(target) == {:ok, progressed}
+
+      {:ok, _} = Config.apply_config(config, %{"version" => 1, "windows" => %{"fast_s" => 10}})
+      assert {:ok, rebuilt} = Observer.snapshot(target)
+      assert rebuilt.means.fast == nil
+      assert :ok = Observer.restore(target, authoritative)
+      assert Observer.snapshot(target) == {:ok, rebuilt}
+
+      GenServer.stop(target)
+
+      {:ok, restarted} =
+        Observer.start_link(
+          observer_opts(target_ctx,
+            dir: dir,
+            config: {Config, config},
+            sync_ms: 3_600_000_000,
+            timeline_ms: 3_600_000_000
+          )
+        )
+
+      assert {:ok, before_duplicate} = Observer.snapshot(restarted)
+      assert :ok = Observer.restore(restarted, authoritative)
+      assert Observer.snapshot(restarted) == {:ok, before_duplicate}
+      GenServer.stop(restarted)
+    end
+
+    test "preserves the historical UTC onset when a restored candidate confirms later" do
+      source_ctx = new_script()
+      source = start_observer(source_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      drive(source, source_ctx, [%{t_ms: 0, twd_deg: 200.0, tws_mps: 6.0}])
+      Agent.update(source_ctx.script, &%{&1 | t_ms: 100_000})
+      onset_t_ms = @wall_base
+
+      :sys.replace_state(source, fn state ->
+        candidate = %{
+          state.step
+          | status: :candidate,
+            dir: :up,
+            onset_ms: 0,
+            cand_sum: 30.0,
+            cand_n: 1
+        }
+
+        %{
+          state
+          | step: candidate,
+            step_clock: %{state.step_clock | onset_t_ms: onset_t_ms},
+            prev_step_status: :candidate
+        }
+      end)
+
+      assert {:ok, authoritative} = Observer.snapshot(source)
+
+      target_ctx = new_script()
+      Agent.update(target_ctx.script, &%{&1 | t_ms: 500_000, wall_offset_ms: 100_000})
+      target = start_observer(target_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      assert :ok = Observer.restore(target, authoritative)
+
+      drive(
+        target,
+        target_ctx,
+        [%{t_ms: 501_000, twd_deg: 240.0, tws_mps: 6.0}],
+        %{wall_offset_ms: 100_000}
+      )
+
+      assert Enum.any?(:sys.get_state(target).pending_events, fn
+               %{kind: "step", detail: %{onset_t_ms: ^onset_t_ms}} -> true
+               _event -> false
+             end)
+    end
+
+    test "preserves confirmed-step learning and resets the restored crossing on wall-clock rotation" do
+      source_ctx = new_script()
+      source = start_observer(source_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      drive(source, source_ctx, for(i <- 0..2, do: %{t_ms: i * 1_000, twd_deg: 200.0, tws_mps: 6.0}), %{twa: 40.0})
+
+      old_extreme_ms = @wall_base + 1_000
+
+      :sys.replace_state(source, fn state ->
+        confirmed_step = %{
+          state.step
+          | status: :confirmed,
+            dir: :up,
+            onset_ms: 1_000,
+            cand_sum: 30.0,
+            cand_n: 1,
+            magnitude: 30.0
+        }
+
+        %{
+          state
+          | step: confirmed_step,
+            step_clock: %{state.step_clock | onset_t_ms: @wall_base + 1_000},
+            prev_step_status: :confirmed,
+            absorb_count: 17,
+            xing: %{side: :pos, extreme: {8.0, 208.0, old_extreme_ms}}
+        }
+      end)
+
+      assert {:ok, authoritative} = Observer.snapshot(source)
+
+      target_ctx = new_script()
+      Agent.update(target_ctx.script, &%{&1 | t_ms: 2_000})
+      target = start_observer(target_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      assert :ok = Observer.restore(target, authoritative)
+
+      restored = :sys.get_state(target)
+      assert StepDetect.snapshot(restored.step).status == :confirmed
+      assert restored.prev_step_status == :confirmed
+      assert restored.absorb_count == 17
+      assert restored.xing == %{side: :pos, extreme: {8.0, 208.0, old_extreme_ms}}
+
+      Agent.update(target_ctx.script, fn script ->
+        %{
+          script
+          | t_ms: 3_000,
+            wall_offset_ms: -24 * 60 * 60 * 1_000 - 4_000,
+            twd: 230.0,
+            tws: 6.0,
+            twa: 40.0
+        }
+      end)
+
+      assert :ok = Observer.tick(target)
+      rotated = :sys.get_state(target)
+      assert StepDetect.snapshot(rotated.step).status == :confirmed
+      assert rotated.prev_step_status == :confirmed
+      refute rotated.xing.extreme == {8.0, 208.0, old_extreme_ms}
+
+      if rotated.xing.extreme do
+        assert elem(rotated.xing.extreme, 2) >= rotated.session.started_at_ms
+      end
+    end
+  end
+
   # --- wally mode signal -----------------------------------------------------------------
 
   test "wally_mode from the config policy publishes as an int signal each tick" do
@@ -1204,4 +1806,37 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     assert_receive {:tx, 2, 130_824, <<0x7D, 0x99, 0x51, 0x21, _, _>>}
     refute_receive {:tx, _, _, <<0x7D, 0x99, 0x52, _, _, _>>}, 20
   end
+
+  defp oscillating_verdict do
+    %{
+      regime: :oscillating,
+      confidence: 0.8,
+      oscillation: %{
+        period_s: 480.0,
+        amplitude_deg: 8.0,
+        phase_rad: 0.5,
+        time_to_next_header_s: %{starboard: 120.0, port: 360.0},
+        phase_frac_to_next_header: %{starboard: 0.25, port: 0.75}
+      },
+      trend_deg_per_hr: 1.5,
+      time_to_next_shift_s: 60.0,
+      ci_s: 48.0,
+      treat_as_persistent: false,
+      regime_alarm: false,
+      phase_deg: 5.0
+    }
+  end
+
+  defp assert_closed_runtime_value(value) when is_map(value) do
+    assert Enum.all?(Map.keys(value), &is_atom/1)
+    Enum.each(Map.values(value), &assert_closed_runtime_value/1)
+  end
+
+  defp assert_closed_runtime_value(value) when is_list(value),
+    do: Enum.each(value, &assert_closed_runtime_value/1)
+
+  defp assert_closed_runtime_value(value)
+       when is_atom(value) or is_binary(value) or is_boolean(value) or is_integer(value) or is_float(value) or
+              is_nil(value),
+       do: :ok
 end

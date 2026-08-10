@@ -127,6 +127,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   alias RacingOrg.Tracker.Pro.Compute.Engine
   alias RacingOrg.Tracker.Pro.Compute.PgnEncode
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
+  alias RacingOrg.Tracker.Pro.WindShift.Checkpoint
   alias RacingOrg.Tracker.Pro.WindShift.Classifier
   alias RacingOrg.Tracker.Pro.WindShift.Config
   alias RacingOrg.Tracker.Pro.WindShift.Cycle
@@ -251,6 +252,26 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   def stats(server \\ __MODULE__), do: GenServer.call(server, :stats)
 
   @doc """
+  Return the complete closed, atom-keyed learner snapshot required for exact
+  continuation. The existing checkpoint-v1 fields retain their Observer.Store
+  shape; all estimation cores and event trackers are included without
+  collaborators, functions, credentials, or open metadata.
+  """
+  @spec snapshot(GenServer.server()) :: {:ok, map()} | {:error, :invalid_wind_shift_runtime_snapshot}
+  def snapshot(server \\ __MODULE__), do: GenServer.call(server, :snapshot)
+
+  @doc """
+  Atomically install one already-authorized runtime snapshot. The entire closed
+  shape is validated before mutation. Re-delivering the identical authoritative
+  snapshot is a non-regressive no-op even after local learner progress.
+  """
+  @spec restore(map()) :: :ok | {:error, :invalid_wind_shift_runtime_snapshot}
+  def restore(snapshot) when is_map(snapshot), do: restore(__MODULE__, snapshot)
+
+  @spec restore(GenServer.server(), map()) :: :ok | {:error, :invalid_wind_shift_runtime_snapshot}
+  def restore(server, snapshot), do: GenServer.call(server, {:restore, snapshot})
+
+  @doc """
   The integer code the `wind_regime` engine signal carries (signals are
   numeric): 0 insufficient_history, 1 calm, 2 oscillating, 3 persistent_ramp,
   4 persistent_step, 5 mixed.
@@ -271,7 +292,8 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     # Anchor the throttle clocks at boot so the FIRST persist/sync/timeline row
     # must also wait a full interval (mirrors Polar.Observer).
     boot_ms = now_fn.()
-    persisted = restore(dir, utc_now_fn)
+    persisted = restore_persisted(dir, utc_now_fn)
+    last_authoritative_fingerprint = restore_authoritative_fingerprint(dir)
 
     state =
       %{
@@ -307,6 +329,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
         last_timeline_ms: boot_ms,
         last_tx_ms: nil,
         dirty_persist: Map.get(persisted, :dirty_persist, false),
+        last_authoritative_fingerprint: last_authoritative_fingerprint,
         stats: %{samples: 0, accepted: 0, rejected: 0, reject_reasons: %{}}
       }
       |> put_policy(fetch_policy(config))
@@ -329,6 +352,23 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   def handle_call(:session, _from, state), do: {:reply, session_view(state.session), state}
 
   def handle_call(:stats, _from, state), do: {:reply, state.stats, state}
+
+  def handle_call(:snapshot, _from, state) do
+    {:reply, Checkpoint.snapshot_runtime(state, state.now_fn.()), state}
+  end
+
+  def handle_call({:restore, snapshot}, _from, state) do
+    case authoritative_fingerprint(snapshot) do
+      {:ok, fingerprint} when fingerprint == state.last_authoritative_fingerprint ->
+        {:reply, :ok, state}
+
+      {:ok, fingerprint} ->
+        restore_authoritative_runtime(snapshot, fingerprint, state)
+
+      {:error, :invalid_wind_shift_runtime_snapshot} = error ->
+        {:reply, error, state}
+    end
+  end
 
   @impl true
   def handle_info(:tick, state) do
@@ -395,7 +435,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
       state
       |> ensure_session(wall_ms)
       |> fold_session(lat, lon, tws)
-      |> step_cores(twd, now)
+      |> step_cores(twd, now, wall_ms)
       |> maybe_estimate_period(now)
 
     means_snap = Means.snapshot(state.means)
@@ -421,7 +461,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     state = %{state | last_verdict: verdict, last_lift: lift, last_tack: tack, dirty_persist: true}
 
     state
-    |> detect_events(verdict, means_snap, env_snap, step_snap, twd, wall_ms, now)
+    |> detect_events(verdict, means_snap, env_snap, step_snap, twd, wall_ms)
     |> maybe_absorb(means_snap, step_snap)
     |> maybe_timeline_row(verdict, means_snap, tws, wall_ms, now)
     |> publish_signals(verdict, means_snap, env_snap, lift, now)
@@ -430,7 +470,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   # --- Cores (the acceptance-harness wiring, verbatim) ---
 
-  defp step_cores(state, twd, now) do
+  defp step_cores(state, twd, now, wall_ms) do
     unwrapped =
       case state.unwrap do
         nil -> twd / 1
@@ -450,6 +490,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     # Residual for step detection: wrap-aware deviation from the slow mean.
     step_resid = Circular.wrapped_delta(Means.snapshot(means).slow, twd)
     step = StepDetect.step(state.step, step_resid, now)
+    step_clock = advance_step_clock(state.step, step, state.step_clock, now, wall_ms)
 
     %{
       state
@@ -457,12 +498,32 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
         envelope: envelope,
         cycle: cycle,
         step: step,
+        step_clock: step_clock,
         unwrap: {twd / 1, unwrapped},
         resid: ring_push(state.resid, resid),
         t0_ms: state.t0_ms || now,
         last_t_ms: now
     }
   end
+
+  defp advance_step_clock(previous, current, clock, now_ms, wall_ms) do
+    %{
+      u_min_t_ms: advance_step_anchor(previous.u_min_ms, current.u_min_ms, clock.u_min_t_ms, now_ms, wall_ms),
+      d_max_t_ms: advance_step_anchor(previous.d_max_ms, current.d_max_ms, clock.d_max_t_ms, now_ms, wall_ms),
+      onset_t_ms: advance_step_anchor(previous.onset_ms, current.onset_ms, clock.onset_t_ms, now_ms, wall_ms)
+    }
+  end
+
+  defp advance_step_anchor(_previous_ms, nil, _previous_t_ms, _now_ms, _wall_ms), do: nil
+
+  defp advance_step_anchor(value_ms, value_ms, previous_t_ms, _now_ms, _wall_ms)
+       when is_integer(previous_t_ms),
+       do: previous_t_ms
+
+  defp advance_step_anchor(_previous_ms, value_ms, _previous_t_ms, now_ms, wall_ms),
+    do: wall_ms - (now_ms - value_ms)
+
+  defp empty_step_clock, do: %{u_min_t_ms: nil, d_max_t_ms: nil, onset_t_ms: nil}
 
   # Bounded FIFO ring (a :queue + count, never a list append on the hot path).
   defp ring_push({queue, n}, value) do
@@ -587,10 +648,10 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   # --- Events (envelope alarms, step confirmations, regime changes, extrema) ---
 
-  defp detect_events(state, verdict, means_snap, env_snap, step_snap, twd, wall_ms, now) do
+  defp detect_events(state, verdict, means_snap, env_snap, step_snap, twd, wall_ms) do
     {state, events} =
       {state, []}
-      |> step_event(step_snap, twd, wall_ms, now)
+      |> step_event(step_snap, twd, wall_ms)
       |> envelope_event(env_snap, twd, wall_ms)
       |> regime_event(verdict, twd, wall_ms)
       |> extrema_event(verdict, means_snap.phase_deg, twd, wall_ms)
@@ -603,14 +664,10 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   # A step CONFIRMATION (the :none/:candidate -> :confirmed transition), with the
   # onset backdated onto the wall clock.
-  defp step_event({state, events}, step_snap, twd, wall_ms, now) do
+  defp step_event({state, events}, step_snap, twd, wall_ms) do
     events =
       if step_snap.status == :confirmed and state.prev_step_status != :confirmed do
-        onset_t_ms =
-          max(
-            wall_ms - (now - step_snap.onset_ms),
-            state.session.started_at_ms
-          )
+        onset_t_ms = max(state.step_clock.onset_t_ms, state.session.started_at_ms)
 
         [
           %{
@@ -729,7 +786,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
       count = state.absorb_count + 1
 
       if count >= @absorb_dwell_ticks do
-        %{state | step: StepDetect.reset(state.step), absorb_count: 0}
+        %{state | step: StepDetect.reset(state.step), step_clock: empty_step_clock(), absorb_count: 0}
       else
         %{state | absorb_count: count}
       end
@@ -975,12 +1032,59 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     %{state | dirty_persist: false, last_persist_ms: state.now_fn.()}
   end
 
+  defp restore_authoritative_runtime(snapshot, fingerprint, state) do
+    now_ms = state.now_fn.()
+    current_utc = state.utc_now_fn.()
+    current_utc_ms = DateTime.to_unix(current_utc, :millisecond)
+
+    with {:ok, learner_state} <- Checkpoint.restore_runtime(snapshot, now_ms, current_utc_ms),
+         :ok <- runtime_compatible_with_policy(learner_state, state) do
+      restored =
+        if stale_runtime_session?(learner_state.session, current_utc) do
+          %{state | seq: max(state.seq, learner_state.seq), dirty_persist: true}
+        else
+          Map.merge(state, learner_state)
+        end
+        |> Map.put(:dirty_persist, true)
+        |> Map.put(:last_authoritative_fingerprint, fingerprint)
+
+      persist_authoritative_fingerprint(state.dir, fingerprint)
+      {:reply, :ok, restored}
+    else
+      {:error, :invalid_wind_shift_runtime_snapshot} = error -> {:reply, error, state}
+    end
+  end
+
+  defp authoritative_fingerprint(snapshot) when is_map(snapshot) do
+    {:ok, :crypto.hash(:sha256, :erlang.term_to_binary(snapshot, [:deterministic]))}
+  rescue
+    _ -> {:error, :invalid_wind_shift_runtime_snapshot}
+  catch
+    _, _ -> {:error, :invalid_wind_shift_runtime_snapshot}
+  end
+
+  defp authoritative_fingerprint(_snapshot), do: {:error, :invalid_wind_shift_runtime_snapshot}
+
+  defp restore_authoritative_fingerprint(nil), do: nil
+
+  defp restore_authoritative_fingerprint(dir) do
+    case Store.load_authoritative_fingerprint(dir) do
+      {:ok, fingerprint} -> fingerprint
+      :empty -> nil
+    end
+  end
+
+  defp persist_authoritative_fingerprint(nil, _fingerprint), do: :ok
+
+  defp persist_authoritative_fingerprint(dir, fingerprint),
+    do: Store.save_authoritative_fingerprint(dir, fingerprint)
+
   # A same-UTC-day persisted session is adopted whole (mid-day reboot keeps the
   # session + unsynced batch); an older one starts a fresh session but keeps the
   # monotonic seq (the backend orders per boat by seq).
-  defp restore(nil, _utc_now_fn), do: %{}
+  defp restore_persisted(nil, _utc_now_fn), do: %{}
 
-  defp restore(dir, utc_now_fn) do
+  defp restore_persisted(dir, utc_now_fn) do
     case Store.load(dir) do
       {:ok, persisted} ->
         if same_utc_day?(Map.get(persisted, :session), utc_now_fn.()) do
@@ -1054,6 +1158,9 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   defp same_utc_day?(_session, _now), do: false
 
+  defp stale_runtime_session?(nil, _current_utc), do: false
+  defp stale_runtime_session?(session, current_utc), do: not same_utc_day?(session, current_utc)
+
   # --- Status (the live half of "wind_shift_status") ---
 
   defp build_status(state) do
@@ -1074,6 +1181,68 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   end
 
   # --- Policy (WindShift.Config collaborator) ---
+
+  defp runtime_compatible_with_policy(runtime, state) do
+    expected_means =
+      Means.new(
+        tau_fast_s: state.windows.fast_s,
+        tau_mid_s: state.windows.mid_s,
+        tau_slow_s: state.windows.slow_s
+      )
+
+    expected_envelope =
+      Envelope.new(
+        window_s: state.windows.envelope_s,
+        margin_deg: state.alarms.new_extreme_margin_deg
+      )
+
+    expected_cycle = Cycle.new()
+    expected_step = StepDetect.new()
+
+    compatible? =
+      Map.take(runtime.means, [:tau_fast_s, :tau_mid_s, :tau_slow_s]) ==
+        Map.take(expected_means, [:tau_fast_s, :tau_mid_s, :tau_slow_s]) and
+        Map.take(runtime.envelope, [:window_ms, :margin_deg, :debounce_ms, :warmup_ms]) ==
+          Map.take(expected_envelope, [:window_ms, :margin_deg, :debounce_ms, :warmup_ms]) and
+        Map.take(runtime.cycle, [
+          :rho_per_s,
+          :obs_var,
+          :q_level_per_s,
+          :q_slope_per_s,
+          :cycle_var,
+          :innovation_tau_s
+        ]) ==
+          Map.take(expected_cycle, [
+            :rho_per_s,
+            :obs_var,
+            :q_level_per_s,
+            :q_slope_per_s,
+            :cycle_var,
+            :innovation_tau_s
+          ]) and
+        Map.take(runtime.step, [
+          :delta_deg,
+          :threshold_deg,
+          :band_deg,
+          :settle_s,
+          :min_magnitude_deg,
+          :fast_confirm_deg,
+          :fast_confirm_s,
+          :max_confirm_s
+        ]) ==
+          Map.take(expected_step, [
+            :delta_deg,
+            :threshold_deg,
+            :band_deg,
+            :settle_s,
+            :min_magnitude_deg,
+            :fast_confirm_deg,
+            :fast_confirm_s,
+            :max_confirm_s
+          ])
+
+    if compatible?, do: :ok, else: {:error, :invalid_wind_shift_runtime_snapshot}
+  end
 
   defp put_policy(state, %{windows: windows, alarms: alarms, wally_mode_code: code}),
     do: %{state | windows: windows, alarms: alarms, wally_mode_code: code}
@@ -1118,6 +1287,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
       envelope: Envelope.new(window_s: windows.envelope_s, margin_deg: state.alarms.new_extreme_margin_deg),
       cycle: Cycle.new(),
       step: StepDetect.new(),
+      step_clock: empty_step_clock(),
       unwrap: nil,
       resid: {:queue.new(), 0},
       period: :none,

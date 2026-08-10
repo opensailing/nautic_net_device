@@ -6,11 +6,11 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Store do
   sync sequence, and the not-yet-synced timeline rows / events — so a mid-day
   reboot keeps the SAME session and sequence instead of starting a new one.
 
-  Deliberately NOT persisted: the estimation cores (means / envelope / Kalman
-  cycle / step detector). They are cheap to rebuild from live data and their
-  freshness is part of the classifier's honesty contract (`history_s` restarts,
-  so a rebooted device honestly reports `:insufficient_history` through its
-  ~20 min warmup rather than resuming stale filter state).
+  The main session snapshot deliberately excludes the estimation cores (means /
+  envelope / Kalman cycle / step detector). A separate fixed-format sidecar
+  stores only the SHA-256 fingerprint of the last accepted authoritative runtime
+  snapshot, never the runtime map itself. That marker makes exact redelivery a
+  durable no-op without defining another runtime-state codec.
 
   Mirrors `RacingOrg.Tracker.Pro.Calibration.Observer.Store`: the snapshot is
   written to a temp file and atomically renamed into place, so a crash
@@ -38,6 +38,10 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Store do
   require Logger
 
   @filename "observer.wind_shift"
+  @authoritative_filename "observer.wind_shift.authoritative"
+  @authoritative_magic "WSAF"
+  @authoritative_version 1
+  @fingerprint_bytes 32
   # Bump if the persisted representation changes incompatibly; older/unknown
   # versions are ignored on load (the Observer starts a fresh session).
   @format_version 1
@@ -57,6 +61,32 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Store do
       {:error, error}
   end
 
+  @doc "Persist the fixed SHA-256 fingerprint of the last accepted authoritative runtime snapshot."
+  @spec save_authoritative_fingerprint(Path.t(), <<_::256>>) :: :ok | {:error, term()}
+  def save_authoritative_fingerprint(dir, fingerprint)
+      when is_binary(fingerprint) and byte_size(fingerprint) == @fingerprint_bytes do
+    File.mkdir_p!(dir)
+    path = authoritative_path(dir)
+    tmp = path <> ".tmp"
+    File.write!(tmp, <<@authoritative_magic, @authoritative_version, fingerprint::binary>>)
+    File.rename!(tmp, path)
+    :ok
+  rescue
+    error ->
+      Logger.warning("Failed to persist wind-shift authoritative fingerprint to #{inspect(dir)}: #{inspect(error)}")
+      {:error, error}
+  end
+
+  @doc "Load the last accepted authoritative runtime fingerprint, or `:empty`."
+  @spec load_authoritative_fingerprint(Path.t()) :: {:ok, <<_::256>>} | :empty
+  def load_authoritative_fingerprint(dir) do
+    case File.read(authoritative_path(dir)) do
+      {:ok, binary} -> decode_authoritative_fingerprint(binary, dir)
+      {:error, :enoent} -> :empty
+      {:error, reason} -> warn_empty(dir, "could not read authoritative fingerprint", reason)
+    end
+  end
+
   @doc "Load the persisted snapshot from `dir`, or `:empty` if absent/unusable."
   @spec load(Path.t()) :: {:ok, map()} | :empty
   def load(dir) do
@@ -71,6 +101,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Store do
   @spec clear(Path.t()) :: :ok
   def clear(dir) do
     _ = File.rm(path(dir))
+    _ = File.rm(authoritative_path(dir))
     :ok
   end
 
@@ -83,6 +114,15 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Store do
     error -> warn_empty(dir, "corrupt", error)
   end
 
+  defp decode_authoritative_fingerprint(
+         <<@authoritative_magic, @authoritative_version, fingerprint::binary-size(@fingerprint_bytes)>>,
+         _dir
+       ),
+       do: {:ok, fingerprint}
+
+  defp decode_authoritative_fingerprint(_binary, dir),
+    do: warn_empty(dir, "unrecognized/incompatible authoritative fingerprint", :format)
+
   defp safe_binary_to_term(binary), do: :erlang.binary_to_term(binary, [:safe])
 
   defp warn_empty(dir, what, detail) do
@@ -91,4 +131,5 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Store do
   end
 
   defp path(dir), do: Path.join(dir, @filename)
+  defp authoritative_path(dir), do: Path.join(dir, @authoritative_filename)
 end
