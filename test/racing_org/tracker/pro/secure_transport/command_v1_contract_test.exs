@@ -305,6 +305,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CommandV1ContractTest do
       assert {:ok, ^raw_bytes} = Messages.encode(:command_ack, textual)
       assert {:ok, ^raw} = Messages.decode(:command_ack, raw_bytes)
 
+      assert {:error, :invalid_device_id} =
+               Messages.encode(:command_ack, %{raw | device_id: String.upcase(@device_uuid)})
+
+      assert {:error, :invalid_command_id} =
+               Messages.encode(:command_ack, %{raw | command_id: String.upcase(@command_uuid)})
+
       assert {:error, :unknown_command_status} =
                Messages.encode(:command_ack, %{raw | status: 0x01})
 
