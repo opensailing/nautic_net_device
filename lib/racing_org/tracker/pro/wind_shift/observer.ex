@@ -141,6 +141,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   @default_persist_ms 60_000
   @default_sync_ms 60_000
   @default_timeline_ms 60_000
+  @max_finite 1.7976931348623157e308
   # A TWD older than this (ms of monotonic time) cannot drive the predictor.
   @default_staleness_ms 3_000
 
@@ -384,10 +385,10 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   end
 
   defp accept(state, signals, twd, now) do
-    tws = optional_fresh(signals, "true_wind_speed", now, state.staleness_ms)
+    tws = optional_fresh(signals, "true_wind_speed", now, state.staleness_ms, &valid_tws?/1)
     twa = resolve_twa(signals, twd, now, state.staleness_ms)
-    lat = optional_fresh(signals, "latitude", now, state.staleness_ms)
-    lon = optional_fresh(signals, "longitude", now, state.staleness_ms)
+    lat = optional_fresh(signals, "latitude", now, state.staleness_ms, &valid_latitude?/1)
+    lon = optional_fresh(signals, "longitude", now, state.staleness_ms, &valid_longitude?/1)
     wall_ms = DateTime.to_unix(state.utc_now_fn.(), :millisecond)
 
     state =
@@ -1081,12 +1082,26 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     end
   end
 
-  defp optional_fresh(signals, name, now, staleness_ms) do
+  defp optional_fresh(signals, name, now, staleness_ms),
+    do: optional_fresh(signals, name, now, staleness_ms, fn _value -> true end)
+
+  defp optional_fresh(signals, name, now, staleness_ms, validator) do
     case Map.get(signals, name) do
-      {value, mono_ms} when is_number(value) and is_integer(mono_ms) and now - mono_ms <= staleness_ms -> value / 1
-      _ -> nil
+      {value, mono_ms} when is_number(value) and is_integer(mono_ms) and now - mono_ms <= staleness_ms ->
+        value = value / 1
+        if validator.(value), do: value, else: nil
+
+      _ ->
+        nil
     end
   end
+
+  defp valid_tws?(value), do: finite_float?(value) and value >= 0.0
+  defp valid_latitude?(value), do: finite_float?(value) and value >= -90.0 and value <= 90.0
+  defp valid_longitude?(value), do: finite_float?(value) and value >= -180.0 and value <= 180.0
+
+  defp finite_float?(value),
+    do: is_float(value) and value == value and value >= -@max_finite and value <= @max_finite
 
   # Signed TWA >= 0 = wind over the starboard side = starboard tack (see
   # Compute.Library.resolve_twa); dead ahead resolves starboard.

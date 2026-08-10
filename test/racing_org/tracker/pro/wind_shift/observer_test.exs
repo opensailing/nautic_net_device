@@ -3,6 +3,7 @@ Code.require_file("support/wind_gen_helper.exs", __DIR__)
 defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
   use ExUnit.Case, async: true
 
+  alias RacingOrg.Tracker.Pro.WindShift.Checkpoint, as: WindCheckpoint
   alias RacingOrg.Tracker.Pro.WindShift.Config
   alias RacingOrg.Tracker.Pro.WindShift.Observer
   alias RacingOrg.Tracker.Pro.WindShift.Observer.Store
@@ -511,6 +512,39 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
       :ok = Observer.persist_now(observer)
       assert {:ok, snapshot} = Store.load(dir)
       assert snapshot.last_summary.mean_twd_deg == 0.0
+    end
+
+    test "treats invalid optional TWS and position samples as absent before persistence", %{dir: dir} do
+      ctx = new_script()
+
+      {:ok, observer} =
+        Observer.start_link(
+          observer_opts(ctx,
+            dir: dir,
+            persist_ms: 3_600_000_000,
+            sync_ms: 3_600_000_000,
+            timeline_ms: 0
+          )
+        )
+
+      drive(observer, ctx, [%{t_ms: 0, twd_deg: 200.0, tws_mps: 6.0}], %{lat: 41.0, lon: -71.0})
+      drive(observer, ctx, [%{t_ms: 1_000, twd_deg: 201.0, tws_mps: -1.0}], %{lat: 91.0, lon: -181.0})
+
+      :ok = Observer.persist_now(observer)
+      assert {:ok, snapshot} = Store.load(dir)
+
+      assert snapshot.session == %{
+               started_at_ms: @wall_base,
+               lat_sum: 41.0,
+               lon_sum: -71.0,
+               pos_n: 1,
+               tws_sum: 6.0,
+               tws_n: 1
+             }
+
+      assert Enum.map(snapshot.pending_timeline, & &1.tws_mps) == [6.0, nil]
+      assert {:ok, _content} = WindCheckpoint.project(snapshot)
+      assert Observer.stats(observer).accepted == 2
     end
 
     test "session started_at_ms is stable across a simulated reboot and seq stays monotonic", %{dir: dir} do
