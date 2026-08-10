@@ -441,6 +441,100 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
       refute SessionHolder.live?(h)
     end
 
+    test "named holder restart kills a callback leased from the prior incarnation", %{
+      holder: _default_holder
+    } do
+      parent = self()
+      name_key = {__MODULE__, make_ref()}
+      name = {:global, name_key}
+
+      {:ok, old_holder} =
+        start_supervised(
+          {SessionHolder, name: name},
+          id: {:restarting_named_holder, make_ref()}
+        )
+
+      assert {:ok, published} =
+               SessionHolder.publish(name, session(session_id: <<36::128>>))
+
+      caller =
+        spawn(fn ->
+          result =
+            SessionHolder.with_session(name, published.generation, fn _session ->
+              send(parent, {:prior_incarnation_callback_started, self()})
+
+              receive do
+                :finish_prior_incarnation_callback -> :completed
+              end
+            end)
+
+          send(parent, {:prior_incarnation_callback_result, self(), result})
+        end)
+
+      caller_ref = Process.monitor(caller)
+      assert_receive {:prior_incarnation_callback_started, ^caller}, 1_000
+
+      holder_ref = Process.monitor(old_holder)
+      Process.exit(old_holder, :kill)
+      assert_receive {:DOWN, ^holder_ref, :process, ^old_holder, :killed}, 1_000
+      assert_receive {:DOWN, ^caller_ref, :process, ^caller, :killed}, 1_000
+
+      assert eventually(fn ->
+               case :global.whereis_name(name_key) do
+                 new_holder when is_pid(new_holder) -> new_holder != old_holder
+                 :undefined -> false
+               end
+             end)
+
+      send(caller, :finish_prior_incarnation_callback)
+      refute_receive {:prior_incarnation_callback_result, ^caller, _result}
+      assert SessionHolder.generation(name) == 0
+    end
+
+    test "a release-side holder exit is contained as the callback API's typed error" do
+      parent = self()
+      generation = 7
+      current = session(session_id: <<37::128>>)
+
+      one_shot_holder =
+        spawn(fn ->
+          receive do
+            {:"$gen_call", from, {:take_session_lease, ^generation}} ->
+              lease = %{
+                ref: make_ref(),
+                holder: self(),
+                generation: generation,
+                session_id: current.session_id
+              }
+
+              GenServer.reply(from, {:ok, current, lease})
+          end
+        end)
+
+      holder_ref = Process.monitor(one_shot_holder)
+
+      caller =
+        spawn(fn ->
+          result =
+            SessionHolder.with_session(one_shot_holder, generation, fn _session ->
+              send(parent, {:release_exit_callback_started, self()})
+
+              receive do
+                :finish_release_exit_callback -> :completed
+              end
+            end)
+
+          send(parent, {:release_exit_callback_result, self(), result})
+        end)
+
+      assert_receive {:release_exit_callback_started, ^caller}, 1_000
+      assert_receive {:DOWN, ^holder_ref, :process, ^one_shot_holder, :normal}, 1_000
+      send(caller, :finish_release_exit_callback)
+
+      assert_receive {:release_exit_callback_result, ^caller, {:error, :session_callback_failed}},
+                     1_000
+    end
+
     test "normal return, raise, throw, and exit all release callback leases with legacy results", %{
       holder: h
     } do
@@ -618,6 +712,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
       assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<1::128>>))
 
       assert {:ok, lease} = SessionHolder.acquire_send_lease(h, first.generation)
+      assert lease.holder == h
       assert lease.session_id == first.session_id
       assert lease.generation == first.generation
 
@@ -652,6 +747,124 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
       refute SessionHolder.live?(h)
     end
 
+    test "a caller-owned token cancels deferred publish before holder observes DOWN", %{
+      holder: h
+    } do
+      parent = self()
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<47::128>>))
+
+      lease_owner =
+        spawn(fn ->
+          result =
+            SessionHolder.with_session(h, first.generation, fn _session ->
+              send(parent, {:deferred_token_lease_started, self()})
+
+              receive do
+                :release_deferred_token_lease -> :released
+              end
+            end)
+
+          send(parent, {:deferred_token_lease_result, self(), result})
+        end)
+
+      assert_receive {:deferred_token_lease_started, ^lease_owner}, 1_000
+
+      publisher =
+        spawn(fn ->
+          result =
+            SessionHolder.publish(
+              h,
+              session(session_id: <<48::128>>),
+              first.generation
+            )
+
+          send(parent, {:deferred_publish_result, self(), result})
+        end)
+
+      publisher_ref = Process.monitor(publisher)
+      assert eventually(fn -> deferred_count(h) == 1 end)
+
+      holder_state = :sys.get_state(h)
+      [deferred_monitor_ref] = holder_state.deferred |> :queue.to_list()
+      %{token_table: token_table, token: token} = holder_state.deferred_monitors[deferred_monitor_ref]
+
+      assert :ets.lookup(token_table, token) == [{token, true}]
+      [lease_ref] = Map.keys(holder_state.send_leases)
+
+      try do
+        :ok = :sys.suspend(h)
+        send(lease_owner, :release_deferred_token_lease)
+
+        assert eventually(fn ->
+                 not is_nil(
+                   queued_message_index(h, fn
+                     {:"$gen_call", _from, {:release_send_lease, ^lease_ref}} -> true
+                     _message -> false
+                   end)
+                 )
+               end)
+
+        Process.exit(publisher, :kill)
+        assert_receive {:DOWN, ^publisher_ref, :process, ^publisher, :killed}, 1_000
+        assert :ets.info(token_table) == :undefined
+
+        assert Map.has_key?(:sys.get_state(h).deferred_monitors, deferred_monitor_ref)
+      after
+        :ok = :sys.resume(h)
+      end
+
+      assert_receive {:deferred_token_lease_result, ^lease_owner, {:ok, :released}}, 1_000
+      refute_receive {:deferred_publish_result, ^publisher, _result}
+      assert SessionHolder.generation(h) == first.generation
+      assert {:ok, ^first} = SessionHolder.get_current_session(h)
+
+      assert {:ok, replacement} =
+               SessionHolder.publish(
+                 h,
+                 session(session_id: <<49::128>>),
+                 first.generation
+               )
+
+      assert replacement.generation == first.generation + 1
+    end
+
+    test "the first deferred mutation drains existing leases and rejects later leases", %{holder: h} do
+      parent = self()
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<50::128>>))
+      assert {:ok, lease} = SessionHolder.acquire_send_lease(h, first.generation)
+
+      clear_task = Task.async(fn -> SessionHolder.clear(h, first.generation) end)
+      assert eventually(fn -> deferred_count(h) == 1 end)
+
+      assert {:error, :stale_session} = SessionHolder.acquire_send_lease(h, first.generation)
+      assert {:error, :stale_session} = SessionHolder.take_send_counter_lease(h, first.generation)
+
+      assert {:error, :stale_session} =
+               SessionHolder.with_session(h, first.generation, fn _session ->
+                 send(parent, :draining_session_callback_ran)
+               end)
+
+      assert {:error, :no_session} =
+               SessionHolder.with_send_counter(h, fn _grant ->
+                 send(parent, :draining_send_callback_ran)
+               end)
+
+      assert {:error, :stale_session} =
+               SessionHolder.seal_control_send(
+                 h,
+                 first.generation,
+                 :readiness,
+                 control_payload(:readiness)
+               )
+
+      refute_receive :draining_session_callback_ran
+      refute_receive :draining_send_callback_ran
+
+      assert :ok = SessionHolder.release_send_lease(h, lease)
+      assert :ok = Task.await(clear_task)
+      refute SessionHolder.live?(h)
+    end
+
     test "a lease cannot be acquired against a stale generation or an idle holder", %{holder: h} do
       assert {:error, :no_session} = SessionHolder.acquire_send_lease(h, 0)
 
@@ -659,7 +872,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
       assert {:ok, second} = SessionHolder.publish(h, session(session_id: <<4::128>>), first.generation)
 
       assert {:error, :stale_session} = SessionHolder.acquire_send_lease(h, first.generation)
-      assert {:ok, _lease} = SessionHolder.acquire_send_lease(h, second.generation)
+      assert {:ok, lease} = SessionHolder.acquire_send_lease(h, second.generation)
+      assert :ok = SessionHolder.release_send_lease(h, lease)
     end
 
     # The holder must never be wedged by a caller that dies mid-send. It monitors
@@ -1457,6 +1671,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
   # to sequence deferrals deterministically instead of racing two Task spawns.
   defp deferred_count(holder) do
     holder |> :sys.get_state() |> Map.fetch!(:deferred) |> :queue.len()
+  end
+
+  defp queued_message_index(holder, matcher) do
+    {:messages, messages} = Process.info(holder, :messages)
+    Enum.find_index(messages, matcher)
   end
 
   defp eventually(fun, retries \\ 100) do

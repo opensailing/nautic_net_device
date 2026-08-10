@@ -414,11 +414,18 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
       end
     end
 
-    case SessionHolder.with_session(state.session_holder, session_generation, callback) do
-      {:ok, {:ok, authorization}} -> {:ok, authorization}
-      {:ok, {:error, reason}} -> {:error, reason}
-      {:error, reason} when reason in [:no_session, :stale_session] -> {:error, :stale_session}
-      {:error, :session_callback_failed} -> {:error, :internal_failure}
+    case with_session_in_manager(state.session_holder, session_generation, callback) do
+      {:ok, {:ok, authorization}} ->
+        {:ok, authorization}
+
+      {:ok, {:error, reason}} ->
+        {:error, reason}
+
+      {:error, reason} when reason in [:no_session, :stale_session, :session_holder_unavailable] ->
+        {:error, :stale_session}
+
+      {:error, :session_callback_failed} ->
+        {:error, :internal_failure}
     end
   end
 
@@ -443,9 +450,14 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
            authorization.session_generation,
            callback
          ) do
-      {:ok, result} -> result
-      {:error, reason} when reason in [:no_session, :stale_session] -> {:error, :stale_session}
-      {:error, :session_callback_failed} -> {:error, :internal_failure}
+      {:ok, result} ->
+        result
+
+      {:error, reason} when reason in [:no_session, :stale_session, :session_holder_unavailable] ->
+        {:error, :stale_session}
+
+      {:error, :session_callback_failed} ->
+        {:error, :internal_failure}
     end
   end
 
@@ -465,7 +477,11 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     # The Manager performs the durable mutation itself, so it must also own the
     # SessionHolder lease. If the bounded lease expires, SessionHolder kills this
     # exact effect executor and waits for its DOWN before applying replacement.
+    # Holder death or a restart gap is an unavailable authorization boundary, not
+    # permission for the exit from GenServer.call/3 to take down the Manager.
     SessionHolder.with_session(session_holder, session_generation, fun)
+  catch
+    :exit, _reason -> {:error, :session_holder_unavailable}
   end
 
   defp deliver_manifest_fenced(state, delivery) do

@@ -69,22 +69,30 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   `with_control_send/5` APIs preserve their callback/result contracts but implement
   them with CALLER-SIDE work under a holder-owned lease. The holder authorizes (and,
   for UDP/control, consumes the nonce atomically) and replies IMMEDIATELY; the
-  caller runs arbitrary work and releases in `after`. A slow or re-entrant callback
-  therefore cannot park the single writer or block `live?/1`, `generation/1`, and
-  `get_current_session/1`.
+  caller runs arbitrary work and releases before returning. A slow or re-entrant
+  callback therefore cannot park the single writer or block `live?/1`,
+  `generation/1`, and `get_current_session/1`.
 
   While a lease is open the holder answers reads normally, but `publish/2,3`,
   `clear/1,2`, and `fence_for_credential_epoch/2` are DEFERRED — parked in arrival
   order and replayed once the last lease clears — so replacement still cannot
-  overtake an authorized send. A mutation attempted by the SAME lease owner fails
-  fast with `{:error, :send_lease_active}` rather than self-deadlocking.
+  overtake an authorized send. The first deferred mutation also enters DRAIN MODE:
+  later lease acquisitions fail closed until the existing leases clear and the FIFO
+  mutation queue applies. Deferred callers are monitored, and every mutation carries
+  a caller-owned token whose ETS lifetime ends atomically with that caller, so a
+  caller that dies while parked cannot be replayed as an orphan even if its monitor
+  `:DOWN` has not reached the holder yet. A mutation attempted by the SAME lease
+  owner fails fast with `{:error, :send_lease_active}` rather than self-deadlocking.
 
   Leaseholders are monitored and every lease has a bounded TTL (30 seconds by
-  default, configurable with `:send_lease_ttl`). If an owner dies, the lease is
-  released automatically. If a live owner exceeds the TTL, the holder first kills
-  it with an untrappable `:kill` signal and only releases the lease after `:DOWN`;
-  it never merely revokes authorization while old-session transport could continue.
-  The default deliberately exceeds Slipstream's 5-second synchronous push timeout.
+  default, configurable with `:send_lease_ttl`). Each lease is bound to the exact
+  holder PID that issued it; a per-incarnation guard kills the owner if that holder
+  dies, so a restarted registered name cannot validate stale work from its
+  predecessor. If an owner dies, the lease is released automatically. If a live
+  owner exceeds the TTL, the holder first kills it with an untrappable `:kill` signal
+  and only releases the lease after `:DOWN`; it never merely revokes authorization
+  while old-session transport could continue. The default deliberately exceeds
+  Slipstream's 5-second synchronous push timeout.
 
   Nonce allocation NEVER leaves the holder. Only callback/transport work does.
 
@@ -157,6 +165,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   @type send_lease :: %{
           ref: reference(),
+          holder: pid(),
           generation: generation(),
           session_id: binary()
         }
@@ -213,7 +222,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   @spec publish(GenServer.server(), Session.t()) ::
           {:ok, Session.t()} | {:error, :epoch_downgrade | :session_reused | :send_lease_active}
   def publish(server \\ __MODULE__, %Session{} = session) do
-    GenServer.call(server, {:publish, session, :any}, :infinity)
+    call_mutation(server, {:publish, session, :any})
   end
 
   @doc "Publish only if `expected_generation` is still the holder's current fence."
@@ -221,7 +230,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
           {:ok, Session.t()} | {:error, publication_error()}
   def publish(server, %Session{} = session, expected_generation)
       when is_integer(expected_generation) and expected_generation >= 0 do
-    GenServer.call(server, {:publish, session, expected_generation}, :infinity)
+    call_mutation(server, {:publish, session, expected_generation})
   end
 
   @doc "Return the current monotonic generation fence, including while no session is live."
@@ -241,20 +250,20 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   def fence_for_credential_epoch(server \\ __MODULE__, credential_epoch)
       when is_integer(credential_epoch) and credential_epoch >= 0 and
              credential_epoch <= 0xFFFF_FFFF do
-    GenServer.call(server, {:fence_for_credential_epoch, credential_epoch}, :infinity)
+    call_mutation(server, {:fence_for_credential_epoch, credential_epoch})
   end
 
   @doc "Drop the current session and advance the generation fence."
   @spec clear(GenServer.server()) :: :ok | {:error, :send_lease_active}
   def clear(server \\ __MODULE__) do
-    GenServer.call(server, {:clear, :any}, :infinity)
+    call_mutation(server, {:clear, :any})
   end
 
   @doc "Drop the session only if it is still the expected generation."
   @spec clear(GenServer.server(), generation()) :: :ok | {:error, mutation_error()}
   def clear(server, expected_generation)
       when is_integer(expected_generation) and expected_generation >= 0 do
-    GenServer.call(server, {:clear, expected_generation}, :infinity)
+    call_mutation(server, {:clear, expected_generation})
   end
 
   @doc """
@@ -472,8 +481,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   or superseded lease is inert, so callers can release unconditionally.
   """
   @spec release_send_lease(GenServer.server(), send_lease()) :: :ok
-  def release_send_lease(server, %{ref: ref}) when is_reference(ref) do
-    GenServer.call(server, {:release_send_lease, ref})
+  def release_send_lease(_server, %{holder: holder, ref: ref})
+      when is_pid(holder) and is_reference(ref) do
+    GenServer.call(holder, {:release_send_lease, ref})
   end
 
   defp with_send_counter_lease(server, expected_generation, fun) do
@@ -481,20 +491,45 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
       {:ok, grant, lease} ->
         invoke_leased_callback(server, lease, fun, grant, :send_failed)
 
+      {:error, :stale_session} when expected_generation == :any ->
+        {:error, :no_session}
+
       {:error, _reason} = error ->
         error
     end
   end
 
   defp invoke_leased_callback(server, lease, fun, value, failure_reason) do
+    callback_result =
+      try do
+        {:ok, fun.(value)}
+      rescue
+        _exception -> {:error, failure_reason}
+      catch
+        _kind, _reason -> {:error, failure_reason}
+      end
+
+    case release_send_lease_safely(server, lease) do
+      :ok -> callback_result
+      {:error, :session_holder_unavailable} -> {:error, failure_reason}
+    end
+  end
+
+  defp release_send_lease_safely(server, lease) do
+    release_send_lease(server, lease)
+  catch
+    :exit, _reason -> {:error, :session_holder_unavailable}
+  end
+
+  defp call_mutation(server, request) do
+    token_table = :ets.new(:session_holder_mutation, [:set, :protected])
+    token = make_ref()
+    true = :ets.insert(token_table, {token, true})
+
     try do
-      {:ok, fun.(value)}
-    rescue
-      _exception -> {:error, failure_reason}
-    catch
-      _kind, _reason -> {:error, failure_reason}
+      GenServer.call(server, {:mutation, request, token_table, token}, :infinity)
     after
-      release_send_lease(server, lease)
+      :ets.delete(token_table)
     end
   end
 
@@ -512,6 +547,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     send_lease_ttl = Keyword.get(opts, :send_lease_ttl, @default_send_lease_ttl)
 
     if is_integer(send_lease_ttl) and send_lease_ttl > 0 do
+      incarnation_guard = start_incarnation_guard()
+
       {:ok,
        %{
          session: nil,
@@ -522,15 +559,37 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
          # clear so a re-derived (therefore same-keyed) session cannot restart its
          # counters. Evicts rather than refusing — see `check_fresh_session/2`.
          used_session_ids: [],
+         incarnation_guard: incarnation_guard,
          # ref => %{owner, monitor_ref, timer_ref, expiring?} for every authorized
          # send still in flight.
          send_leases: %{},
+         send_lease_monitors: %{},
          send_lease_ttl: send_lease_ttl,
-         # Mutations parked behind those leases, replayed in arrival order.
-         deferred: :queue.new()
+         # The queue holds only monitor refs; key-bearing request terms live in the
+         # map so DOWN drops them in O(1). Queue tombstones are skipped on drain.
+         deferred: :queue.new(),
+         deferred_monitors: %{}
        }}
     else
       {:stop, :invalid_send_lease_ttl}
+    end
+  end
+
+  defp start_incarnation_guard do
+    holder = self()
+    spawn(fn -> incarnation_guard_loop(holder, Process.monitor(holder), %{}) end)
+  end
+
+  defp incarnation_guard_loop(holder, holder_monitor, owners) do
+    receive do
+      {:register_send_lease, ^holder, ref, owner} when is_reference(ref) and is_pid(owner) ->
+        incarnation_guard_loop(holder, holder_monitor, Map.put(owners, ref, owner))
+
+      {:unregister_send_lease, ^holder, ref} when is_reference(ref) ->
+        incarnation_guard_loop(holder, holder_monitor, Map.delete(owners, ref))
+
+      {:DOWN, ^holder_monitor, :process, ^holder, _reason} ->
+        Enum.each(owners, fn {_ref, owner} -> Process.exit(owner, :kill) end)
     end
   end
 
@@ -538,17 +597,37 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   # open they are parked (in arrival order) and replayed the moment the last lease
   # is released; reads are never parked, so the holder stays responsive.
   @impl true
-  def handle_call({:publish, _session, _expected_generation} = request, from, state) do
-    maybe_defer(request, from, state)
+  def handle_call(
+        {:mutation, {:publish, _session, _expected_generation} = request, token_table, token},
+        from,
+        state
+      ) do
+    maybe_defer(request, from, token_table, token, state)
   end
 
-  def handle_call({:clear, _expected_generation} = request, from, state) do
-    maybe_defer(request, from, state)
+  def handle_call(
+        {:mutation, {:clear, _expected_generation} = request, token_table, token},
+        from,
+        state
+      ) do
+    maybe_defer(request, from, token_table, token, state)
   end
 
-  def handle_call({:fence_for_credential_epoch, _credential_epoch} = request, from, state) do
-    maybe_defer(request, from, state)
+  def handle_call(
+        {:mutation, {:fence_for_credential_epoch, _credential_epoch} = request, token_table, token},
+        from,
+        state
+      ) do
+    maybe_defer(request, from, token_table, token, state)
   end
+
+  def handle_call(
+        {:acquire_send_lease, _expected_generation},
+        _from,
+        %{deferred_monitors: deferred} = state
+      )
+      when map_size(deferred) > 0,
+      do: {:reply, {:error, :stale_session}, state}
 
   def handle_call({:acquire_send_lease, expected_generation}, {pid, _tag}, state) do
     with :ok <- check_generation(state, expected_generation),
@@ -561,6 +640,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     end
   end
 
+  def handle_call(
+        {:take_session_lease, _expected_generation},
+        _from,
+        %{deferred_monitors: deferred} = state
+      )
+      when map_size(deferred) > 0,
+      do: {:reply, {:error, :stale_session}, state}
+
   def handle_call({:take_session_lease, expected_generation}, {pid, _tag}, state) do
     with :ok <- check_generation(state, expected_generation),
          %Session{} = session <- state.session do
@@ -571,6 +658,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
       {:error, :stale_session} = error -> {:reply, error, state}
     end
   end
+
+  def handle_call(
+        {:take_send_counter_lease, _expected_generation},
+        _from,
+        %{deferred_monitors: deferred} = state
+      )
+      when map_size(deferred) > 0,
+      do: {:reply, {:error, :stale_session}, state}
 
   def handle_call({:take_send_counter_lease, expected_generation}, {pid, _tag}, state) do
     case reserve_counters(state, 1, expected_generation) do
@@ -586,6 +681,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   def handle_call({:release_send_lease, ref}, _from, state) do
     {:reply, :ok, release_lease(state, ref)}
   end
+
+  def handle_call(
+        {:seal_control_send, _expected_generation, _type, _encoded_payload},
+        _from,
+        %{deferred_monitors: deferred} = state
+      )
+      when map_size(deferred) > 0,
+      do: {:reply, {:error, :stale_session}, state}
 
   # Nonce allocation stays in the holder; only the transport write leaves it.
   def handle_call(
@@ -647,11 +750,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   # A leaseholder that dies mid-send must never wedge session replacement.
   @impl true
   def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
-    case Enum.find(state.send_leases, fn {_ref, lease_state} ->
-           lease_state.monitor_ref == monitor_ref
-         end) do
-      {ref, _lease_state} -> {:noreply, release_lease(state, ref, :owner_down)}
-      nil -> {:noreply, state}
+    cond do
+      Map.has_key?(state.deferred_monitors, monitor_ref) ->
+        {:noreply, cancel_deferred(state, monitor_ref)}
+
+      lease_ref = Map.get(state.send_lease_monitors, monitor_ref) ->
+        {:noreply, release_lease(state, lease_ref, :owner_down)}
+
+      true ->
+        {:noreply, state}
     end
   end
 
@@ -677,16 +784,37 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   # Mutations run immediately when nothing is in flight, and are otherwise parked
   # until the last lease is released. Reads never reach here, so an open lease
   # never blocks `live?/1`, `get_current_session/0`, or counter allocation.
-  defp maybe_defer(request, _from, %{send_leases: leases} = state) when map_size(leases) == 0 do
-    {reply, next_state} = apply_request(request, state)
-    {:reply, reply, next_state}
-  end
+  defp maybe_defer(request, {pid, _tag} = from, token_table, token, state)
+       when is_pid(pid) do
+    cond do
+      lease_owner?(state, pid) ->
+        {:reply, {:error, :send_lease_active}, state}
 
-  defp maybe_defer(request, {pid, _tag} = from, state) when is_pid(pid) do
-    if lease_owner?(state, pid) do
-      {:reply, {:error, :send_lease_active}, state}
-    else
-      {:noreply, %{state | deferred: :queue.in({request, from}, state.deferred)}}
+      map_size(state.send_leases) == 0 ->
+        if mutation_token_live?(token_table, token) do
+          {reply, next_state} = apply_request(request, state)
+          {:reply, reply, next_state}
+        else
+          {:reply, {:error, :stale_session}, state}
+        end
+
+      true ->
+        monitor_ref = Process.monitor(pid)
+
+        entry = %{
+          request: request,
+          from: from,
+          owner: pid,
+          token_table: token_table,
+          token: token
+        }
+
+        {:noreply,
+         %{
+           state
+           | deferred: :queue.in(monitor_ref, state.deferred),
+             deferred_monitors: Map.put(state.deferred_monitors, monitor_ref, entry)
+         }}
     end
   end
 
@@ -695,7 +823,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     monitor_ref = Process.monitor(owner)
     timer_ref = Process.send_after(self(), {:send_lease_expired, ref}, state.send_lease_ttl)
 
-    lease = %{ref: ref, generation: state.generation, session_id: session.session_id}
+    lease = %{ref: ref, holder: self(), generation: state.generation, session_id: session.session_id}
 
     lease_state = %{
       owner: owner,
@@ -704,11 +832,28 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
       expiring?: false
     }
 
-    {lease, %{state | send_leases: Map.put(state.send_leases, ref, lease_state)}}
+    send(state.incarnation_guard, {:register_send_lease, self(), ref, owner})
+
+    {lease,
+     %{
+       state
+       | send_leases: Map.put(state.send_leases, ref, lease_state),
+         send_lease_monitors: Map.put(state.send_lease_monitors, monitor_ref, ref)
+     }}
   end
 
   defp lease_owner?(state, pid) do
     Enum.any?(state.send_leases, fn {_ref, lease_state} -> lease_state.owner == pid end)
+  end
+
+  defp mutation_token_live?(token_table, token) do
+    :ets.lookup(token_table, token) == [{token, true}]
+  rescue
+    ArgumentError -> false
+  end
+
+  defp cancel_deferred(state, monitor_ref) do
+    %{state | deferred_monitors: Map.delete(state.deferred_monitors, monitor_ref)}
   end
 
   defp release_lease(state, ref, release_reason \\ :owner_release) do
@@ -726,9 +871,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
           Process.demonitor(lease_state.monitor_ref, [:flush])
         end
 
+        send(state.incarnation_guard, {:unregister_send_lease, self(), ref})
         cancel_lease_timer(ref, lease_state.timer_ref)
         leases = Map.delete(state.send_leases, ref)
-        flush_deferred(%{state | send_leases: leases})
+        lease_monitors = Map.delete(state.send_lease_monitors, lease_state.monitor_ref)
+        flush_deferred(%{state | send_leases: leases, send_lease_monitors: lease_monitors})
     end
   end
 
@@ -751,10 +898,26 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   defp flush_deferred(state) do
     case :queue.out(state.deferred) do
-      {{:value, {request, from}}, rest} ->
-        {reply, next_state} = apply_request(request, %{state | deferred: rest})
-        GenServer.reply(from, reply)
-        flush_deferred(next_state)
+      {{:value, monitor_ref}, rest} ->
+        {entry, deferred_monitors} = Map.pop(state.deferred_monitors, monitor_ref)
+        next_state = %{state | deferred: rest, deferred_monitors: deferred_monitors}
+
+        case entry do
+          nil ->
+            flush_deferred(next_state)
+
+          %{request: request, from: from, token_table: token_table, token: token} ->
+            token_live? = mutation_token_live?(token_table, token)
+            Process.demonitor(monitor_ref, [:flush])
+
+            if token_live? do
+              {reply, applied_state} = apply_request(request, next_state)
+              GenServer.reply(from, reply)
+              flush_deferred(applied_state)
+            else
+              flush_deferred(next_state)
+            end
+        end
 
       {:empty, _rest} ->
         state

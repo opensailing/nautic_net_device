@@ -745,6 +745,27 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     assert received == %{}
   end
 
+  test "holder death during authorization fails closed without crashing the manager or caller", ctx do
+    pid = start_manager(ctx)
+    manager_ref = Process.monitor(pid)
+    holder_ref = Process.monitor(ctx.holder)
+
+    Process.exit(ctx.holder, :kill)
+    assert_receive {:DOWN, ^holder_ref, :process, holder_pid, :killed}, 1_000
+    assert holder_pid == ctx.holder
+
+    result =
+      try do
+        Manager.deliver_manifest(pid, ctx.session_generation, DS.generation_fixture().delivery)
+      catch
+        :exit, reason -> {:exit, reason}
+      end
+
+    assert result == {:error, :stale_session}
+    assert Process.alive?(pid)
+    refute_receive {:DOWN, ^manager_ref, :process, ^pid, _reason}
+  end
+
   test "session replacement stays responsive and fences activation before the pointer commit", ctx do
     prior = fully_stage(ctx.store, DS.generation_fixture(generation: 1))
     assert {:ok, nil} = Store.activate(ctx.store, 1, prior.manifest_hash)
@@ -954,6 +975,81 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     assert_receive {:DOWN, ^manager_ref, :process, ^pid, :killed}, 1_000
     assert_receive {:expired_transition_result, {:exit, _reason}}, 1_000
     assert Store.active(store) == {:ok, pointer(prior)}
+    refute_receive {:ack, %{status: :effective, generation: 2}, _meta}
+  end
+
+  test "named holder restart kills a blocked durable transition from the prior incarnation", ctx do
+    prior = fully_stage(ctx.store, DS.generation_fixture(generation: 1))
+    assert {:ok, nil} = Store.activate(ctx.store, 1, prior.manifest_hash)
+
+    holder_name_key = {__MODULE__, make_ref(), :restarting_holder}
+    holder_name = {:global, holder_name_key}
+
+    old_holder =
+      start_supervised!(
+        Supervisor.child_spec(
+          {SessionHolder, name: holder_name},
+          id: make_ref()
+        )
+      )
+
+    {:ok, current_session} = SessionHolder.publish(holder_name, session(<<2::128>>))
+
+    store =
+      Store.new(
+        base_dir: ctx.base,
+        storage_epoch: DS.storage_epoch(),
+        file_system: BlockingFileSystem
+      )
+
+    ctx = %{
+      ctx
+      | holder: holder_name,
+        session_generation: current_session.generation,
+        store: store
+    }
+
+    pid = start_manager(ctx, owner_retry_base_ms: 10)
+    assert_receive {:applier, :reconcile, _startup}
+
+    candidate = DS.generation_fixture(generation: 2)
+    final_chunk = deliver_until_final_chunk(pid, candidate, ctx.session_generation)
+    active_pointer_path = Store.active_pointer_path(store)
+    BlockingFileSystem.block_rename(active_pointer_path, self())
+    on_exit(fn -> BlockingFileSystem.clear_rename(active_pointer_path) end)
+
+    caller = self()
+
+    spawn(fn ->
+      result =
+        try do
+          Manager.deliver_chunk(pid, ctx.session_generation, final_chunk)
+        catch
+          :exit, reason -> {:exit, reason}
+        end
+
+      send(caller, {:restarted_holder_transition_result, result})
+    end)
+
+    assert_receive {:ack, %{status: :staged}, _meta}, 1_000
+    assert_receive {:active_pointer_rename_blocked, ^pid}, 1_000
+
+    manager_ref = Process.monitor(pid)
+    holder_ref = Process.monitor(old_holder)
+    Process.exit(old_holder, :kill)
+
+    assert_receive {:DOWN, ^holder_ref, :process, ^old_holder, :killed}, 1_000
+    assert_receive {:DOWN, ^manager_ref, :process, ^pid, :killed}, 1_000
+    assert_receive {:restarted_holder_transition_result, {:exit, _reason}}, 1_000
+
+    eventually(fn ->
+      new_holder = :global.whereis_name(holder_name_key)
+      assert is_pid(new_holder)
+      assert new_holder != old_holder
+    end)
+
+    assert Store.active(store) == {:ok, pointer(prior)}
+    refute_receive {:active_pointer_rename_resumed, ^pid}
     refute_receive {:ack, %{status: :effective, generation: 2}, _meta}
   end
 
