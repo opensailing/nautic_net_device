@@ -105,17 +105,78 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
     assert Path.join([ctx.base, "generations", "candidate", "chunks"]) in synced_paths
   end
 
-  test "a temporary-name collision never removes another writer's file", ctx do
+  test "a temporary-name collision retries without removing another writer's file", ctx do
     File.mkdir_p!(ctx.base)
     destination = Path.join(ctx.base, "record")
     collision = destination <> ".tmp.same"
     File.write!(collision, "other-writer")
 
-    assert {:error, {:open, :eexist}} =
-             AtomicFile.write(destination, "ours", temp_suffix: fn -> "same" end)
+    assert :ok = AtomicFile.write(destination, "ours", temp_suffix: fn -> "same" end)
 
     assert File.read!(collision) == "other-writer"
-    refute File.exists?(destination)
+    assert File.read!(destination) == "ours"
+  end
+
+  test "distinguishes pre-rename failure, durability uncertainty, and durable success", ctx do
+    pre_path = Path.join(ctx.base, "pre")
+
+    assert {:error, {:pre_rename, {:fault_injected, :before_rename, :power_loss}}} =
+             AtomicFile.write(pre_path, "pre",
+               temp_suffix: fn -> "pre" end,
+               fault_injector: fail_at(:before_rename)
+             )
+
+    refute File.exists?(pre_path)
+    assert [] == Path.wildcard(pre_path <> ".tmp.*")
+
+    uncertain_path = Path.join(ctx.base, "uncertain")
+
+    assert {:error, {:durability_uncertain, {:fault_injected, :renamed, :power_loss}}} =
+             AtomicFile.write(uncertain_path, "visible",
+               temp_suffix: fn -> "uncertain" end,
+               fault_injector: fail_at(:renamed)
+             )
+
+    assert File.read!(uncertain_path) == "visible"
+
+    durable_path = Path.join(ctx.base, "durable")
+
+    assert :ok =
+             AtomicFile.write(durable_path, "durable", fault_injector: fail_at(:parent_synced))
+
+    assert File.read!(durable_path) == "durable"
+  end
+
+  test "idempotent remove syncs durable absence and reports post-remove uncertainty", ctx do
+    File.mkdir_p!(ctx.base)
+    TracingFileSystem.attach(self())
+    absent = Path.join(ctx.base, "absent")
+
+    assert :ok =
+             AtomicFile.remove(absent,
+               file_system: TracingFileSystem,
+               directory_root: ctx.base
+             )
+
+    assert ctx.base in collect_synced_paths([])
+
+    present = Path.join(ctx.base, "present")
+    File.write!(present, "value")
+
+    assert {:error, {:durability_uncertain, {:fault_injected, :removed, :power_loss}}} =
+             AtomicFile.remove(present,
+               directory_root: ctx.base,
+               fault_injector: fail_at(:removed)
+             )
+
+    refute File.exists?(present)
+  end
+
+  defp fail_at(stage) do
+    fn
+      ^stage -> {:error, :power_loss}
+      _other -> :ok
+    end
   end
 
   defp collect_synced_paths(acc) do

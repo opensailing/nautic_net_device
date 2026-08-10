@@ -1399,16 +1399,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
   end
 
   defp write_identity_record_authoritative(store, path, type, value) do
-    case write_identity_record(store, path, type, value) do
-      :ok ->
-        :ok
-
-      {:error, _reason} = error ->
-        case read_identity_record(store, path, type) do
-          {:ok, ^value} -> :ok
-          _other -> error
-        end
-    end
+    write_identity_record(store, path, type, value)
   end
 
   defp write_record(store, path, type, value) do
@@ -1416,29 +1407,11 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Store do
   end
 
   defp write_record_authoritative(store, path, type, value) do
-    case write_record(store, path, type, value) do
-      :ok ->
-        :ok
-
-      {:error, _reason} = error ->
-        case read_record(store, path, type) do
-          {:ok, ^value} -> :ok
-          _other -> error
-        end
-    end
+    write_record(store, path, type, value)
   end
 
   defp remove_record_authoritative(store, path) do
-    case AtomicFile.remove(path, atomic_opts(store)) do
-      :ok ->
-        :ok
-
-      {:error, _reason} = error ->
-        case read_file(store, path) do
-          {:error, :enoent} -> :ok
-          _other -> error
-        end
-    end
+    AtomicFile.remove(path, atomic_opts(store))
   end
 
   defp read_identity_record(store, path, type) do

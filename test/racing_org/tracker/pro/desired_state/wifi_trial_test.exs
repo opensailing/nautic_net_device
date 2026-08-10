@@ -204,6 +204,34 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.WiFiTrialTest do
             }} = Store.load(dir)
   end
 
+  test "directory-sync uncertainty is never reconciled from visible owner-marker bytes", %{dir: dir} do
+    prior = %{version: 4, enabled: true, ssid: "prior", psk: "prior-secret"}
+    assert :ok = Store.save(dir, prior)
+
+    pid =
+      start_manager(dir,
+        confirm_fun: fn -> :ok end,
+        store_save_fun: fn store_dir, record ->
+          assert :ok = Store.save(store_dir, record)
+          {:error, {:durability_uncertain, :directory_sync}}
+        end
+      )
+
+    assert_receive {:configure, "prior", "prior-secret"}
+    assert_receive :rfkill_unblock
+
+    assert {:error, :wifi_authority_indeterminate} =
+             WiFiManager.trial_config(
+               pid,
+               %{"version" => 5, "enabled" => true, "ssid" => "candidate"},
+               Secret.new("candidate-secret"),
+               <<8::256>>
+             )
+
+    assert_receive {:configure, "candidate", "candidate-secret"}
+    assert WiFiManager.desired_activation_id(pid) == nil
+  end
+
   test "an unreadable owner marker aborts a trial before radio mutation", %{dir: dir} do
     prior_activation_id = <<5::256>>
 

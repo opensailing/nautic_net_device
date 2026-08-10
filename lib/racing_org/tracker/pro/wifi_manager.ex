@@ -740,9 +740,17 @@ defmodule RacingOrg.Tracker.Pro.WiFiManager do
   # unreadable authority where guessing would risk disk/radio divergence.
   defp save_marker(marker, state) do
     case safely_save_marker(marker, state) do
-      :ok -> :ok
-      {:error, reason} -> confirm_durable_marker(marker, reason, state)
-      other -> confirm_durable_marker(marker, other, state)
+      :ok ->
+        :ok
+
+      {:error, {:durability_uncertain, _reason}} ->
+        {:error, :wifi_authority_indeterminate}
+
+      {:error, reason} ->
+        confirm_durable_marker(marker, reason, state)
+
+      other ->
+        confirm_durable_marker(marker, other, state)
     end
   end
 

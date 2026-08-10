@@ -18,42 +18,35 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
           | :parent_synced
           | :removed
 
-  @spec write(Path.t(), iodata(), keyword()) :: :ok | {:error, term()}
+  @type write_error ::
+          {:pre_rename, term()}
+          | {:durability_uncertain, term()}
+
+  @spec write(Path.t(), iodata(), keyword()) :: :ok | {:error, write_error()}
   def write(path, contents, opts \\ []) do
     with :ok <- ensure_directory(Path.dirname(path), opts),
          {:ok, temp_path} <- write_exclusive_temp(path, contents, opts, @temp_attempts) do
-      result =
-        with :ok <- inject_fault(:before_rename, opts),
-             :ok <- rename(temp_path, path, opts),
-             :ok <- inject_fault(:renamed, opts),
-             :ok <- sync_parent_directory(path, opts),
-             :ok <- inject_fault(:parent_synced, opts) do
-          :ok
-        end
-
-      if result != :ok, do: file_system(opts).remove(temp_path)
-      result
+      commit_temp(temp_path, path, opts)
+    else
+      {:error, reason} -> {:error, {:pre_rename, reason}}
     end
   end
 
-  @spec remove(Path.t(), keyword()) :: :ok | {:error, term()}
+  @type remove_error ::
+          {:pre_remove, term()}
+          | {:durability_uncertain, term()}
+
+  @spec remove(Path.t(), keyword()) :: :ok | {:error, remove_error()}
   def remove(path, opts \\ []) do
-    case file_system(opts).remove(path) do
-      :ok ->
-        with :ok <- inject_fault(:removed, opts),
-             :ok <- sync_parent_directory(path, opts),
-             :ok <- inject_fault(:parent_synced, opts) do
-          :ok
-        end
-
-      {:error, :enoent} ->
-        :ok
-
-      {:error, reason} ->
-        {:error, {:remove, reason}}
-
-      other ->
-        {:error, {:remove, other}}
+    with :ok <- ensure_directory(Path.dirname(path), opts) do
+      case file_system(opts).remove(path) do
+        :ok -> finish_removed(path, opts)
+        {:error, :enoent} -> establish_durable_absence(path, opts)
+        {:error, reason} -> {:error, {:pre_remove, {:remove, reason}}}
+        other -> {:error, {:pre_remove, {:remove, other}}}
+      end
+    else
+      {:error, reason} -> {:error, {:pre_remove, reason}}
     end
   end
 
@@ -67,6 +60,60 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
         {:error, _reason} = error -> {:halt, error}
       end
     end)
+  end
+
+  defp commit_temp(temp_path, path, opts) do
+    case inject_fault(:before_rename, opts) do
+      :ok ->
+        case rename(temp_path, path, opts) do
+          :ok -> finish_renamed(path, opts)
+          {:error, reason} -> cleanup_pre_rename(temp_path, reason, opts)
+        end
+
+      {:error, reason} ->
+        cleanup_pre_rename(temp_path, reason, opts)
+    end
+  end
+
+  defp finish_renamed(path, opts) do
+    with :ok <- inject_fault(:renamed, opts),
+         :ok <- sync_parent_directory(path, opts) do
+      _durable_fault = inject_fault(:parent_synced, opts)
+      :ok
+    else
+      {:error, reason} -> {:error, {:durability_uncertain, reason}}
+    end
+  end
+
+  defp cleanup_pre_rename(temp_path, reason, opts) do
+    cleanup_result = file_system(opts).remove(temp_path)
+
+    case cleanup_result do
+      :ok -> {:error, {:pre_rename, reason}}
+      {:error, :enoent} -> {:error, {:pre_rename, reason}}
+      other -> {:error, {:pre_rename, {reason, {:temp_cleanup, other}}}}
+    end
+  end
+
+  defp finish_removed(path, opts) do
+    with :ok <- inject_fault(:removed, opts),
+         :ok <- sync_parent_directory(path, opts) do
+      _durable_fault = inject_fault(:parent_synced, opts)
+      :ok
+    else
+      {:error, reason} -> {:error, {:durability_uncertain, reason}}
+    end
+  end
+
+  defp establish_durable_absence(path, opts) do
+    case sync_parent_directory(path, opts) do
+      :ok ->
+        _durable_fault = inject_fault(:parent_synced, opts)
+        :ok
+
+      {:error, reason} ->
+        {:error, {:durability_uncertain, reason}}
+    end
   end
 
   defp directory_chain(directory, opts) do
@@ -105,7 +152,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
   defp write_exclusive_temp(_path, _contents, _opts, 0), do: {:error, {:open, :eexist}}
 
   defp write_exclusive_temp(path, contents, opts, attempts) do
-    temp_path = temporary_path(path, opts)
+    temp_path = temporary_path(path, opts, attempts)
 
     case open_and_sync_temp(temp_path, contents, opts) do
       :ok ->
@@ -212,9 +259,12 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
   defp fs_result({:error, reason}, operation), do: {:error, {operation, reason}}
   defp fs_result(other, operation), do: {:error, {operation, other}}
 
-  defp temporary_path(path, opts) do
+  defp temporary_path(path, opts, attempts_remaining) do
     suffix_fun = Keyword.get(opts, :temp_suffix, &default_temp_suffix/0)
-    path <> ".tmp." <> suffix_fun.()
+    suffix = suffix_fun.()
+    attempt = @temp_attempts - attempts_remaining + 1
+    attempt_suffix = if attempt == 1, do: suffix, else: suffix <> "." <> Integer.to_string(attempt)
+    path <> ".tmp." <> attempt_suffix
   end
 
   defp default_temp_suffix do

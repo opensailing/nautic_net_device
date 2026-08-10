@@ -430,27 +430,12 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
         :ok ->
           {:ok, %{store | snapshot: snapshot}}
 
-        {:error, _reason} = write_error ->
-          reconcile_ambiguous_write(store, snapshot, write_error)
+        {:error, {:durability_uncertain, reason}} ->
+          {:error, {:command_ledger_durability_uncertain, reason}}
+
+        {:error, reason} ->
+          {:error, {:write_command_ledger, reason}}
       end
     end
   end
-
-  defp reconcile_ambiguous_write(store, intended, write_error) do
-    case read_snapshot(store) do
-      {:ok, ^intended} ->
-        {:ok, %{store | snapshot: intended}}
-
-      {:ok, _other} ->
-        {:error, wrap_write_error(write_error)}
-
-      {:error, :enoent} ->
-        {:error, wrap_write_error(write_error)}
-
-      {:error, read_error} ->
-        {:error, {:command_ledger_authority_indeterminate, wrap_write_error(write_error), read_error}}
-    end
-  end
-
-  defp wrap_write_error({:error, reason}), do: {:write_command_ledger, reason}
 end

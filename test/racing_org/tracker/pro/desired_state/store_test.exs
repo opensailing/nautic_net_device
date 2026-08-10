@@ -759,7 +759,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
     assert {:ok, %{generation: 1}} = Store.active(ctx.store)
   end
 
-  test "active pointer fault boundaries report the durable commit authoritatively", ctx do
+  test "active pointer transitions never claim success before directory durability", ctx do
     for stage <- [
           :temp_opened,
           :temp_chmodded,
@@ -789,14 +789,21 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
       result = Store.activate(faulted, 2, second.manifest_hash)
       assert {:ok, pointer} = Store.active(clean)
 
-      if stage in [:renamed, :parent_synced] do
-        assert {:ok, %{generation: 1}} = result
-        assert pointer.generation == 2
-        assert pointer.manifest_hash == second.manifest_hash
-      else
-        assert {:error, {:fault_injected, ^stage, :power_loss}} = result
-        assert pointer.generation == 1
-        assert pointer.manifest_hash == first.manifest_hash
+      case stage do
+        :renamed ->
+          assert {:error, {:durability_uncertain, {:fault_injected, :renamed, :power_loss}}} = result
+          assert pointer.generation == 1
+          assert pointer.manifest_hash == first.manifest_hash
+
+        :parent_synced ->
+          assert {:ok, %{generation: 1}} = result
+          assert pointer.generation == 2
+          assert pointer.manifest_hash == second.manifest_hash
+
+        pre_rename_stage ->
+          assert {:error, {:pre_rename, {:fault_injected, ^pre_rename_stage, :power_loss}}} = result
+          assert pointer.generation == 1
+          assert pointer.manifest_hash == first.manifest_hash
       end
     end
   end
@@ -827,7 +834,15 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
           end
         )
 
-      assert {:ok, :stored} = Store.put_pending_ack(faulted, ack)
+      result = Store.put_pending_ack(faulted, ack)
+
+      case stage do
+        :renamed ->
+          assert {:error, {:durability_uncertain, {:fault_injected, :renamed, :power_loss}}} = result
+
+        :parent_synced ->
+          assert {:ok, :stored} = result
+      end
 
       clean = Store.new(base_dir: base, storage_epoch: DS.storage_epoch())
       assert {:ok, [^ack]} = Store.pending_acks(clean)

@@ -307,16 +307,24 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.RuntimeIdentityTest do
           end
         )
 
-      assert {:error, {:fault_injected, ^failed_stage, :simulated_power_loss}} = result
-      :persistent_term.erase(key)
-
       case failed_stage do
-        stage when stage in [:renamed, :parent_synced] ->
+        :renamed ->
+          assert {:error, {:durability_uncertain, {:fault_injected, :renamed, :simulated_power_loss}}} = result
+
           assert File.read!(RuntimeIdentity.storage_epoch_path(base_dir: base)) == <<0x92::128>>
 
-        _ ->
+        :parent_synced ->
+          assert {:ok, pid} = result
+          assert RuntimeIdentity.storage_epoch(pid) == <<0x92::128>>
+          GenServer.stop(pid)
+
+        pre_rename_stage ->
+          assert {:error, {:pre_rename, {:fault_injected, ^pre_rename_stage, :simulated_power_loss}}} = result
+
           refute File.exists?(RuntimeIdentity.storage_epoch_path(base_dir: base))
       end
+
+      :persistent_term.erase(key)
     end)
   end
 

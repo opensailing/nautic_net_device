@@ -16,7 +16,8 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreSnapshotTest do
     :temp_closed,
     :before_rename
   ]
-  @post_rename_faults [:renamed, :parent_synced]
+  @uncertain_faults [:renamed]
+  @durable_faults [:parent_synced]
 
   setup do
     root = Path.join(System.tmp_dir!(), "command_ledger_snapshot_#{System.unique_integer([:positive])}")
@@ -77,13 +78,11 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreSnapshotTest do
     end
   end
 
-  test "pre-rename failures do not claim initialization and post-rename failures use authoritative read-back", %{
-    root: root
-  } do
+  test "initialization releases success only after the parent directory is durable", %{root: root} do
     for stage <- @pre_rename_faults do
       path = Path.join([root, Atom.to_string(stage), "ledger.snapshot"])
 
-      assert {:error, {:write_command_ledger, {:fault_injected, ^stage, :power_loss}}} =
+      assert {:error, {:write_command_ledger, {:pre_rename, {:fault_injected, ^stage, :power_loss}}}} =
                open_store(path, fault_injector: fail_at(stage))
 
       refute File.exists?(path)
@@ -91,12 +90,21 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreSnapshotTest do
       assert Store.snapshot(clean).next_expected_sequence == 1
     end
 
-    for stage <- @post_rename_faults do
+    for stage <- @uncertain_faults do
+      path = Path.join([root, Atom.to_string(stage), "ledger.snapshot"])
+
+      assert {:error, {:command_ledger_durability_uncertain, {:fault_injected, ^stage, :power_loss}}} =
+               open_store(path, fault_injector: fail_at(stage))
+
+      assert File.exists?(path)
+      assert {:ok, reopened} = open_store(path)
+      assert Store.snapshot(reopened).next_expected_sequence == 1
+    end
+
+    for stage <- @durable_faults do
       path = Path.join([root, Atom.to_string(stage), "ledger.snapshot"])
 
       assert {:ok, store} = open_store(path, fault_injector: fail_at(stage))
-      assert File.exists?(path)
-      assert Store.snapshot(store).next_expected_sequence == 1
       assert {:ok, reopened} = open_store(path)
       assert Store.snapshot(reopened) == Store.snapshot(store)
     end

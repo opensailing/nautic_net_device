@@ -17,7 +17,8 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
     :temp_closed,
     :before_rename
   ]
-  @post_rename_faults [:renamed, :parent_synced]
+  @uncertain_faults [:renamed]
+  @durable_faults [:parent_synced]
 
   setup do
     root = Path.join(System.tmp_dir!(), "command_ledger_transition_#{System.unique_integer([:positive])}")
@@ -278,22 +279,35 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
     assert Store.snapshot(reopened_completed) == Store.snapshot(completed)
   end
 
-  test "all transition fault stages resolve from the authoritative snapshot", %{root: root} do
+  test "transitions never release execution or ACK on directory-sync uncertainty", %{root: root} do
     for stage <- @pre_rename_faults do
       path = Path.join([root, "pre", Atom.to_string(stage), "ledger.snapshot"])
       assert {:ok, _clean} = open_store(path)
       assert {:ok, faulted} = open_store(path, fault_injector: fail_at(stage))
       delivery = delivery(command_id: command_id(1))
 
-      assert {:error, {:write_command_ledger, {:fault_injected, ^stage, :power_loss}}} =
+      assert {:error, {:write_command_ledger, {:pre_rename, {:fault_injected, ^stage, :power_loss}}}} =
                Store.begin_intent(faulted, execution_plan(delivery, :set_tracking, 8))
 
       assert {:ok, reopened} = open_store(path)
       assert Store.pending_intent(reopened) == nil
     end
 
-    for stage <- @post_rename_faults do
-      path = Path.join([root, "post", Atom.to_string(stage), "ledger.snapshot"])
+    for stage <- @uncertain_faults do
+      path = Path.join([root, "uncertain", Atom.to_string(stage), "ledger.snapshot"])
+      assert {:ok, _clean} = open_store(path)
+      assert {:ok, faulted} = open_store(path, fault_injector: fail_at(stage))
+      delivery = delivery(command_id: command_id(1))
+
+      assert {:error, {:command_ledger_durability_uncertain, {:fault_injected, ^stage, :power_loss}}} =
+               Store.begin_intent(faulted, execution_plan(delivery, :set_tracking, 8))
+
+      assert {:ok, reopened} = open_store(path)
+      assert Store.pending_intent(reopened).command_id == delivery.command_id
+    end
+
+    for stage <- @durable_faults do
+      path = Path.join([root, "durable", Atom.to_string(stage), "ledger.snapshot"])
       assert {:ok, _clean} = open_store(path)
       assert {:ok, faulted} = open_store(path, fault_injector: fail_at(stage))
       delivery = delivery(command_id: command_id(1))
@@ -312,7 +326,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
       assert {:ok, intent, _pending} = Store.begin_intent(clean, execution_plan(delivery, :set_tracking, 8))
       assert {:ok, faulted} = open_store(path, fault_injector: fail_at(stage))
 
-      assert {:error, {:write_command_ledger, {:fault_injected, ^stage, :power_loss}}} =
+      assert {:error, {:write_command_ledger, {:pre_rename, {:fault_injected, ^stage, :power_loss}}}} =
                Store.complete_intent(faulted, "result", 1_700_000_000_000)
 
       assert {:ok, reopened} = open_store(path)
@@ -320,8 +334,23 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
       assert Store.snapshot(reopened).outcomes == %{}
     end
 
-    for stage <- @post_rename_faults do
-      path = Path.join([root, "outcome-post", Atom.to_string(stage), "ledger.snapshot"])
+    for stage <- @uncertain_faults do
+      path = Path.join([root, "outcome-uncertain", Atom.to_string(stage), "ledger.snapshot"])
+      assert {:ok, clean} = open_store(path)
+      delivery = delivery(command_id: command_id(1))
+      assert {:ok, _intent, _pending} = Store.begin_intent(clean, execution_plan(delivery, :set_tracking, 8))
+      assert {:ok, faulted} = open_store(path, fault_injector: fail_at(stage))
+
+      assert {:error, {:command_ledger_durability_uncertain, {:fault_injected, ^stage, :power_loss}}} =
+               Store.complete_intent(faulted, "result", 1_700_000_000_000)
+
+      assert {:ok, reopened} = open_store(path)
+      assert Store.pending_intent(reopened) == nil
+      assert Map.fetch!(Store.snapshot(reopened).outcomes, delivery.command_id).result == "result"
+    end
+
+    for stage <- @durable_faults do
+      path = Path.join([root, "outcome-durable", Atom.to_string(stage), "ledger.snapshot"])
       assert {:ok, clean} = open_store(path)
       delivery = delivery(command_id: command_id(1))
       assert {:ok, _intent, _pending} = Store.begin_intent(clean, execution_plan(delivery, :set_tracking, 8))
@@ -329,10 +358,6 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
 
       assert {:ok, ack, _completed} = Store.complete_intent(faulted, "result", 1_700_000_000_000)
       assert ack.result == "result"
-
-      assert {:ok, reopened} = open_store(path)
-      assert Store.pending_intent(reopened) == nil
-      assert Map.fetch!(Store.snapshot(reopened).outcomes, delivery.command_id).result == "result"
     end
   end
 
