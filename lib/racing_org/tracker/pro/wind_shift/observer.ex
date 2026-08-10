@@ -528,22 +528,29 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
       Logger.warning("[WindShift.Observer] dropping unsynced previous-day rows at UTC rollover")
     end
 
-    # last_summary resets so the new session's FIRST sync always goes out. A
-    # candidate or confirmed step is session-scoped because its onset wall time
-    # is derived from the detector's monotonic onset. Re-arm it at rotation so a
-    # later confirmation cannot backdate into the previous UTC session.
+    # last_summary resets so the new session's FIRST sync always goes out.
+    # Unconfirmed Page-Hinkley/onset state is session-scoped and must re-arm, but
+    # a confirmed front remains active until the existing absorption logic resets
+    # it; clearing it here would transiently lose the persistent-step regime and
+    # let the same lagging slow mean emit a duplicate confirmation.
+    state = rotate_step_state(state)
+
     %{
       state
       | session: nil,
         pending_timeline: [],
         pending_events: [],
         last_summary: nil,
-        step: StepDetect.reset(state.step),
-        prev_step_status: :none,
-        absorb_count: 0,
         xing: %{side: nil, extreme: nil}
     }
     |> start_session(wall_ms)
+  end
+
+  defp rotate_step_state(state) do
+    case StepDetect.snapshot(state.step).status do
+      :confirmed -> %{state | prev_step_status: :confirmed}
+      _unconfirmed -> %{state | step: StepDetect.reset(state.step), prev_step_status: :none, absorb_count: 0}
+    end
   end
 
   defp utc_date(ms), do: ms |> DateTime.from_unix!(:millisecond) |> DateTime.to_date()
