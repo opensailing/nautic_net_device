@@ -162,6 +162,42 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.BinsTest do
       refute Bins.valid_key?(b, {max_tws_idx + 1, 0})
     end
 
+    test "admits the exact geometry whose largest index is u32_max, and nothing finer" do
+      # The index space is 0..u32_max, so the admissible BIN COUNT is u32_max + 1.
+      # The exact boundary width is the one that fills it precisely; its largest
+      # index must land on u32_max, not one short of it and not one past it.
+      exact_twa = 180.0 / (0xFFFF_FFFF + 1)
+      exact_tws = 51.4444 / (0xFFFF_FFFF + 1)
+
+      b = Bins.new(twa_width_deg: exact_twa, tws_width_mps: exact_tws, max_tws_mps: 51.4444)
+      assert Bins.max_key(b) == {0xFFFF_FFFF, 0xFFFF_FFFF}
+
+      # One step finer overflows the index space and must fail closed.
+      assert_raise ArgumentError, fn -> Bins.new(twa_width_deg: exact_twa / 2) end
+
+      assert_raise ArgumentError, fn ->
+        Bins.new(tws_width_mps: exact_tws / 2, max_tws_mps: 51.4444)
+      end
+    end
+
+    test "an unrepresentably large integer extent or width is an ArgumentError, not ArithmeticError" do
+      # `finite_number?/1` treats EVERY integer as finite, but an integer beyond
+      # the float range raises ArithmeticError the moment `+ 0.0` converts it —
+      # leaking a raw arithmetic fault out of a constructor that documents
+      # ArgumentError for bad geometry.
+      huge = 10 ** 400
+
+      assert_raise ArgumentError, fn -> Bins.new(max_tws_mps: huge) end
+      assert_raise ArgumentError, fn -> Bins.new(tws_width_mps: huge) end
+      assert_raise ArgumentError, fn -> Bins.new(twa_width_deg: huge) end
+      assert_raise ArgumentError, fn -> Bins.new(max_tws_mps: -huge) end
+
+      # Ordinary integer options keep converting to floats exactly as before.
+      assert Bins.new(tws_width_mps: 1, max_tws_mps: 30).tws_width_mps == 1.0
+      assert Bins.new(tws_width_mps: 1, max_tws_mps: 30).max_tws_mps == 30.0
+      assert Bins.new(twa_width_deg: 5).twa_width_deg == 5.0
+    end
+
     test "valid_key?/2 rejects keys outside the bound (poisoned/restored state)" do
       b = Bins.new()
       refute Bins.valid_key?(b, {100, 0})

@@ -18,6 +18,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
   @u64_max 0xFFFF_FFFF_FFFF_FFFF
   @database_int_max 9_223_372_036_854_775_807
   @max_finite 1.7976931348623157e308
+  # Largest integer that still converts to a finite float; beyond it `+ 0.0`
+  # raises rather than yielding infinity.
+  @max_finite_integer trunc(1.7976931348623157e308)
+  # Polar cell indices run 0..u32_max, so an axis may hold at most u32_max + 1
+  # bins. Named as a COUNT to keep it distinct from the largest index.
+  @polar_axis_bin_count 0xFFFF_FFFF + 1
   @max_estimators 256
   @max_prev_applied 512
   @max_regime_legs 256
@@ -422,26 +428,48 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
   The largest bin index an axis of `extent` divided into `width` bins can produce,
   or `{:error, :invalid_checkpoint_content}` when that index space does not fit u32.
 
+  Indices run `0..u32_max`, so the admissible BIN COUNT is `u32_max + 1` and the
+  largest admissible index is `u32_max`. Both bounds are stated in those terms
+  here and in `Polar.Observer.Bins` so the wire grid and the runtime grid admit
+  exactly the same geometries — a disagreement at the boundary would mean a
+  sailed polar a device can legally accumulate cannot be checkpointed.
+
   The width is bounded BEFORE the division, not after. `extent / width` for a
   finite but unboundedly small width overflows to `+Inf`, and float overflow
   RAISES `ArithmeticError` on the BEAM — so a check on the quotient never runs,
   and hostile geometry crashes the validator instead of being rejected by it.
-  Dividing the extent by the large `u32_max + 1` constant cannot overflow (it
-  can only underflow toward zero), which makes the minimum representable width
-  safe to compute for any finite extent.
+  Dividing the extent by the large `@polar_axis_bin_count` constant cannot
+  overflow (it can only underflow toward zero), which makes the minimum
+  representable width safe to compute for any finite extent.
 
-  Shared with `Polar.Observer.Bins` so the wire grid and the runtime grid agree
-  on exactly which geometries are indexable.
+  Total: this function is public and shared, so it is reachable with whatever a
+  caller holds. Non-number, non-finite, and non-positive terms fail closed
+  rather than surfacing an arithmetic fault.
   """
-  @spec polar_axis_bins(float(), float()) ::
+  @spec polar_axis_bins(term(), term()) ::
           {:ok, non_neg_integer()} | {:error, :invalid_checkpoint_content}
   def polar_axis_bins(extent, width) do
-    with :ok <- ensure(width >= extent / (@u32_max + 1)),
+    with :ok <- ensure(finite_positive_number?(extent)),
+         :ok <- ensure(finite_positive_number?(width)),
+         extent = extent + 0.0,
+         width = width + 0.0,
+         :ok <- ensure(width >= extent / @polar_axis_bin_count),
          ratio = extent / width,
-         :ok <- ensure(ratio <= @u32_max) do
-      {:ok, max(trunc(:math.ceil(ratio)) - 1, 0)}
+         :ok <- ensure(ratio <= @polar_axis_bin_count) do
+      {:ok, min(max(trunc(:math.ceil(ratio)) - 1, 0), @u32_max)}
     end
   end
+
+  # An integer is only "finite" here if it survives conversion to a float: every
+  # integer satisfies `is_integer/1`, but one beyond the float range raises the
+  # moment `+ 0.0` converts it.
+  defp finite_positive_number?(value) when is_float(value),
+    do: value == value and value > 0.0 and value <= @max_finite
+
+  defp finite_positive_number?(value) when is_integer(value),
+    do: value > 0 and value <= @max_finite_integer
+
+  defp finite_positive_number?(_value), do: false
 
   defp validate_polar_cell(cell, p, {max_tws_bin, max_twa_bin}) do
     with :ok <- exact_string_keys(cell, ~w(count quantile twa_bin tws_bin)),

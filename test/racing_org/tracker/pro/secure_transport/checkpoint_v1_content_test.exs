@@ -1,6 +1,7 @@
 defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
   use ExUnit.Case, async: true
 
+  alias RacingOrg.Tracker.Pro.Polar.Observer.Bins
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Canonical
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint
@@ -245,6 +246,63 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
         assert {:error, :invalid_checkpoint_content} =
                  Checkpoint.canonical_content(:polar, @polar_schema, %{content | "tws_width_mps" => invalid})
       end
+    end
+
+    test "agrees with the runtime grid at the exact u32 index boundary" do
+      # The runtime grid (Bins) and the wire grid (this validator) must admit
+      # EXACTLY the same geometries. A disagreement at the boundary means a
+      # sailed polar a device can legally accumulate cannot be checkpointed, or
+      # the reverse — either way the two views of one grid have forked.
+      exact_twa = 180.0 / (0xFFFF_FFFF + 1)
+      exact_tws = 51.4444 / (0xFFFF_FFFF + 1)
+
+      assert {:ok, 0xFFFF_FFFF} = Checkpoint.polar_axis_bins(180.0, exact_twa)
+      assert {:ok, 0xFFFF_FFFF} = Checkpoint.polar_axis_bins(51.4444, exact_tws)
+
+      runtime = Bins.new(twa_width_deg: exact_twa, tws_width_mps: exact_tws, max_tws_mps: 51.4444)
+      assert Bins.max_key(runtime) == {0xFFFF_FFFF, 0xFFFF_FFFF}
+
+      # One step finer fails closed on both sides, without raising.
+      assert {:error, :invalid_checkpoint_content} = Checkpoint.polar_axis_bins(180.0, exact_twa / 2)
+      assert_raise ArgumentError, fn -> Bins.new(twa_width_deg: exact_twa / 2) end
+
+      # Content declaring the boundary geometry is accepted end to end.
+      boundary = %{
+        polar_checkpoint()
+        | "cells" => [],
+          "twa_width_deg" => exact_twa,
+          "tws_width_mps" => exact_tws
+      }
+
+      assert {:ok, _bytes} = Checkpoint.canonical_content(:polar, @polar_schema, boundary)
+    end
+
+    test "polar_axis_bins/2 is total for hostile terms rather than raising" do
+      # This function is public and shared across modules, so it is reachable
+      # with whatever a caller holds. Every non-finite, non-positive, or
+      # non-number term must fail closed instead of surfacing ArithmeticError.
+      hostile = [
+        {180.0, 0.0},
+        {180.0, -1.0},
+        {180.0, :wide},
+        {180.0, nil},
+        {180.0, "5"},
+        {180.0, 10 ** 400},
+        {:wide, 5.0},
+        {nil, 5.0},
+        {"180", 5.0},
+        {10 ** 400, 5.0},
+        {-180.0, 5.0},
+        {0.0, 5.0}
+      ]
+
+      for {extent, width} <- hostile do
+        assert {:error, :invalid_checkpoint_content} = Checkpoint.polar_axis_bins(extent, width),
+               "#{inspect({extent, width})} must fail closed"
+      end
+
+      # Ordinary integer arguments remain acceptable numbers.
+      assert {:ok, 35} = Checkpoint.polar_axis_bins(180.0, 5)
     end
 
     test "keeps admitting the finest grid that still fits the u32 index space" do

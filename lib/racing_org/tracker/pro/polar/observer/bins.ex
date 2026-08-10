@@ -79,9 +79,11 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Bins do
   # A wind angle is always reported within one turn either way; beyond that the
   # reading is garbage rather than an unwrapped angle.
   @max_abs_twa_deg 360.0
-  # Every cell index is persisted and shipped on the wire as a u32, so neither
-  # axis may divide into more indices than that space holds.
-  @max_axis_bins 0xFFFF_FFFF
+  # Every cell index is persisted and shipped on the wire as a u32. Indices run
+  # 0..u32_max, so an axis may hold at most u32_max + 1 BINS — named as a count
+  # to keep it distinct from the largest index, which is one less.
+  @max_axis_index 0xFFFF_FFFF
+  @max_axis_bin_count @max_axis_index + 1
 
   @enforce_keys [:twa_width_deg, :tws_width_mps, :max_tws_mps]
   defstruct twa_width_deg: @default_twa_width_deg,
@@ -115,12 +117,12 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Bins do
 
     unless indexable?(max_tws + 0.0, tws + 0.0) do
       raise ArgumentError,
-            "tws_width_mps #{tws} divides the [0, #{max_tws}] m/s axis into more than #{@max_axis_bins} bins"
+            "tws_width_mps #{tws} divides the [0, #{max_tws}] m/s axis into more than #{@max_axis_bin_count} bins"
     end
 
     unless indexable?(180.0, twa + 0.0) do
       raise ArgumentError,
-            "twa_width_deg #{twa} divides the [0, 180] deg axis into more than #{@max_axis_bins} bins"
+            "twa_width_deg #{twa} divides the [0, 180] deg axis into more than #{@max_axis_bin_count} bins"
     end
 
     %__MODULE__{twa_width_deg: twa + 0.0, tws_width_mps: tws + 0.0, max_tws_mps: max_tws + 0.0}
@@ -259,10 +261,16 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Bins do
   # bin instead of spawning an empty singleton.
   defp twa_index(twa, width), do: min(floor_div(twa, width), max_twa_index(width))
 
+  # `new/1` bounds both axes to at most `@max_axis_bin_count` bins, so the top
+  # index is already inside u32; the clamp keeps that explicit and holds even for
+  # a struct built directly rather than through the constructor.
   defp max_tws_index(%__MODULE__{max_tws_mps: max_tws, tws_width_mps: width}),
-    do: max(trunc(:math.ceil(max_tws / width)) - 1, 0)
+    do: axis_index(max_tws, width)
 
-  defp max_twa_index(width), do: max(trunc(:math.ceil(180.0 / width)) - 1, 0)
+  defp max_twa_index(width), do: axis_index(180.0, width)
+
+  defp axis_index(extent, width),
+    do: min(max(trunc(:math.ceil(extent / width)) - 1, 0), @max_axis_index)
 
   defp floor_div(v, width), do: trunc(:math.floor(v / width))
 
@@ -272,16 +280,29 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Bins do
   # unboundedly small width, and float overflow RAISES on the BEAM — so checking
   # the quotient would crash `max_key/1`, `valid_key?/2`, and every restore path
   # that screens persisted keys, instead of rejecting the misconfiguration here.
-  # Dividing by the large `@max_axis_bins + 1` constant cannot overflow.
-  defp indexable?(extent, width), do: width >= extent / (@max_axis_bins + 1)
+  # Dividing by the large bin-count constant cannot overflow.
+  #
+  # The bound is the BIN COUNT, matching
+  # `SecureTransport.DesiredStateV1.Checkpoint.polar_axis_bins/2` exactly: the
+  # runtime grid and the wire grid must admit the same geometries, so the width
+  # that fills the index space precisely (largest index == u32_max) is valid on
+  # both sides.
+  defp indexable?(extent, width), do: width >= extent / @max_axis_bin_count
 
   defp positive_finite?(v), do: finite_number?(v) and v > 0.0
 
   # Largest finite IEEE-754 double; anything strictly beyond is ±Inf, and NaN is
   # the only value with `v != v`. Mirrors `Polar.Lookup` / `Observer.PSquare`.
   @max_finite 1.7976931348623157e308
+  # Largest integer that still converts to a finite float.
+  @max_finite_integer trunc(1.7976931348623157e308)
 
   defp finite_number?(v) when is_float(v), do: v == v and v <= @max_finite and v >= -@max_finite
-  defp finite_number?(v) when is_integer(v), do: true
+  # An arbitrary-precision integer is not automatically representable: one beyond
+  # the float range RAISES the moment `+ 0.0` converts it, which would leak a raw
+  # ArithmeticError out of a constructor documented to signal bad geometry with
+  # ArgumentError. Bound it against the float range instead of trusting
+  # `is_integer/1` alone.
+  defp finite_number?(v) when is_integer(v), do: v <= @max_finite_integer and v >= -@max_finite_integer
   defp finite_number?(_), do: false
 end
