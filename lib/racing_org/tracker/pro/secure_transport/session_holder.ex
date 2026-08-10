@@ -114,7 +114,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     end
   end
 
-  @doc "Publish a replacement session and return it with its new monotonic generation."
+  @doc """
+  Publish a replacement session and return it with its new monotonic generation.
+
+  A cryptographic `session_id` already used in the current credential epoch is
+  rejected even after replacement or clear, preventing holder-owned counters and
+  replay windows from resetting under reused keys. A higher credential epoch starts
+  a fresh id set because its keys and nonce epoch are distinct.
+  """
   @spec publish(GenServer.server(), Session.t()) ::
           {:ok, Session.t()} | {:error, :epoch_downgrade | :session_reused}
   def publish(server \\ __MODULE__, %Session{} = session) do
@@ -302,7 +309,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   @impl true
   def init(_opts) do
-    {:ok, %{session: nil, control: nil, generation: 0, credential_epoch: nil}}
+    {:ok,
+     %{
+       session: nil,
+       control: nil,
+       generation: 0,
+       credential_epoch: nil,
+       used_session_ids: MapSet.new()
+     }}
   end
 
   @impl true
@@ -312,6 +326,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
          :ok <- check_fresh_session(state, session) do
       generation = state.generation + 1
       published = %{session | generation: generation}
+      used_session_ids = remember_session_id(state, published)
 
       {:reply, {:ok, published},
        %{
@@ -319,7 +334,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
          | session: published,
            control: new_control_state(published),
            generation: generation,
-           credential_epoch: session.credential_epoch
+           credential_epoch: session.credential_epoch,
+           used_session_ids: used_session_ids
        }}
     else
       {:error, reason} = error when reason in [:stale_session, :epoch_downgrade, :session_reused] ->
@@ -361,7 +377,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
        | session: nil,
          control: nil,
          generation: generation,
-         credential_epoch: credential_epoch
+         credential_epoch: credential_epoch,
+         used_session_ids: MapSet.new()
      }}
   end
 
@@ -494,16 +511,28 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   defp check_generation(%{generation: generation}, generation), do: :ok
   defp check_generation(_state, _expected_generation), do: {:error, :stale_session}
 
-  # Reinstalling the same cryptographic session would reset its holder-owned
-  # counter and reuse AEAD nonces under the same key. A replacement handshake
-  # must always derive a distinct session_id.
+  # Reinstalling any cryptographic session already used in this credential epoch
+  # would reset holder-owned counters/windows and reuse AEAD nonces. Remember ids
+  # across replacement and clear; a strictly higher epoch can safely prune them.
   defp check_fresh_session(
-         %{session: %Session{session_id: session_id}},
-         %Session{session_id: session_id}
-       ),
-       do: {:error, :session_reused}
+         %{credential_epoch: credential_epoch, used_session_ids: used_session_ids},
+         %Session{credential_epoch: credential_epoch, session_id: session_id}
+       ) do
+    if MapSet.member?(used_session_ids, session_id),
+      do: {:error, :session_reused},
+      else: :ok
+  end
 
   defp check_fresh_session(_state, _session), do: :ok
+
+  defp remember_session_id(
+         %{credential_epoch: credential_epoch, used_session_ids: used_session_ids},
+         %Session{credential_epoch: credential_epoch, session_id: session_id}
+       ),
+       do: MapSet.put(used_session_ids, session_id)
+
+  defp remember_session_id(_state, %Session{session_id: session_id}),
+    do: MapSet.new([session_id])
 
   defp check_credential_epoch(%{credential_epoch: nil}, _credential_epoch), do: :ok
 

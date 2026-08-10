@@ -614,6 +614,98 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
                SessionHolder.open_control(h, epoch_replacement.generation, epoch_frame)
     end
 
+    test "cannot reinstall a used cryptographic session after replacement", %{holder: h} do
+      first_session = session(session_id: <<16::128>>, epoch: 7)
+      assert {:ok, first} = SessionHolder.publish(h, first_session)
+      assert_control_counter(h, first.generation, 0)
+      assert {:ok, %{counter: 0}} = SessionHolder.take_send_counter(h, first.generation)
+
+      first_frame = control_frame(peer_session(first_session), :control_accept, 0)
+
+      assert {:ok, :control_accept, _payload} =
+               SessionHolder.open_control(h, first.generation, first_frame)
+
+      replacement_session = session(session_id: <<17::128>>, epoch: 7)
+
+      assert {:ok, replacement} =
+               SessionHolder.publish(h, replacement_session, first.generation)
+
+      assert_control_counter(h, replacement.generation, 0)
+      assert {:ok, %{counter: 0}} = SessionHolder.take_send_counter(h, replacement.generation)
+      replacement_frame = control_frame(peer_session(replacement_session), :control_accept, 0)
+
+      assert {:ok, :control_accept, _payload} =
+               SessionHolder.open_control(h, replacement.generation, replacement_frame)
+
+      assert {:error, :session_reused} = SessionHolder.put(h, first_session)
+
+      assert_control_counter(h, replacement.generation, 1)
+      assert {:ok, %{counter: 1}} = SessionHolder.take_send_counter(h, replacement.generation)
+
+      assert {:error, :replayed} =
+               SessionHolder.open_control(h, replacement.generation, replacement_frame)
+    end
+
+    test "cannot reinstall a used cryptographic session after clear", %{holder: h} do
+      used_session = session(session_id: <<18::128>>, epoch: 7)
+      assert {:ok, published} = SessionHolder.publish(h, used_session)
+      assert_control_counter(h, published.generation, 0)
+      assert {:ok, %{counter: 0}} = SessionHolder.take_send_counter(h, published.generation)
+
+      frame = control_frame(peer_session(used_session), :control_accept, 0)
+
+      assert {:ok, :control_accept, _payload} =
+               SessionHolder.open_control(h, published.generation, frame)
+
+      assert :ok = SessionHolder.clear(h, published.generation)
+      cleared_generation = SessionHolder.generation(h)
+
+      assert {:error, :session_reused} =
+               SessionHolder.publish(h, used_session, cleared_generation)
+
+      assert SessionHolder.generation(h) == cleared_generation
+      assert {:error, :no_session} = SessionHolder.get_current_session(h)
+      assert {:error, :no_session} = SessionHolder.take_send_counter(h)
+
+      assert {:error, :no_session} =
+               SessionHolder.with_control_send(
+                 h,
+                 cleared_generation,
+                 :readiness,
+                 control_payload(:readiness),
+                 fn _frame -> flunk("reused control send ran") end
+               )
+
+      assert {:error, :no_session} =
+               SessionHolder.open_control(h, cleared_generation, frame)
+    end
+
+    test "a higher credential epoch can reuse the id under new keys and resets the epoch set", %{
+      holder: h
+    } do
+      session_id = <<19::128>>
+      old_session = session(session_id: session_id, epoch: 7)
+      assert {:ok, old} = SessionHolder.publish(h, old_session)
+      assert_control_counter(h, old.generation, 0)
+
+      old_frame = control_frame(peer_session(old_session), :control_accept, 0)
+
+      assert {:ok, :control_accept, _payload} =
+               SessionHolder.open_control(h, old.generation, old_frame)
+
+      new_session = session(session_id: session_id, epoch: 8)
+      assert {:ok, new} = SessionHolder.publish(h, new_session, old.generation)
+      assert_control_counter(h, new.generation, 0)
+
+      new_frame = control_frame(peer_session(new_session), :control_accept, 0)
+
+      assert {:ok, :control_accept, _payload} =
+               SessionHolder.open_control(h, new.generation, new_frame)
+
+      assert {:error, :epoch_downgrade} =
+               SessionHolder.publish(h, old_session, new.generation)
+    end
+
     test "reports control counter rekey and exhaustion without advancing state", %{holder: h} do
       assert {:ok, published} = SessionHolder.publish(h, session(session_id: <<14::128>>))
       payload = control_payload(:readiness)
