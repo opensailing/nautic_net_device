@@ -27,6 +27,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   ]
   @delivery_keys @command_hash_keys ++ [:command_hash, :payload]
   @terminal_reasons [:expired, :unsupported_command, :invalid_payload]
+  @abort_reasons @terminal_reasons ++ [:operational_gate_closed]
   @max_command_result_size Contract.max_command_result_size()
 
   @enforce_keys [
@@ -104,15 +105,24 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
 
   def begin_intent(_store, _plan), do: {:error, :invalid_command_intent}
 
-  @doc "Atomically retain an applied result, clear its intent, and advance before returning an ACK."
-  @spec complete_intent(t(), binary()) :: {:ok, map(), t()} | {:error, term()}
-  def complete_intent(%__MODULE__{snapshot: %{pending_intent: nil}}, _result),
+  @doc """
+  Atomically retain an applied result, clear its intent, and advance before
+  returning an ACK.
+
+  Completion requires trusted current time and fails closed at or after the
+  intent expiry boundary. Call `abort_intent/2` to durably resolve an expired
+  or otherwise failed effect.
+  """
+  @spec complete_intent(t(), binary(), non_neg_integer() | :unavailable) ::
+          {:ok, map(), t()} | {:error, term()}
+  def complete_intent(%__MODULE__{snapshot: %{pending_intent: nil}}, _result, _trusted_now_ms),
     do: {:error, :no_pending_command_intent}
 
-  def complete_intent(%__MODULE__{} = store, result) do
+  def complete_intent(%__MODULE__{} = store, result, trusted_now_ms) do
     intent = store.snapshot.pending_intent
 
-    with :ok <- valid_result(result),
+    with :ok <- unexpired_at(intent, trusted_now_ms),
+         :ok <- valid_result(result),
          :ok <- within_reservation(result, intent.reserved_result_bytes),
          :ok <- admit_result_bytes(store, store.snapshot, byte_size(result)),
          {:ok, ack} <- Ack.build(intent, :applied, :none, result),
@@ -123,7 +133,33 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
     end
   end
 
-  def complete_intent(_store, _result), do: {:error, :invalid_command_ledger_store}
+  def complete_intent(_store, _result, _trusted_now_ms),
+    do: {:error, :invalid_command_ledger_store}
+
+  @doc """
+  Durably resolve the sole pending intent as a bounded rejected outcome.
+
+  This is the recovery path for expired commands, failed effects, and invalid
+  or oversized effect results. It retains an empty result, advances exactly
+  once, and returns no ACK unless the rejected outcome is durably persisted.
+  """
+  @spec abort_intent(t(), atom()) :: {:ok, map(), t()} | {:error, term()}
+  def abort_intent(%__MODULE__{snapshot: %{pending_intent: nil}}, _reason),
+    do: {:error, :no_pending_command_intent}
+
+  def abort_intent(%__MODULE__{} = store, reason) do
+    intent = store.snapshot.pending_intent
+
+    with :ok <- valid_abort_reason(reason),
+         {:ok, ack} <- Ack.build(intent, :rejected, reason, <<>>),
+         outcome = retained_outcome(intent, ack),
+         intended = retain_and_advance(store.snapshot, intent.command_id, outcome),
+         {:ok, persisted} <- persist_snapshot(store, intended) do
+      {:ok, ack, persisted}
+    end
+  end
+
+  def abort_intent(_store, _reason), do: {:error, :invalid_command_ledger_store}
 
   @doc "Durably retain a terminal non-execution result and advance before returning an ACK."
   @spec record_terminal(t(), map()) :: {:ok, map(), t()} | {:error, term()}
@@ -201,6 +237,19 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
        do: :ok
 
   defp valid_reservation(_bytes), do: {:error, :invalid_command_result_reservation}
+
+  defp unexpired_at(_intent, :unavailable), do: {:error, :trusted_clock_unavailable}
+
+  defp unexpired_at(intent, trusted_now_ms) when is_integer(trusted_now_ms) and trusted_now_ms >= 0 do
+    if trusted_now_ms < intent.expires_at_ms,
+      do: :ok,
+      else: {:error, :pending_command_intent_expired}
+  end
+
+  defp unexpired_at(_intent, _trusted_now_ms), do: {:error, :trusted_clock_unavailable}
+
+  defp valid_abort_reason(reason) when reason in @abort_reasons, do: :ok
+  defp valid_abort_reason(_reason), do: {:error, :invalid_command_abort_reason}
 
   defp valid_result(result) when is_binary(result) and byte_size(result) <= @max_command_result_size,
     do: :ok

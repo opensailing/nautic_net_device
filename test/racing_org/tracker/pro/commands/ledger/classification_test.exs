@@ -53,7 +53,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
     original = delivery(command_id: command_id(1), payload: <<0x00, 0xFF, "original">>)
     assert {:ok, _intent, store} = Store.begin_intent(store, execution_plan(original, 32))
     result = <<0x00, 0xFF, "exact-result">>
-    assert {:ok, _ack, store} = Store.complete_intent(store, result)
+    assert {:ok, _ack, store} = Store.complete_intent(store, result, 1_700_000_000_000)
 
     assert {:duplicate, duplicate_ack} = Ledger.classify(original, context(store))
     assert duplicate_ack.status == :duplicate
@@ -271,7 +271,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
     assert {:ok, byte_store} = open_store(path <> ".bytes", max_result_bytes: 5)
     applied = delivery(command_id: command_id(5))
     assert {:ok, _intent, byte_store} = Store.begin_intent(byte_store, execution_plan(applied, 4))
-    assert {:ok, _ack, byte_store} = Store.complete_intent(byte_store, "1234")
+    assert {:ok, _ack, byte_store} = Store.complete_intent(byte_store, "1234", 1_700_000_000_000)
 
     assert {:defer, {:capacity, :result_bytes}} =
              Ledger.classify(
@@ -280,10 +280,15 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
              )
   end
 
-  test "exposes pending-intent recovery and does not classify another command for execution", %{store: store} do
+  test "recovery requires trusted time and aborts expired pending intents", %{store: store} do
     command = delivery(command_id: command_id(1))
     assert {:ok, intent, store} = Store.begin_intent(store, execution_plan(command, 16))
-    assert {:recover, ^intent} = Ledger.recover_pending(Store.snapshot(store))
+
+    assert {:defer, :trusted_clock_unavailable} =
+             Ledger.recover_pending(Store.snapshot(store), :unavailable)
+
+    assert {:recover, ^intent} = Ledger.recover_pending(Store.snapshot(store), intent.expires_at_ms - 1)
+    assert {:abort, ^intent, :expired} = Ledger.recover_pending(Store.snapshot(store), intent.expires_at_ms)
 
     next = delivery(command_id: command_id(2))
     assert {:defer, :pending_command_intent} = Ledger.classify(next, context(store))

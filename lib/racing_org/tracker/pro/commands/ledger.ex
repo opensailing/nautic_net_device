@@ -74,10 +74,31 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger do
 
   def classify(_delivery, _context), do: {:defer, :invalid_command_classification_context}
 
-  @doc "Expose the exact pending intent that must be recovered before new classification."
-  @spec recover_pending(Snapshot.t()) :: {:recover, Snapshot.intent()} | :none
-  def recover_pending(%Snapshot{pending_intent: nil}), do: :none
-  def recover_pending(%Snapshot{pending_intent: intent}), do: {:recover, intent}
+  @doc """
+  Classify pending-intent recovery against a trusted current time.
+
+  Returns `:none` when no recovery is required, `{:recover, intent}` only while
+  the intent remains unexpired, `{:abort, intent, :expired}` at or after its
+  expiry boundary, and defers when trusted time is unavailable or invalid.
+  """
+  @spec recover_pending(Snapshot.t(), non_neg_integer() | :unavailable) ::
+          {:recover, Snapshot.intent()}
+          | {:abort, Snapshot.intent(), :expired}
+          | {:defer, :trusted_clock_unavailable}
+          | :none
+  def recover_pending(%Snapshot{pending_intent: nil}, _trusted_now_ms), do: :none
+
+  def recover_pending(%Snapshot{pending_intent: _intent}, :unavailable),
+    do: {:defer, :trusted_clock_unavailable}
+
+  def recover_pending(%Snapshot{pending_intent: intent}, trusted_now_ms)
+      when is_integer(trusted_now_ms) and trusted_now_ms >= 0 do
+    if trusted_now_ms >= intent.expires_at_ms,
+      do: {:abort, intent, :expired},
+      else: {:recover, intent}
+  end
+
+  def recover_pending(%Snapshot{}, _trusted_now_ms), do: {:defer, :trusted_clock_unavailable}
 
   defp device_fence(delivery, snapshot) do
     if delivery.device_id == snapshot.device_id,

@@ -43,7 +43,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
     assert Store.snapshot(interrupted).next_expected_sequence == 1
 
     result = <<0x00, 0xFF, "persisted-result">>
-    assert {:ok, ack, completed} = Store.complete_intent(interrupted, result)
+    assert {:ok, ack, completed} = Store.complete_intent(interrupted, result, 1_700_000_000_000)
     assert {:ok, encoded_ack} = Messages.encode(:command_ack, ack)
     assert {:ok, ^ack} = Messages.decode(:command_ack, encoded_ack)
 
@@ -130,8 +130,48 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
 
     assert {:ok, reopened} = open_store(path)
     assert Store.pending_intent(reopened) == intent
-    assert {:ok, _ack, completed} = Store.complete_intent(reopened, "recovered")
+    assert {:ok, _ack, completed} = Store.complete_intent(reopened, "recovered", 1_700_000_000_000)
     assert Store.pending_intent(completed) == nil
+  end
+
+  test "expired, failed, and oversized effects have one durable bounded abort transition", %{root: root} do
+    expired_path = Path.join(root, "expired.snapshot")
+    assert {:ok, expired_store} = open_store(expired_path)
+    expired_delivery = delivery(command_id: command_id(1), expires_at_ms: 100)
+
+    assert {:ok, expired_intent, expired_store} =
+             Store.begin_intent(expired_store, execution_plan(expired_delivery, :set_tracking, 8))
+
+    assert {:error, :pending_command_intent_expired} =
+             Store.complete_intent(expired_store, "late", expired_intent.expires_at_ms)
+
+    assert {:ok, expired_ack, expired_store} = Store.abort_intent(expired_store, :expired)
+    assert expired_ack.status == :rejected
+    assert expired_ack.reason == :expired
+    assert expired_ack.result == <<>>
+    assert Store.pending_intent(expired_store) == nil
+
+    assert {:ok, reopened_expired} = open_store(expired_path)
+    assert Store.snapshot(reopened_expired) == Store.snapshot(expired_store)
+
+    failed_path = Path.join(root, "failed.snapshot")
+    assert {:ok, failed_store} = open_store(failed_path)
+    failed_delivery = delivery(command_id: command_id(2))
+
+    assert {:ok, _intent, failed_store} =
+             Store.begin_intent(failed_store, execution_plan(failed_delivery, :set_tracking, 3))
+
+    assert {:error, :command_result_reservation_exceeded} =
+             Store.complete_intent(failed_store, "four", failed_delivery.expires_at_ms - 1)
+
+    assert {:error, :invalid_command_abort_reason} = Store.abort_intent(failed_store, :arbitrary)
+    assert Store.pending_intent(failed_store) != nil
+
+    assert {:ok, failed_ack, failed_store} = Store.abort_intent(failed_store, :invalid_payload)
+    assert failed_ack.status == :rejected
+    assert failed_ack.reason == :invalid_payload
+    assert Store.pending_intent(failed_store) == nil
+    assert Store.snapshot(failed_store).next_expected_sequence == 2
   end
 
   test "strictly higher epochs reset history atomically only at sequence one without an intent", %{path: path} do
@@ -202,7 +242,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
     assert {:ok, byte_store} = open_store(bytes_path, max_result_bytes: 4)
     applied = delivery(command_id: command_id(3))
     assert {:ok, _intent, byte_store} = Store.begin_intent(byte_store, execution_plan(applied, :set_tracking, 4))
-    assert {:ok, _ack, byte_store} = Store.complete_intent(byte_store, "1234")
+    assert {:ok, _ack, byte_store} = Store.complete_intent(byte_store, "1234", 1_700_000_000_000)
     assert Store.usage(byte_store) == %{outcomes: 1, result_bytes: 4}
 
     assert {:error, {:command_ledger_capacity, :result_bytes}} =
@@ -218,7 +258,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
     assert {:ok, roomy} = open_store(Path.join(root, "reservation.snapshot"), max_result_bytes: 8)
     reserved = delivery(command_id: command_id(5))
     assert {:ok, _intent, pending} = Store.begin_intent(roomy, execution_plan(reserved, :set_tracking, 3))
-    assert {:error, :command_result_reservation_exceeded} = Store.complete_intent(pending, "four")
+    assert {:error, :command_result_reservation_exceeded} = Store.complete_intent(pending, "four", 1_700_000_000_000)
     assert Store.pending_intent(pending) != nil
   end
 
@@ -257,7 +297,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
       assert {:ok, faulted} = open_store(path, fault_injector: fail_at(stage))
 
       assert {:error, {:write_command_ledger, {:fault_injected, ^stage, :power_loss}}} =
-               Store.complete_intent(faulted, "result")
+               Store.complete_intent(faulted, "result", 1_700_000_000_000)
 
       assert {:ok, reopened} = open_store(path)
       assert Store.pending_intent(reopened) == intent
@@ -271,7 +311,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
       assert {:ok, _intent, _pending} = Store.begin_intent(clean, execution_plan(delivery, :set_tracking, 8))
       assert {:ok, faulted} = open_store(path, fault_injector: fail_at(stage))
 
-      assert {:ok, ack, _completed} = Store.complete_intent(faulted, "result")
+      assert {:ok, ack, _completed} = Store.complete_intent(faulted, "result", 1_700_000_000_000)
       assert ack.result == "result"
 
       assert {:ok, reopened} = open_store(path)
