@@ -204,6 +204,68 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
                Checkpoint.encode_content(:polar, @polar_schema, %{content | "cells" => [full_n]})
     end
 
+    test "fails closed rather than raising on a finite but unboundedly small declared width" do
+      content = polar_checkpoint()
+
+      # A width small enough to overflow `extent / width` to +Inf makes the
+      # division itself raise ArithmeticError on the BEAM, so the bound must be
+      # checked before the division rather than on its result. A hostile
+      # checkpoint must never crash a validator: that turns a rejected upload
+      # into a downed process.
+      hostile_widths = [
+        1.0e-320,
+        # smallest positive subnormal
+        5.0e-324,
+        1.0e-300,
+        1.0e-8
+      ]
+
+      for width <- hostile_widths do
+        assert {:error, :invalid_checkpoint_content} =
+                 Checkpoint.canonical_content(:polar, @polar_schema, %{content | "tws_width_mps" => width}),
+               "tws_width_mps #{width} must fail closed"
+
+        assert {:error, :invalid_checkpoint_content} =
+                 Checkpoint.canonical_content(:polar, @polar_schema, %{content | "twa_width_deg" => width}),
+               "twa_width_deg #{width} must fail closed"
+
+        assert {:error, :invalid_checkpoint_content} =
+                 Checkpoint.encode_content(:polar, @polar_schema, %{content | "tws_width_mps" => width})
+      end
+
+      # A colossal ceiling against a normal width overflows the same way.
+      assert {:error, :invalid_checkpoint_content} =
+               Checkpoint.canonical_content(:polar, @polar_schema, %{
+                 content
+                 | "max_tws_mps" => 1.7976931348623157e308
+               })
+
+      # Non-finite geometry is refused by the finiteness guards, still without raising.
+      for invalid <- [0.0, -1.0, 1, nil, "5"] do
+        assert {:error, :invalid_checkpoint_content} =
+                 Checkpoint.canonical_content(:polar, @polar_schema, %{content | "tws_width_mps" => invalid})
+      end
+    end
+
+    test "keeps admitting the finest grid that still fits the u32 index space" do
+      content = %{polar_checkpoint() | "cells" => []}
+
+      # The guard must reject only what actually overflows. A width just above
+      # extent/(u32_max + 1) yields an in-range index space and stays valid.
+      assert {:ok, _bytes} =
+               Checkpoint.canonical_content(:polar, @polar_schema, %{content | "tws_width_mps" => 1.2e-8})
+
+      assert {:ok, _bytes} =
+               Checkpoint.canonical_content(:polar, @polar_schema, %{content | "twa_width_deg" => 4.2e-8})
+
+      # Valid geometry keeps byte-identical canonical output.
+      assert {:ok, bytes} = Checkpoint.canonical_content(:polar, @polar_schema, polar_checkpoint())
+      assert byte_size(bytes) == 326
+
+      assert Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) ==
+               "d47326c2c0889c82b06aa98101e819e63c6369ca93c27a44baaf89030dc55bd8"
+    end
+
     test "rejects impossible calibration counters and open wind-shift event details" do
       calibration = calibration_checkpoint()
       [awa] = calibration["awa_estimators"]

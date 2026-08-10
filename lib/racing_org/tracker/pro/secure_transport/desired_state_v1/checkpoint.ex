@@ -410,9 +410,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
 
   # The inclusive upper index corner of the declared grid, mirroring
   # `Polar.Observer.Bins.max_key/1` exactly. Both axes must stay inside u32 so
-  # every admissible key is representable on the wire — and the ratio is bounded
-  # BEFORE `trunc/1`, because a width small enough to overflow the division would
-  # otherwise raise out of a validator rather than fail closed.
+  # every admissible key is representable on the wire.
   defp polar_grid(content) do
     with {:ok, max_tws_bin} <- polar_axis_bins(content["max_tws_mps"], content["tws_width_mps"]),
          {:ok, max_twa_bin} <- polar_axis_bins(180.0, content["twa_width_deg"]) do
@@ -420,10 +418,27 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
     end
   end
 
-  defp polar_axis_bins(extent, width) do
-    ratio = extent / width
+  @doc """
+  The largest bin index an axis of `extent` divided into `width` bins can produce,
+  or `{:error, :invalid_checkpoint_content}` when that index space does not fit u32.
 
-    with :ok <- ensure(ratio <= @u32_max) do
+  The width is bounded BEFORE the division, not after. `extent / width` for a
+  finite but unboundedly small width overflows to `+Inf`, and float overflow
+  RAISES `ArithmeticError` on the BEAM — so a check on the quotient never runs,
+  and hostile geometry crashes the validator instead of being rejected by it.
+  Dividing the extent by the large `u32_max + 1` constant cannot overflow (it
+  can only underflow toward zero), which makes the minimum representable width
+  safe to compute for any finite extent.
+
+  Shared with `Polar.Observer.Bins` so the wire grid and the runtime grid agree
+  on exactly which geometries are indexable.
+  """
+  @spec polar_axis_bins(float(), float()) ::
+          {:ok, non_neg_integer()} | {:error, :invalid_checkpoint_content}
+  def polar_axis_bins(extent, width) do
+    with :ok <- ensure(width >= extent / (@u32_max + 1)),
+         ratio = extent / width,
+         :ok <- ensure(ratio <= @u32_max) do
       {:ok, max(trunc(:math.ceil(ratio)) - 1, 0)}
     end
   end

@@ -79,6 +79,9 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Bins do
   # A wind angle is always reported within one turn either way; beyond that the
   # reading is garbage rather than an unwrapped angle.
   @max_abs_twa_deg 360.0
+  # Every cell index is persisted and shipped on the wire as a u32, so neither
+  # axis may divide into more indices than that space holds.
+  @max_axis_bins 0xFFFF_FFFF
 
   @enforce_keys [:twa_width_deg, :tws_width_mps, :max_tws_mps]
   defstruct twa_width_deg: @default_twa_width_deg,
@@ -109,6 +112,16 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Bins do
     unless positive_finite?(twa), do: raise(ArgumentError, "twa_width_deg must be a finite number > 0")
     unless positive_finite?(tws), do: raise(ArgumentError, "tws_width_mps must be a finite number > 0")
     unless positive_finite?(max_tws), do: raise(ArgumentError, "max_tws_mps must be a finite number > 0")
+
+    unless indexable?(max_tws + 0.0, tws + 0.0) do
+      raise ArgumentError,
+            "tws_width_mps #{tws} divides the [0, #{max_tws}] m/s axis into more than #{@max_axis_bins} bins"
+    end
+
+    unless indexable?(180.0, twa + 0.0) do
+      raise ArgumentError,
+            "twa_width_deg #{twa} divides the [0, 180] deg axis into more than #{@max_axis_bins} bins"
+    end
 
     %__MODULE__{twa_width_deg: twa + 0.0, tws_width_mps: tws + 0.0, max_tws_mps: max_tws + 0.0}
   end
@@ -252,6 +265,15 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Bins do
   defp max_twa_index(width), do: max(trunc(:math.ceil(180.0 / width)) - 1, 0)
 
   defp floor_div(v, width), do: trunc(:math.floor(v / width))
+
+  # An axis must divide into an index space that fits u32, because every index is
+  # a persisted, wire-visible cell key. The width is bounded BEFORE `extent /
+  # width` is evaluated: that quotient overflows to +Inf for a finite but
+  # unboundedly small width, and float overflow RAISES on the BEAM — so checking
+  # the quotient would crash `max_key/1`, `valid_key?/2`, and every restore path
+  # that screens persisted keys, instead of rejecting the misconfiguration here.
+  # Dividing by the large `@max_axis_bins + 1` constant cannot overflow.
+  defp indexable?(extent, width), do: width >= extent / (@max_axis_bins + 1)
 
   defp positive_finite?(v), do: finite_number?(v) and v > 0.0
 

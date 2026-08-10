@@ -69,7 +69,13 @@ defmodule RacingOrg.Tracker.Pro.Polar.Checkpoint do
   @spec project(Bins.t(), float(), store_cells()) ::
           {:ok, content()} | {:error, :invalid_checkpoint_content}
   def project(%Bins{} = bins, p, cells) when is_number(p) and is_map(cells) do
-    with {:ok, projected_cells} <- project_cells(bins, p + 0.0, Map.to_list(cells)),
+    # The grid is bounded FIRST. `project_cells/3` screens every key through
+    # `Bins.valid_key?/2`, which divides by the bin width, so a struct built
+    # around an unindexably small width — one that bypassed `Bins.new/1`, or was
+    # decoded from state written before it guarded this — would raise out of the
+    # screen before any validator saw the content.
+    with {:ok, _grid} <- indexable_grid(bins),
+         {:ok, projected_cells} <- project_cells(bins, p + 0.0, Map.to_list(cells)),
          content = %{
            "cells" => Enum.sort_by(projected_cells, &cell_sort_key/1),
            "max_tws_mps" => bins.max_tws_mps,
@@ -105,6 +111,28 @@ defmodule RacingOrg.Tracker.Pro.Polar.Checkpoint do
   end
 
   def hydrate(_content), do: @invalid
+
+  # Both axes must divide into a u32-representable index space, using the same
+  # bound the wire validator applies so a runtime grid and a decoded grid agree
+  # on exactly which geometries are indexable.
+  defp indexable_grid(%Bins{} = bins) do
+    with true <- finite_positive?(bins.max_tws_mps),
+         true <- finite_positive?(bins.tws_width_mps),
+         true <- finite_positive?(bins.twa_width_deg),
+         {:ok, max_tws_bin} <- ContractCheckpoint.polar_axis_bins(bins.max_tws_mps, bins.tws_width_mps),
+         {:ok, max_twa_bin} <- ContractCheckpoint.polar_axis_bins(180.0, bins.twa_width_deg) do
+      {:ok, {max_tws_bin, max_twa_bin}}
+    else
+      _error -> @invalid
+    end
+  end
+
+  @max_finite 1.7976931348623157e308
+
+  defp finite_positive?(v) when is_float(v),
+    do: v == v and v > 0.0 and v <= @max_finite
+
+  defp finite_positive?(_v), do: false
 
   defp project_cells(bins, p, cells) do
     Enum.reduce_while(cells, {:ok, []}, fn cell, {:ok, projected} ->

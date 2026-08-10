@@ -139,6 +139,29 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.BinsTest do
       assert MapSet.size(MapSet.new(keys)) <= (max_tws_idx + 1) * (max_twa_idx + 1)
     end
 
+    test "a width too fine to index refuses construction instead of raising later" do
+      # `max_key/1` divides the axis extent by the bin width. A finite but
+      # unboundedly small width overflows that division to +Inf, which raises
+      # ArithmeticError on the BEAM — and it would raise from `max_key/1`,
+      # `valid_key?/2`, and every restore path that screens persisted keys,
+      # far from the misconfiguration that caused it. Reject it at the source.
+      for width <- [1.0e-320, 5.0e-324, 1.0e-8] do
+        assert_raise ArgumentError, fn -> Bins.new(tws_width_mps: width) end
+        assert_raise ArgumentError, fn -> Bins.new(twa_width_deg: width) end
+      end
+
+      assert_raise ArgumentError, fn -> Bins.new(max_tws_mps: 1.7976931348623157e308) end
+
+      # The finest grid that still fits the u32 index space stays constructible,
+      # and every key-space query on it answers without raising.
+      b = Bins.new(tws_width_mps: 1.2e-8, twa_width_deg: 4.2e-8, max_tws_mps: 51.4444)
+      {max_tws_idx, max_twa_idx} = Bins.max_key(b)
+      assert max_tws_idx <= 0xFFFF_FFFF
+      assert max_twa_idx <= 0xFFFF_FFFF
+      assert Bins.valid_key?(b, {0, 0})
+      refute Bins.valid_key?(b, {max_tws_idx + 1, 0})
+    end
+
     test "valid_key?/2 rejects keys outside the bound (poisoned/restored state)" do
       b = Bins.new()
       refute Bins.valid_key?(b, {100, 0})

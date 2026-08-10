@@ -126,6 +126,24 @@ defmodule RacingOrg.Tracker.Pro.Polar.CheckpointTest do
       assert {:error, :invalid_checkpoint_content} = PolarCheckpoint.project(bins(), 1.0, snapshot)
       assert {:error, :invalid_checkpoint_content} = PolarCheckpoint.project(:not_bins, @p, snapshot)
     end
+
+    test "fails closed on a runtime grid too fine to index, without raising" do
+      # `Bins.new/1` now refuses these outright, but the struct can still be built
+      # directly — including by a term decoded from persisted state written before
+      # the constructor guard existed. Projection must report that as invalid
+      # content rather than crash the observer that owns the grid.
+      for width <- [1.0e-320, 5.0e-324, 1.0e-8] do
+        assert_raise ArgumentError, fn -> Bins.new(tws_width_mps: width) end
+
+        overflowing = %Bins{twa_width_deg: 5.0, tws_width_mps: width, max_tws_mps: 51.4444}
+
+        assert {:error, :invalid_checkpoint_content} = PolarCheckpoint.project(overflowing, @p, %{}),
+               "tws_width_mps #{width} must fail closed"
+
+        assert {:error, :invalid_checkpoint_content} =
+                 PolarCheckpoint.project(overflowing, @p, snapshot())
+      end
+    end
   end
 
   describe "hydrate/1" do
@@ -238,6 +256,25 @@ defmodule RacingOrg.Tracker.Pro.Polar.CheckpointTest do
       assert {:error, :checkpoint_secret_forbidden} = PolarCheckpoint.hydrate(Map.put(valid, "metadata", %{}))
 
       assert {:error, :invalid_checkpoint_content} = PolarCheckpoint.hydrate(:not_content)
+    end
+
+    test "fails closed rather than raising on a finite but unboundedly small width" do
+      assert {:ok, valid} = PolarCheckpoint.project(bins(), @p, snapshot())
+
+      # Content whose declared width would overflow `extent / width` must be
+      # refused with the documented error, never by raising out of hydration —
+      # this content arrives from the network.
+      for width <- [1.0e-320, 5.0e-324, 1.0e-300, 1.0e-8] do
+        assert {:error, :invalid_checkpoint_content} =
+                 PolarCheckpoint.hydrate(%{valid | "tws_width_mps" => width}),
+               "tws_width_mps #{width} must fail closed"
+
+        assert {:error, :invalid_checkpoint_content} =
+                 PolarCheckpoint.hydrate(%{valid | "twa_width_deg" => width})
+      end
+
+      assert {:error, :invalid_checkpoint_content} =
+               PolarCheckpoint.hydrate(%{valid | "max_tws_mps" => 1.7976931348623157e308})
     end
 
     test "rejects a declared grid that shifts the meaning of a persisted index" do
