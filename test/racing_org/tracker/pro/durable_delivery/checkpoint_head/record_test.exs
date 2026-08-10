@@ -286,6 +286,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.RecordTest do
                Record.decode(:erlang.term_to_binary({1, :checkpoint_head, tampered}))
     end
 
+    test "rejects extra record keys during in-memory verification" do
+      assert {:ok, record} = Record.build(attrs())
+      assert {:error, :corrupt_checkpoint_head} = Record.verify(Map.put(record, :extra, 1))
+    end
+
     test "never persist a decoded content map alongside the canonical bytes" do
       assert {:ok, record} = Record.build(attrs())
 

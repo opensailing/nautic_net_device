@@ -216,7 +216,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   """
   @spec verify(map()) :: :ok | {:error, atom()}
   def verify(record) when is_map(record) do
-    with {:ok, rebuilt} <- build(Map.take(record, @build_keys)) do
+    with :ok <- exact_keys(record, @record_keys),
+         {:ok, rebuilt} <- build(Map.take(record, @build_keys)) do
       if secure_equal(rebuilt.content_hash, Map.get(record, :content_hash)) and
            secure_equal(rebuilt.checkpoint_hash, Map.get(record, :checkpoint_hash)) and
            secure_equal(rebuilt.binding_hash, Map.get(record, :binding_hash)) and
@@ -225,6 +226,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
       else
         {:error, :corrupt_checkpoint_head}
       end
+    else
+      _error -> {:error, :corrupt_checkpoint_head}
     end
   end
 
