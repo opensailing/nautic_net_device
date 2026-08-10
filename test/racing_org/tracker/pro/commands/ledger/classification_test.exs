@@ -73,6 +73,38 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ClassificationTest do
     assert conflict_ack.reason == :command_id_conflict
   end
 
+  test "lost ACK replay precedes mutable desired-state fences but still enforces immutable delivery identity", %{
+    store: store
+  } do
+    original = delivery(command_id: command_id(1), payload: "already-applied")
+    assert {:ok, _intent, store} = Store.begin_intent(store, execution_plan(original, 16))
+    assert {:ok, applied_ack, store} = Store.complete_intent(store, "effect-result", 1_700_000_000_000)
+
+    advanced_context =
+      context(store,
+        active_generation: 43,
+        active_manifest_hash: @other_manifest_hash
+      )
+
+    assert {:duplicate, replayed_ack} = Ledger.classify(original, advanced_context)
+    assert replayed_ack.status == :duplicate
+    assert replayed_ack.result == applied_ack.result
+
+    mutated =
+      delivery(
+        command_id: original.command_id,
+        command_sequence: 2,
+        required_generation: 43,
+        required_manifest_hash: @other_manifest_hash,
+        payload: "mutated-delivery"
+      )
+
+    assert_transient_reason(Ledger.classify(mutated, advanced_context), :command_id_conflict)
+
+    foreign = delivery(device_id: @other_device_id, command_id: original.command_id)
+    assert {:defer, :device_mismatch} = Ledger.classify(foreign, advanced_context)
+  end
+
   test "higher epoch resets may reuse command IDs while same-epoch conflicts fail closed", %{store: store} do
     original = delivery(command_id: command_id(1), expires_at_ms: 0)
     assert {:ok, _ack, store} = Store.record_terminal(store, terminal_plan(original, :expired))
