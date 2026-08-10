@@ -539,7 +539,8 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
         last_summary: nil,
         step: StepDetect.reset(state.step),
         prev_step_status: :none,
-        absorb_count: 0
+        absorb_count: 0,
+        xing: %{side: nil, extreme: nil}
     }
     |> start_session(wall_ms)
   end

@@ -653,6 +653,60 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     assert Enum.all?(step_events, &(&1.detail.onset_t_ms >= started_at_ms))
   end
 
+  test "UTC rotation clears a pre-session oscillation crossing extreme" do
+    ctx = new_script()
+
+    observer =
+      start_observer(ctx,
+        sync_ms: 3_600_000_000,
+        timeline_ms: 3_600_000_000
+      )
+
+    drive(observer, ctx, [%{t_ms: 0, twd_deg: 200.0, tws_mps: 6.0}], %{twa: 40.0})
+
+    now = 14 * 60 * 60 * 1_000
+    started_at_ms = @wall_base + now
+    old_extreme_ms = @wall_base + 60_000
+    to_rad = fn degrees -> :math.pi() * degrees / 180.0 end
+
+    Agent.update(ctx.script, &%{&1 | t_ms: now, twd: 190.0, tws: 6.0, twa: 40.0})
+
+    :sys.replace_state(observer, fn state ->
+      means = %{
+        state.means
+        | fast: {to_rad.(190.0), now - 1_000},
+          mid: {to_rad.(195.0), now - 1_000},
+          slow: {to_rad.(200.0), now - 1_000},
+          sin: {:math.sin(to_rad.(200.0)), now - 1_000},
+          cos: {:math.cos(to_rad.(200.0)), now - 1_000}
+      }
+
+      %{
+        state
+        | means: means,
+          cycle: %{state.cycle | x: [200.0, 0.0, 10.0, 0.0]},
+          period: %{period_s: 480.0, confidence: 1.0},
+          last_period_ms: now,
+          t0_ms: 0,
+          last_t_ms: now - 1_000,
+          unwrap: {200.0, 200.0},
+          prev_regime: :oscillating,
+          xing: %{side: :pos, extreme: {8.0, 208.0, old_extreme_ms}}
+      }
+    end)
+
+    Observer.tick(observer)
+
+    assert [%{session: %{started_at_ms: @wall_base}}] = collect_syncs()
+
+    state = :sys.get_state(observer)
+    assert state.session.started_at_ms == started_at_ms
+
+    refute Enum.any?(state.pending_events, &(&1.t_ms < started_at_ms))
+    assert %{side: :neg, extreme: {_phase_deg, _twd_deg, extreme_ms}} = state.xing
+    assert extreme_ms >= started_at_ms
+  end
+
   # --- wally mode signal -----------------------------------------------------------------
 
   test "wally_mode from the config policy publishes as an int signal each tick" do
