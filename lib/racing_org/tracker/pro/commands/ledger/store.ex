@@ -3,8 +3,10 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   Single-writer durable command-ledger state backed by one atomic snapshot.
 
   Every successful mutation replaces and fsyncs the complete bounded snapshot.
-  If an atomic write reports an error after rename may have happened, the exact
-  snapshot is read back as authority before success or failure is reported.
+  Existing snapshots are rewritten and fsynced before `open/2` returns, and
+  every mutation verifies that its immutable handle still matches disk before
+  replacing state. A handle retained across an uncertain write therefore cannot
+  overwrite the visibly advanced snapshot.
   """
 
   alias RacingOrg.Tracker.Pro.Commands.Ledger.{Ack, Snapshot}
@@ -27,7 +29,9 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   ]
   @delivery_keys @command_hash_keys ++ [:command_hash, :payload]
   @terminal_reasons [:expired, :unsupported_command, :invalid_payload]
-  @abort_reasons @terminal_reasons ++ [:operational_gate_closed]
+  @recovery_rejection_reasons [:operational_gate_closed]
+  @recovery_proofs [:effect_not_started, :effect_verified_absent]
+  @rejection_plan_keys [:action, :command_hash, :command_id, :command_type, :proof, :reason]
   @max_command_result_size Contract.max_command_result_size()
 
   @enforce_keys [
@@ -88,6 +92,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   def begin_intent(%__MODULE__{} = store, plan) when is_map(plan) do
     with :ok <- exact_keys(plan, [:action, :command_type, :delivery, :reserved_result_bytes, :reset_epoch?]),
          true <- plan.action == :execute,
+         :ok <- current_snapshot(store),
          :ok <- no_pending_intent(store.snapshot),
          :ok <- validate_delivery(plan.delivery, store.snapshot),
          {:ok, base} <- transition_base(store.snapshot, plan.delivery, plan.reset_epoch?),
@@ -109,22 +114,20 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   Atomically retain an applied result, clear its intent, and advance before
   returning an ACK.
 
-  Completion requires trusted current time and fails closed at or after the
-  intent expiry boundary. Call `abort_intent/2` to durably resolve an expired
-  or otherwise failed effect.
+  Expiry is checked before intent admission, never after an external effect may
+  have started. Completion therefore records a proven applied result even when
+  the command's original expiry has elapsed.
   """
-  @spec complete_intent(t(), binary(), non_neg_integer() | :unavailable) ::
-          {:ok, map(), t()} | {:error, term()}
-  def complete_intent(%__MODULE__{snapshot: %{pending_intent: nil}}, _result, _trusted_now_ms),
+  @spec complete_intent(t(), binary()) :: {:ok, map(), t()} | {:error, term()}
+  def complete_intent(%__MODULE__{snapshot: %{pending_intent: nil}}, _result),
     do: {:error, :no_pending_command_intent}
 
-  def complete_intent(%__MODULE__{} = store, result, trusted_now_ms) do
+  def complete_intent(%__MODULE__{} = store, result) do
     intent = store.snapshot.pending_intent
 
-    with :ok <- unexpired_at(intent, trusted_now_ms),
+    with :ok <- current_snapshot(store),
          :ok <- valid_result(result),
          :ok <- within_reservation(result, intent.reserved_result_bytes),
-         :ok <- admit_result_bytes(store, store.snapshot, byte_size(result)),
          {:ok, ack} <- Ack.build(intent, :applied, :none, result),
          outcome = retained_outcome(intent, ack),
          intended = retain_and_advance(store.snapshot, intent.command_id, outcome),
@@ -133,25 +136,26 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
     end
   end
 
-  def complete_intent(_store, _result, _trusted_now_ms),
-    do: {:error, :invalid_command_ledger_store}
+  def complete_intent(_store, _result), do: {:error, :invalid_command_ledger_store}
 
   @doc """
-  Durably resolve the sole pending intent as a bounded rejected outcome.
+  Durably reject a pending intent only after exact proof that its effect did not
+  apply.
 
-  This is the recovery path for expired commands, failed effects, and invalid
-  or oversized effect results. It retains an empty result, advances exactly
-  once, and returns no ACK unless the rejected outcome is durably persisted.
+  The closed rejection plan is bound to the pending command ID, command hash,
+  command type, a registered non-application proof, and a reason that remains
+  truthful after intent admission. Ambiguous effects remain pending.
   """
-  @spec abort_intent(t(), atom()) :: {:ok, map(), t()} | {:error, term()}
-  def abort_intent(%__MODULE__{snapshot: %{pending_intent: nil}}, _reason),
+  @spec reject_intent(t(), map()) :: {:ok, map(), t()} | {:error, term()}
+  def reject_intent(%__MODULE__{snapshot: %{pending_intent: nil}}, _plan),
     do: {:error, :no_pending_command_intent}
 
-  def abort_intent(%__MODULE__{} = store, reason) do
+  def reject_intent(%__MODULE__{} = store, plan) when is_map(plan) do
     intent = store.snapshot.pending_intent
 
-    with :ok <- valid_abort_reason(reason),
-         {:ok, ack} <- Ack.build(intent, :rejected, reason, <<>>),
+    with :ok <- current_snapshot(store),
+         :ok <- valid_rejection_plan(plan, intent),
+         {:ok, ack} <- Ack.build(intent, :rejected, plan.reason, <<>>),
          outcome = retained_outcome(intent, ack),
          intended = retain_and_advance(store.snapshot, intent.command_id, outcome),
          {:ok, persisted} <- persist_snapshot(store, intended) do
@@ -159,7 +163,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
     end
   end
 
-  def abort_intent(_store, _reason), do: {:error, :invalid_command_ledger_store}
+  def reject_intent(_store, _plan), do: {:error, :invalid_command_rejection_plan}
 
   @doc "Durably retain a terminal non-execution result and advance before returning an ACK."
   @spec record_terminal(t(), map()) :: {:ok, map(), t()} | {:error, term()}
@@ -169,6 +173,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
          true <- plan.status == :rejected,
          true <- plan.reason in @terminal_reasons,
          :ok <- valid_result(plan.result),
+         :ok <- current_snapshot(store),
          :ok <- no_pending_intent(store.snapshot),
          :ok <- validate_delivery(plan.delivery, store.snapshot),
          {:ok, base} <- transition_base(store.snapshot, plan.delivery, plan.reset_epoch?),
@@ -195,9 +200,9 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
          true <- delivery.credential_epoch == snapshot.credential_epoch,
          true <- delivery.storage_epoch == snapshot.storage_epoch,
          {:ok, payload_hash} <- Command.payload_hash(delivery.payload),
-         true <- payload_hash == delivery.payload_hash,
+         true <- fixed_hash_equal?(payload_hash, delivery.payload_hash),
          {:ok, command_hash} <- Command.hash(Map.take(delivery, @command_hash_keys)),
-         true <- command_hash == delivery.command_hash do
+         true <- fixed_hash_equal?(command_hash, delivery.command_hash) do
       :ok
     else
       _other -> {:error, :invalid_command_delivery}
@@ -238,18 +243,19 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
 
   defp valid_reservation(_bytes), do: {:error, :invalid_command_result_reservation}
 
-  defp unexpired_at(_intent, :unavailable), do: {:error, :trusted_clock_unavailable}
-
-  defp unexpired_at(intent, trusted_now_ms) when is_integer(trusted_now_ms) and trusted_now_ms >= 0 do
-    if trusted_now_ms < intent.expires_at_ms,
-      do: :ok,
-      else: {:error, :pending_command_intent_expired}
+  defp valid_rejection_plan(plan, intent) do
+    with :ok <- exact_keys(plan, @rejection_plan_keys),
+         true <- plan.action == :reject,
+         true <- plan.command_id == intent.command_id,
+         true <- fixed_hash_equal?(plan.command_hash, intent.command_hash),
+         true <- plan.command_type == intent.command_type,
+         true <- plan.proof in @recovery_proofs,
+         true <- plan.reason in @recovery_rejection_reasons do
+      :ok
+    else
+      _other -> {:error, :invalid_command_rejection_plan}
+    end
   end
-
-  defp unexpired_at(_intent, _trusted_now_ms), do: {:error, :trusted_clock_unavailable}
-
-  defp valid_abort_reason(reason) when reason in @abort_reasons, do: :ok
-  defp valid_abort_reason(_reason), do: {:error, :invalid_command_abort_reason}
 
   defp valid_result(result) when is_binary(result) and byte_size(result) <= @max_command_result_size,
     do: :ok
@@ -316,6 +322,12 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
     }
   end
 
+  defp fixed_hash_equal?(left, right)
+       when is_binary(left) and byte_size(left) == 32 and is_binary(right) and byte_size(right) == 32,
+       do: :crypto.hash_equals(left, right)
+
+  defp fixed_hash_equal?(_left, _right), do: false
+
   defp exact_keys(map, expected) do
     if Enum.sort(Map.keys(map)) == Enum.sort(expected),
       do: :ok,
@@ -380,8 +392,8 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
 
   defp open_existing(store, snapshot) do
     with :ok <- exact_identity(store.snapshot, snapshot),
-         :ok <- within_capacity(store, snapshot) do
-      {:ok, %{store | snapshot: snapshot}}
+         {:ok, reestablished} <- persist_snapshot(store, snapshot) do
+      {:ok, reestablished}
     end
   end
 
@@ -395,22 +407,11 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
     end
   end
 
-  defp within_capacity(store, snapshot) do
-    {reserved_outcomes, reserved_result_bytes} =
-      case snapshot.pending_intent do
-        nil -> {0, 0}
-        intent -> {1, intent.reserved_result_bytes}
-      end
-
-    cond do
-      map_size(snapshot.outcomes) + reserved_outcomes > store.max_outcomes ->
-        {:error, :command_ledger_capacity_exceeded}
-
-      Snapshot.result_bytes(snapshot) + reserved_result_bytes > store.max_result_bytes ->
-        {:error, :command_ledger_capacity_exceeded}
-
-      true ->
-        :ok
+  defp current_snapshot(store) do
+    case read_snapshot(store) do
+      {:ok, snapshot} when snapshot == store.snapshot -> :ok
+      {:ok, _snapshot} -> {:error, :stale_command_ledger_store}
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -424,8 +425,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   end
 
   defp persist_snapshot(store, snapshot) do
-    with :ok <- within_capacity(store, snapshot),
-         {:ok, bytes} <- Snapshot.encode(snapshot) do
+    with {:ok, bytes} <- Snapshot.encode(snapshot) do
       case AtomicFile.write(store.path, bytes, store.atomic_opts) do
         :ok ->
           {:ok, %{store | snapshot: snapshot}}

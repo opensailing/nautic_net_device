@@ -75,30 +75,16 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger do
   def classify(_delivery, _context), do: {:defer, :invalid_command_classification_context}
 
   @doc """
-  Classify pending-intent recovery against a trusted current time.
+  Return the sole pending intent for effect-specific recovery.
 
-  Returns `:none` when no recovery is required, `{:recover, intent}` only while
-  the intent remains unexpired, `{:abort, intent, :expired}` at or after its
-  expiry boundary, and defers when trusted time is unavailable or invalid.
+  Expiry is an admission fence only. Once an intent is durable, elapsed time is
+  not proof that its external effect did not happen, so recovery never converts
+  an intent into a rejected outcome. The command executor must prove the effect
+  applied, prove it did not apply, or leave the intent pending while ambiguous.
   """
-  @spec recover_pending(Snapshot.t(), non_neg_integer() | :unavailable) ::
-          {:recover, Snapshot.intent()}
-          | {:abort, Snapshot.intent(), :expired}
-          | {:defer, :trusted_clock_unavailable}
-          | :none
-  def recover_pending(%Snapshot{pending_intent: nil}, _trusted_now_ms), do: :none
-
-  def recover_pending(%Snapshot{pending_intent: _intent}, :unavailable),
-    do: {:defer, :trusted_clock_unavailable}
-
-  def recover_pending(%Snapshot{pending_intent: intent}, trusted_now_ms)
-      when is_integer(trusted_now_ms) and trusted_now_ms >= 0 do
-    if trusted_now_ms >= intent.expires_at_ms,
-      do: {:abort, intent, :expired},
-      else: {:recover, intent}
-  end
-
-  def recover_pending(%Snapshot{}, _trusted_now_ms), do: {:defer, :trusted_clock_unavailable}
+  @spec recover_pending(Snapshot.t()) :: {:recover, Snapshot.intent()} | :none
+  def recover_pending(%Snapshot{pending_intent: nil}), do: :none
+  def recover_pending(%Snapshot{pending_intent: intent}), do: {:recover, intent}
 
   defp device_fence(delivery, snapshot) do
     if delivery.device_id == snapshot.device_id,
@@ -125,7 +111,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger do
   end
 
   defp manifest_fence(delivery, context) do
-    if delivery.required_manifest_hash == context.active_manifest_hash,
+    if fixed_hash_equal?(delivery.required_manifest_hash, context.active_manifest_hash),
       do: :ok,
       else: transient(delivery, :manifest_hash_mismatch)
   end
@@ -145,17 +131,18 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger do
 
   defp command_id_fence(delivery, snapshot, false) do
     case Map.fetch(snapshot.outcomes, delivery.command_id) do
-      {:ok, %{hash: hash} = outcome} when hash == delivery.command_hash ->
-        with {:ok, payload_hash} <- Command.payload_hash(delivery.payload),
-             true <- :crypto.hash_equals(payload_hash, delivery.payload_hash),
-             {:ok, ack} <- Ack.replay(delivery, outcome) do
-          stop({:duplicate, ack})
+      {:ok, %{hash: hash} = outcome} ->
+        if fixed_hash_equal?(hash, delivery.command_hash) do
+          with {:ok, payload_hash} <- Command.payload_hash(delivery.payload),
+               true <- fixed_hash_equal?(payload_hash, delivery.payload_hash),
+               {:ok, ack} <- Ack.replay(delivery, outcome) do
+            stop({:duplicate, ack})
+          else
+            _other -> stop({:defer, :invalid_command_delivery})
+          end
         else
-          _other -> stop({:defer, :invalid_command_delivery})
+          transient(delivery, :command_id_conflict)
         end
-
-      {:ok, _outcome} ->
-        transient(delivery, :command_id_conflict)
 
       :error ->
         :ok
@@ -206,7 +193,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger do
 
   defp payload_fence(delivery, context, reset_epoch?) do
     with {:ok, payload_hash} <- Command.payload_hash(delivery.payload),
-         true <- payload_hash == delivery.payload_hash,
+         true <- fixed_hash_equal?(payload_hash, delivery.payload_hash),
          {:ok, {:ok, decoded}} <- invoke(context.decode_payload, delivery.payload) do
       {:ok, decoded}
     else
@@ -227,22 +214,22 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger do
   end
 
   defp gate_fence(delivery, context) do
-    expected = %{
-      credential_epoch: context.snapshot.credential_epoch,
-      storage_epoch: context.snapshot.storage_epoch,
-      generation: context.active_generation,
-      manifest_hash: context.active_manifest_hash
-    }
-
     case context.gate do
       {:open, binding} when is_map(binding) ->
-        if Map.take(binding, Map.keys(expected)) == expected,
-          do: :ok,
-          else: transient(delivery, :operational_gate_closed)
+        if binding.credential_epoch == context.snapshot.credential_epoch and
+             binding.storage_epoch == context.snapshot.storage_epoch and
+             binding.generation == context.active_generation and
+             fixed_hash_equal?(binding.manifest_hash, context.active_manifest_hash) do
+          :ok
+        else
+          transient(delivery, :operational_gate_closed)
+        end
 
       _closed ->
         transient(delivery, :operational_gate_closed)
     end
+  rescue
+    _exception -> transient(delivery, :operational_gate_closed)
   end
 
   defp terminal(delivery, reason, context, reset_epoch?) do
@@ -292,6 +279,12 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger do
       {:error, _reason} -> stop({:defer, :invalid_command_delivery})
     end
   end
+
+  defp fixed_hash_equal?(left, right)
+       when is_binary(left) and byte_size(left) == 32 and is_binary(right) and byte_size(right) == 32,
+       do: :crypto.hash_equals(left, right)
+
+  defp fixed_hash_equal?(_left, _right), do: false
 
   defp invoke(callback, value) when is_function(callback, 1) do
     {:ok, callback.(value)}
