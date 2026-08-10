@@ -455,8 +455,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
 
   defp validate_events(events) do
     with :ok <- bounded_list(events, @max_pending_rows),
-         :ok <- validate_each(events, &validate_event/1),
-         :ok <- nondecreasing_by(events, & &1["t_ms"]) do
+         :ok <- validate_each(events, &validate_event/1) do
       :ok
     end
   end

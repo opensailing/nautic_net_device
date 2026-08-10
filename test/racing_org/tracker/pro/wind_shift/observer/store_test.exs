@@ -49,6 +49,30 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.StoreTest do
     assert loaded == @snapshot
   end
 
+  test "preserves pending event list order without sorting or restamping", %{dir: dir} do
+    newer_current = %{
+      t_ms: 1_784_800_880_000,
+      kind: "regime_change",
+      twd_deg: 214.0,
+      magnitude_deg: nil,
+      detail: %{from: "calm", to: "oscillating", confidence: 0.8}
+    }
+
+    delayed_extreme = %{
+      t_ms: 1_784_800_875_000,
+      kind: "lift_extreme",
+      twd_deg: 216.0,
+      magnitude_deg: 4.0,
+      detail: %{phase_deg: 4.0}
+    }
+
+    snapshot = %{@snapshot | pending_events: [newer_current, delayed_extreme]}
+
+    assert :ok = Store.save(dir, snapshot)
+    assert {:ok, loaded} = Store.load(dir)
+    assert loaded.pending_events == [newer_current, delayed_extreme]
+  end
+
   test "loading a missing store returns :empty", %{dir: dir} do
     assert :empty = Store.load(dir)
   end

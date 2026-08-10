@@ -45,6 +45,26 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
       end
     end
 
+    test "preserves durable wind-shift event list order when a delayed extreme is older" do
+      content = wind_shift_checkpoint()
+      newer_current = Enum.find(content["pending_events"], &(&1["kind"] == "regime_change"))
+
+      delayed_extreme =
+        content["pending_events"]
+        |> Enum.find(&(&1["kind"] == "lift_extreme"))
+        |> Map.put("t_ms", content["session"]["started_at_ms"] + 20_000)
+
+      content = %{content | "pending_events" => [newer_current, delayed_extreme]}
+
+      assert Enum.map(content["pending_events"], & &1["t_ms"]) == [
+               content["session"]["started_at_ms"] + 30_000,
+               content["session"]["started_at_ms"] + 20_000
+             ]
+
+      assert {:ok, bytes} = Checkpoint.encode_content(:wind_shift, 1, content)
+      assert {:ok, ^content} = Checkpoint.decode_content(:wind_shift, 1, bytes)
+    end
+
     test "rejects structurally impossible P-square and polar cell state" do
       content = polar_checkpoint()
       [cell] = content["cells"]
@@ -102,6 +122,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
                  1,
                  %{wind_shift | "pending_events" => [noncanonical_direction | rest]}
                )
+
+      noncanonical_summary = put_in(wind_shift, ["last_summary", "mean_twd_deg"], 360.0)
+
+      assert {:error, :invalid_checkpoint_content} =
+               Checkpoint.encode_content(:wind_shift, 1, noncanonical_summary)
 
       [timeline] = wind_shift["pending_timeline"]
       noncanonical_phase = %{timeline | "phase_deg" => 180.0}

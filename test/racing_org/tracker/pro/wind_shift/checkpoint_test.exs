@@ -19,6 +19,29 @@ defmodule RacingOrg.Tracker.Pro.WindShift.CheckpointTest do
     assert hydrated == snapshot
   end
 
+  test "preserves a newer current event followed by a delayed older extreme exactly" do
+    newer_current =
+      snapshot().pending_events
+      |> Enum.find(&(&1.kind == "regime_change"))
+      |> Map.put(:t_ms, @started_at_ms + 40_000)
+
+    delayed_extreme =
+      snapshot().pending_events
+      |> Enum.find(&(&1.kind == "lift_extreme"))
+      |> Map.put(:t_ms, @started_at_ms + 20_000)
+
+    snapshot = %{snapshot() | pending_events: [newer_current, delayed_extreme]}
+
+    assert {:ok, content} = Checkpoint.project(snapshot)
+    assert Enum.map(content["pending_events"], & &1["t_ms"]) == [@started_at_ms + 40_000, @started_at_ms + 20_000]
+    assert Enum.map(content["pending_events"], & &1["kind"]) == ["regime_change", "lift_extreme"]
+
+    assert {:ok, bytes} = ContractCheckpoint.encode_content(:wind_shift, 1, content)
+    assert {:ok, decoded} = ContractCheckpoint.decode_content(:wind_shift, 1, bytes)
+    assert {:ok, hydrated} = Checkpoint.hydrate(decoded)
+    assert hydrated == snapshot
+  end
+
   test "round-trips the pre-session Observer.Store snapshot without inventing learner state" do
     snapshot = %{
       session: nil,
@@ -44,10 +67,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.CheckpointTest do
     end
   end
 
-  test "rejects malformed, out-of-order, and session-unbound Observer.Store snapshots" do
-    [first, second | rest] = snapshot().pending_events
-    out_of_order_events = put_in(snapshot(), [:pending_events], [second, first | rest])
-
+  test "rejects malformed, out-of-order timeline, and session-unbound Observer.Store snapshots" do
     [first_row, second_row] = snapshot().pending_timeline
     out_of_order_timeline = put_in(snapshot(), [:pending_timeline], [second_row, first_row])
 
@@ -62,7 +82,6 @@ defmodule RacingOrg.Tracker.Pro.WindShift.CheckpointTest do
 
     for malformed <- [
           %{snapshot() | seq: -1},
-          out_of_order_events,
           out_of_order_timeline,
           onset_before_session,
           no_bound_session
@@ -88,10 +107,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.CheckpointTest do
              |> Checkpoint.hydrate()
   end
 
-  test "rejects noncanonical event ordering and step onset binding during hydration" do
-    [first, second | rest] = content()["pending_events"]
-    out_of_order = %{content() | "pending_events" => [second, first | rest]}
-
+  test "rejects a step onset before the bound session during hydration" do
     step_index = Enum.find_index(content()["pending_events"], &(&1["kind"] == "step"))
 
     pre_session_onset =
@@ -99,7 +115,6 @@ defmodule RacingOrg.Tracker.Pro.WindShift.CheckpointTest do
         @started_at_ms - 1
       end)
 
-    assert {:error, :invalid_checkpoint_content} = Checkpoint.hydrate(out_of_order)
     assert {:error, :invalid_checkpoint_content} = Checkpoint.hydrate(pre_session_onset)
   end
 

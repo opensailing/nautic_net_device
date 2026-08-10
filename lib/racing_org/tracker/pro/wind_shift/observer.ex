@@ -527,8 +527,20 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
       Logger.warning("[WindShift.Observer] dropping unsynced previous-day rows at UTC rollover")
     end
 
-    # last_summary resets so the new session's FIRST sync always goes out.
-    %{state | session: nil, pending_timeline: [], pending_events: [], last_summary: nil}
+    # last_summary resets so the new session's FIRST sync always goes out. A
+    # candidate or confirmed step is session-scoped because its onset wall time
+    # is derived from the detector's monotonic onset. Re-arm it at rotation so a
+    # later confirmation cannot backdate into the previous UTC session.
+    %{
+      state
+      | session: nil,
+        pending_timeline: [],
+        pending_events: [],
+        last_summary: nil,
+        step: StepDetect.reset(state.step),
+        prev_step_status: :none,
+        absorb_count: 0
+    }
     |> start_session(wall_ms)
   end
 
@@ -616,7 +628,10 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
             kind: kind,
             twd_deg: twd,
             magnitude_deg: env_snap.range_deg,
-            detail: %{min_deg: env_snap.min_deg, max_deg: env_snap.max_deg}
+            detail: %{
+              min_deg: normalize_direction(env_snap.min_deg),
+              max_deg: normalize_direction(env_snap.max_deg)
+            }
           }
           | events
         ]
@@ -719,7 +734,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
       row = %{
         t_ms: wall_ms,
-        mean_twd_deg: means_snap.slow,
+        mean_twd_deg: normalize_optional_direction(means_snap.slow),
         phase_deg: means_snap.phase_deg,
         amplitude_deg: osc && osc.amplitude_deg,
         period_s: osc && osc.period_s,
@@ -884,7 +899,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     osc = verdict.oscillation
 
     %{
-      mean_twd_deg: round2(Means.snapshot(state.means).slow),
+      mean_twd_deg: round_direction2(Means.snapshot(state.means).slow),
       trend_deg_per_hr: round2(verdict.trend_deg_per_hr),
       oscillation_period_s: round2(osc && osc.period_s),
       oscillation_amplitude_deg: round2(osc && osc.amplitude_deg),
@@ -892,6 +907,9 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
       tws_mean_mps: round2(tws_mean(state.session))
     }
   end
+
+  defp round_direction2(nil), do: nil
+  defp round_direction2(value), do: value |> round2() |> normalize_direction()
 
   defp round2(nil), do: nil
   defp round2(value), do: Float.round(value / 1, 2)
@@ -1053,7 +1071,9 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   defp fetch_twd(signals, now, staleness_ms) do
     case Map.get(signals, "true_wind_direction") do
       {value, mono_ms} when is_number(value) and is_integer(mono_ms) ->
-        if now - mono_ms <= staleness_ms, do: {:ok, value / 1}, else: {:error, :stale_twd}
+        if now - mono_ms <= staleness_ms,
+          do: {:ok, normalize_direction(value)},
+          else: {:error, :stale_twd}
 
       _ ->
         {:error, :no_twd}
@@ -1090,6 +1110,16 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
           heading when is_number(heading) -> wrap180(twd - heading)
           nil -> nil
         end
+    end
+  end
+
+  defp normalize_optional_direction(nil), do: nil
+  defp normalize_optional_direction(value), do: normalize_direction(value)
+
+  defp normalize_direction(value) do
+    case Circular.normalize(value) do
+      zero when zero == 0.0 -> 0.0
+      normalized -> normalized
     end
   end
 

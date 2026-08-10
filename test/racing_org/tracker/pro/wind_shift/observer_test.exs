@@ -5,6 +5,8 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
 
   alias RacingOrg.Tracker.Pro.WindShift.Config
   alias RacingOrg.Tracker.Pro.WindShift.Observer
+  alias RacingOrg.Tracker.Pro.WindShift.Observer.Store
+  alias RacingOrg.Tracker.Pro.WindShift.StepDetect
   alias RacingOrg.Tracker.Pro.WindShift.WindGen
 
   @utc_base ~U[2026-07-17 10:00:00.000Z]
@@ -277,6 +279,55 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     assert Observer.status(observer).regime == "persistent_step"
   end
 
+  test "keeps current events before a delayed older oscillation extreme" do
+    ctx = new_script()
+    observer = start_observer(ctx)
+
+    drive(observer, ctx, [%{t_ms: 0, twd_deg: 200.0, tws_mps: 6.0}], %{twa: 40.0})
+
+    now = 1_200_000
+    current_wall_ms = @wall_base + now
+    delayed_wall_ms = current_wall_ms - 120_000
+    to_rad = fn degrees -> :math.pi() * degrees / 180.0 end
+
+    Agent.update(ctx.script, &%{&1 | t_ms: now, twd: 190.0, tws: 6.0, twa: 40.0})
+
+    :sys.replace_state(observer, fn state ->
+      means = %{
+        state.means
+        | fast: {to_rad.(190.0), now - 1_000},
+          mid: {to_rad.(195.0), now - 1_000},
+          slow: {to_rad.(200.0), now - 1_000},
+          sin: {:math.sin(to_rad.(200.0)), now - 1_000},
+          cos: {:math.cos(to_rad.(200.0)), now - 1_000}
+      }
+
+      %{
+        state
+        | means: means,
+          cycle: %{state.cycle | x: [200.0, 0.0, 10.0, 0.0]},
+          period: %{period_s: 480.0, confidence: 1.0},
+          last_period_ms: now,
+          t0_ms: 0,
+          last_t_ms: now - 1_000,
+          unwrap: {200.0, 200.0},
+          prev_regime: :calm,
+          xing: %{side: :pos, extreme: {8.0, 208.0, delayed_wall_ms}}
+      }
+    end)
+
+    Observer.tick(observer)
+
+    assert [%{events: events}] = collect_syncs()
+    assert length(events) >= 2
+    assert List.last(events).kind == "lift_extreme"
+    assert List.last(events).t_ms == delayed_wall_ms
+
+    events
+    |> Enum.drop(-1)
+    |> Enum.each(fn event -> assert event.t_ms == current_wall_ms end)
+  end
+
   test "envelope alarm events are suppressed when alarms are disabled" do
     ctx = new_script()
     config = start_supervised!({Config, name: nil, store_dir: nil}, id: make_ref())
@@ -414,6 +465,54 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
       {:ok, dir: dir}
     end
 
+    test "normalizes raw negative and 360-degree event directions before persistence", %{dir: dir} do
+      ctx = new_script()
+
+      {:ok, observer} =
+        Observer.start_link(
+          observer_opts(ctx,
+            dir: dir,
+            persist_ms: 3_600_000_000,
+            sync_ms: 3_600_000_000,
+            timeline_ms: 3_600_000_000
+          )
+        )
+
+      :sys.replace_state(observer, &%{&1 | prev_regime: :calm})
+      drive(observer, ctx, [%{t_ms: 0, twd_deg: -1.0, tws_mps: 6.0}])
+
+      :sys.replace_state(observer, &%{&1 | prev_regime: :calm})
+      drive(observer, ctx, [%{t_ms: 1_000, twd_deg: 360.0, tws_mps: 6.0}])
+
+      :ok = Observer.persist_now(observer)
+      assert {:ok, snapshot} = Store.load(dir)
+      assert Enum.map(snapshot.pending_events, & &1.twd_deg) == [359.0, 0.0]
+    end
+
+    test "normalizes a rounded 360-degree summary after rounding and persists that canonical value", %{dir: dir} do
+      ctx = new_script()
+
+      {:ok, observer} =
+        Observer.start_link(
+          observer_opts(ctx,
+            dir: dir,
+            persist_ms: 3_600_000_000,
+            sync_ms: 3_600_000_000,
+            timeline_ms: 3_600_000_000
+          )
+        )
+
+      drive(observer, ctx, [%{t_ms: 0, twd_deg: 359.999, tws_mps: 6.0}])
+      :ok = Observer.sync_now(observer)
+
+      assert_receive {:sync, %{session: %{summary: %{mean_twd_deg: mean_twd_deg}}}}
+      assert mean_twd_deg == 0.0
+
+      :ok = Observer.persist_now(observer)
+      assert {:ok, snapshot} = Store.load(dir)
+      assert snapshot.last_summary.mean_twd_deg == 0.0
+    end
+
     test "session started_at_ms is stable across a simulated reboot and seq stays monotonic", %{dir: dir} do
       ctx = new_script()
       {:ok, observer} = Observer.start_link(observer_opts(ctx, dir: dir))
@@ -500,6 +599,58 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     assert update.timeline != []
     assert Enum.all?(update.timeline, &(&1.t_ms >= started))
     refute_receive {:sync, _}, 20
+  end
+
+  test "UTC rotation resets a step candidate before any new-session confirmation" do
+    ctx = new_script()
+
+    observer =
+      start_observer(ctx,
+        sync_ms: 3_600_000_000,
+        timeline_ms: 3_600_000_000
+      )
+
+    drive(observer, ctx, gen([%{dur_s: 60, base: 200.0}]))
+
+    pre_rotation_front =
+      for i <- 60..64, do: %{t_ms: i * 1_000, twd_deg: 230.0, tws_mps: 6.0}
+
+    drive(observer, ctx, pre_rotation_front)
+    assert StepDetect.snapshot(:sys.get_state(observer).step).status == :candidate
+
+    jump_ms = 14 * 60 * 60 * 1_000
+    drive(observer, ctx, [%{t_ms: jump_ms, twd_deg: 230.0, tws_mps: 6.0}])
+
+    assert [%{session: %{started_at_ms: @wall_base}}] = collect_syncs()
+
+    state = :sys.get_state(observer)
+    started_at_ms = @wall_base + jump_ms
+    assert state.session.started_at_ms == started_at_ms
+    assert StepDetect.snapshot(state.step).status == :none
+    assert state.prev_step_status == :none
+
+    refute Enum.any?(state.pending_events, fn
+             %{kind: "step", detail: %{onset_t_ms: onset_t_ms}} -> onset_t_ms < started_at_ms
+             _event -> false
+           end)
+
+    post_rotation_baseline =
+      for i <- 1..30,
+          do: %{t_ms: jump_ms + i * 1_000, twd_deg: 230.0, tws_mps: 6.0}
+
+    post_rotation_front =
+      for i <- 31..160,
+          do: %{t_ms: jump_ms + i * 1_000, twd_deg: 260.0, tws_mps: 6.0}
+
+    drive(observer, ctx, post_rotation_baseline ++ post_rotation_front)
+    assert StepDetect.snapshot(:sys.get_state(observer).step).status == :confirmed
+
+    :ok = Observer.sync_now(observer)
+    assert [%{session: %{started_at_ms: ^started_at_ms}, events: events}] = collect_syncs()
+
+    step_events = Enum.filter(events, &(&1.kind == "step"))
+    assert step_events != []
+    assert Enum.all?(step_events, &(&1.detail.onset_t_ms >= started_at_ms))
   end
 
   # --- wally mode signal -----------------------------------------------------------------
