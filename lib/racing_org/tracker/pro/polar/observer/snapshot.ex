@@ -179,12 +179,14 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.Snapshot do
 
   defp envelope(_snapshot), do: {:error, :invalid_checkpoint}
 
-  defp validate_authority(value)
-       when is_binary(value) and byte_size(value) > 0 and byte_size(value) <= 65_535 do
+  @doc false
+  @spec validate_authority(term()) :: :ok | {:error, :invalid_checkpoint}
+  def validate_authority(value)
+      when is_binary(value) and byte_size(value) > 0 and byte_size(value) <= 65_535 do
     if String.valid?(value), do: :ok, else: {:error, :invalid_checkpoint}
   end
 
-  defp validate_authority(_value), do: {:error, :invalid_checkpoint}
+  def validate_authority(_value), do: {:error, :invalid_checkpoint}
 
   defp validate_hash(value) when is_binary(value) and byte_size(value) == 32, do: :ok
   defp validate_hash(_value), do: {:error, :invalid_checkpoint}

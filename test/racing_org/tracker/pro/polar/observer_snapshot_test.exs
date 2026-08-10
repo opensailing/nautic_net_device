@@ -1,6 +1,8 @@
 defmodule RacingOrg.Tracker.Pro.Polar.ObserverSnapshotTest do
   use ExUnit.Case, async: true
 
+  import ExUnit.CaptureLog
+
   alias RacingOrg.Tracker.Pro.Polar.Checkpoint, as: PolarCheckpoint
   alias RacingOrg.Tracker.Pro.Polar.Observer
   alias RacingOrg.Tracker.Pro.Polar.Observer.Bins
@@ -79,6 +81,22 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverSnapshotTest do
   end
 
   describe "snapshot/1" do
+    test "rejects an invalid checkpoint authority or quantile policy at startup" do
+      base = [
+        name: nil,
+        sample_ms: 0,
+        dir: nil,
+        signals_fn: fn -> %{} end,
+        sender: fn _channel, _update -> :ok end
+      ]
+
+      assert {:error, :invalid_checkpoint_config} =
+               Observer.start_link(Keyword.put(base, :boat_identifier, ""))
+
+      assert {:error, :invalid_checkpoint_config} =
+               Observer.start_link(Keyword.put(base, :p, 1))
+    end
+
     test "captures canonical polar-v2 content and hash at GenServer call time" do
       bins = Bins.new(twa_width_deg: 2.5, tws_width_mps: 1.0, max_tws_mps: 30.0)
       observer = start_observer(p: @p, bins: bins)
@@ -251,7 +269,13 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverSnapshotTest do
       :ok = put_cells(source, source_cells)
       assert {:ok, snapshot} = Observer.snapshot(source)
 
-      target_sender = fn _channel, _update -> :ok end
+      owner = self()
+
+      target_sender = fn _channel, update ->
+        send(owner, {:restored_sync, update})
+        :ok
+      end
+
       target = start_observer(dir: dir, sender: target_sender)
 
       :sys.replace_state(target, fn state ->
@@ -273,13 +297,22 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverSnapshotTest do
       assert state.sender === target_sender
       assert state.seq == 43
       assert state.last_sync_ms == 88_888
-      assert state.dirty_sync == MapSet.new()
+      assert state.dirty_sync == MapSet.new(Map.keys(source_cells))
       assert state.source_generation == snapshot.source_generation
       assert is_binary(state.last_restore_fingerprint)
       refute state.force_persist
       assert state.dirty_persist == MapSet.new()
       assert state.last_persist_ms == 100_000
       assert {:ok, ^source_cells} = Store.load(dir)
+
+      assert :ok = Observer.sync_now(target)
+      assert_receive {:restored_sync, %{seq: 44, cells: synced_cells}}
+      assert length(synced_cells) == map_size(source_cells)
+      assert :sys.get_state(target).seq == 44
+
+      GenServer.stop(target)
+      rebooted = start_observer(dir: dir)
+      assert :sys.get_state(rebooted).seq == 44
     end
 
     test "forces an accepted empty polar to clear stale target-local persistence", %{dir: dir} do
@@ -325,9 +358,12 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverSnapshotTest do
       File.write!(blocker, "blocked")
       bad_dir = Path.join(blocker, "child")
 
+      {:ok, clock} = Agent.start_link(fn -> 100_000 end)
+
       target =
         start_observer(
           dir: bad_dir,
+          now_fn: fn -> Agent.get(clock, & &1) end,
           window_size: 1,
           gate: [min_dwell: 1],
           signals_fn: fn ->
@@ -345,10 +381,51 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverSnapshotTest do
       refute Enum.empty?(dirty.dirty_persist)
       assert dirty.last_persist_ms == 100_000
 
+      Agent.update(clock, fn _ -> 101_000 end)
       assert {:error, _reason} = Observer.persist_now(target)
       failed = :sys.get_state(target)
       assert failed.dirty_persist == dirty.dirty_persist
-      assert failed.last_persist_ms == 100_000
+      assert failed.last_persist_ms == 101_000
+    end
+
+    test "automatic persistence failure is throttled instead of retried on every sample tick", %{
+      dir: dir
+    } do
+      File.mkdir_p!(dir)
+      blocker = Path.join(dir, "retry-blocker")
+      File.write!(blocker, "blocked")
+      bad_dir = Path.join(blocker, "child")
+      {:ok, clock} = Agent.start_link(fn -> 100_000 end)
+
+      target =
+        start_observer(
+          dir: bad_dir,
+          persist_ms: 60_000,
+          now_fn: fn -> Agent.get(clock, & &1) end,
+          window_size: 1,
+          gate: [min_dwell: 1],
+          signals_fn: fn ->
+            %{
+              "boat_speed" => {4.0, 101_000},
+              "true_wind_speed" => {3.0, 101_000},
+              "true_wind_angle" => {45.0, 101_000},
+              "heading" => {0.0, 101_000}
+            }
+          end
+        )
+
+      Agent.update(clock, fn _ -> 160_000 end)
+
+      log =
+        capture_log(fn ->
+          assert :ok = Observer.tick(target)
+          assert :ok = Observer.tick(target)
+        end)
+
+      assert length(Regex.scan(~r/Failed to persist sailed polar to/, log)) == 1
+      state = :sys.get_state(target)
+      refute Enum.empty?(state.dirty_persist)
+      assert state.last_persist_ms == 160_000
     end
 
     test "startup rejects locally persisted authority, policy, probability, or geometry drift and scrubs it", %{
@@ -405,6 +482,16 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverSnapshotTest do
       assert :ok = Observer.persist_now(bounded_target)
       assert {:ok, persisted} = Store.load(bounded_dir)
       assert persisted == Map.new([valid_cell])
+
+      divergent_dir = Path.join(dir, "divergent")
+      divergent_cell = {{1, 1}, {2, feed(@p, [5.0])}}
+      assert :ok = Store.save(divergent_dir, Map.new([valid_cell, divergent_cell]))
+
+      divergent_target = start_observer(dir: divergent_dir)
+      divergent_state = :sys.get_state(divergent_target)
+      assert divergent_state.cells == Map.new([valid_cell])
+      assert divergent_state.source_generation == 1
+      assert divergent_state.force_persist
     end
 
     test "rejects authority, admission policy, and grid geometry mismatch without mutation" do

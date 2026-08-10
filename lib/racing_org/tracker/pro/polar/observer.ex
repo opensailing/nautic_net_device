@@ -149,10 +149,12 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    case Keyword.fetch(opts, :name) do
-      {:ok, nil} -> GenServer.start_link(__MODULE__, opts)
-      {:ok, name} -> GenServer.start_link(__MODULE__, opts, name: name)
-      :error -> GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    with :ok <- validate_checkpoint_config(opts) do
+      case Keyword.fetch(opts, :name) do
+        {:ok, nil} -> GenServer.start_link(__MODULE__, opts)
+        {:ok, name} -> GenServer.start_link(__MODULE__, opts, name: name)
+        :error -> GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+      end
     end
   end
 
@@ -179,10 +181,14 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
   @doc """
   Reconcile one canonical polar snapshot into this Observer.
 
-  The Observer remains the sole writer. Accepted content is made target-locally
-  durable before the call replies and before restored cells become observable.
-  Repeating an accepted canonical identity is a no-op, including after reboot and
-  newer live samples.
+  The Observer remains the sole writer. When `:dir` is configured, accepted
+  content is made target-locally durable before the call replies and before
+  restored cells become observable. With persistence disabled (`dir: nil`), the
+  same transition is atomic but intentionally memory-only. Repeating an accepted
+  canonical identity is a no-op, including after reboot and newer live samples.
+
+  Canonical hashes provide integrity and identity, not authenticity. A production
+  caller must authenticate and authorize the envelope before invoking this API.
   """
   @spec restore(GenServer.server(), Snapshot.t()) ::
           :ok
@@ -228,52 +234,57 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
     boat_identifier = Keyword.get_lazy(opts, :boat_identifier, &RacingOrg.Tracker.Pro.boat_identifier/0)
     gate = build_gate(Keyword.get(opts, :gate, []))
     bins = build_bins(Keyword.get(opts, :bins, []))
-    policy_hash = build_policy_hash(gate, min_stw_mps, window_size, p)
-    restored = restore_runtime(dir, boat_identifier, policy_hash, p, bins)
-    now_fn = Keyword.get(opts, :now_fn, fn -> System.monotonic_time(:millisecond) end)
-    # Anchor both throttle clocks at boot so the FIRST ordinary persist/sync must
-    # also wait a full interval. A rejected or legacy persisted runtime is marked
-    # immediately due for canonical scrubbing.
-    boot_ms = now_fn.()
 
-    state = %{
-      dir: dir,
-      boat_identifier: boat_identifier,
-      sample_ms: sample_ms,
-      persist_ms: persist_ms,
-      sync_ms: Keyword.get(opts, :sync_ms, @default_sync_ms),
-      p: p,
-      min_stw_mps: min_stw_mps,
-      window_size: window_size,
-      bins: bins,
-      gate: gate,
-      policy_hash: policy_hash,
-      signals_fn: Keyword.get(opts, :signals_fn, fn -> safe_signals() end),
-      sender: Keyword.get(opts, :sender, &ChannelClient.send_sailed_polar_update/2),
-      now_fn: now_fn,
-      # Accumulated cells: %{key => {count, PSquare.t()}}.
-      cells: restored.cells,
-      source_generation: restored.source_generation,
-      # Rolling window of recent samples (most-recent LAST).
-      window: [],
-      # Keys touched since the last persist / last sync. `force_persist` also
-      # represents an EMPTY repair, for which there is no key to mark.
-      dirty_persist: MapSet.new(),
-      dirty_sync: MapSet.new(),
-      force_persist: restored.force_persist,
-      # Persisted fixed canonical fingerprint of the last accepted restore, so a
-      # retry remains idempotent across reboot and subsequent live progress.
-      last_restore_fingerprint: restored.last_restore_fingerprint,
-      # Throttle clocks (monotonic ms of the last write/sync).
-      last_persist_ms: if(restored.force_persist, do: boot_ms - persist_ms, else: boot_ms),
-      last_sync_ms: boot_ms,
-      # Monotonic sync sequence the server orders/merges by.
-      seq: 0,
-      stats: %{admitted: 0, rejected: 0, samples: 0, reject_reasons: %{}}
-    }
+    with {:ok, policy_hash} <- Snapshot.policy_hash(gate, min_stw_mps, window_size, p),
+         {:ok, _empty_snapshot} <- Snapshot.capture(boat_identifier, policy_hash, bins, p, 0, %{}) do
+      restored = restore_runtime(dir, boat_identifier, policy_hash, p, bins)
+      now_fn = Keyword.get(opts, :now_fn, fn -> System.monotonic_time(:millisecond) end)
+      # Anchor both throttle clocks at boot so the FIRST ordinary persist/sync must
+      # also wait a full interval. A rejected or legacy persisted runtime is marked
+      # immediately due for canonical scrubbing.
+      boot_ms = now_fn.()
 
-    schedule_tick(state)
-    {:ok, state}
+      state = %{
+        dir: dir,
+        boat_identifier: boat_identifier,
+        sample_ms: sample_ms,
+        persist_ms: persist_ms,
+        sync_ms: Keyword.get(opts, :sync_ms, @default_sync_ms),
+        p: p,
+        min_stw_mps: min_stw_mps,
+        window_size: window_size,
+        bins: bins,
+        gate: gate,
+        policy_hash: policy_hash,
+        signals_fn: Keyword.get(opts, :signals_fn, fn -> safe_signals() end),
+        sender: Keyword.get(opts, :sender, &ChannelClient.send_sailed_polar_update/2),
+        now_fn: now_fn,
+        # Accumulated cells: %{key => {count, PSquare.t()}}.
+        cells: restored.cells,
+        source_generation: restored.source_generation,
+        # Rolling window of recent samples (most-recent LAST).
+        window: [],
+        # Keys touched since the last persist / last sync. `force_persist` also
+        # represents an EMPTY repair, for which there is no key to mark.
+        dirty_persist: MapSet.new(),
+        dirty_sync: MapSet.new(),
+        force_persist: restored.force_persist,
+        # Persisted fixed canonical fingerprint of the last accepted restore, so a
+        # retry remains idempotent across reboot and subsequent live progress.
+        last_restore_fingerprint: restored.last_restore_fingerprint,
+        # Throttle clocks (monotonic ms of the last write/sync).
+        last_persist_ms: if(restored.force_persist, do: boot_ms - persist_ms, else: boot_ms),
+        last_sync_ms: boot_ms,
+        # Monotonic sync sequence the server orders/merges by.
+        seq: restored.seq,
+        stats: %{admitted: 0, rejected: 0, samples: 0, reject_reasons: %{}}
+      }
+
+      schedule_tick(state)
+      {:ok, state}
+    else
+      _invalid -> {:stop, :invalid_checkpoint_config}
+    end
   end
 
   @impl true
@@ -327,13 +338,6 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
 
   # --- Canonical call-time checkpoint reconciliation ---
 
-  defp build_policy_hash(gate, min_stw_mps, window_size, p) do
-    case Snapshot.policy_hash(gate, min_stw_mps, window_size, p) do
-      {:ok, policy_hash} -> policy_hash
-      {:error, :invalid_checkpoint} -> raise ArgumentError, "invalid polar Observer admission policy"
-    end
-  end
-
   defp capture_snapshot(state) do
     Snapshot.capture(
       state.boat_identifier,
@@ -370,9 +374,15 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
     if state.bins === incoming.bins, do: :ok, else: {:error, :geometry_mismatch}
   end
 
+  defp same_fingerprint?(left, right)
+       when is_binary(left) and byte_size(left) == 32 and is_binary(right) and byte_size(right) == 32,
+       do: :crypto.hash_equals(left, right)
+
+  defp same_fingerprint?(_left, _right), do: false
+
   defp reconcile_snapshot(state, incoming) do
     cond do
-      incoming.fingerprint == state.last_restore_fingerprint ->
+      same_fingerprint?(incoming.fingerprint, state.last_restore_fingerprint) ->
         {:ok, state}
 
       incoming.source_generation < state.source_generation ->
@@ -388,7 +398,7 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
 
   defp reconcile_same_generation(state, incoming) do
     with {:ok, current} <- capture_snapshot(state) do
-      if incoming.fingerprint == Snapshot.fingerprint(current),
+      if same_fingerprint?(incoming.fingerprint, Snapshot.fingerprint(current)),
         do: persist_restored_snapshot(state, incoming),
         else: {:error, :checkpoint_conflict}
     end
@@ -411,7 +421,7 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
       | cells: incoming.cells,
         source_generation: incoming.source_generation,
         dirty_persist: MapSet.new(Map.keys(incoming.cells)),
-        dirty_sync: MapSet.new(),
+        dirty_sync: MapSet.new(Map.keys(incoming.cells)),
         force_persist: true,
         last_persist_ms: now_ms - state.persist_ms,
         last_restore_fingerprint: incoming.fingerprint
@@ -429,15 +439,15 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
         |> push_window(sample)
         |> admit(sample)
         |> bump_samples()
-        |> maybe_persist()
         |> maybe_sync()
+        |> maybe_persist()
 
       :no_true_wind ->
         state
         |> bump_samples()
         |> tally_reject(:no_true_wind)
-        |> maybe_persist()
         |> maybe_sync()
+        |> maybe_persist()
     end
   end
 
@@ -589,7 +599,7 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
     if mode in [:force, :restore] or persistence_dirty?(state) do
       case Store.save_runtime(state.dir, persisted_runtime(state)) do
         :ok -> {:ok, persistence_succeeded(state)}
-        {:error, reason} -> {:error, reason, state}
+        {:error, reason} -> {:error, reason, persistence_failed(state)}
       end
     else
       {:ok, state}
@@ -601,6 +611,7 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
       authority: state.boat_identifier,
       policy_hash: state.policy_hash,
       source_generation: state.source_generation,
+      seq: state.seq,
       last_restore_fingerprint: state.last_restore_fingerprint,
       p: state.p,
       bins: state.bins,
@@ -616,6 +627,8 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
         last_persist_ms: state.now_fn.()
     }
   end
+
+  defp persistence_failed(state), do: %{state | last_persist_ms: state.now_fn.()}
 
   defp persistence_dirty?(state),
     do: state.force_persist or not Enum.empty?(state.dirty_persist)
@@ -640,17 +653,17 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
   end
 
   defp restore_legacy_runtime(runtime, p, bins) do
-    case validated_cells(runtime.cells, p, bins) do
-      {:ok, cells, _repaired?} ->
-        %{
-          cells: cells,
-          source_generation: runtime.source_generation,
-          last_restore_fingerprint: nil,
-          force_persist: true
-        }
-
-      :error ->
-        empty_restored(true)
+    with {:ok, cells, _repaired?} <- validated_cells(runtime.cells, p, bins),
+         {:ok, source_generation} <- legacy_generation(cells) do
+      %{
+        cells: cells,
+        source_generation: source_generation,
+        seq: runtime.seq,
+        last_restore_fingerprint: nil,
+        force_persist: true
+      }
+    else
+      _invalid -> empty_restored(true)
     end
   end
 
@@ -660,11 +673,14 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
          true <- runtime.p === p,
          true <- runtime.bins === bins,
          {:ok, cells, repaired?} <- validated_cells(runtime.cells, p, bins) do
+      upgrade? = Map.get(runtime, :upgrade?, false)
+
       %{
         cells: cells,
         source_generation: runtime.source_generation,
+        seq: runtime.seq,
         last_restore_fingerprint: if(repaired?, do: nil, else: runtime.last_restore_fingerprint),
-        force_persist: repaired?
+        force_persist: repaired? or upgrade?
       }
     else
       _mismatch -> empty_restored(true)
@@ -672,11 +688,25 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
   end
 
   defp validated_cells(cells, p, bins) when is_map(cells) do
-    {kept, repaired?} = drop_out_of_domain(cells, bins)
+    with {:ok, _empty_content} <- PolarCheckpoint.project(bins, p, %{}) do
+      {in_domain, domain_repaired?} = drop_out_of_domain(cells, bins)
 
-    case PolarCheckpoint.project(bins, p, kept) do
-      {:ok, _content} -> {:ok, kept, repaired?}
-      {:error, :invalid_checkpoint_content} -> :error
+      {valid, rejected} =
+        Enum.reduce(in_domain, {%{}, []}, fn {key, cell}, {accepted, rejected} ->
+          case PolarCheckpoint.project(bins, p, %{key => cell}) do
+            {:ok, _content} -> {Map.put(accepted, key, cell), rejected}
+            {:error, :invalid_checkpoint_content} -> {accepted, [key | rejected]}
+          end
+        end)
+
+      if rejected != [] do
+        Logger.warning(
+          "[Polar.Observer] dropped #{length(rejected)} malformed sailed-polar cell(s) on restore: " <>
+            inspect(Enum.take(rejected, 5))
+        )
+      end
+
+      {:ok, valid, domain_repaired? or rejected != []}
     end
   rescue
     _error -> :error
@@ -684,10 +714,22 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
 
   defp validated_cells(_cells, _p, _bins), do: :error
 
+  defp legacy_generation(cells) do
+    Enum.reduce_while(cells, {:ok, 0}, fn
+      {_key, {count, _quantile}}, {:ok, total}
+      when is_integer(count) and count > 0 and total <= @database_int_max - count ->
+        {:cont, {:ok, total + count}}
+
+      _cell, _total ->
+        {:halt, :error}
+    end)
+  end
+
   defp empty_restored(force_persist) do
     %{
       cells: %{},
       source_generation: 0,
+      seq: 0,
       last_restore_fingerprint: nil,
       force_persist: force_persist
     }
@@ -721,6 +763,11 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
     end
   end
 
+  defp sync(%{seq: @database_int_max} = state, _mode) do
+    Logger.warning("[Polar.Observer] sailed-polar sync sequence exhausted")
+    state
+  end
+
   defp sync(state, _mode) do
     if Enum.empty?(state.dirty_sync) do
       state
@@ -728,9 +775,16 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
       seq = state.seq + 1
       changed = MapSet.to_list(state.dirty_sync)
       update = %{boat_identifier: state.boat_identifier, seq: seq, cells: encode_cells(state, changed)}
+      candidate = %{state | seq: seq, force_persist: true}
 
-      _ = safe_send(state.sender, update)
-      %{state | dirty_sync: MapSet.new(), last_sync_ms: state.now_fn.(), seq: seq}
+      case persist(candidate, :force) do
+        {:ok, persisted} ->
+          _ = safe_send(persisted.sender, update)
+          %{persisted | dirty_sync: MapSet.new(), last_sync_ms: persisted.now_fn.()}
+
+        {:error, _reason, failed} ->
+          %{state | last_persist_ms: failed.last_persist_ms, last_sync_ms: state.now_fn.()}
+      end
     end
   end
 
@@ -765,6 +819,24 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
 
   defp schedule_tick(%{sample_ms: ms}) when ms > 0, do: Process.send_after(self(), :tick, ms)
   defp schedule_tick(_state), do: :ok
+
+  defp validate_checkpoint_config(opts) do
+    p = Keyword.get(opts, :p, @default_p)
+    min_stw_mps = Keyword.get(opts, :min_stw_mps, @default_min_stw_mps)
+    window_size = Keyword.get(opts, :window_size, @default_window_size)
+    boat_identifier = Keyword.get_lazy(opts, :boat_identifier, &RacingOrg.Tracker.Pro.boat_identifier/0)
+    gate = build_gate(Keyword.get(opts, :gate, []))
+    bins = build_bins(Keyword.get(opts, :bins, []))
+
+    with {:ok, policy_hash} <- Snapshot.policy_hash(gate, min_stw_mps, window_size, p),
+         {:ok, _empty_snapshot} <- Snapshot.capture(boat_identifier, policy_hash, bins, p, 0, %{}) do
+      :ok
+    else
+      _invalid -> {:error, :invalid_checkpoint_config}
+    end
+  rescue
+    _invalid -> {:error, :invalid_checkpoint_config}
+  end
 
   defp build_bins(%Bins{} = b), do: b
   defp build_bins(opts) when is_list(opts), do: Bins.new(opts)
