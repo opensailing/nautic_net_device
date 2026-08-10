@@ -5,6 +5,16 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
   alias RacingOrg.Tracker.Pro.FirmwareValidation.Trial
 
   @git_sha String.duplicate("c", 40)
+  @fault_stages [
+    :temp_opened,
+    :temp_chmodded,
+    :temp_written,
+    :temp_synced,
+    :temp_closed,
+    :before_rename,
+    :renamed,
+    :parent_synced
+  ]
 
   setup do
     dir = Path.join(System.tmp_dir!(), "firmware_trial_#{System.unique_integer([:positive])}")
@@ -55,7 +65,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     assert {:ok, %{phase: :validated, result: :ready}} = DiagnosticsStore.load(dir)
   end
 
-  test "non-exact validation success retries, then durably decides rollback before revert and reboot", %{dir: dir} do
+  test "definitively unvalidated failure retains bounded terminal rollback", %{dir: dir} do
     clock = agent(0)
     parent = self()
 
@@ -84,8 +94,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     Agent.update(clock, fn _ -> 10 end)
     assert :ok = Trial.check_now(pid)
     assert_receive :validate_attempt
-    refute_receive :revert
-    assert %{phase: :monitoring} = Trial.status(pid)
+    assert %{phase: :validation_decided, effect_status: :validation_failed} = Trial.status(pid)
 
     Agent.update(clock, fn _ -> 100 end)
     assert :ok = Trial.check_now(pid)
@@ -95,17 +104,64 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     assert %{phase: :reboot_pending} = Trial.status(pid)
   end
 
+  test "uncertain validation outcome never rolls back and later validity completes without revalidation", %{
+    dir: dir
+  } do
+    clock = agent(0)
+    statuses = agent([false, :unavailable, true])
+    validation_count = agent(0)
+    parent = self()
+
+    pid =
+      start_trial(dir,
+        clock: fn -> Agent.get(clock, & &1) end,
+        snapshot_opts: healthy_snapshot_opts(),
+        status_fun: fn ->
+          case Agent.get_and_update(statuses, fn [next | rest] -> {next, rest} end) do
+            :unavailable -> raise "status unavailable"
+            status -> status
+          end
+        end,
+        validate_fun: fn ->
+          Agent.update(validation_count, &(&1 + 1))
+          {:ok, :not_exact}
+        end,
+        revert_fun: fn ->
+          send(parent, :unexpected_revert)
+          :ok
+        end,
+        reboot_fun: fn ->
+          send(parent, :unexpected_reboot)
+          :ok
+        end,
+        target: target(deadline_at_ms: 1, soak_period_ms: 1)
+      )
+
+    Agent.update(clock, fn _ -> 1 end)
+    assert :ok = Trial.check_now(pid)
+    assert %{phase: :validation_decided, effect_status: :validation_uncertain} = Trial.status(pid)
+    assert Agent.get(validation_count, & &1) == 1
+    refute_receive :unexpected_revert
+    refute_receive :unexpected_reboot
+
+    assert :ok = Trial.check_now(pid)
+    assert %{phase: :validated} = Trial.status(pid)
+    assert Agent.get(validation_count, & &1) == 1
+    assert {:ok, %{phase: :validated}} = DiagnosticsStore.load(dir)
+  end
+
   test "default runtime passively reverts, persists reboot pending, and explicitly reboots without repeating revert after restart",
        %{
          dir: dir
        } do
     clock = agent(0)
+    health = agent(:unhealthy)
     runtime = configure_runtime_spy(dir, reboot: {:error, :reboot_failed})
 
     first =
       start_trial(dir,
         clock: fn -> Agent.get(clock, & &1) end,
-        snapshot_opts: healthy_snapshot_opts(),
+        snapshot_opts: healthy_snapshot_opts(health),
         runtime_module: __MODULE__.RuntimeSpy,
         target: target(deadline_at_ms: 1, soak_period_ms: 1)
       )
@@ -139,12 +195,13 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     dir: dir
   } do
     clock = agent(0)
+    health = agent(:unhealthy)
     _runtime = configure_runtime_spy(dir, revert: {:ok, :not_exact})
 
     pid =
       start_trial(dir,
         clock: fn -> Agent.get(clock, & &1) end,
-        snapshot_opts: healthy_snapshot_opts(),
+        snapshot_opts: healthy_snapshot_opts(health),
         runtime_module: __MODULE__.RuntimeSpy,
         target: target(deadline_at_ms: 1, soak_period_ms: 1)
       )
@@ -207,6 +264,175 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     refute_receive :unexpected_reboot
   end
 
+  test "validation decision fences every terminal persistence crash point", %{dir: dir} do
+    parent = self()
+    early_faults = @fault_stages -- [:renamed, :parent_synced]
+
+    for stage <- @fault_stages do
+      stage_dir = Path.join(dir, Atom.to_string(stage))
+      clock = agent(0)
+      firmware_valid = agent(false)
+      validation_count = agent(0)
+      fault_armed = agent(false)
+
+      store_opts = [
+        fault_injector: fn observed_stage ->
+          if Agent.get(fault_armed, & &1) and observed_stage == stage do
+            {:error, :simulated_power_loss}
+          else
+            :ok
+          end
+        end,
+        temp_suffix: fn -> Integer.to_string(System.unique_integer([:positive])) end
+      ]
+
+      opts = [
+        clock: fn -> Agent.get(clock, & &1) end,
+        snapshot_opts: healthy_snapshot_opts(),
+        store_opts: store_opts,
+        status_fun: fn -> Agent.get(firmware_valid, & &1) end,
+        validate_fun: fn ->
+          send(parent, {:validation_observed_record, stage, DiagnosticsStore.load(stage_dir, store_opts)})
+          Agent.update(validation_count, &(&1 + 1))
+          Agent.update(firmware_valid, fn _ -> true end)
+          Agent.update(fault_armed, fn _ -> true end)
+          :ok
+        end,
+        revert_fun: fn ->
+          send(parent, {:unexpected_revert, stage})
+          :ok
+        end,
+        reboot_fun: fn ->
+          send(parent, {:unexpected_reboot, stage})
+          :ok
+        end,
+        target: target(deadline_at_ms: 1, soak_period_ms: 1)
+      ]
+
+      first = start_trial(stage_dir, opts)
+      Process.unlink(first)
+      Agent.update(clock, fn _ -> 1 end)
+      result = Trial.check_now(first)
+
+      assert_receive {:validation_observed_record, ^stage, {:ok, %{phase: :validation_decided, result: :ready}}}
+
+      if stage in early_faults do
+        assert {:error, {:diagnostics_persist_failed, {:fault_injected, ^stage, :simulated_power_loss}}} = result
+
+        assert {:ok, %{phase: :validation_decided}} =
+                 DiagnosticsStore.load(stage_dir, store_opts)
+      else
+        assert :ok = result
+        assert {:ok, %{phase: :validated}} = DiagnosticsStore.load(stage_dir, store_opts)
+      end
+
+      if Process.alive?(first), do: GenServer.stop(first)
+      Agent.update(fault_armed, fn _ -> false end)
+      Agent.update(clock, fn _ -> 0 end)
+
+      restarted = start_trial(stage_dir, opts)
+      Process.unlink(restarted)
+      assert :ok = Trial.check_now(restarted)
+      assert %{phase: :validated} = Trial.status(restarted)
+      assert {:ok, %{phase: :validated}} = DiagnosticsStore.load(stage_dir, store_opts)
+      assert Agent.get(validation_count, & &1) == 1
+      refute_receive {:unexpected_revert, ^stage}
+      refute_receive {:unexpected_reboot, ^stage}
+      GenServer.stop(restarted)
+    end
+  end
+
+  test "validation-decided recovery retries exact validation within the durable remaining budget", %{dir: dir} do
+    clock = agent(0)
+    validation_result = agent({:ok, :not_exact})
+    parent = self()
+
+    assert :ok =
+             DiagnosticsStore.save(dir, %{
+               phase: :validation_decided,
+               result: :ready,
+               timing: %{remaining_deadline_ms: 10, healthy_for_ms: 100},
+               target: Map.delete(target(deadline_at_ms: 1, soak_period_ms: 1), :deadline_at_ms)
+             })
+
+    pid =
+      start_trial(dir,
+        clock: fn -> Agent.get(clock, & &1) end,
+        snapshot_opts: healthy_snapshot_opts(),
+        retry_ms: 5,
+        status_fun: fn -> false end,
+        validate_fun: fn ->
+          result = Agent.get(validation_result, & &1)
+          send(parent, {:validation_attempt, result})
+          result
+        end,
+        revert_fun: fn ->
+          send(parent, :unexpected_revert)
+          :ok
+        end,
+        reboot_fun: fn ->
+          send(parent, :unexpected_reboot)
+          :ok
+        end,
+        target: target(deadline_at_ms: 1, soak_period_ms: 1)
+      )
+
+    assert_receive {:validation_attempt, {:ok, :not_exact}}
+    assert %{phase: :validation_decided, effect_status: :validation_failed} = Trial.status(pid)
+
+    assert {:ok, %{phase: :validation_decided, timing: %{remaining_deadline_ms: 5}}} =
+             DiagnosticsStore.load(dir)
+
+    Agent.update(validation_result, fn _ -> :ok end)
+    assert :ok = Trial.check_now(pid)
+    assert_receive {:validation_attempt, :ok}
+    assert %{phase: :validated} = Trial.status(pid)
+    assert {:ok, %{phase: :validated}} = DiagnosticsStore.load(dir)
+    refute_receive :unexpected_revert
+    refute_receive :unexpected_reboot
+  end
+
+  test "a regressing validation retry clock fails closed after proving firmware is still invalid", %{dir: dir} do
+    clock = agent(100)
+    parent = self()
+
+    assert :ok =
+             DiagnosticsStore.save(dir, %{
+               phase: :validation_decided,
+               result: :ready,
+               timing: %{remaining_deadline_ms: 100, healthy_for_ms: 1},
+               target: Map.delete(target(deadline_at_ms: 1, soak_period_ms: 1), :deadline_at_ms)
+             })
+
+    pid =
+      start_trial(dir,
+        clock: fn -> Agent.get(clock, & &1) end,
+        snapshot_opts: healthy_snapshot_opts(),
+        status_fun: fn -> false end,
+        validate_fun: fn ->
+          send(parent, :regression_validation_attempt)
+          Agent.update(clock, fn _ -> 90 end)
+          {:ok, :not_exact}
+        end,
+        revert_fun: fn ->
+          assert {:ok, %{phase: :rollback_decided}} = DiagnosticsStore.load(dir)
+          send(parent, :regression_validation_revert)
+          :ok
+        end,
+        reboot_fun: fn ->
+          assert {:ok, %{phase: :reboot_pending}} = DiagnosticsStore.load(dir)
+          send(parent, :regression_validation_reboot)
+          :ok
+        end,
+        target: target(deadline_at_ms: 1, soak_period_ms: 1)
+      )
+
+    assert_receive :regression_validation_attempt
+    assert_receive :regression_validation_revert
+    assert_receive :regression_validation_reboot
+    assert %{phase: :reboot_pending} = Trial.status(pid)
+  end
+
   test "restart recovers a conservative remaining budget and resets soak continuity", %{dir: dir} do
     clock = agent(0)
     parent = self()
@@ -248,12 +474,13 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
 
   test "a reboot-pending terminal decision resumes reboot without repeating revert", %{dir: dir} do
     clock = agent(0)
+    health = agent(:unhealthy)
     parent = self()
 
     first =
       start_trial(dir,
         clock: fn -> Agent.get(clock, & &1) end,
-        snapshot_opts: healthy_snapshot_opts(),
+        snapshot_opts: healthy_snapshot_opts(health),
         status_fun: fn -> false end,
         validate_fun: fn -> :error end,
         revert_fun: fn ->

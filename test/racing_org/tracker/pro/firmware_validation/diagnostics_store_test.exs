@@ -42,6 +42,17 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.DiagnosticsStoreTest do
     assert Bitwise.band(dir_stat.mode, 0o777) == 0o700
   end
 
+  test "accepts the closed validation-decided phase only for a ready result", %{dir: dir} do
+    decision = %{pending_record() | phase: :validation_decided, result: :ready}
+
+    assert :ok = DiagnosticsStore.save(dir, decision)
+    assert {:ok, ^decision} = DiagnosticsStore.load(dir)
+
+    invalid_decision = %{decision | result: pending_record().result}
+    assert {:error, :invalid_record} = DiagnosticsStore.save(dir, invalid_decision)
+    assert {:ok, ^decision} = DiagnosticsStore.load(dir)
+  end
+
   test "rejects snapshots, pids, session keys, secrets, unknown fields, and nonregistry atoms", %{dir: dir} do
     secret = "snapshot-secret"
 

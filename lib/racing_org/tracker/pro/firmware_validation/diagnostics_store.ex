@@ -20,7 +20,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.DiagnosticsStore do
   @max_u64 0xFFFF_FFFF_FFFF_FFFF
   @max_version_bytes 128
   @git_sha_bytes 40
-  @phases [:monitoring, :validated, :rollback_decided, :reboot_pending]
+  @phases [:monitoring, :validation_decided, :validated, :rollback_decided, :reboot_pending]
   @record_keys [:phase, :result, :timing, :target]
   @timing_keys [:remaining_deadline_ms, :healthy_for_ms]
   @target_keys [:firmware, :credential_epoch, :desired_generation, :soak_period_ms]
@@ -45,7 +45,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.DiagnosticsStore do
     input: [:invalid_snapshot, :invalid_target]
   }
 
-  @type phase :: :monitoring | :validated | :rollback_decided | :reboot_pending
+  @type phase :: :monitoring | :validation_decided | :validated | :rollback_decided | :reboot_pending
   @type target_identity :: %{
           firmware: %{version: binary(), git_sha: binary()},
           credential_epoch: non_neg_integer(),
@@ -192,7 +192,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.DiagnosticsStore do
   end
 
   defp phase_matches_result?(:monitoring, result), do: result == :ready or match?({:pending, _unmet}, result)
-  defp phase_matches_result?(:validated, :ready), do: true
+  defp phase_matches_result?(phase, :ready) when phase in [:validation_decided, :validated], do: true
 
   defp phase_matches_result?(phase, {:rollback_required, _unmet})
        when phase in [:rollback_decided, :reboot_pending],

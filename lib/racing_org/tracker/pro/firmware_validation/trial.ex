@@ -5,9 +5,10 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
   The controller evaluates `HealthCriteria` on a nonnegative boot-relative
   monotonic clock, requires one uninterrupted healthy soak, and retries until a
   terminal deadline. It persists only the sanitized `DiagnosticsStore` record.
-  A rollback decision is durably committed before partition reversion, and a
-  second durable phase records that passive reversion completed before an
-  explicit reboot is requested.
+  A validation decision is durably committed before firmware validity changes;
+  recovery proves existing validity or retries exact validation before any
+  bounded rollback. A rollback decision is likewise committed before partition
+  reversion, and a second durable phase records passive reversion before reboot.
   """
 
   use GenServer
@@ -19,8 +20,16 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
 
   @max_u64 0xFFFF_FFFF_FFFF_FFFF
   @default_retry_ms 1_000
-  @phases [:monitoring, :validated, :rollback_decided, :reboot_pending]
-  @effect_statuses [nil, :runtime_unavailable, :revert_failed, :reboot_failed, :reboot_requested]
+  @phases [:monitoring, :validation_decided, :validated, :rollback_decided, :reboot_pending]
+  @effect_statuses [
+    nil,
+    :runtime_unavailable,
+    :validation_failed,
+    :validation_uncertain,
+    :revert_failed,
+    :reboot_failed,
+    :reboot_requested
+  ]
   @invalid_snapshot [%{criterion: :input, diagnostic_code: :invalid_snapshot}]
 
   @doc false
@@ -73,6 +82,12 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
   @impl true
   def handle_continue(:resume, %{phase: :validated} = state), do: {:noreply, state}
 
+  def handle_continue(:resume, %{phase: :validation_decided} = state) do
+    state
+    |> run_validation_effect()
+    |> noreply_result()
+  end
+
   def handle_continue(:resume, %{phase: phase} = state)
       when phase in [:rollback_decided, :reboot_pending] do
     state
@@ -96,7 +111,14 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
   def handle_call(:check_now, _from, state) do
     state = cancel_timer(state)
 
-    case if(state.phase == :monitoring, do: run_check(state), else: enforce_rollback(state)) do
+    result =
+      case state.phase do
+        :monitoring -> run_check(state)
+        :validation_decided -> run_validation_effect(state)
+        _rollback_phase -> enforce_rollback(state)
+      end
+
+    case result do
       {:ok, next_state} -> {:reply, :ok, next_state}
       {:stop, reason, next_state} -> {:stop, reason, {:error, reason}, next_state}
     end
@@ -110,6 +132,13 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
     |> noreply_result()
   end
 
+  def handle_info({:validation_effect, token}, %{timer_token: token, phase: :validation_decided} = state) do
+    state
+    |> clear_timer()
+    |> run_validation_effect()
+    |> noreply_result()
+  end
+
   def handle_info({:rollback_effect, token}, %{timer_token: token} = state) do
     state
     |> clear_timer()
@@ -117,7 +146,10 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
     |> noreply_result()
   end
 
-  def handle_info({kind, _stale_token}, state) when kind in [:trial_check, :rollback_effect], do: {:noreply, state}
+  def handle_info({kind, _stale_token}, state)
+      when kind in [:trial_check, :validation_effect, :rollback_effect],
+      do: {:noreply, state}
+
   def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
@@ -250,22 +282,107 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
   end
 
   defp attempt_validation(state) do
+    state = %{
+      cancel_timer(state)
+      | phase: :validation_decided,
+        result: :ready,
+        effect_status: nil
+    }
+
+    case persist_record(state, :validation_decided, :ready, state.remaining_deadline_ms) do
+      :ok -> enforce_validation(state)
+      {:error, reason} -> {:stop, {:diagnostics_persist_failed, reason}, state}
+    end
+  end
+
+  defp enforce_validation(%{phase: :validation_decided} = state) do
     case firmware_validation(state) do
       result when result in [:validated, :already_valid] ->
-        case persist_record(state, :validated, :ready, state.remaining_deadline_ms) do
-          :ok -> {:ok, %{cancel_timer(state) | phase: :validated, result: :ready}}
-          {:error, reason} -> {:stop, {:diagnostics_persist_failed, reason}, state}
-        end
+        persist_validated(state)
 
       :unavailable ->
         state = %{cancel_timer(state) | effect_status: :runtime_unavailable}
         {:stop, :firmware_validation_unavailable, state}
 
-      _failure when state.remaining_deadline_ms > 0 ->
-        persist_monitoring_and_schedule(state)
-
       _failure ->
+        handle_validation_failure(state)
+    end
+  end
+
+  defp handle_validation_failure(state) do
+    case firmware_status(state) do
+      :valid ->
+        persist_validated(state)
+
+      :invalid when state.remaining_deadline_ms > 0 ->
+        persist_validation_failure_and_schedule(state)
+
+      :invalid ->
         decide_rollback(state, {:rollback_required, @invalid_snapshot})
+
+      :uncertain ->
+        state
+        |> Map.put(:effect_status, :validation_uncertain)
+        |> schedule(:validation_effect, state.retry_ms)
+    end
+  end
+
+  defp persist_validated(state) do
+    case persist_record(state, :validated, :ready, state.remaining_deadline_ms) do
+      :ok -> {:ok, %{cancel_timer(state) | phase: :validated, result: :ready, effect_status: nil}}
+      {:error, reason} -> {:stop, {:diagnostics_persist_failed, reason}, state}
+    end
+  end
+
+  defp run_validation_effect(%{effect_status: :validation_failed} = state) do
+    case read_clock(state.clock) do
+      {:ok, now_ms} when now_ms >= state.last_now_ms ->
+        elapsed_ms = now_ms - state.last_now_ms
+
+        state
+        |> Map.merge(%{
+          remaining_deadline_ms: max(state.remaining_deadline_ms - elapsed_ms, 0),
+          last_now_ms: now_ms
+        })
+        |> enforce_validation()
+
+      {:ok, now_ms} ->
+        state
+        |> Map.merge(%{remaining_deadline_ms: 0, last_now_ms: now_ms})
+        |> enforce_validation()
+
+      {:error, _reason} ->
+        state
+        |> Map.put(:remaining_deadline_ms, 0)
+        |> enforce_validation()
+    end
+  end
+
+  defp run_validation_effect(state), do: enforce_validation(state)
+
+  defp persist_validation_failure_and_schedule(state) do
+    state =
+      state
+      |> Map.put(:effect_status, :validation_failed)
+      |> anchor_validation_retry_clock()
+
+    if state.remaining_deadline_ms > 0 do
+      delay_ms = min(state.retry_ms, state.remaining_deadline_ms)
+      recoverable_remaining_ms = max(state.remaining_deadline_ms - delay_ms, 0)
+
+      case persist_record(state, :validation_decided, :ready, recoverable_remaining_ms) do
+        :ok -> schedule(state, :validation_effect, delay_ms)
+        {:error, reason} -> {:stop, {:diagnostics_persist_failed, reason}, state}
+      end
+    else
+      decide_rollback(state, {:rollback_required, @invalid_snapshot})
+    end
+  end
+
+  defp anchor_validation_retry_clock(state) do
+    case read_clock(state.clock) do
+      {:ok, now_ms} when now_ms >= state.last_now_ms -> %{state | last_now_ms: now_ms}
+      _untrusted_clock -> %{state | remaining_deadline_ms: 0}
     end
   end
 
@@ -334,6 +451,24 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
     |> maybe_put_validator_option(:firmware_valid?, state.status_fun, &safe_status/1)
     |> maybe_put_validator_option(:validate, state.validate_fun, &safe_validate/1)
     |> FirmwareValidator.validate_on_connect()
+  end
+
+  defp firmware_status(%{status_fun: fun}) when is_function(fun, 0), do: exact_firmware_status(fun)
+
+  defp firmware_status(state) do
+    exact_firmware_status(fn -> apply(state.runtime_module, :firmware_valid?, []) end)
+  end
+
+  defp exact_firmware_status(fun) do
+    case fun.() do
+      true -> :valid
+      false -> :invalid
+      _other -> :uncertain
+    end
+  rescue
+    _exception -> :uncertain
+  catch
+    _kind, _reason -> :uncertain
   end
 
   defp ensure_validation_available(opts) do
