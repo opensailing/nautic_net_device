@@ -57,6 +57,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
   @impl true
   def init(opts) do
     with {:ok, target_identity, initial_deadline_at_ms} <- validate_target(Keyword.fetch!(opts, :target)),
+         :ok <- ensure_validation_available(opts),
          {:ok, now_ms} <- read_clock(Keyword.fetch!(opts, :clock)),
          {:ok, state} <- initial_state(opts, target_identity, initial_deadline_at_ms, now_ms) do
       {:ok, state, {:continue, :resume}}
@@ -150,6 +151,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
       snapshot_opts: Keyword.get(opts, :snapshot_opts, []),
       status_fun: Keyword.get(opts, :status_fun),
       validate_fun: Keyword.get(opts, :validate_fun),
+      runtime_module: Keyword.get(opts, :runtime_module, Nerves.Runtime),
       revert_fun: Keyword.get(opts, :revert_fun),
       reboot_fun: Keyword.get(opts, :reboot_fun),
       schedule_fun: Keyword.get(opts, :schedule_fun, &default_schedule/2),
@@ -255,6 +257,10 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
           {:error, reason} -> {:stop, {:diagnostics_persist_failed, reason}, state}
         end
 
+      :unavailable ->
+        state = %{cancel_timer(state) | effect_status: :runtime_unavailable}
+        {:stop, :firmware_validation_unavailable, state}
+
       _failure when state.remaining_deadline_ms > 0 ->
         persist_monitoring_and_schedule(state)
 
@@ -289,7 +295,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
   end
 
   defp enforce_rollback(%{phase: :rollback_decided} = state) do
-    case rollback_effect(state.revert_fun, :revert) do
+    case rollback_effect(state.revert_fun, state.runtime_module, :revert) do
       :ok ->
         state = %{state | phase: :reboot_pending, effect_status: nil}
 
@@ -309,7 +315,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
   end
 
   defp enforce_rollback(%{phase: :reboot_pending} = state) do
-    case rollback_effect(state.reboot_fun, :reboot) do
+    case rollback_effect(state.reboot_fun, state.runtime_module, :reboot) do
       :ok ->
         {:ok, %{state | effect_status: :reboot_requested}}
 
@@ -324,10 +330,21 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
   end
 
   defp firmware_validation(state) do
-    []
+    [runtime_module: state.runtime_module]
     |> maybe_put_validator_option(:firmware_valid?, state.status_fun, &safe_status/1)
     |> maybe_put_validator_option(:validate, state.validate_fun, &safe_validate/1)
     |> FirmwareValidator.validate_on_connect()
+  end
+
+  defp ensure_validation_available(opts) do
+    [runtime_module: Keyword.get(opts, :runtime_module, Nerves.Runtime)]
+    |> maybe_put_validator_option(:firmware_valid?, Keyword.get(opts, :status_fun), &Function.identity/1)
+    |> maybe_put_validator_option(:validate, Keyword.get(opts, :validate_fun), &Function.identity/1)
+    |> FirmwareValidator.validation_available?()
+    |> case do
+      true -> :ok
+      false -> {:error, :firmware_validation_unavailable}
+    end
   end
 
   defp maybe_put_validator_option(opts, _key, nil, _wrapper), do: opts
@@ -360,9 +377,9 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
     _kind, _reason -> :error
   end
 
-  defp rollback_effect(nil, operation), do: runtime_call(operation)
+  defp rollback_effect(nil, runtime_module, operation), do: runtime_call(runtime_module, operation)
 
-  defp rollback_effect(fun, _operation) when is_function(fun, 0) do
+  defp rollback_effect(fun, _runtime_module, _operation) when is_function(fun, 0) do
     case fun.() do
       :ok -> :ok
       {:error, :nerves_runtime_unavailable} -> {:error, :nerves_runtime_unavailable}
@@ -374,11 +391,19 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
     _kind, _reason -> {:error, :effect_failed}
   end
 
-  defp rollback_effect(_invalid, _operation), do: {:error, :effect_failed}
+  defp rollback_effect(_invalid, _runtime_module, _operation), do: {:error, :effect_failed}
 
-  defp runtime_call(operation) do
-    if Code.ensure_loaded?(Nerves.Runtime) and function_exported?(Nerves.Runtime, operation, 0) do
-      case apply(Nerves.Runtime, operation, []) do
+  defp runtime_call(runtime_module, :revert) do
+    runtime_call(runtime_module, :revert, 1, [[reboot: false]])
+  end
+
+  defp runtime_call(runtime_module, :reboot) do
+    runtime_call(runtime_module, :reboot, 0, [])
+  end
+
+  defp runtime_call(runtime_module, operation, arity, arguments) do
+    if Code.ensure_loaded?(runtime_module) and function_exported?(runtime_module, operation, arity) do
+      case apply(runtime_module, operation, arguments) do
         :ok -> :ok
         _other -> {:error, :effect_failed}
       end

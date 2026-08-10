@@ -56,7 +56,16 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidatorTest do
              )
   end
 
+  test "uses an injectable runtime module for the default validation path" do
+    assert :validated = FirmwareValidator.validate_on_connect(runtime_module: __MODULE__.RuntimeModule)
+  end
+
   test "no-op on host where Nerves.Runtime is unavailable and nothing injected" do
     assert :unavailable = FirmwareValidator.validate_on_connect()
+  end
+
+  defmodule RuntimeModule do
+    def firmware_valid?, do: false
+    def validate_firmware, do: :ok
   end
 end

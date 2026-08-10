@@ -1,5 +1,5 @@
 defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias RacingOrg.Tracker.Pro.FirmwareValidation.DiagnosticsStore
   alias RacingOrg.Tracker.Pro.FirmwareValidation.Trial
@@ -93,6 +93,70 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     assert_receive :revert
     assert_receive :reboot
     assert %{phase: :reboot_pending} = Trial.status(pid)
+  end
+
+  test "default runtime passively reverts, persists reboot pending, and explicitly reboots without repeating revert after restart",
+       %{
+         dir: dir
+       } do
+    clock = agent(0)
+    runtime = configure_runtime_spy(dir, reboot: {:error, :reboot_failed})
+
+    first =
+      start_trial(dir,
+        clock: fn -> Agent.get(clock, & &1) end,
+        snapshot_opts: healthy_snapshot_opts(),
+        runtime_module: __MODULE__.RuntimeSpy,
+        target: target(deadline_at_ms: 1, soak_period_ms: 1)
+      )
+
+    Agent.update(clock, fn _ -> 1 end)
+    assert :ok = Trial.check_now(first)
+
+    assert_receive {:runtime_call, :revert, [reboot: false], {:ok, %{phase: :rollback_decided}}}
+    refute_receive {:runtime_call, :revert_zero, _args, _record}
+    assert_receive {:runtime_call, :reboot, [], {:ok, %{phase: :reboot_pending}}}
+    assert {:ok, %{phase: :reboot_pending}} = DiagnosticsStore.load(dir)
+
+    GenServer.stop(first)
+    Agent.update(runtime, &Map.put(&1, :reboot, :ok))
+    Agent.update(clock, fn _ -> 0 end)
+
+    _restarted =
+      start_trial(dir,
+        clock: fn -> Agent.get(clock, & &1) end,
+        snapshot_opts: healthy_snapshot_opts(),
+        runtime_module: __MODULE__.RuntimeSpy,
+        target: target(deadline_at_ms: 1, soak_period_ms: 1)
+      )
+
+    assert_receive {:runtime_call, :reboot, [], {:ok, %{phase: :reboot_pending}}}
+    refute_receive {:runtime_call, :revert, _args, _record}
+    refute_receive {:runtime_call, :revert_zero, _args, _record}
+  end
+
+  test "default runtime requires exact :ok from passive revert before persisting reboot pending", %{
+    dir: dir
+  } do
+    clock = agent(0)
+    _runtime = configure_runtime_spy(dir, revert: {:ok, :not_exact})
+
+    pid =
+      start_trial(dir,
+        clock: fn -> Agent.get(clock, & &1) end,
+        snapshot_opts: healthy_snapshot_opts(),
+        runtime_module: __MODULE__.RuntimeSpy,
+        target: target(deadline_at_ms: 1, soak_period_ms: 1)
+      )
+
+    Agent.update(clock, fn _ -> 1 end)
+    assert :ok = Trial.check_now(pid)
+
+    assert_receive {:runtime_call, :revert, [reboot: false], {:ok, %{phase: :rollback_decided}}}
+    refute_receive {:runtime_call, :reboot, _args, _record}
+
+    assert %{phase: :rollback_decided, effect_status: :revert_failed} = Trial.status(pid)
+    assert {:ok, %{phase: :rollback_decided}} = DiagnosticsStore.load(dir)
   end
 
   test "restart recovers a conservative remaining budget and resets soak continuity", %{dir: dir} do
@@ -192,6 +256,8 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     first =
       start_trial(dir,
         snapshot_opts: healthy_snapshot_opts(),
+        status_fun: fn -> false end,
+        validate_fun: fn -> :error end,
         retry_ms: 100,
         target: target(deadline_at_ms: deadline_at_ms)
       )
@@ -207,6 +273,8 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     recovered =
       start_trial(dir,
         snapshot_opts: healthy_snapshot_opts(),
+        status_fun: fn -> false end,
+        validate_fun: fn -> :error end,
         retry_ms: 100,
         target: target(deadline_at_ms: deadline_at_ms)
       )
@@ -221,6 +289,8 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     fresh =
       start_trial(fresh_dir,
         snapshot_opts: healthy_snapshot_opts(),
+        status_fun: fn -> false end,
+        validate_fun: fn -> :error end,
         retry_ms: 100,
         target: target(deadline_at_ms: deadline_at_ms)
       )
@@ -229,21 +299,32 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     assert fresh_remaining_ms < first_remaining_ms
   end
 
-  test "host runtime unavailability is terminal but non-destructive", %{dir: dir} do
-    clock = agent(0)
+  test "host runtime unavailability start-gates the trial without consuming deadline or deciding rollback", %{
+    dir: dir
+  } do
+    parent = self()
+    previous_trap_exit = Process.flag(:trap_exit, true)
 
-    pid =
-      start_trial(dir,
-        clock: fn -> Agent.get(clock, & &1) end,
-        snapshot_opts: healthy_snapshot_opts(),
-        target: target(deadline_at_ms: 1, soak_period_ms: 1)
-      )
+    assert {:error, :firmware_validation_unavailable} =
+             Trial.start_link(
+               name: nil,
+               store_dir: dir,
+               snapshot_opts: healthy_snapshot_opts(),
+               target: target(deadline_at_ms: 1, soak_period_ms: 1),
+               revert_fun: fn ->
+                 send(parent, :unexpected_revert)
+                 :ok
+               end,
+               reboot_fun: fn ->
+                 send(parent, :unexpected_reboot)
+                 :ok
+               end
+             )
 
-    Agent.update(clock, fn _ -> 1 end)
-    assert :ok = Trial.check_now(pid)
-    assert Process.alive?(pid)
-    assert %{phase: :rollback_decided, effect_status: :runtime_unavailable} = Trial.status(pid)
-    assert {:ok, %{phase: :rollback_decided}} = DiagnosticsStore.load(dir)
+    Process.flag(:trap_exit, previous_trap_exit)
+    assert :empty = DiagnosticsStore.load(dir)
+    refute_receive :unexpected_revert
+    refute_receive :unexpected_reboot
   end
 
   test "a regressing injected clock fails closed into a durable rollback decision", %{dir: dir} do
@@ -423,6 +504,28 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     }
   end
 
+  defp configure_runtime_spy(dir, overrides) do
+    runtime =
+      agent(
+        Map.merge(
+          %{
+            owner: self(),
+            dir: dir,
+            firmware_valid?: false,
+            validate_firmware: :error,
+            revert: :ok,
+            revert_zero: :ok,
+            reboot: :ok
+          },
+          Map.new(overrides)
+        )
+      )
+
+    Application.put_env(:racing_org_tracker_pro, __MODULE__.RuntimeSpy, runtime)
+    on_exit(fn -> Application.delete_env(:racing_org_tracker_pro, __MODULE__.RuntimeSpy) end)
+    runtime
+  end
+
   defp vm_boot_ms do
     System.monotonic_time()
     |> Kernel.-(:erlang.system_info(:start_time))
@@ -434,5 +537,22 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
       id: make_ref(),
       start: {Agent, :start_link, [fn -> initial end]}
     })
+  end
+
+  defmodule RuntimeSpy do
+    alias RacingOrg.Tracker.Pro.FirmwareValidation.DiagnosticsStore
+
+    def firmware_valid?, do: call(:firmware_valid?, [])
+    def validate_firmware, do: call(:validate_firmware, [])
+    def revert, do: call(:revert_zero, [])
+    def revert(opts), do: call(:revert, opts)
+    def reboot, do: call(:reboot, [])
+
+    defp call(operation, args) do
+      runtime = Application.fetch_env!(:racing_org_tracker_pro, __MODULE__)
+      config = Agent.get(runtime, & &1)
+      send(config.owner, {:runtime_call, operation, args, DiagnosticsStore.load(config.dir)})
+      Map.fetch!(config, operation)
+    end
   end
 end

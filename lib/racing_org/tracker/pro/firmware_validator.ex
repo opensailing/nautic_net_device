@@ -31,21 +31,24 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidator do
       (default: `Nerves.Runtime.firmware_valid?/0`)
     * `:validate` — 0-arity, marks the firmware valid
       (default: `Nerves.Runtime.validate_firmware/0`)
+    * `:runtime_module` — module supplying both default calls
+      (default: `Nerves.Runtime`)
   """
   @spec validate_on_connect(keyword()) :: :already_valid | :validated | :unavailable | :error
   def validate_on_connect(opts \\ []) do
+    runtime_module = Keyword.get(opts, :runtime_module, Nerves.Runtime)
     valid_fun = Keyword.get(opts, :firmware_valid?)
     validate_fun = Keyword.get(opts, :validate)
 
     cond do
-      is_nil(valid_fun) and is_nil(validate_fun) and not runtime_available?() ->
+      not validation_available?(opts) ->
         :unavailable
 
-      (valid_fun || (&default_valid?/0)).() ->
+      (valid_fun || fn -> default_valid?(runtime_module) end).() ->
         :already_valid
 
       true ->
-        case (validate_fun || (&default_validate/0)).() do
+        case (validate_fun || fn -> default_validate(runtime_module) end).() do
           :ok ->
             Logger.info("[FirmwareValidator] firmware validated after RacingOrg connect")
             :validated
@@ -62,8 +65,27 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidator do
       :error
   end
 
-  defp runtime_available?, do: Code.ensure_loaded?(Nerves.Runtime)
+  @doc false
+  @spec validation_available?(keyword()) :: boolean()
+  def validation_available?(opts \\ []) do
+    runtime_module = Keyword.get(opts, :runtime_module, Nerves.Runtime)
 
-  defp default_valid?, do: apply(Nerves.Runtime, :firmware_valid?, [])
-  defp default_validate, do: apply(Nerves.Runtime, :validate_firmware, [])
+    callable?(Keyword.get(opts, :firmware_valid?), runtime_module, :firmware_valid?) and
+      callable?(Keyword.get(opts, :validate), runtime_module, :validate_firmware)
+  rescue
+    _exception -> false
+  catch
+    _kind, _reason -> false
+  end
+
+  defp callable?(fun, _runtime_module, _function) when is_function(fun, 0), do: true
+
+  defp callable?(nil, runtime_module, function) do
+    Code.ensure_loaded?(runtime_module) and function_exported?(runtime_module, function, 0)
+  end
+
+  defp callable?(_invalid, _runtime_module, _function), do: false
+
+  defp default_valid?(runtime_module), do: apply(runtime_module, :firmware_valid?, [])
+  defp default_validate(runtime_module), do: apply(runtime_module, :validate_firmware, [])
 end
