@@ -41,6 +41,20 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
        (default p = 0.90) in O(1), and bump the cell's count. The touched cell is
        marked dirty for the next persist + sync.
 
+  ## Wind-domain admission (fail-closed) — orthogonal to steadiness
+
+  Binning is bounds-checked at step 3 and the sample is DROPPED when `(tws, twa)`
+  falls outside the `Bins` operating domain (`:tws_out_of_domain` /
+  `:twa_out_of_domain` in `stats/1`). The steadiness gates cannot catch this: a
+  wind sensor stuck at an absurd value is perfectly steady, on-angle and
+  non-accelerating, so it sails straight through every `Gate` check. Rejection is
+  deliberately FAIL-CLOSED rather than clamped — clamping a 1e9 m/s reading into
+  the top wind bin would fold garbage into a legitimate learned percentile,
+  whereas leaving it unbounded would mint an arbitrary cell key that is persisted
+  to flash and synced upstream forever. On restore, cells whose keys fall outside
+  the domain (a file written before this check existed) are dropped for the same
+  reason.
+
   ## Min-STW (admission floor) — why in the Observer, not the Gate
 
   `Gate` answers "is the boat in quasi-steady sailing state?" — its filters are all
@@ -159,7 +173,9 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
   @doc """
   Observability: `%{admitted, rejected, samples, populated_cells, reject_reasons}`.
   `reject_reasons` is a `%{reason => count}` tally (incl. `:at_rest` for the min-STW
-  floor and `:no_true_wind` when true wind could not be derived).
+  floor, `:no_true_wind` when true wind could not be derived, and
+  `:tws_out_of_domain` / `:twa_out_of_domain` for readings outside the `Bins`
+  operating domain).
   """
   @spec stats(GenServer.server()) :: map()
   def stats(server \\ __MODULE__), do: GenServer.call(server, :stats)
@@ -177,6 +193,7 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
     # Anchor both throttle clocks at boot so the FIRST persist/sync must also wait a
     # full interval — the device never writes flash or hits the network on tick 1.
     boot_ms = now_fn.()
+    bins = build_bins(Keyword.get(opts, :bins, []))
 
     state = %{
       dir: dir,
@@ -187,13 +204,13 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
       p: p,
       min_stw_mps: Keyword.get(opts, :min_stw_mps, @default_min_stw_mps),
       window_size: Keyword.get(opts, :window_size, @default_window_size),
-      bins: build_bins(Keyword.get(opts, :bins, [])),
+      bins: bins,
       gate: build_gate(Keyword.get(opts, :gate, [])),
       signals_fn: Keyword.get(opts, :signals_fn, fn -> safe_signals() end),
       sender: Keyword.get(opts, :sender, &ChannelClient.send_sailed_polar_update/2),
       now_fn: now_fn,
       # Accumulated cells: %{key => {count, PSquare.t()}}.
-      cells: restore(dir),
+      cells: restore(dir, bins),
       # Rolling window of recent samples (most-recent LAST).
       window: [],
       # Keys touched since the last persist / last sync.
@@ -330,18 +347,32 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
   end
 
   # Fold STW into the cell's PSquare, bump its count, mark it dirty for persist+sync.
+  #
+  # The (TWS, TWA) pair is bounds-checked FIRST and the sample is dropped when it
+  # falls outside the binning domain. This is deliberately FAIL-CLOSED rather than
+  # clamped: a wind sensor reading 1e9 m/s would otherwise either mint an
+  # unbounded junk cell key (persisted to flash and synced upstream forever) or,
+  # if clamped, fold its boat speed into the highest REAL wind cell and poison a
+  # legitimate learned percentile. The steadiness gates cannot catch this — a
+  # stuck-high sensor is perfectly steady. See `Bins` for the domain and its
+  # justification.
   defp accumulate(state, %{tws_mps: tws, twa_deg: twa, stw_mps: stw}) do
-    key = Bins.cell(state.bins, tws, twa)
-    {count, ps} = Map.get(state.cells, key) || {0, PSquare.new(state.p)}
-    cell = {count + 1, PSquare.add(ps, stw)}
+    case Bins.fetch_cell(state.bins, tws, twa) do
+      {:ok, key} ->
+        {count, ps} = Map.get(state.cells, key) || {0, PSquare.new(state.p)}
+        cell = {count + 1, PSquare.add(ps, stw)}
 
-    %{
-      state
-      | cells: Map.put(state.cells, key, cell),
-        dirty_persist: MapSet.put(state.dirty_persist, key),
-        dirty_sync: MapSet.put(state.dirty_sync, key),
-        stats: Map.update!(state.stats, :admitted, &(&1 + 1))
-    }
+        %{
+          state
+          | cells: Map.put(state.cells, key, cell),
+            dirty_persist: MapSet.put(state.dirty_persist, key),
+            dirty_sync: MapSet.put(state.dirty_sync, key),
+            stats: Map.update!(state.stats, :admitted, &(&1 + 1))
+        }
+
+      {:error, reason} ->
+        tally_reject(state, reason)
+    end
   end
 
   defp bump_samples(state),
@@ -378,13 +409,30 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
     end
   end
 
-  defp restore(nil), do: %{}
+  defp restore(nil, _bins), do: %{}
 
-  defp restore(dir) do
+  defp restore(dir, bins) do
     case Store.load(dir) do
-      {:ok, cells} -> cells
+      {:ok, cells} -> drop_out_of_domain(cells, bins)
       :empty -> %{}
     end
+  end
+
+  # A file written before the binning domain was enforced (or a tampered one) can
+  # carry unbounded junk keys minted from a bad sensor reading. Restoring them
+  # would resurrect the poisoned state and re-sync it upstream forever, so they
+  # are dropped on load — the same fail-closed stance as ingestion.
+  defp drop_out_of_domain(cells, bins) do
+    {kept, dropped} = Map.split_with(cells, fn {key, _cell} -> Bins.valid_key?(bins, key) end)
+
+    if map_size(dropped) > 0 do
+      Logger.warning(
+        "[Polar.Observer] dropped #{map_size(dropped)} out-of-domain sailed-polar cell(s) on restore: " <>
+          inspect(Map.keys(dropped) |> Enum.take(5))
+      )
+    end
+
+    kept
   end
 
   # --- Throttled / batched upstream sync ---

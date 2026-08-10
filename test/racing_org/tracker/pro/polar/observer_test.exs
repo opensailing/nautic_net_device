@@ -5,6 +5,8 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverTest do
   alias RacingOrg.Tracker.Pro.Polar
   alias RacingOrg.Tracker.Pro.Polar.Observer
   alias RacingOrg.Tracker.Pro.Polar.Observer.Bins
+  alias RacingOrg.Tracker.Pro.Polar.Observer.PSquare
+  alias RacingOrg.Tracker.Pro.Polar.Observer.Store
   alias RacingOrg.Tracker.Protobuf.DeviceCommand
   alias RacingOrg.Tracker.Protobuf.PolarCell
   alias RacingOrg.Tracker.Protobuf.PolarOptimum
@@ -187,6 +189,137 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverTest do
       # The missing heel never surfaced as a rejection or stalled the pipeline.
       refute Map.has_key?(stats.reject_reasons, :heel_out_of_band)
       refute Map.has_key?(stats.reject_reasons, :no_true_wind)
+    end
+
+    test "an out-of-domain TWS cannot create a cell or bump learned state" do
+      # A broken wind sensor pegging TWS at 1e9 m/s: steady, on-angle, moving — it
+      # passes every steadiness gate. Before the domain check it minted an
+      # arbitrarily large tws_idx (floor(1e9 / 0.514444) ≈ 1.94e9), creating a junk
+      # cell that persisted and synced upstream. It must now be rejected outright,
+      # not clamped into the top wind bin (which would poison a REAL cell).
+      stream =
+        for i <- 0..11,
+            do: signals(i * 1000, %{"true_wind_speed" => 1.0e9, "true_wind_angle" => 92.0})
+
+      pid = start_observer(signals_fn: scripted(stream))
+
+      for _ <- 0..11, do: Observer.tick(pid)
+
+      assert Observer.cells(pid) == []
+      stats = Observer.stats(pid)
+      assert stats.admitted == 0
+      assert stats.populated_cells == 0
+      assert stats.reject_reasons[:tws_out_of_domain] >= 1
+    end
+
+    test "an out-of-domain TWS is not clamped into the top wind bin (no poisoning)" do
+      # First learn a legitimate cell at the very top of the wind domain, then feed
+      # a garbage TWS. A clamping implementation would fold the garbage sample's
+      # boat speed into that same top cell; fail-closed rejection must leave the
+      # learned cell's count and percentile untouched.
+      top_tws = Bins.max_tws_mps() - 0.01
+      good = for i <- 0..14, do: signals(i * 1000, %{"true_wind_speed" => top_tws, "true_wind_angle" => 92.0})
+      pid = start_observer(signals_fn: scripted(good))
+      for _ <- 0..14, do: Observer.tick(pid)
+
+      assert [{key, _, %{boat_speed_mps: bsp_before, count: count_before}}] = Observer.cells(pid)
+
+      # Same steady stream, but the wind sensor now reads absurdly high AND the
+      # boat "speed" is absurd too — neither may touch the learned cell.
+      GenServer.stop(pid)
+
+      garbage =
+        for i <- 0..14,
+            do: signals(i * 1000, %{"true_wind_speed" => 1.0e12, "true_wind_angle" => 92.0})
+
+      pid2 = start_observer(signals_fn: scripted(Enum.concat(good, garbage)))
+      for _ <- 0..29, do: Observer.tick(pid2)
+
+      assert [{^key, _, %{boat_speed_mps: bsp_after, count: count_after}}] = Observer.cells(pid2)
+      assert count_after >= count_before
+      assert_in_delta bsp_after, bsp_before, 1.0e-9
+      assert Observer.stats(pid2).reject_reasons[:tws_out_of_domain] >= 1
+    end
+
+    test "a negative TWS cannot create a cell (no clamp to bin 0)" do
+      stream =
+        for i <- 0..11,
+            do: signals(i * 1000, %{"true_wind_speed" => -5.0, "true_wind_angle" => 92.0})
+
+      pid = start_observer(signals_fn: scripted(stream))
+
+      for _ <- 0..11, do: Observer.tick(pid)
+
+      assert Observer.cells(pid) == []
+      assert Observer.stats(pid).reject_reasons[:tws_out_of_domain] >= 1
+    end
+
+    test "an out-of-domain TWA cannot create a cell or mutate learned state" do
+      # A garbage wind-angle reading well beyond a full turn. Wrapping it would
+      # alias it onto a perfectly valid angle bin and poison that cell.
+      stream =
+        for i <- 0..11,
+            do: signals(i * 1000, %{"true_wind_speed" => 10.3, "true_wind_angle" => 1.0e9})
+
+      pid = start_observer(signals_fn: scripted(stream))
+
+      for _ <- 0..11, do: Observer.tick(pid)
+
+      assert Observer.cells(pid) == []
+      assert Observer.stats(pid).reject_reasons[:twa_out_of_domain] >= 1
+    end
+
+    test "boundary TWS/TWA values remain stable and admissible" do
+      # The closed edges of the domain must still bin (and into the LAST bin, not a
+      # new index one past the end): TWS exactly at the ceiling, TWA exactly 180.
+      # TWA 180 is outside the gate's no-go band, so widen the band for this check.
+      max_tws = Bins.max_tws_mps()
+
+      stream =
+        for i <- 0..14,
+            do: signals(i * 1000, %{"true_wind_speed" => max_tws, "true_wind_angle" => 180.0})
+
+      pid = start_observer(signals_fn: scripted(stream), gate: [angle_band_deg: {25.0, 180.0}])
+
+      for _ <- 0..14, do: Observer.tick(pid)
+
+      assert [{{tws_idx, twa_idx}, _, %{count: count}}] = Observer.cells(pid)
+      assert {tws_idx, twa_idx} == Bins.max_key(Bins.new())
+      assert count >= 1
+      refute Map.has_key?(Observer.stats(pid).reject_reasons, :tws_out_of_domain)
+      refute Map.has_key?(Observer.stats(pid).reject_reasons, :twa_out_of_domain)
+    end
+
+    test "an out-of-domain sample never marks anything dirty for persist or sync" do
+      pid =
+        start_observer(
+          signals_fn: fn -> signals(0, %{"true_wind_speed" => 1.0e9, "true_wind_angle" => 92.0}) end,
+          sender: collecting_sender(),
+          sync_ms: 0
+        )
+
+      for _ <- 0..30, do: Observer.tick(pid)
+      :ok = Observer.sync_now(pid)
+
+      refute_received {:sailed_update, _}
+    end
+
+    test "restored cells outside the bounded key space are dropped, not resumed" do
+      # A persisted file from an older build (or a corrupted one) can carry the
+      # unbounded junk keys this domain check now prevents. Restoring them would
+      # resurrect the poisoned state and re-sync it upstream forever.
+      dir = Path.join(System.tmp_dir!(), "nn_observer_dom_#{System.unique_integer([:positive])}")
+      File.rm_rf(dir)
+      on_exit(fn -> File.rm_rf(dir) end)
+
+      good_key = {9, 10}
+      junk = %{{1_943_846_171, 18} => {50, PSquare.add(PSquare.new(0.9), 4.0)}}
+      cells = Map.put(junk, good_key, {3, PSquare.add(PSquare.new(0.9), 4.0)})
+      :ok = Store.save(dir, cells)
+
+      pid = start_observer(signals_fn: fn -> signals(0) end, dir: dir)
+
+      assert [{^good_key, _, _}] = Observer.cells(pid)
     end
 
     test "with heel PRESENT, an out-of-band heel still rejects :heel_out_of_band" do
