@@ -243,6 +243,73 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
                    expected_hash::binary-size(32), byte_size(submission.content)::32, submission.content::binary>>
     end
 
+    test "exposes the exact checkpoint record-hash preimage codec" do
+      submission = checkpoint_submission_attrs()
+      attrs = Map.drop(submission, [:checkpoint_hash, :content])
+
+      assert {:ok, preimage} = Checkpoint.encode(attrs)
+
+      expected =
+        Contract.checkpoint_hash_domain() <>
+          <<Contract.version(), @device_id::binary, 7::32, @storage_epoch::binary, 11::64, 0x02, @polar_schema::16,
+            42::64, @parent_hash::binary, submission.content_hash::binary-size(32)>>
+
+      assert byte_size(preimage) == 153
+      assert preimage == expected
+      assert {:ok, ^attrs} = Checkpoint.decode(preimage)
+
+      assert {:ok, checkpoint_hash} = Checkpoint.hash(attrs)
+      assert checkpoint_hash == :crypto.hash(:sha256, preimage)
+      assert checkpoint_hash == submission.checkpoint_hash
+    end
+
+    test "strictly rejects malformed checkpoint record-hash preimages" do
+      submission = checkpoint_submission_attrs()
+      attrs = Map.drop(submission, [:checkpoint_hash, :content])
+      assert {:ok, preimage} = Checkpoint.encode(attrs)
+
+      domain = Contract.checkpoint_hash_domain()
+      domain_size = byte_size(domain)
+      <<_first, domain_rest::binary>> = preimage
+
+      assert {:error, :checkpoint_hash_domain_mismatch} =
+               Checkpoint.decode(<<0, domain_rest::binary>>)
+
+      <<presented_domain::binary-size(domain_size), _version, body::binary>> = preimage
+      assert presented_domain == domain
+
+      assert {:error, :unsupported_checkpoint_hash_version} =
+               Checkpoint.decode(domain <> <<Contract.version() + 1>> <> body)
+
+      assert {:error, :truncated} =
+               Checkpoint.decode(binary_part(preimage, 0, byte_size(preimage) - 1))
+
+      assert {:error, :trailing_bytes} = Checkpoint.decode(preimage <> <<0>>)
+
+      <<kind_prefix::binary-size(78), _kind, kind_suffix::binary>> = preimage
+
+      assert {:error, :unknown_checkpoint_kind} =
+               Checkpoint.decode(kind_prefix <> <<0xFF>> <> kind_suffix)
+
+      <<schema_prefix::binary-size(79), _schema::16, schema_suffix::binary>> = preimage
+
+      assert {:error, :unsupported_checkpoint_schema} =
+               Checkpoint.decode(schema_prefix <> <<1::16>> <> schema_suffix)
+
+      <<sequence_prefix::binary-size(70), _sequence::64, sequence_suffix::binary>> = preimage
+
+      assert {:error, :invalid_delivery_sequence} =
+               Checkpoint.decode(sequence_prefix <> <<0::64>> <> sequence_suffix)
+
+      <<storage_prefix::binary-size(54), _storage::binary-size(16), storage_suffix::binary>> =
+        preimage
+
+      assert {:error, :invalid_storage_epoch} =
+               Checkpoint.decode(storage_prefix <> <<0::128>> <> storage_suffix)
+
+      assert {:error, :invalid_checkpoint} = Checkpoint.decode(:not_binary)
+    end
+
     test "round-trips hydration across credential rotation and storage replacement" do
       submission = checkpoint_submission_attrs()
 

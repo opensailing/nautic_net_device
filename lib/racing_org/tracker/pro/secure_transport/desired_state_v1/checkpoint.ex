@@ -104,21 +104,23 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
     end
   end
 
-  @doc "Hash one exact checkpoint record, including its record-level parent hash."
-  def hash(attrs) when is_map(attrs) do
-    expected = [
-      :device_id,
-      :credential_epoch,
-      :storage_epoch,
-      :sequence,
-      :kind,
-      :schema_version,
-      :source_generation,
-      :parent_hash,
-      :content_hash
-    ]
+  @checkpoint_hash_domain_size byte_size(Contract.checkpoint_hash_domain())
+  @checkpoint_preimage_size 153
+  @checkpoint_keys [
+    :device_id,
+    :credential_epoch,
+    :storage_epoch,
+    :sequence,
+    :kind,
+    :schema_version,
+    :source_generation,
+    :parent_hash,
+    :content_hash
+  ]
 
-    with :ok <- exact_atom_keys(attrs, expected, :invalid_checkpoint),
+  @doc "Encode the exact fixed-width checkpoint record-hash preimage."
+  def encode(attrs) when is_map(attrs) do
+    with :ok <- exact_atom_keys(attrs, @checkpoint_keys, :invalid_checkpoint),
          :ok <- fixed_binary(attrs.device_id, @device_id_size, :invalid_device_id),
          :ok <- u32(attrs.credential_epoch, :invalid_credential_epoch),
          :ok <- nonzero_binary(attrs.storage_epoch, @storage_epoch_size, :invalid_storage_epoch),
@@ -127,18 +129,59 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
          :ok <- database_int(attrs.source_generation, :invalid_source_generation),
          :ok <- fixed_binary(attrs.parent_hash, @hash_size, :invalid_parent_hash),
          :ok <- fixed_binary(attrs.content_hash, @hash_size, :invalid_checkpoint_content_hash) do
-      preimage =
-        Contract.checkpoint_hash_domain() <>
-          <<Contract.version(), attrs.device_id::binary-size(@device_id_size), attrs.credential_epoch::32,
-            attrs.storage_epoch::binary-size(@storage_epoch_size), attrs.sequence::64, kind_code,
-            attrs.schema_version::16, attrs.source_generation::64, attrs.parent_hash::binary-size(@hash_size),
-            attrs.content_hash::binary-size(@hash_size)>>
-
-      {:ok, :crypto.hash(:sha256, preimage)}
+      {:ok,
+       Contract.checkpoint_hash_domain() <>
+         <<Contract.version(), attrs.device_id::binary-size(@device_id_size), attrs.credential_epoch::32,
+           attrs.storage_epoch::binary-size(@storage_epoch_size), attrs.sequence::64, kind_code,
+           attrs.schema_version::16, attrs.source_generation::64, attrs.parent_hash::binary-size(@hash_size),
+           attrs.content_hash::binary-size(@hash_size)>>}
     end
   end
 
-  def hash(_attrs), do: {:error, :invalid_checkpoint}
+  def encode(_attrs), do: {:error, :invalid_checkpoint}
+
+  @doc "Decode and revalidate one exact fixed-width checkpoint record-hash preimage."
+  def decode(bytes) when is_binary(bytes) and byte_size(bytes) < @checkpoint_preimage_size,
+    do: {:error, :truncated}
+
+  def decode(bytes) when is_binary(bytes) and byte_size(bytes) > @checkpoint_preimage_size,
+    do: {:error, :trailing_bytes}
+
+  def decode(
+        <<domain::binary-size(@checkpoint_hash_domain_size), version, device_id::binary-size(@device_id_size),
+          credential_epoch::32, storage_epoch::binary-size(@storage_epoch_size), sequence::64, kind_code,
+          schema_version::16, source_generation::64, parent_hash::binary-size(@hash_size),
+          content_hash::binary-size(@hash_size)>> = bytes
+      ) do
+    with :ok <- ensure(domain == Contract.checkpoint_hash_domain(), :checkpoint_hash_domain_mismatch),
+         :ok <- ensure(version == Contract.version(), :unsupported_checkpoint_hash_version),
+         {:ok, kind, expected_schema} <- Contract.checkpoint_kind(kind_code),
+         :ok <- ensure(schema_version == expected_schema, :unsupported_checkpoint_schema),
+         attrs = %{
+           device_id: device_id,
+           credential_epoch: credential_epoch,
+           storage_epoch: storage_epoch,
+           sequence: sequence,
+           kind: kind,
+           schema_version: schema_version,
+           source_generation: source_generation,
+           parent_hash: parent_hash,
+           content_hash: content_hash
+         },
+         {:ok, encoded} <- encode(attrs),
+         :ok <- ensure(encoded == bytes, :invalid_checkpoint) do
+      {:ok, attrs}
+    end
+  end
+
+  def decode(_bytes), do: {:error, :invalid_checkpoint}
+
+  @doc "Hash one exact checkpoint record, including its record-level parent hash."
+  def hash(attrs) do
+    with {:ok, preimage} <- encode(attrs) do
+      {:ok, :crypto.hash(:sha256, preimage)}
+    end
+  end
 
   defp checkpoint_identity(kind, schema_version) when is_atom(kind) do
     case Contract.checkpoint_kind(kind) do
