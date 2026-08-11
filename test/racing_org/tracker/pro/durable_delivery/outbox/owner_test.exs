@@ -233,7 +233,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       assert removed_fourth.sequence == fourth.sequence
     end
 
-    test "a cumulative receipt cannot infer an unproven missing acceptance", %{root: root} do
+    test "a cumulative receipt retains contiguous proof beyond exact-history eviction", %{root: root} do
       assert {:ok, owner} = start_owner(root)
       assert {:ok, first} = Owner.enqueue(owner, :telemetry, "first")
       assert {:ok, second} = Owner.enqueue(owner, :telemetry, "second")
@@ -242,16 +242,30 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       assert {:ok, [_first]} = Owner.acknowledge(owner, first)
       GenServer.stop(owner)
 
-      snapshot = Path.join(root, "snapshot.bin")
-      bytes = File.read!(snapshot)
-      File.write!(snapshot, bytes)
       assert {:ok, reopened} = start_owner(root, max_resolved_receipts: 1)
       assert {:ok, [_second]} = Owner.acknowledge(reopened, second)
 
-      assert {:error, :non_contiguous_cumulative_prefix} =
+      assert {:ok, [_third]} =
                Owner.acknowledge(reopened, %{third | cumulative_sequence: 3})
 
-      assert Enum.map(Owner.pending(reopened), & &1.sequence) == [3]
+      assert Owner.pending(reopened) == []
+    end
+
+    test "a cumulative receipt still rejects a genuinely unproven evicted gap", %{root: root} do
+      assert {:ok, owner} = start_owner(root, max_resolved_receipts: 1)
+      assert {:ok, first} = Owner.enqueue(owner, :telemetry, "first")
+      assert {:ok, second} = Owner.enqueue(owner, :telemetry, "second")
+      assert {:ok, third} = Owner.enqueue(owner, :telemetry, "third")
+      assert {:ok, fourth} = Owner.enqueue(owner, :telemetry, "fourth")
+
+      assert {:ok, [_second]} = Owner.acknowledge(owner, second)
+      assert {:ok, [_third]} = Owner.acknowledge(owner, third)
+
+      assert {:error, :non_contiguous_cumulative_prefix} =
+               Owner.acknowledge(owner, %{fourth | cumulative_sequence: 3})
+
+      assert Enum.map(Owner.pending(owner), & &1.sequence) == [1, 4]
+      assert first.sequence == 1
     end
 
     test "a stale receipt from a superseded storage epoch is refused", %{root: root} do

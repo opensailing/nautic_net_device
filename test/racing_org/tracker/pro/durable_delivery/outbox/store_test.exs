@@ -896,6 +896,142 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     refute File.exists?(run_state)
   end
 
+  test "migrates schema-v2 snapshots with conservative acknowledged floors", %{root: root} do
+    opts = [max_resolved_receipts: 2]
+    assert {:ok, store} = open_store(root, opts)
+
+    {[first, second, third], store} =
+      Enum.map_reduce(1..3, store, fn n, acc ->
+        {:ok, entry, acc} =
+          Store.enqueue(acc, :telemetry, "payload-#{n}", entry_id: entry_id(n))
+
+        {entry, acc}
+      end)
+
+    assert {:ok, [^first], store} = Store.acknowledge(store, receipt_for(first))
+    assert {:ok, [^second], _store} = Store.acknowledge(store, receipt_for(second))
+
+    snapshot_path = Path.join(root, "snapshot.bin")
+    assert {:ok, snapshot} = snapshot_path |> File.read!() |> Snapshot.decode()
+
+    assert {:ok, legacy_bytes} =
+             snapshot
+             |> Map.put("schema_version", 2)
+             |> Map.delete("acknowledged_floors")
+             |> Snapshot.encode()
+
+    File.write!(snapshot_path, legacy_bytes)
+
+    assert {:ok, recovered} = open_store(root, opts)
+    assert recovered.run_state_required
+    assert recovered.acknowledged_floors == %{health: 0, telemetry: 0}
+
+    assert {:ok, [removed_third], empty} =
+             Store.acknowledge(
+               recovered,
+               %{receipt_for(third) | cumulative_sequence: 3}
+             )
+
+    assert receipt_for(removed_third) == receipt_for(third)
+    assert Store.pending(empty) == []
+  end
+
+  test "schema-v2 migration does not invent evicted contiguous proof", %{root: root} do
+    opts = [max_resolved_receipts: 1]
+    assert {:ok, store} = open_store(root, opts)
+
+    {[first, second, third], store} =
+      Enum.map_reduce(1..3, store, fn n, acc ->
+        {:ok, entry, acc} =
+          Store.enqueue(acc, :telemetry, "payload-#{n}", entry_id: entry_id(n))
+
+        {entry, acc}
+      end)
+
+    assert {:ok, [^first], store} = Store.acknowledge(store, receipt_for(first))
+    assert {:ok, [^second], _store} = Store.acknowledge(store, receipt_for(second))
+
+    downgrade_snapshot_to_v2!(root)
+
+    assert {:ok, recovered} = open_store(root, opts)
+    assert recovered.acknowledged_floors == %{health: 0, telemetry: 0}
+
+    assert {:error, :non_contiguous_cumulative_prefix} =
+             Store.acknowledge(
+               recovered,
+               %{receipt_for(third) | cumulative_sequence: 3}
+             )
+
+    assert Enum.map(Store.pending(recovered), & &1.sequence) == [3]
+  end
+
+  test "schema-v3 snapshots require a complete valid acknowledged frontier", %{root: root} do
+    assert {:ok, store} = open_store(root)
+    assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
+    assert {:ok, [^entry], _store} = Store.acknowledge(store, receipt_for(entry))
+
+    assert {:ok, valid_snapshot} =
+             root
+             |> Path.join("snapshot.bin")
+             |> File.read!()
+             |> Snapshot.decode()
+
+    invalid_frontiers = [
+      :missing,
+      [{"health", 0}, {"telemetry", -1}],
+      [{"health", 0}, {"health", 0}, {"telemetry", 1}]
+    ]
+
+    Enum.with_index(invalid_frontiers, fn frontier, index ->
+      case_root = root <> "_#{index}"
+      on_exit(fn -> File.rm_rf(case_root) end)
+      File.mkdir_p!(case_root)
+
+      snapshot =
+        if frontier == :missing,
+          do: Map.delete(valid_snapshot, "acknowledged_floors"),
+          else: Map.put(valid_snapshot, "acknowledged_floors", frontier)
+
+      assert {:ok, bytes} = Snapshot.encode(snapshot)
+      File.write!(Path.join(case_root, "snapshot.bin"), bytes)
+
+      assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} =
+               open_store(case_root)
+
+      assert File.exists?(quarantine_path)
+    end)
+  end
+
+  test "schema-v3 acknowledged floors cannot cross an explicitly lost sequence", %{root: root} do
+    assert {:ok, store} = open_store(root)
+    assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
+
+    identity =
+      Map.take(entry, [
+        :stream,
+        :device_id,
+        :credential_epoch,
+        :storage_epoch,
+        :sequence,
+        :payload_hash
+      ])
+
+    assert {:ok, ^entry, _store} = Store.authorize_loss(store, identity, "operator ticket")
+
+    snapshot_path = Path.join(root, "snapshot.bin")
+    assert {:ok, snapshot} = snapshot_path |> File.read!() |> Snapshot.decode()
+
+    assert {:ok, bytes} =
+             snapshot
+             |> Map.put("acknowledged_floors", [{"health", 0}, {"telemetry", 1}])
+             |> Snapshot.encode()
+
+    File.write!(snapshot_path, bytes)
+
+    assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} = open_store(root)
+    assert File.exists?(quarantine_path)
+  end
+
   test "snapshot decoding rejects compressed external terms before inflation without quarantine", %{root: root} do
     expanded = %{"entries" => List.duplicate(String.duplicate("x", 1_024), 1_024)}
     payload = :erlang.term_to_binary(expanded, compressed: 9)
@@ -1440,6 +1576,40 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert Store.pending(gap_store) == []
   end
 
+  test "persists a contiguous acknowledged floor beyond bounded exact receipt history", %{root: root} do
+    opts = [max_resolved_receipts: 1]
+    assert {:ok, store} = open_store(root, opts)
+
+    {[first, second, third], store} =
+      Enum.map_reduce(1..3, store, fn n, acc ->
+        {:ok, entry, acc} =
+          Store.enqueue(acc, :telemetry, "payload-#{n}", entry_id: entry_id(n))
+
+        {entry, acc}
+      end)
+
+    assert {:ok, [^first], store} = Store.acknowledge(store, receipt_for(first))
+    assert {:ok, [^second], _store} = Store.acknowledge(store, receipt_for(second))
+
+    assert {:ok, recovered} = open_store(root, opts)
+
+    assert {:ok, [removed_third], empty} =
+             Store.acknowledge(recovered, %{receipt_for(third) | cumulative_sequence: 3})
+
+    assert receipt_for(removed_third) == receipt_for(third)
+    assert Store.pending(empty) == []
+
+    assert {:ok, recovered} = open_store(root, opts)
+
+    assert {:ok, fourth, recovered} =
+             Store.enqueue(recovered, :telemetry, "payload-4", entry_id: entry_id(4))
+
+    assert {:ok, [^fourth], empty} =
+             Store.acknowledge(recovered, %{receipt_for(fourth) | cumulative_sequence: 4})
+
+    assert Store.pending(empty) == []
+  end
+
   test "binds device id and credential epoch into durable identity and fails closed on mismatch", %{root: root} do
     assert {:ok, store} = open_store(root)
     assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
@@ -1564,6 +1734,19 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
     {:ok, bytes} = Snapshot.encode(snapshot)
     bytes
+  end
+
+  defp downgrade_snapshot_to_v2!(root) do
+    path = Path.join(root, "snapshot.bin")
+    {:ok, snapshot} = path |> File.read!() |> Snapshot.decode()
+
+    {:ok, bytes} =
+      snapshot
+      |> Map.put("schema_version", 2)
+      |> Map.delete("acknowledged_floors")
+      |> Snapshot.encode()
+
+    File.write!(path, bytes)
   end
 
   defp snapshot_frame(version, payload) do
