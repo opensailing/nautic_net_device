@@ -216,6 +216,39 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
                Owner.acknowledge(owner, refute_result, idempotent: true)
     end
 
+    test "a stronger cumulative retry can advance from a retained resolved anchor", %{root: root} do
+      assert {:ok, owner} = start_owner(root)
+      assert {:ok, first} = Owner.enqueue(owner, :telemetry, "first")
+      assert {:ok, second} = Owner.enqueue(owner, :telemetry, "second")
+      assert {:ok, third} = Owner.enqueue(owner, :telemetry, "third")
+
+      assert {:ok, removed} =
+               Owner.acknowledge(
+                 owner,
+                 %{third | cumulative_sequence: 1}
+               )
+
+      assert Enum.map(removed, & &1.sequence) == [first.sequence, third.sequence]
+      assert Enum.map(Owner.pending(owner), & &1.sequence) == [second.sequence]
+      GenServer.stop(owner)
+
+      assert {:ok, reopened} = start_owner(root)
+
+      assert {:ok, [removed_second]} =
+               Owner.acknowledge(
+                 reopened,
+                 %{third | cumulative_sequence: 3},
+                 idempotent: true
+               )
+
+      assert removed_second.sequence == second.sequence
+      assert Owner.pending(reopened) == []
+      GenServer.stop(reopened)
+
+      assert {:ok, replayed} = start_owner(root)
+      assert Owner.pending(replayed) == []
+    end
+
     test "a cumulative receipt durably proves every exact entry it resolves", %{root: root} do
       assert {:ok, owner} = start_owner(root)
       assert {:ok, first} = Owner.enqueue(owner, :telemetry, "first")

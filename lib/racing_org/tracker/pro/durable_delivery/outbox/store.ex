@@ -323,9 +323,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   @doc """
   Durably apply an already authenticated receipt map.
 
-  The exact stream, storage epoch, sequence, and payload hash must match a live
-  entry. A cumulative sequence may additionally remove only a numerically
-  contiguous prefix of the currently pending entries for that stream.
+  The exact durable identity must match a live entry. A retained exact resolved
+  receipt may anchor a stronger cumulative retry only when that retry removes a
+  newly proven prefix. Cumulative removal remains numerically contiguous.
   """
   @spec acknowledge(t(), map()) :: {:ok, [Entry.t()], t()} | {:error, term()}
   def acknowledge(%__MODULE__{} = store, receipt) when is_map(receipt) do
@@ -875,6 +875,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          {:ok, entry_id_tombstones} <-
            hydrate_entry_id_tombstones(store, snapshot, schema_version, live_entry_ids),
          {:ok, resolved_receipts} <- hydrate_resolved_receipts(store, snapshot, schema_version),
+         :ok <-
+           validate_resolved_receipts(
+             resolved_receipts,
+             next_sequences,
+             entries,
+             loss_authorizations
+           ),
          {:ok, acknowledged_floors} <-
            hydrate_acknowledged_floors(
              store,
@@ -882,7 +889,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
              schema_version,
              next_sequences,
              entries,
-             loss_authorizations
+             loss_authorizations,
+             resolved_receipts
            ) do
       {:ok,
        %{
@@ -900,7 +908,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
            entry_id_history_complete: entry_id_history_complete,
            seen_entry_ids: rebuild_seen_entry_ids(entries, entry_id_tombstones),
            entry_id_tombstones: entry_id_tombstones,
-           resolved_receipts: resolved_receipts,
+           resolved_receipts: retain_latest(resolved_receipts, store.max_resolved_receipts),
            loss_authorizations: retain_latest(loss_authorizations, store.max_loss_authorizations),
            next_ordinal: length(entries) + 1,
            current_segment_id: covered_segment_id
@@ -920,7 +928,23 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     )
   end
 
-  defp hydrate_stream_counters(store, values, invalid_reason, valid_counter?)
+  defp hydrate_stream_counters(store, values, invalid_reason, valid_counter?) do
+    hydrate_stream_counters(
+      store,
+      values,
+      invalid_reason,
+      valid_counter?,
+      :stream_set_mismatch
+    )
+  end
+
+  defp hydrate_stream_counters(
+         store,
+         values,
+         invalid_reason,
+         valid_counter?,
+         stream_set_mismatch_reason
+       )
        when is_list(values) do
     valid_values? =
       Enum.all?(values, fn
@@ -940,7 +964,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
           {:error, invalid_reason}
 
         MapSet.new(names) != MapSet.new(configured_names) ->
-          {:error, :stream_set_mismatch}
+          {:error, stream_set_mismatch_reason}
 
         true ->
           {:ok,
@@ -953,8 +977,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     end
   end
 
-  defp hydrate_stream_counters(_store, _values, invalid_reason, _valid_counter?),
-    do: {:error, invalid_reason}
+  defp hydrate_stream_counters(
+         _store,
+         _values,
+         invalid_reason,
+         _valid_counter?,
+         _stream_set_mismatch_reason
+       ),
+       do: {:error, invalid_reason}
 
   defp hydrate_entries(store, values, next_sequences) when is_list(values) do
     result =
@@ -1190,7 +1220,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
         end
       end)
       |> case do
-        {:ok, receipts} -> {:ok, retain_latest(receipts, store.max_resolved_receipts)}
+        {:ok, receipts} -> {:ok, receipts}
         error -> error
       end
     else
@@ -1232,16 +1262,105 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
   defp hydrate_resolved_receipt(_store, _value), do: {:error, :invalid_snapshot}
 
+  defp validate_resolved_receipts(
+         receipts,
+         next_sequences,
+         entries,
+         loss_authorizations
+       ) do
+    claims =
+      MapSet.new(
+        receipts,
+        &{&1.stream, &1.sequence}
+      )
+
+    live_claims =
+      MapSet.new(
+        entries,
+        &{&1.stream, &1.sequence}
+      )
+
+    lost_claims =
+      MapSet.new(
+        loss_authorizations,
+        &{&1.stream, &1.sequence}
+      )
+
+    cond do
+      MapSet.size(claims) !=
+          length(receipts) ->
+        {:error, :invalid_snapshot}
+
+      Enum.any?(
+        receipts,
+        fn receipt ->
+          receipt.sequence >=
+              Map.fetch!(
+                next_sequences,
+                receipt.stream
+              )
+        end
+      ) ->
+        {:error, :invalid_snapshot}
+
+      not MapSet.disjoint?(
+        claims,
+        live_claims
+      ) ->
+        {:error, :invalid_snapshot}
+
+      not MapSet.disjoint?(
+        claims,
+        lost_claims
+      ) ->
+        {:error, :invalid_snapshot}
+
+      true ->
+        :ok
+    end
+  end
+
   defp hydrate_acknowledged_floors(
          store,
          _snapshot,
-         schema_version,
+         1,
          _next_sequences,
          _entries,
-         _loss_authorizations
-       )
-       when schema_version in [1, 2] do
-    {:ok, Map.new(store.stream_names, fn {stream, _name} -> {stream, 0} end)}
+         _loss_authorizations,
+         _resolved_receipts
+       ) do
+    {:ok,
+     Map.new(
+       store.stream_names,
+       fn {stream, _name} ->
+         {stream, 0}
+       end
+     )}
+  end
+
+  defp hydrate_acknowledged_floors(
+         store,
+         _snapshot,
+         2,
+         _next_sequences,
+         _entries,
+         _loss_authorizations,
+         resolved_receipts
+       ) do
+    floors =
+      Map.new(
+        store.stream_names,
+        fn {stream, _name} ->
+          {stream, 0}
+        end
+      )
+
+    {:ok,
+     advance_acknowledged_floors(
+       floors,
+       resolved_receipts,
+       Map.keys(store.stream_names)
+     )}
   end
 
   defp hydrate_acknowledged_floors(
@@ -1250,7 +1369,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          @snapshot_schema_version,
          next_sequences,
          entries,
-         loss_authorizations
+         loss_authorizations,
+         _resolved_receipts
        ) do
     with {:ok, values} <- Map.fetch(snapshot, "acknowledged_floors"),
          {:ok, floors} <-
@@ -1258,7 +1378,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
              store,
              values,
              :invalid_snapshot,
-             &(is_integer(&1) and &1 >= 0)
+             &(is_integer(&1) and &1 >= 0),
+             :invalid_snapshot
            ),
          true <-
            Enum.all?(floors, fn {stream, floor} ->
@@ -2543,14 +2664,82 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   end
 
   defp acknowledged_entries(store, receipt) do
-    with {:ok, exact} <- matching_entry(store, receipt),
-         {:ok, prefix} <- cumulative_prefix(store, receipt.stream, receipt.cumulative_sequence) do
-      removed =
-        store.entries
-        |> Enum.filter(fn entry -> entry == exact or entry in prefix end)
+    case matching_entry(
+           store,
+           receipt
+         ) do
+      {:ok, exact} ->
+        with {:ok, prefix} <-
+               cumulative_prefix(
+                 store,
+                 receipt.stream,
+                 receipt.cumulative_sequence
+               ) do
+          {:ok,
+           select_acknowledged_entries(
+             store.entries,
+             [exact | prefix]
+           )}
+        end
 
-      {:ok, removed}
+      {:error, :receipt_entry_not_found} ->
+        acknowledged_entries_from_resolved_anchor(
+          store,
+          receipt
+        )
+
+      error ->
+        error
     end
+  end
+
+  defp acknowledged_entries_from_resolved_anchor(
+         store,
+         receipt
+       ) do
+    if Enum.any?(
+         store.resolved_receipts,
+         &same_receipt_identity?(
+           &1,
+           receipt
+         )
+       ) do
+      with {:ok, prefix} <-
+             cumulative_prefix(
+               store,
+               receipt.stream,
+               receipt.cumulative_sequence
+             ) do
+        case prefix do
+          [] ->
+            {:error, :receipt_entry_not_found}
+
+          entries ->
+            {:ok, entries}
+        end
+      end
+    else
+      {:error, :receipt_entry_not_found}
+    end
+  end
+
+  defp select_acknowledged_entries(
+         live_entries,
+         acknowledged_entries
+       ) do
+    identities =
+      MapSet.new(
+        acknowledged_entries,
+        &entry_identity/1
+      )
+
+    Enum.filter(
+      live_entries,
+      &MapSet.member?(
+        identities,
+        entry_identity(&1)
+      )
+    )
   end
 
   defp cumulative_prefix(_store, _stream, 0), do: {:ok, []}

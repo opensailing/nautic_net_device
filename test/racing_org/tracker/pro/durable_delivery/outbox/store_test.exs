@@ -896,9 +896,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     refute File.exists?(run_state)
   end
 
-  test "migrates schema-v2 snapshots with conservative acknowledged floors", %{root: root} do
-    opts = [max_resolved_receipts: 2]
-    assert {:ok, store} = open_store(root, opts)
+  test "migrates schema-v2 contiguous proof before applying a smaller history bound", %{root: root} do
+    assert {:ok, store} = open_store(root, max_resolved_receipts: 2)
 
     {[first, second, third], store} =
       Enum.map_reduce(1..3, store, fn n, acc ->
@@ -911,20 +910,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert {:ok, [^first], store} = Store.acknowledge(store, receipt_for(first))
     assert {:ok, [^second], _store} = Store.acknowledge(store, receipt_for(second))
 
-    snapshot_path = Path.join(root, "snapshot.bin")
-    assert {:ok, snapshot} = snapshot_path |> File.read!() |> Snapshot.decode()
+    downgrade_snapshot_to_v2!(root)
 
-    assert {:ok, legacy_bytes} =
-             snapshot
-             |> Map.put("schema_version", 2)
-             |> Map.delete("acknowledged_floors")
-             |> Snapshot.encode()
-
-    File.write!(snapshot_path, legacy_bytes)
-
-    assert {:ok, recovered} = open_store(root, opts)
+    assert {:ok, recovered} = open_store(root, max_resolved_receipts: 1)
     assert recovered.run_state_required
-    assert recovered.acknowledged_floors == %{health: 0, telemetry: 0}
+    assert recovered.acknowledged_floors == %{health: 0, telemetry: 2}
+    assert Enum.map(recovered.resolved_receipts, & &1.sequence) == [2]
 
     assert {:ok, [removed_third], empty} =
              Store.acknowledge(
@@ -979,7 +970,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     invalid_frontiers = [
       :missing,
       [{"health", 0}, {"telemetry", -1}],
-      [{"health", 0}, {"health", 0}, {"telemetry", 1}]
+      [{"health", 0}, {"health", 0}, {"telemetry", 1}],
+      [{"telemetry", 1}],
+      [{"health", 0}, {"other", 0}]
     ]
 
     Enum.with_index(invalid_frontiers, fn frontier, index ->
@@ -993,6 +986,68 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
           else: Map.put(valid_snapshot, "acknowledged_floors", frontier)
 
       assert {:ok, bytes} = Snapshot.encode(snapshot)
+      File.write!(Path.join(case_root, "snapshot.bin"), bytes)
+
+      assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} =
+               open_store(case_root)
+
+      assert File.exists?(quarantine_path)
+    end)
+  end
+
+  test "schema-v3 snapshots reject contradictory resolved receipt proof", %{root: root} do
+    assert {:ok, store} = open_store(root)
+
+    assert {:ok, live, store} =
+             Store.enqueue(store, :telemetry, "live", entry_id: entry_id(1))
+
+    assert {:ok, resolved, store} =
+             Store.enqueue(store, :health, "resolved", entry_id: entry_id(2))
+
+    assert {:ok, [^resolved], store} = Store.acknowledge(store, receipt_for(resolved))
+
+    assert {:ok, lost, store} =
+             Store.enqueue(store, :health, "lost", entry_id: entry_id(3))
+
+    loss_identity =
+      Map.take(lost, [
+        :stream,
+        :device_id,
+        :credential_epoch,
+        :storage_epoch,
+        :sequence,
+        :payload_hash
+      ])
+
+    assert {:ok, ^lost, _store} =
+             Store.authorize_loss(store, loss_identity, "operator ticket")
+
+    assert {:ok, valid_snapshot} =
+             root
+             |> Path.join("snapshot.bin")
+             |> File.read!()
+             |> Snapshot.decode()
+
+    valid_receipts = Map.fetch!(valid_snapshot, "resolved_receipts")
+
+    contradictions = [
+      [snapshot_resolved_receipt(live)],
+      [snapshot_resolved_receipt(lost)],
+      [snapshot_resolved_receipt(%{live | sequence: 2})],
+      valid_receipts ++
+        [snapshot_resolved_receipt(%{resolved | payload_hash: <<7::256>>})]
+    ]
+
+    Enum.with_index(contradictions, fn receipts, index ->
+      case_root = root <> "_receipt_#{index}"
+      on_exit(fn -> File.rm_rf(case_root) end)
+      File.mkdir_p!(case_root)
+
+      assert {:ok, bytes} =
+               valid_snapshot
+               |> Map.put("resolved_receipts", receipts)
+               |> Snapshot.encode()
+
       File.write!(Path.join(case_root, "snapshot.bin"), bytes)
 
       assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} =
@@ -1767,6 +1822,17 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     {:ok, ^size} = :file.position(device, size)
     :ok = :file.truncate(device)
     :ok = :file.close(device)
+  end
+
+  defp snapshot_resolved_receipt(entry) do
+    %{
+      "stream" => Atom.to_string(entry.stream),
+      "device_id" => entry.device_id,
+      "credential_epoch" => entry.credential_epoch,
+      "storage_epoch" => entry.storage_epoch,
+      "sequence" => entry.sequence,
+      "payload_hash" => entry.payload_hash
+    }
   end
 
   defp receipt_for(entry) do
