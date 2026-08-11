@@ -370,6 +370,55 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
     end
   end
 
+  describe "checkpoint enqueue" do
+    test "rejects arbitrary checkpoint payloads from generic enqueue", %{root: root} do
+      assert {:ok, owner} = start_owner(root, streams: [:checkpoint])
+
+      assert {:error, :checkpoint_builder_required} =
+               Owner.enqueue(owner, :checkpoint, "forged-child", priority: 255)
+
+      assert Owner.pending(owner, stream: :checkpoint) == []
+    end
+
+    test "builds checkpoint payloads from authoritative sequences in parent-first order", %{root: root} do
+      assert {:ok, owner} = start_owner(root, streams: [:checkpoint])
+
+      assert {:ok, first} =
+               Owner.enqueue_checkpoint(owner, fn 1 ->
+                 {:ok, "parent-sequence-1"}
+               end)
+
+      assert {:ok, second} =
+               Owner.enqueue_checkpoint(owner, fn 2 ->
+                 {:ok, "child-sequence-2"}
+               end)
+
+      assert first.sequence == 1
+      assert first.payload_hash == :crypto.hash(:sha256, "parent-sequence-1")
+      assert second.sequence == 2
+      assert second.payload_hash == :crypto.hash(:sha256, "child-sequence-2")
+
+      assert Enum.map(
+               Owner.pending(owner, stream: :checkpoint),
+               &{&1.sequence, &1.payload, &1.priority}
+             ) == [
+               {1, "parent-sequence-1", 0},
+               {2, "child-sequence-2", 0}
+             ]
+
+      assert :ok = stop_owner(owner)
+      assert {:ok, restarted} = start_owner(root, streams: [:checkpoint])
+
+      assert Enum.map(
+               Owner.pending(restarted, stream: :checkpoint),
+               &{&1.sequence, &1.payload}
+             ) == [
+               {1, "parent-sequence-1"},
+               {2, "child-sequence-2"}
+             ]
+    end
+  end
+
   describe "status sanitization" do
     test "contains no payload bytes, hashes, credentials, paths, or pids", %{root: root} do
       secret_payload = "wifi-psk-hunter2-and-a-bearer-token"

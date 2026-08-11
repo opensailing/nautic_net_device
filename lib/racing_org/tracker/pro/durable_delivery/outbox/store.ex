@@ -34,6 +34,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   @default_max_loss_authorizations 128
   @default_max_entry_id_tombstones 4_096
   @default_max_resolved_receipts 4_096
+  @checkpoint_priority 0
   @entry_id_tombstone_domain "RacingOrg-DurableOutboxEntryIdTombstone-v1"
   @max_symlink_hops 40
   @u32_max 0xFFFF_FFFF
@@ -182,16 +183,55 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     with_mutation_lock(store, fn -> do_enqueue(store, stream, payload, opts) end)
   end
 
+  @doc "Build and durably append one checkpoint payload under its exact locked sequence."
+  @spec enqueue_checkpoint(t(), (pos_integer() -> {:ok, binary()} | {:error, term()}), keyword()) ::
+          {:ok, Entry.t(), t()} | {:error, term()}
+  def enqueue_checkpoint(store, builder, opts \\ [])
+
+  def enqueue_checkpoint(%__MODULE__{} = store, builder, opts) when is_function(builder, 1) do
+    with_mutation_lock(store, fn -> do_enqueue_checkpoint(store, builder, opts) end)
+  end
+
+  def enqueue_checkpoint(%__MODULE__{}, _builder, _opts), do: {:error, :invalid_checkpoint_builder}
+
   defp do_enqueue(store, stream, payload, opts) do
     with :ok <- complete_entry_id_history(store),
          {:ok, stream_name} <- configured_stream_name(store, stream),
+         :ok <- generic_enqueue_stream(stream),
          :ok <- validate_payload(payload),
          {:ok, priority} <- priority(opts),
          {:ok, entry_id} <- entry_id(store, opts),
          :ok <- unique_entry_id(store, entry_id),
-         sequence <- Map.fetch!(store.next_sequences, stream),
-         payload_hash <- :crypto.hash(:sha256, payload),
-         {:ok, encoded} <-
+         sequence <- Map.fetch!(store.next_sequences, stream) do
+      append_entry(store, stream, stream_name, sequence, entry_id, payload, priority)
+    end
+  end
+
+  defp do_enqueue_checkpoint(store, builder, opts) do
+    with :ok <- complete_entry_id_history(store),
+         {:ok, stream_name} <- configured_stream_name(store, :checkpoint),
+         :ok <- verify_fresh(store),
+         {:ok, entry_id} <- entry_id(store, opts),
+         :ok <- unique_entry_id(store, entry_id),
+         sequence <- Map.fetch!(store.next_sequences, :checkpoint),
+         {:ok, payload} <- checkpoint_payload(builder, sequence),
+         :ok <- validate_payload(payload) do
+      append_entry(
+        store,
+        :checkpoint,
+        stream_name,
+        sequence,
+        entry_id,
+        payload,
+        @checkpoint_priority
+      )
+    end
+  end
+
+  defp append_entry(store, stream, stream_name, sequence, entry_id, payload, priority) do
+    payload_hash = :crypto.hash(:sha256, payload)
+
+    with {:ok, encoded} <-
            Record.encode(%{
              kind: :entry,
              stream: stream_name,
@@ -1528,6 +1568,31 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       {:ok, stream} -> {:ok, stream}
       :error -> {:error, :unknown_stream}
     end
+  end
+
+  defp generic_enqueue_stream(:checkpoint),
+    do: {:error, :checkpoint_builder_required}
+
+  defp generic_enqueue_stream(_stream),
+    do: :ok
+
+  defp checkpoint_payload(builder, sequence) do
+    case builder.(sequence) do
+      {:ok, payload} ->
+        {:ok, payload}
+
+      {:error, _reason} = error ->
+        error
+
+      _other ->
+        {:error, :invalid_checkpoint_builder_result}
+    end
+  rescue
+    _exception ->
+      {:error, :checkpoint_builder_failed}
+  catch
+    _kind, _reason ->
+      {:error, :checkpoint_builder_failed}
   end
 
   defp validate_payload(payload) when is_binary(payload), do: :ok

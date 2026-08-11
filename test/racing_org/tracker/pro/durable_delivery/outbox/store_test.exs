@@ -313,6 +313,75 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert Store.next_sequence(recovered, :health) == {:ok, 2}
   end
 
+  test "raw enqueue cannot write the reserved checkpoint stream", %{root: root} do
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+
+    assert {:error, :checkpoint_builder_required} =
+             Store.enqueue(
+               store,
+               :checkpoint,
+               "arbitrary-checkpoint-bytes",
+               entry_id: entry_id(1),
+               priority: 255
+             )
+
+    assert Store.pending(store) == []
+    assert Store.next_sequence(store, :checkpoint) == {:ok, 1}
+  end
+
+  test "checkpoint builder receives the locked sequence before hashing and append", %{root: root} do
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+
+    assert {:ok, entry, store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> {:ok, "checkpoint-1"} end,
+               entry_id: entry_id(1)
+             )
+
+    assert entry.stream == :checkpoint
+    assert entry.sequence == 1
+    assert entry.payload == "checkpoint-1"
+    assert entry.payload_hash == :crypto.hash(:sha256, "checkpoint-1")
+    assert entry.priority == 0
+    assert Store.next_sequence(store, :checkpoint) == {:ok, 2}
+
+    assert {:ok, recovered} = open_store(root, streams: [:checkpoint])
+
+    assert [
+             %{
+               stream: :checkpoint,
+               sequence: 1,
+               payload: "checkpoint-1",
+               priority: 0
+             }
+           ] = Store.pending(recovered)
+  end
+
+  test "checkpoint builder failure consumes neither sequence nor storage", %{root: root} do
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+
+    assert {:error, :checkpoint_build_failed} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> {:error, :checkpoint_build_failed} end,
+               entry_id: entry_id(1)
+             )
+
+    assert Store.pending(store) == []
+    assert Store.next_sequence(store, :checkpoint) == {:ok, 1}
+    assert segment_paths(root) == []
+
+    assert {:ok, entry, _store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> {:ok, "retry-at-sequence-1"} end,
+               entry_id: entry_id(1)
+             )
+
+    assert entry.sequence == 1
+  end
+
   test "a sync failure never returns enqueue success and reboot recovers any uncertain append", %{root: root} do
     assert {:ok, store} = open_store(root, file_system: TracingFileSystem)
     assert {:ok, _first, store} = Store.enqueue(store, :telemetry, "first", entry_id: entry_id(1))
@@ -442,6 +511,32 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
     assert {:ok, recovered} = open_store(root)
     assert Enum.map(Store.pending(recovered), & &1.sequence) == [1, 2]
+  end
+
+  test "rejects a stale handle before its checkpoint builder runs", %{root: root} do
+    assert {:ok, first_handle} = open_store(root, streams: [:checkpoint])
+    assert {:ok, stale_handle} = open_store(root, streams: [:checkpoint])
+
+    assert {:ok, _parent, _first_handle} =
+             Store.enqueue_checkpoint(
+               first_handle,
+               fn 1 -> {:ok, "parent"} end,
+               entry_id: entry_id(1)
+             )
+
+    test_pid = self()
+
+    assert {:error, :stale_store} =
+             Store.enqueue_checkpoint(
+               stale_handle,
+               fn _sequence ->
+                 send(test_pid, :stale_builder_ran)
+                 {:ok, "child"}
+               end,
+               entry_id: entry_id(2)
+             )
+
+    refute_receive :stale_builder_ran
   end
 
   test "serializes simultaneous handles so only one sequence append succeeds", %{root: root} do

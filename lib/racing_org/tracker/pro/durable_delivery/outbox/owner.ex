@@ -115,6 +115,21 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   end
 
   @doc """
+  Build and durably append one checkpoint payload under its exact sequence.
+
+  The builder runs only after identity validation and while the Store holds its
+  mutation lock. It receives the authoritative checkpoint sequence before the
+  payload is hashed or appended.
+  """
+  @spec enqueue_checkpoint(
+          GenServer.server(),
+          (pos_integer() -> {:ok, binary()} | {:error, term()})
+        ) :: {:ok, receipt()} | {:error, term()}
+  def enqueue_checkpoint(server, builder) do
+    call(server, {:enqueue_checkpoint, builder})
+  end
+
+  @doc """
   Durably resolve entries covered by an already authenticated receipt.
 
   The caller must authenticate and decode the wire receipt first; this boundary
@@ -192,6 +207,19 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
     case verify_identity(state) do
       :ok ->
         case Store.enqueue(state.store, stream, payload, opts) do
+          {:ok, entry, store} -> {:reply, {:ok, receipt_for(entry)}, %{state | store: store}}
+          {:error, reason} -> {:reply, {:error, reason}, latch_storage_fault(state, reason)}
+        end
+
+      {:error, reason} ->
+        {:reply, {:error, reason}, %{state | quarantined: true}}
+    end
+  end
+
+  def handle_call({:enqueue_checkpoint, builder}, _from, state) do
+    case verify_identity(state) do
+      :ok ->
+        case Store.enqueue_checkpoint(state.store, builder) do
           {:ok, entry, store} -> {:reply, {:ok, receipt_for(entry)}, %{state | store: store}}
           {:error, reason} -> {:reply, {:error, reason}, latch_storage_fault(state, reason)}
         end
