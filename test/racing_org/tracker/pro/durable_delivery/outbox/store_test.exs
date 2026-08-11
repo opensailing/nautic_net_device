@@ -1307,6 +1307,22 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert File.exists?(quarantine_path)
   end
 
+  test "does not disguise a complete corrupt zero-tailed record as a torn write", %{root: root} do
+    File.mkdir_p!(root)
+    segment = Path.join(root, "segment-00000000000000000001.log")
+    payload = "payload" <> :binary.copy(<<0>>, 16)
+    encoded = encoded_entry(1, entry_id(1), payload)
+    corruption_offset = byte_size(encoded) - 17
+
+    <<prefix::binary-size(corruption_offset), byte, suffix::binary>> = encoded
+    corrupt = prefix <> <<Bitwise.bxor(byte, 1)>> <> suffix
+    File.write!(segment, corrupt)
+
+    assert {:error, {:quarantined, :checksum_mismatch, quarantine_path}} = open_store(root)
+    assert File.read!(quarantine_path) == corrupt
+    assert {:error, {:quarantined, _files}} = open_store(root)
+  end
+
   test "quarantines checksum and semantic corruption instead of skipping entries", %{root: root} do
     assert {:ok, store} = open_store(root)
     assert {:ok, _entry, _store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))

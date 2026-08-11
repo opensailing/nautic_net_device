@@ -1356,7 +1356,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
         {:corrupt, {:incomplete_record, offset}}
 
       {:error, reason} ->
-        if final? and recoverable_zero_padded_tail?(bytes),
+        if final? and recoverable_zero_padded_tail?(store, path, bytes, offset),
           do: {:ok, store, offset, {path, offset}},
           else: {:corrupt, reason}
     end
@@ -1408,17 +1408,28 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     end
   end
 
-  defp recoverable_zero_padded_tail?(bytes) do
+  defp recoverable_zero_padded_tail?(store, path, bytes, offset) do
     trimmed = trim_trailing_zeroes(bytes)
-
     zero_padding_size = byte_size(bytes) - byte_size(trimmed)
 
     cond do
-      trimmed == <<>> -> true
-      zero_padding_size < 8 -> false
-      match?({:incomplete, _expected_size}, Record.decode_next(trimmed)) -> true
-      true -> false
+      trimmed == <<>> ->
+        true
+
+      zero_padding_size < 8 ->
+        false
+
+      committed_segment_boundary?(store, path, offset) ->
+        match?({:incomplete, _expected_size}, Record.decode_next(trimmed))
+
+      true ->
+        false
     end
+  end
+
+  defp committed_segment_boundary?(store, path, offset) do
+    segment_id = segment_id_from_path(path)
+    Map.get(store.committed_segment_sizes, segment_id) == offset
   end
 
   defp trim_trailing_zeroes(bytes), do: trim_trailing_zeroes(bytes, byte_size(bytes))
