@@ -269,10 +269,20 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   end
 
   @doc "Return pending entries in priority order, retaining FIFO within a priority."
-  @spec pending(t()) :: [Entry.t()]
-  def pending(%__MODULE__{entries: entries}) do
-    Enum.sort_by(entries, &{-&1.priority, &1.ordinal})
+  @spec pending(t(), keyword()) :: [Entry.t()] | {:error, term()}
+  def pending(store, opts \\ [])
+
+  def pending(%__MODULE__{} = store, opts) when is_list(opts) do
+    with {:ok, stream} <- pending_stream(store, opts),
+         {:ok, limit} <- pending_limit(opts) do
+      store.entries
+      |> filter_pending_stream(stream)
+      |> Enum.sort_by(&{-&1.priority, &1.ordinal})
+      |> limit_pending(limit)
+    end
   end
+
+  def pending(%__MODULE__{}, _opts), do: {:error, :invalid_options}
 
   @doc "Return the next sequence that will be allocated for a configured stream."
   @spec next_sequence(t(), atom()) :: {:ok, pos_integer()} | {:error, :unknown_stream}
@@ -1569,6 +1579,35 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       :error -> {:error, :unknown_stream}
     end
   end
+
+  defp pending_stream(store, opts) do
+    case Keyword.fetch(opts, :stream) do
+      :error ->
+        {:ok, :all}
+
+      {:ok, stream} when is_atom(stream) ->
+        if Map.has_key?(store.stream_names, stream),
+          do: {:ok, stream},
+          else: {:error, :unknown_stream}
+
+      {:ok, _stream} ->
+        {:error, :unknown_stream}
+    end
+  end
+
+  defp pending_limit(opts) do
+    case Keyword.fetch(opts, :limit) do
+      :error -> {:ok, :all}
+      {:ok, limit} when is_integer(limit) and limit > 0 -> {:ok, limit}
+      {:ok, _limit} -> {:error, :invalid_limit}
+    end
+  end
+
+  defp filter_pending_stream(entries, :all), do: entries
+  defp filter_pending_stream(entries, stream), do: Enum.filter(entries, &(&1.stream == stream))
+
+  defp limit_pending(entries, :all), do: entries
+  defp limit_pending(entries, limit), do: Enum.take(entries, limit)
 
   defp generic_enqueue_stream(:checkpoint),
     do: {:error, :checkpoint_builder_required}

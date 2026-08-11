@@ -302,44 +302,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
     end
   end
 
-  defp select_pending(state, opts) do
-    with {:ok, stream} <- pending_stream(state, opts),
-         {:ok, limit} <- pending_limit(opts) do
-      state.store
-      |> Store.pending()
-      |> filter_stream(stream)
-      |> take_limit(limit)
-    end
-  end
-
-  defp pending_stream(state, opts) do
-    case Keyword.fetch(opts, :stream) do
-      :error ->
-        {:ok, :all}
-
-      {:ok, stream} when is_atom(stream) ->
-        if Map.has_key?(state.store.stream_names, stream),
-          do: {:ok, stream},
-          else: {:error, :unknown_stream}
-
-      {:ok, _stream} ->
-        {:error, :unknown_stream}
-    end
-  end
-
-  defp pending_limit(opts) do
-    case Keyword.fetch(opts, :limit) do
-      :error -> {:ok, :all}
-      {:ok, limit} when is_integer(limit) and limit > 0 -> {:ok, limit}
-      {:ok, _limit} -> {:error, :invalid_limit}
-    end
-  end
-
-  defp filter_stream(entries, :all), do: entries
-  defp filter_stream(entries, stream), do: Enum.filter(entries, &(&1.stream == stream))
-
-  defp take_limit(entries, :all), do: entries
-  defp take_limit(entries, limit), do: Enum.take(entries, limit)
+  defp select_pending(state, opts), do: Store.pending(state.store, opts)
 
   defp receipt_for(%Entry{} = entry) do
     %{

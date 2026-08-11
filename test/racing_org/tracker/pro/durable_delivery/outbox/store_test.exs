@@ -313,6 +313,109 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert Store.next_sequence(recovered, :health) == {:ok, 2}
   end
 
+  test "selects pending entries by stream and limit before and after replay", %{root: root} do
+    assert {:ok, store} = open_store(root)
+
+    assert {:ok, _telemetry_low, store} =
+             Store.enqueue(store, :telemetry, "telemetry-low",
+               entry_id: entry_id(1),
+               priority: 1
+             )
+
+    assert {:ok, _health_high, store} =
+             Store.enqueue(store, :health, "health-high",
+               entry_id: entry_id(2),
+               priority: 9
+             )
+
+    assert {:ok, _telemetry_high, store} =
+             Store.enqueue(store, :telemetry, "telemetry-high",
+               entry_id: entry_id(3),
+               priority: 7
+             )
+
+    assert Enum.map(Store.pending(store, limit: 2), & &1.payload) == [
+             "health-high",
+             "telemetry-high"
+           ]
+
+    assert Enum.map(Store.pending(store, stream: :telemetry), & &1.payload) == [
+             "telemetry-high",
+             "telemetry-low"
+           ]
+
+    assert Enum.map(Store.pending(store, stream: :telemetry, limit: 1), & &1.payload) == [
+             "telemetry-high"
+           ]
+
+    assert {:error, :unknown_stream} = Store.pending(store, stream: :not_configured)
+    assert {:error, :invalid_limit} = Store.pending(store, limit: 0)
+
+    assert {:ok, recovered} = open_store(root)
+
+    assert Enum.map(Store.pending(recovered, stream: :telemetry, limit: 1), & &1.payload) == [
+             "telemetry-high"
+           ]
+  end
+
+  test "keeps scoped pending selection consistent across acknowledgement and loss", %{root: root} do
+    assert {:ok, store} = open_store(root)
+
+    assert {:ok, telemetry_first, store} =
+             Store.enqueue(store, :telemetry, "telemetry-first",
+               entry_id: entry_id(1),
+               priority: 1
+             )
+
+    assert {:ok, health, store} =
+             Store.enqueue(store, :health, "health",
+               entry_id: entry_id(2),
+               priority: 9
+             )
+
+    assert {:ok, telemetry_second, store} =
+             Store.enqueue(store, :telemetry, "telemetry-second",
+               entry_id: entry_id(3),
+               priority: 7
+             )
+
+    assert {:ok, [^telemetry_second], store} =
+             Store.acknowledge(store, receipt_for(telemetry_second))
+
+    assert Store.pending(store, stream: :telemetry) == [telemetry_first]
+
+    health_identity =
+      Map.take(health, [
+        :stream,
+        :device_id,
+        :credential_epoch,
+        :storage_epoch,
+        :sequence,
+        :payload_hash
+      ])
+
+    assert {:ok, ^health, store} =
+             Store.authorize_loss(store, health_identity, "operator approved")
+
+    assert Store.pending(store, limit: 1) == [telemetry_first]
+
+    assert {:ok, telemetry_third, store} =
+             Store.enqueue(store, :telemetry, "telemetry-third",
+               entry_id: entry_id(4),
+               priority: 5
+             )
+
+    cumulative_receipt = %{receipt_for(telemetry_third) | cumulative_sequence: 1}
+
+    assert {:ok, [^telemetry_first, ^telemetry_third], empty} =
+             Store.acknowledge(store, cumulative_receipt)
+
+    assert Store.pending(empty, stream: :telemetry, limit: 1) == []
+
+    assert {:ok, recovered} = open_store(root)
+    assert Store.pending(recovered, stream: :telemetry, limit: 1) == []
+  end
+
   test "raw enqueue cannot write the reserved checkpoint stream", %{root: root} do
     assert {:ok, store} = open_store(root, streams: [:checkpoint])
 
