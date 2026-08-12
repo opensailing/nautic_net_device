@@ -47,8 +47,8 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Provider.ValidateFirmware do
   defp firmware_valid?(context) do
     opts = validator_opts(context)
 
-    if FirmwareValidator.validation_available?(opts) do
-      {:ok, !!read_valid_flag(opts)}
+    if valid_flag_readable?(opts) do
+      {:ok, read_valid_flag(opts) == true}
     else
       :error
     end
@@ -56,6 +56,20 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Provider.ValidateFirmware do
     _exception -> :error
   catch
     _kind, _reason -> :error
+  end
+
+  defp valid_flag_readable?(opts) do
+    case Keyword.get(opts, :firmware_valid?) do
+      fun when is_function(fun, 0) ->
+        true
+
+      nil ->
+        runtime_module = Keyword.get(opts, :runtime_module, Nerves.Runtime)
+        Code.ensure_loaded?(runtime_module) and function_exported?(runtime_module, :firmware_valid?, 0)
+
+      _invalid ->
+        false
+    end
   end
 
   defp read_valid_flag(opts) do
