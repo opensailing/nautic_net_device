@@ -62,7 +62,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Provider.Checkpoints do
   rescue
     _exception -> "unavailable"
   catch
-    :exit, _reason -> "unavailable"
+    _kind, _reason -> "unavailable"
   end
 
   # A target resolves either to its production module name or to an injected
