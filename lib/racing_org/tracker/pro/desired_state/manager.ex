@@ -189,8 +189,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
   end
 
   def handle_call({:deliver_manifest, session_generation, delivery}, _from, state) do
-    handle_fenced_call(state, session_generation, delivery, fn _authorization ->
-      deliver_manifest_fenced(state, delivery)
+    handle_fenced_call(state, session_generation, delivery, fn authorization ->
+      deliver_manifest_fenced(state, delivery, authorization)
     end)
   end
 
@@ -484,12 +484,14 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     :exit, _reason -> {:error, :session_holder_unavailable}
   end
 
-  defp deliver_manifest_fenced(state, delivery) do
+  defp deliver_manifest_fenced(state, delivery, authorization) do
     with {:ok, manifest} <- decode_manifest(delivery),
          :ok <- validate_manifest_identity(delivery, manifest),
          :ok <- validate_generation_transition(state.store, manifest),
          :ok <- validate_compatibility(manifest, state.compatibility) do
-      case Store.stage_manifest(state.store, delivery) do
+      case with_authorized_session_transition(state, authorization, fn ->
+             Store.stage_manifest(state.store, delivery)
+           end) do
         {:ok, disposition} -> {{:ok, disposition}, :none}
         {:error, reason} -> {{:error, storage_or_protocol_error(reason)}, :none}
       end
@@ -509,7 +511,10 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
 
   defp deliver_chunk_fenced(state, payload, authorization) do
     with :ok <- validate_generation_payload(state.store, payload),
-         {:ok, disposition} <- Store.put_chunk(state.store, payload) do
+         {:ok, disposition} <-
+           with_authorized_session_transition(state, authorization, fn ->
+             Store.put_chunk(state.store, payload)
+           end) do
       complete_generation_after_chunk(state, payload, disposition, authorization)
     else
       {:error, reason} -> {{:error, storage_or_protocol_error(reason)}, :none}

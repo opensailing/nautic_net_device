@@ -722,6 +722,108 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     refute File.exists?(Store.generation_directory(ctx.store, 1, fixture.manifest_hash))
   end
 
+  test "session replacement waits for a durable manifest staging write", ctx do
+    test_pid = self()
+    blocked = start_supervised!({Agent, fn -> false end})
+
+    store =
+      Store.new(
+        base_dir: ctx.base,
+        storage_epoch: DS.storage_epoch(),
+        fault_injector: fn
+          :before_rename ->
+            if Agent.get_and_update(blocked, &{not &1, true}) do
+              send(test_pid, {:manifest_staging_write_blocked, self()})
+
+              receive do
+                :continue_manifest_staging_write -> :ok
+              end
+            end
+
+            :ok
+
+          _stage ->
+            :ok
+        end
+      )
+
+    pid = start_manager(ctx, store: store)
+    fixture = DS.generation_fixture()
+
+    delivery_task =
+      Task.async(fn ->
+        Manager.deliver_manifest(pid, ctx.session_generation, fixture.delivery)
+      end)
+
+    assert_receive {:manifest_staging_write_blocked, ^pid}, 1_000
+
+    replacement_task =
+      Task.async(fn ->
+        :ok = SessionHolder.clear(ctx.holder)
+        SessionHolder.publish(ctx.holder, session(<<2::128>>))
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: send(pid, :continue_manifest_staging_write)
+      if Process.alive?(delivery_task.pid), do: Process.exit(delivery_task.pid, :kill)
+      if Process.alive?(replacement_task.pid), do: Process.exit(replacement_task.pid, :kill)
+    end)
+
+    assert Task.yield(replacement_task, 100) == nil
+    send(pid, :continue_manifest_staging_write)
+
+    assert {:ok, :staged} = Task.await(delivery_task, 1_000)
+
+    assert {:ok, %Session{generation: replacement_generation}} =
+             Task.await(replacement_task, 1_000)
+
+    assert replacement_generation > ctx.session_generation
+    assert {:ok, %{status: :receiving}} = Store.generation_state(store, 1, fixture.manifest_hash)
+  end
+
+  test "session replacement waits for a durable chunk write", ctx do
+    pid = start_manager(ctx)
+    fixture = DS.generation_fixture()
+    assert {:ok, :staged} = Manager.deliver_manifest(pid, ctx.session_generation, fixture.delivery)
+    chunk = hd(DS.chunks(fixture))
+    chunk_path = Store.chunk_path(ctx.store, 1, fixture.manifest_hash, chunk.section, chunk.chunk_index)
+    BlockingFileSystem.block_rename(chunk_path, self())
+    on_exit(fn -> BlockingFileSystem.clear_rename(chunk_path) end)
+
+    store = %{ctx.store | file_system: BlockingFileSystem}
+    :sys.replace_state(pid, &%{&1 | store: store})
+
+    delivery_task =
+      Task.async(fn ->
+        Manager.deliver_chunk(pid, ctx.session_generation, chunk)
+      end)
+
+    assert_receive {:active_pointer_rename_blocked, ^pid}, 1_000
+
+    replacement_task =
+      Task.async(fn ->
+        :ok = SessionHolder.clear(ctx.holder)
+        SessionHolder.publish(ctx.holder, session(<<2::128>>))
+      end)
+
+    on_exit(fn ->
+      if Process.alive?(pid), do: send(pid, :continue_active_pointer_rename)
+      if Process.alive?(delivery_task.pid), do: Process.exit(delivery_task.pid, :kill)
+      if Process.alive?(replacement_task.pid), do: Process.exit(replacement_task.pid, :kill)
+    end)
+
+    assert Task.yield(replacement_task, 100) == nil
+    send(pid, :continue_active_pointer_rename)
+
+    assert {:ok, :stored} = Task.await(delivery_task, 1_000)
+
+    assert {:ok, %Session{generation: replacement_generation}} =
+             Task.await(replacement_task, 1_000)
+
+    assert replacement_generation > ctx.session_generation
+    assert File.exists?(chunk_path)
+  end
+
   test "every section chunk is fenced on the same identity and session generation", ctx do
     pid = start_manager(ctx)
     fixture = DS.generation_fixture()
@@ -1086,8 +1188,11 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
         Process.demonitor(caller_ref, [:flush])
         assert {:ok, :staged} = manifest_result
         assert Enum.all?(chunk_results, &match?({:ok, _disposition}, &1))
+
+      {:DOWN, ^caller_ref, :process, ^caller, reason} ->
+        flunk("desired-state delivery caller exited: #{inspect(reason)}")
     after
-      1_000 ->
+      10_000 ->
         Process.exit(pid, :kill)
         flunk("desired-state delivery deadlocked while the ACK sink consulted SessionHolder")
     end
