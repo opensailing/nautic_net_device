@@ -239,6 +239,35 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
       refute Keyword.has_key?(opts, :boot_id)
     end
 
+    test "a relative command-ledger override stays inside persistent desired-state storage" do
+      Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+      previous = Application.get_env(:racing_org_tracker_pro, :command_ledger_path)
+      Application.put_env(:racing_org_tracker_pro, :command_ledger_path, "custom/commands.ledger")
+
+      on_exit(fn ->
+        case previous do
+          nil -> Application.delete_env(:racing_org_tracker_pro, :command_ledger_path)
+          value -> Application.put_env(:racing_org_tracker_pro, :command_ledger_path, value)
+        end
+      end)
+
+      specs =
+        :logger
+        |> RacingOrg.Tracker.Pro.Application.child_specs(:racing_org_rpi3)
+        |> Enum.map(&Supervisor.child_spec(&1, []))
+
+      executor_spec = Enum.find(specs, &(&1.id == CommandExecutor))
+      assert {CommandExecutor, :start_link, [opts]} = executor_spec.start
+
+      expected =
+        RuntimeIdentity.storage_epoch_path()
+        |> Path.dirname()
+        |> Path.join("custom/commands.ledger")
+
+      assert Keyword.fetch!(opts, :path) == expected
+      assert Path.type(Keyword.fetch!(opts, :path)) == :absolute
+    end
+
     test "the durable outbox is bound to persistent storage and starts before receipt dispatch" do
       Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
 

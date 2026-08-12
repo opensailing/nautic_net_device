@@ -225,8 +225,19 @@ defmodule RacingOrg.Tracker.Pro.Application do
   end
 
   defp command_ledger_path do
-    Application.get_env(:racing_org_tracker_pro, :command_ledger_path) ||
-      RacingOrg.Tracker.Pro.Commands.Ledger.Executor.default_path()
+    case Application.get_env(:racing_org_tracker_pro, :command_ledger_path) do
+      path when is_binary(path) and path != "" ->
+        if Path.type(path) == :absolute do
+          path
+        else
+          RacingOrg.Tracker.Pro.DesiredState.RuntimeIdentity.storage_epoch_path()
+          |> Path.dirname()
+          |> Path.join(path)
+        end
+
+      _unset_or_invalid ->
+        RacingOrg.Tracker.Pro.Commands.Ledger.Executor.default_path()
+    end
   end
 
   defp desired_state_manager_children(:logger, controller_capability) do
