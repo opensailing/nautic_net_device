@@ -1016,6 +1016,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     %{root: root}
   end
 
+  test "rejects filesystem adapters that omit required callbacks", %{root: root} do
+    assert {:error, {:invalid_option, :file_system}} =
+             open_store(root, file_system: __MODULE__)
+
+    assert {:error, {:invalid_option, :segment_file_system}} =
+             open_store(root, segment_file_system: __MODULE__)
+  end
+
   test "allocates only wire-safe sequences and stops generic enqueue at the frozen bound", %{
     root: root
   } do

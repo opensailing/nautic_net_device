@@ -739,15 +739,28 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
   defp option_file_system(opts) do
     case Keyword.get(opts, :file_system, FileSystem) do
-      module when is_atom(module) -> {:ok, module}
+      module when is_atom(module) -> validate_adapter(module, FileSystem, :file_system)
       _other -> {:error, {:invalid_option, :file_system}}
     end
   end
 
   defp option_segment_file_system(opts) do
     case Keyword.get(opts, :segment_file_system, SegmentFileSystem) do
-      module when is_atom(module) -> {:ok, module}
+      module when is_atom(module) -> validate_adapter(module, SegmentFileSystem, :segment_file_system)
       _other -> {:error, {:invalid_option, :segment_file_system}}
+    end
+  end
+
+  defp validate_adapter(module, behaviour, option) do
+    callbacks = behaviour.behaviour_info(:callbacks)
+
+    if Code.ensure_loaded?(module) and
+         Enum.all?(callbacks, fn {function, arity} ->
+           function_exported?(module, function, arity)
+         end) do
+      {:ok, module}
+    else
+      {:error, {:invalid_option, option}}
     end
   end
 
