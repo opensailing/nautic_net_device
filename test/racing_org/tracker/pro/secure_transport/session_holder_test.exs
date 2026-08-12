@@ -908,6 +908,54 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
       assert published.generation > first.generation
     end
 
+    test "guard death kills active lease owners before holder replacement", %{
+      holder: _default_holder
+    } do
+      parent = self()
+      name_key = {__MODULE__, make_ref()}
+      name = {:global, name_key}
+
+      {:ok, old_holder} =
+        start_supervised(
+          {SessionHolder, name: name},
+          id: {:guard_death_with_lease, make_ref()}
+        )
+
+      assert {:ok, published} =
+               SessionHolder.publish(name, session(session_id: <<53::128>>))
+
+      owner =
+        spawn(fn ->
+          SessionHolder.with_session(name, published.generation, fn _session ->
+            send(parent, {:guard_death_lease_started, self()})
+
+            receive do
+              :transmit -> send(parent, {:guard_death_old_session_transmitted, self()})
+            end
+          end)
+        end)
+
+      owner_ref = Process.monitor(owner)
+      assert_receive {:guard_death_lease_started, ^owner}, 1_000
+
+      old_holder_ref = Process.monitor(old_holder)
+      guard = :sys.get_state(old_holder).incarnation_guard
+      Process.exit(guard, :kill)
+
+      assert_receive {:DOWN, ^old_holder_ref, :process, ^old_holder, _reason}, 1_000
+      assert_receive {:DOWN, ^owner_ref, :process, ^owner, :killed}, 1_000
+
+      assert eventually(fn ->
+               case :global.whereis_name(name_key) do
+                 replacement when is_pid(replacement) -> replacement != old_holder
+                 :undefined -> false
+               end
+             end)
+
+      send(owner, :transmit)
+      refute_receive {:guard_death_old_session_transmitted, ^owner}
+    end
+
     test "the holder cannot outlive a failed incarnation guard", %{holder: _default_holder} do
       name_key = {__MODULE__, make_ref()}
       name = {:global, name_key}

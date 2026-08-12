@@ -548,7 +548,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     send_lease_ttl = Keyword.get(opts, :send_lease_ttl, @default_send_lease_ttl)
 
     if is_integer(send_lease_ttl) and send_lease_ttl > 0 do
-      incarnation_guard = start_incarnation_guard()
+      {incarnation_guard, incarnation_guard_monitor} = start_incarnation_guard()
 
       {:ok,
        %{
@@ -561,6 +561,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
          # counters. Evicts rather than refusing — see `check_fresh_session/2`.
          used_session_ids: [],
          incarnation_guard: incarnation_guard,
+         incarnation_guard_monitor: incarnation_guard_monitor,
          # ref => %{owner, monitor_ref, timer_ref, expiring?} for every authorized
          # send still in flight.
          send_leases: %{},
@@ -579,16 +580,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   defp start_incarnation_guard do
     holder = self()
 
-    guard =
-      spawn_link(fn ->
-        Process.flag(:trap_exit, true)
+    {guard, guard_monitor} =
+      spawn_monitor(fn ->
         holder_monitor = Process.monitor(holder)
         send(holder, {:incarnation_guard_ready, self()})
         incarnation_guard_loop(holder, holder_monitor, %{})
       end)
 
     receive do
-      {:incarnation_guard_ready, ^guard} -> guard
+      {:incarnation_guard_ready, ^guard} -> {guard, guard_monitor}
     after
       5_000 -> exit(:incarnation_guard_start_timeout)
     end
@@ -773,6 +773,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   # A leaseholder that dies mid-send must never wedge session replacement.
   @impl true
+  def handle_info(
+        {:DOWN, monitor_ref, :process, guard, reason},
+        %{incarnation_guard: guard, incarnation_guard_monitor: monitor_ref} = state
+      ) do
+    kill_send_lease_owners(state.send_leases)
+    {:stop, {:incarnation_guard_down, reason}, state}
+  end
+
   def handle_info({:DOWN, monitor_ref, :process, _pid, _reason}, state) do
     cond do
       Map.has_key?(state.deferred_monitors, monitor_ref) ->
@@ -840,6 +848,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
              deferred_monitors: Map.put(state.deferred_monitors, monitor_ref, entry)
          }}
     end
+  end
+
+  defp kill_send_lease_owners(send_leases) do
+    Enum.each(send_leases, fn {_ref, %{owner: owner}} -> Process.exit(owner, :kill) end)
   end
 
   defp new_send_lease(%{session: %Session{} = session} = state, owner) when is_pid(owner) do
