@@ -480,7 +480,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
   unblocking deferred replacement/clear. Releasing an unknown, already-released,
   or superseded lease is inert, so callers can release unconditionally.
   """
-  @spec release_send_lease(GenServer.server(), send_lease()) :: :ok
+  @spec release_send_lease(GenServer.server(), send_lease()) ::
+          :ok | {:error, :not_send_lease_owner}
   def release_send_lease(_server, %{holder: holder, ref: ref})
       when is_pid(holder) and is_reference(ref) do
     GenServer.call(holder, {:release_send_lease, ref})
@@ -577,7 +578,20 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   defp start_incarnation_guard do
     holder = self()
-    spawn(fn -> incarnation_guard_loop(holder, Process.monitor(holder), %{}) end)
+
+    guard =
+      spawn_link(fn ->
+        Process.flag(:trap_exit, true)
+        holder_monitor = Process.monitor(holder)
+        send(holder, {:incarnation_guard_ready, self()})
+        incarnation_guard_loop(holder, holder_monitor, %{})
+      end)
+
+    receive do
+      {:incarnation_guard_ready, ^guard} -> guard
+    after
+      5_000 -> exit(:incarnation_guard_start_timeout)
+    end
   end
 
   defp incarnation_guard_loop(holder, holder_monitor, owners) do
@@ -589,8 +603,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
         incarnation_guard_loop(holder, holder_monitor, Map.delete(owners, ref))
 
       {:DOWN, ^holder_monitor, :process, ^holder, _reason} ->
-        Enum.each(owners, fn {_ref, owner} -> Process.exit(owner, :kill) end)
+        kill_lease_owners(owners)
+
+      {:EXIT, ^holder, _reason} ->
+        kill_lease_owners(owners)
     end
+  end
+
+  defp kill_lease_owners(owners) do
+    Enum.each(owners, fn {_ref, owner} -> Process.exit(owner, :kill) end)
   end
 
   # Session-mutating calls must not overtake an authorized send. While any lease is
@@ -678,8 +699,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
     end
   end
 
-  def handle_call({:release_send_lease, ref}, _from, state) do
-    {:reply, :ok, release_lease(state, ref)}
+  def handle_call({:release_send_lease, ref}, {pid, _tag}, state) do
+    case release_owned_lease(state, ref, pid) do
+      {:ok, next_state} -> {:reply, :ok, next_state}
+      {:error, :not_send_lease_owner} -> {:reply, {:error, :not_send_lease_owner}, state}
+    end
   end
 
   def handle_call(
@@ -854,6 +878,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolder do
 
   defp cancel_deferred(state, monitor_ref) do
     %{state | deferred_monitors: Map.delete(state.deferred_monitors, monitor_ref)}
+  end
+
+  defp release_owned_lease(state, ref, owner) do
+    case Map.fetch(state.send_leases, ref) do
+      :error ->
+        {:ok, state}
+
+      {:ok, %{owner: ^owner}} ->
+        {:ok, release_lease(state, ref)}
+
+      {:ok, _lease_state} ->
+        {:error, :not_send_lease_owner}
+    end
   end
 
   defp release_lease(state, ref, release_reason \\ :owner_release) do

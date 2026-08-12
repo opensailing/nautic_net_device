@@ -876,6 +876,62 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.SessionHolderTest do
       assert :ok = SessionHolder.release_send_lease(h, lease)
     end
 
+    test "a copied lease cannot be released by a process other than its owner", %{holder: h} do
+      parent = self()
+      assert {:ok, first} = SessionHolder.publish(h, session(session_id: <<51::128>>))
+
+      owner =
+        spawn(fn ->
+          {:ok, lease} = SessionHolder.acquire_send_lease(h, first.generation)
+          send(parent, {:owned_lease, self(), lease})
+
+          receive do
+            :transmit -> send(parent, {:old_session_transmitted, self()})
+            :release -> :ok = SessionHolder.release_send_lease(h, lease)
+          end
+        end)
+
+      assert_receive {:owned_lease, ^owner, lease}, 1_000
+      assert {:error, :not_send_lease_owner} = SessionHolder.release_send_lease(h, lease)
+
+      replacement =
+        Task.async(fn ->
+          SessionHolder.publish(h, session(session_id: <<52::128>>), first.generation)
+        end)
+
+      assert Task.yield(replacement, 50) == nil
+      send(owner, :transmit)
+      assert_receive {:old_session_transmitted, ^owner}, 1_000
+
+      send(owner, :release)
+      assert {:ok, published} = Task.await(replacement)
+      assert published.generation > first.generation
+    end
+
+    test "the holder cannot outlive a failed incarnation guard", %{holder: _default_holder} do
+      name_key = {__MODULE__, make_ref()}
+      name = {:global, name_key}
+
+      {:ok, holder} =
+        start_supervised(
+          {SessionHolder, name: name},
+          id: {:guarded_named_holder, make_ref()}
+        )
+
+      holder_ref = Process.monitor(holder)
+      guard = :sys.get_state(holder).incarnation_guard
+      Process.exit(guard, :kill)
+
+      assert_receive {:DOWN, ^holder_ref, :process, ^holder, _reason}, 1_000
+
+      assert eventually(fn ->
+               case :global.whereis_name(name_key) do
+                 new_holder when is_pid(new_holder) -> new_holder != holder
+                 :undefined -> false
+               end
+             end)
+    end
+
     # The holder must never be wedged by a caller that dies mid-send. It monitors
     # every lease holder and releases the lease on DOWN.
     test "a crashed lease holder releases its lease automatically", %{holder: h} do
