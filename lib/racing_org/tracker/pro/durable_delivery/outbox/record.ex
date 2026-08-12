@@ -83,6 +83,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
   def decode_next(binary) when is_binary(binary) and byte_size(binary) < @header_size do
     case partial_header_expected_size(binary) do
       {:ok, expected_size} -> {:incomplete, expected_size}
+      {:error, reason} -> {:error, reason}
       :error -> {:error, :invalid_partial_header}
     end
   end
@@ -431,6 +432,10 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
     if binary == expected_prefix, do: {:ok, @header_size}, else: :error
   end
 
+  defp partial_header_expected_size(<<@magic, version, _rest::binary>>)
+       when version > @version,
+       do: {:error, :future_record_version}
+
   defp partial_header_expected_size(<<@magic, version, rest::binary>>) do
     cond do
       version != @version ->
@@ -481,6 +486,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Record do
   defp validate_magic(_magic), do: {:error, :invalid_magic}
 
   defp validate_version(@version), do: :ok
+  defp validate_version(version) when version > @version, do: {:error, :future_record_version}
   defp validate_version(_version), do: {:error, :unsupported_record_version}
 
   defp decode_kind(code) do

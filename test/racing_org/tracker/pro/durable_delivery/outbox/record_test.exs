@@ -76,6 +76,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.RecordTest do
     assert {:error, :invalid_partial_header} = Record.decode_next(<<"RODO", 1>>)
   end
 
+  test "classifies future record versions without interpreting their framing" do
+    assert {:error, :future_record_version} = Record.decode_next(<<"RODO", 3>>)
+
+    assert {:error, :future_record_version} =
+             Record.decode_next(<<"RODO", 3, 255, 0xFFFF_FFFF::32, 0::32>>)
+  end
+
   test "round-trips a versioned entry record with a positive signed bigint sequence" do
     payload = <<0, 1, 2, 255, 0, 128>>
     sequence = 1 <<< 130
@@ -160,7 +167,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.RecordTest do
   test "truncation accepts only a plausible canonical header prefix" do
     assert {:incomplete, 14} = Record.decode_next("RO")
     assert {:error, :invalid_partial_header} = Record.decode_next("RX")
-    assert {:error, :invalid_partial_header} = Record.decode_next(<<"RODO", 3>>)
+    assert {:error, :future_record_version} = Record.decode_next(<<"RODO", 3>>)
     assert {:error, :invalid_partial_header} = Record.decode_next(<<"RODO", 2, 99>>)
     assert {:error, :invalid_partial_header} = Record.decode_next(<<"RODO", 2, 1, 0xFF>>)
 

@@ -123,7 +123,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   """
   @spec enqueue_checkpoint(
           GenServer.server(),
-          (pos_integer() -> {:ok, binary()} | {:error, term()})
+          (pos_integer() ->
+             {:ok, %{payload: binary(), payload_hash: <<_::256>>}} | {:error, term()})
         ) :: {:ok, receipt()} | {:error, term()}
   def enqueue_checkpoint(server, builder) do
     call(server, {:enqueue_checkpoint, builder})

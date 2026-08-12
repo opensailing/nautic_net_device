@@ -10,6 +10,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     Store
   }
 
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{
+    Checkpoint,
+    Messages
+  }
+
   @storage_epoch Base.decode16!("00112233445566778899aabbccddeeff", case: :lower)
   @device_id Base.decode16!("0f1e2d3c4b5a69788796a5b4c3d2e1f0", case: :lower)
   @other_device_id Base.decode16!("aabbccddeeff00112233445566778899", case: :lower)
@@ -1189,27 +1196,269 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert {:ok, entry, store} =
              Store.enqueue_checkpoint(
                store,
-               fn 1 -> {:ok, "checkpoint-1"} end,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
                entry_id: entry_id(1)
              )
 
     assert entry.stream == :checkpoint
     assert entry.sequence == 1
-    assert entry.payload == "checkpoint-1"
-    assert entry.payload_hash == :crypto.hash(:sha256, "checkpoint-1")
+    assert {:ok, submission} = Messages.decode(:checkpoint_submission, entry.payload)
+    assert submission.sequence == 1
+    assert entry.payload_hash == submission.checkpoint_hash
     assert entry.priority == 0
     assert Store.next_sequence(store, :checkpoint) == {:ok, 2}
 
     assert {:ok, recovered} = open_store(root, streams: [:checkpoint])
 
-    assert [
-             %{
-               stream: :checkpoint,
+    assert [%{stream: :checkpoint, sequence: 1, priority: 0} = replayed] =
+             Store.pending(recovered)
+
+    assert replayed.payload == entry.payload
+    assert replayed.payload_hash == entry.payload_hash
+    assert replayed.payload_checksum == entry.payload_checksum
+  end
+
+  test "segment replay preserves legacy checkpoint payloads that resemble canonical headers", %{root: root} do
+    File.mkdir_p!(root)
+
+    payload =
+      Contract.payload_domain(:checkpoint_submission) <>
+        <<Contract.version(), 0x31, 0, 1, 2, 3>>
+
+    payload_hash = :crypto.hash(:sha256, payload)
+
+    assert {:ok, encoded} =
+             Record.encode(%{
+               kind: :entry,
+               stream: "checkpoint",
+               device_id: @device_id,
+               credential_epoch: @credential_epoch,
+               storage_epoch: @storage_epoch,
                sequence: 1,
-               payload: "checkpoint-1",
+               entry_id: entry_id(1),
+               payload_hash: payload_hash,
+               payload: payload,
                priority: 0
-             }
-           ] = Store.pending(recovered)
+             })
+
+    File.write!(Path.join(root, "segment-00000000000000000001.log"), encoded)
+
+    assert {:ok, recovered} = open_store(root, streams: [:checkpoint])
+    assert [entry] = Store.pending(recovered)
+    assert entry.payload == payload
+    assert entry.payload_hash == payload_hash
+    assert entry.payload_checksum == payload_hash
+  end
+
+  test "segment replay rejects canonical checkpoint submissions with stale durable identity", %{
+    root: root
+  } do
+    File.mkdir_p!(root)
+    {:ok, delivery} = checkpoint_delivery(1, <<0::256>>)
+    {:ok, submission} = Messages.decode(:checkpoint_submission, delivery.payload)
+    stale_submission = %{submission | storage_epoch: <<0x11::128>>}
+
+    assert {:ok, checkpoint_hash} =
+             stale_submission
+             |> Map.drop([:checkpoint_hash, :content])
+             |> Checkpoint.hash()
+
+    assert {:ok, payload} =
+             stale_submission
+             |> Map.put(:checkpoint_hash, checkpoint_hash)
+             |> then(&Messages.encode(:checkpoint_submission, &1))
+
+    assert {:ok, encoded} =
+             Record.encode(%{
+               kind: :entry,
+               stream: "checkpoint",
+               device_id: @device_id,
+               credential_epoch: @credential_epoch,
+               storage_epoch: @storage_epoch,
+               sequence: 1,
+               entry_id: entry_id(1),
+               payload_hash: :crypto.hash(:sha256, payload),
+               payload: payload,
+               priority: 0
+             })
+
+    segment = Path.join(root, "segment-00000000000000000001.log")
+    File.write!(segment, encoded)
+
+    assert {:error, {:quarantined, :checkpoint_submission_mismatch, quarantine_path}} =
+             open_store(root, streams: [:checkpoint])
+
+    assert File.exists?(quarantine_path)
+  end
+
+  test "segment replay preserves arbitrary-binary legacy checkpoint entries", %{root: root} do
+    File.mkdir_p!(root)
+    payload = "legacy-checkpoint-payload"
+    payload_hash = :crypto.hash(:sha256, payload)
+
+    assert {:ok, encoded} =
+             Record.encode(%{
+               kind: :entry,
+               stream: "checkpoint",
+               device_id: @device_id,
+               credential_epoch: @credential_epoch,
+               storage_epoch: @storage_epoch,
+               sequence: 1,
+               entry_id: entry_id(1),
+               payload_hash: payload_hash,
+               payload: payload,
+               priority: 0
+             })
+
+    File.write!(Path.join(root, "segment-00000000000000000001.log"), encoded)
+
+    assert {:ok, recovered} = open_store(root, streams: [:checkpoint])
+    assert [entry] = Store.pending(recovered)
+    assert entry.payload == payload
+    assert entry.payload_hash == payload_hash
+    assert entry.payload_checksum == payload_hash
+  end
+
+  test "legacy arbitrary-binary checkpoint entries survive current snapshot compaction", %{root: root} do
+    File.mkdir_p!(root)
+    payload = "legacy-checkpoint-payload"
+    payload_hash = :crypto.hash(:sha256, payload)
+
+    assert {:ok, encoded} =
+             Record.encode(%{
+               kind: :entry,
+               stream: "checkpoint",
+               device_id: @device_id,
+               credential_epoch: @credential_epoch,
+               storage_epoch: @storage_epoch,
+               sequence: 1,
+               entry_id: entry_id(1),
+               payload_hash: payload_hash,
+               payload: payload,
+               priority: 0
+             })
+
+    File.write!(Path.join(root, "segment-00000000000000000001.log"), encoded)
+    assert {:ok, recovered} = open_store(root, streams: [:checkpoint])
+
+    assert {:ok, second, recovered} =
+             Store.enqueue_checkpoint(
+               recovered,
+               fn 2 -> checkpoint_delivery(2, <<0::256>>) end,
+               entry_id: entry_id(2)
+             )
+
+    assert {:ok, [^second], compacted} = Store.acknowledge(recovered, receipt_for(second))
+    assert segment_paths(root) == []
+    assert [legacy] = Store.pending(compacted)
+    assert legacy.payload_hash == payload_hash
+    assert legacy.payload_checksum == payload_hash
+
+    assert {:ok, reopened} = open_store(root, streams: [:checkpoint])
+    assert [hydrated] = Store.pending(reopened)
+    assert hydrated.payload == payload
+    assert hydrated.payload_hash == payload_hash
+    assert hydrated.payload_checksum == payload_hash
+  end
+
+  test "checkpoint durable identity survives segment replay and current snapshot hydration", %{root: root} do
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+
+    assert {:ok, fresh, _store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
+               entry_id: entry_id(1)
+             )
+
+    assert fresh.payload_hash != fresh.payload_checksum
+
+    assert {:ok, segment_replayed} = open_store(root, streams: [:checkpoint])
+    assert [segment_entry] = Store.pending(segment_replayed)
+
+    assert Map.take(segment_entry, [:payload_hash, :payload_checksum, :payload]) ==
+             Map.take(fresh, [:payload_hash, :payload_checksum, :payload])
+
+    assert {:ok, second, segment_replayed} =
+             Store.enqueue_checkpoint(
+               segment_replayed,
+               fn 2 -> checkpoint_delivery(2, fresh.payload_hash) end,
+               entry_id: entry_id(2)
+             )
+
+    assert {:ok, [^second], compacted} = Store.acknowledge(segment_replayed, receipt_for(second))
+    assert Store.pending(compacted) == [fresh]
+    assert segment_paths(root) == []
+
+    assert {:ok, snapshot} =
+             root
+             |> Path.join("snapshot.bin")
+             |> File.read!()
+             |> Snapshot.decode()
+
+    assert snapshot["schema_version"] == 4
+
+    assert {:ok, snapshot_replayed} = open_store(root, streams: [:checkpoint])
+    assert [snapshot_entry] = Store.pending(snapshot_replayed)
+
+    assert Map.take(snapshot_entry, [:payload_hash, :payload_checksum, :payload]) ==
+             Map.take(fresh, [:payload_hash, :payload_checksum, :payload])
+  end
+
+  test "checkpoint builder rejects malformed semantic identities without consuming storage", %{root: root} do
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+
+    for result <- [
+          {:ok, "legacy-payload"},
+          {:ok, %{payload: "checkpoint", payload_hash: <<0::248>>}},
+          {:ok, %{payload: "checkpoint", payload_hash: <<0::256>>, extra: true}}
+        ] do
+      assert {:error, :invalid_checkpoint_builder_result} =
+               Store.enqueue_checkpoint(
+                 store,
+                 fn 1 -> result end,
+                 entry_id: entry_id(1)
+               )
+
+      assert Store.pending(store) == []
+      assert Store.next_sequence(store, :checkpoint) == {:ok, 1}
+      assert segment_paths(root) == []
+    end
+  end
+
+  test "checkpoint builder cannot decouple payload from the locked receipt identity", %{root: root} do
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+
+    invalid_builders = [
+      fn sequence ->
+        {:ok, delivery} = checkpoint_delivery(sequence, <<0::256>>)
+        {:ok, %{delivery | payload_hash: <<0xA5::256>>}}
+      end,
+      fn sequence -> checkpoint_delivery(sequence + 1, <<0::256>>) end,
+      fn sequence ->
+        {:ok, delivery} = checkpoint_delivery(sequence, <<0::256>>)
+        {:ok, submission} = Messages.decode(:checkpoint_submission, delivery.payload)
+        submission = %{submission | storage_epoch: <<0x11::128>>}
+
+        {:ok, checkpoint_hash} =
+          submission
+          |> Map.drop([:checkpoint_hash, :content])
+          |> Checkpoint.hash()
+
+        submission = %{submission | checkpoint_hash: checkpoint_hash}
+        {:ok, payload} = Messages.encode(:checkpoint_submission, submission)
+        {:ok, %{payload: payload, payload_hash: checkpoint_hash}}
+      end
+    ]
+
+    for builder <- invalid_builders do
+      assert {:error, :checkpoint_submission_mismatch} =
+               Store.enqueue_checkpoint(store, builder, entry_id: entry_id(1))
+
+      assert Store.pending(store) == []
+      assert Store.next_sequence(store, :checkpoint) == {:ok, 1}
+      assert segment_paths(root) == []
+    end
   end
 
   test "checkpoint builder failure consumes neither sequence nor storage", %{root: root} do
@@ -1229,7 +1478,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert {:ok, entry, _store} =
              Store.enqueue_checkpoint(
                store,
-               fn 1 -> {:ok, "retry-at-sequence-1"} end,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
                entry_id: entry_id(1)
              )
 
@@ -1650,7 +1899,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert {:ok, _parent, _first_handle} =
              Store.enqueue_checkpoint(
                first_handle,
-               fn 1 -> {:ok, "parent"} end,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
                entry_id: entry_id(1)
              )
 
@@ -1661,7 +1910,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
                stale_handle,
                fn _sequence ->
                  send(test_pid, :stale_builder_ran)
-                 {:ok, "child"}
+                 checkpoint_delivery(1, <<0::256>>)
                end,
                entry_id: entry_id(2)
              )
@@ -1710,7 +1959,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert {:ok, _seed, store} =
              Store.enqueue_checkpoint(
                store,
-               fn 1 -> {:ok, "seed"} end,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
                entry_id: entry_id(1)
              )
 
@@ -1724,7 +1973,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
             send(owner, {:replacement_builder_waiting, self()})
 
             receive do
-              :continue_replaced_builder -> {:ok, "stale-root"}
+              :continue_replaced_builder -> checkpoint_delivery(2, <<0::256>>)
             end
           end,
           entry_id: entry_id(2)
@@ -1744,7 +1993,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
             :continue_replacement ->
               Store.enqueue_checkpoint(
                 replacement_store,
-                fn 2 -> {:ok, "replacement-root"} end,
+                fn 2 -> checkpoint_delivery(2, <<0::256>>) end,
                 entry_id: entry_id(3)
               )
           end
@@ -1772,17 +2021,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
     refute replacement_entered_while_locked
     assert {:error, :stale_store} = in_flight_result
-    assert {:ok, %{sequence: 2, payload: "replacement-root"}, _store} = replacement_result
+    assert {:ok, %{sequence: 2}, _store} = replacement_result
 
     assert {:ok, recovered_replacement} = open_store(root, streams: [:checkpoint])
-
-    assert Enum.map(Store.pending(recovered_replacement), &{&1.sequence, &1.payload}) == [
-             {1, "seed"},
-             {2, "replacement-root"}
-           ]
+    assert Enum.map(Store.pending(recovered_replacement), & &1.sequence) == [1, 2]
 
     assert {:ok, recovered_original} = open_store(displaced_root, streams: [:checkpoint])
-    assert Enum.map(Store.pending(recovered_original), &{&1.sequence, &1.payload}) == [{1, "seed"}]
+    assert Enum.map(Store.pending(recovered_original), & &1.sequence) == [1]
   end
 
   test "revalidates root identity after append open before writing", %{root: root} do
@@ -1964,7 +2209,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert {:ok, store} = open_store(root, streams: [:checkpoint])
     owner = self()
 
-    assert {:ok, %{sequence: 1, payload: "outer-checkpoint"}, _store} =
+    assert {:ok, %{sequence: 1} = outer_entry, _store} =
              Store.enqueue_checkpoint(
                store,
                fn 1 ->
@@ -1983,13 +2228,15 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
                  send(owner, {:independent_mutation, result})
 
                  case result do
-                   {:ok, _entry} -> {:ok, "outer-checkpoint"}
+                   {:ok, _entry} -> checkpoint_delivery(1, <<0::256>>)
                    {:error, reason} -> {:error, {:side_effect_failed, reason}}
                  end
                end,
                entry_id: entry_id(1)
              )
 
+    assert {:ok, outer_submission} = Messages.decode(:checkpoint_submission, outer_entry.payload)
+    assert outer_entry.payload_hash == outer_submission.checkpoint_hash
     assert_receive {:independent_mutation, {:ok, %{sequence: 1, payload: "independent-payload"}}}
     assert {:ok, recovered} = open_store(independent_root)
     assert Enum.map(Store.pending(recovered), & &1.payload) == ["independent-payload"]
@@ -2021,7 +2268,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
                        "nested-#{label}",
                        entry_id: entry_id(inner_id)
                      ) do
-                  {:ok, _entry, _store} -> {:ok, "outer-#{label}"}
+                  {:ok, _entry, _store} -> checkpoint_delivery(1, <<0::256>>)
                   {:error, reason} -> {:error, {:nested_failed, reason}}
                 end
             end
@@ -2077,7 +2324,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
             send(owner, {:outer_builder_waiting, self()})
 
             receive do
-              :continue_outer_builder -> {:ok, "outer-checkpoint"}
+              :continue_outer_builder -> checkpoint_delivery(1, <<0::256>>)
             end
           end,
           entry_id: entry_id(1)
@@ -2094,7 +2341,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
           second_handle,
           fn 1 ->
             send(owner, :second_builder_ran)
-            {:ok, "second-checkpoint"}
+            checkpoint_delivery(1, <<0::256>>)
           end,
           entry_id: entry_id(2)
         )
@@ -2104,7 +2351,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     refute_receive :second_builder_ran, 100
     send(outer_pid, :continue_outer_builder)
 
-    assert {:ok, %{sequence: 1, payload: "outer-checkpoint"}, _store} = Task.await(outer)
+    assert {:ok, %{sequence: 1}, _store} = Task.await(outer)
     assert {:error, :stale_store} = Task.await(second)
     refute_receive :second_builder_ran
   end
@@ -2214,7 +2461,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
               send(owner, {:case_builder_waiting, self()})
 
               receive do
-                :continue_case_builder -> {:ok, "first-checkpoint"}
+                :continue_case_builder -> checkpoint_delivery(1, <<0::256>>)
               end
             end,
             entry_id: entry_id(1)
@@ -2231,7 +2478,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
             alias_handle,
             fn 1 ->
               send(owner, :aliased_case_builder_ran)
-              {:ok, "aliased-checkpoint"}
+              checkpoint_delivery(1, <<0::256>>)
             end,
             entry_id: entry_id(2)
           )
@@ -2241,7 +2488,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
       refute_receive :aliased_case_builder_ran, 100
       send(first_pid, :continue_case_builder)
 
-      assert {:ok, %{sequence: 1, payload: "first-checkpoint"}, _store} = Task.await(first)
+      assert {:ok, %{sequence: 1}, _store} = Task.await(first)
       assert {:error, :stale_store} = Task.await(aliased)
       refute_receive :aliased_case_builder_ran
       assert real_handle.root_path == alias_handle.root_path
@@ -2289,7 +2536,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
       assert {:ok, _first, real_handle} =
                Store.enqueue_checkpoint(
                  real_handle,
-                 fn 1 -> {:ok, "first-checkpoint"} end,
+                 fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
                  entry_id: entry_id(1)
                )
 
@@ -2304,7 +2551,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
               send(owner, {:firmlink_builder_waiting, self()})
 
               receive do
-                :continue_firmlink_builder -> {:ok, "second-checkpoint"}
+                :continue_firmlink_builder -> checkpoint_delivery(2, <<0::256>>)
               end
             end,
             entry_id: entry_id(2)
@@ -2321,7 +2568,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
             alias_handle,
             fn 2 ->
               send(owner, :firmlink_alias_builder_ran)
-              {:ok, "duplicate-second-checkpoint"}
+              checkpoint_delivery(2, <<0::256>>)
             end,
             entry_id: entry_id(3)
           )
@@ -2666,6 +2913,203 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
              open_store(root, segment_max_bytes: 500, max_disk_bytes: 10_000)
 
     assert committed_bytes > before_ack
+  end
+
+  test "checkpoint acknowledgement replay uses the v2 physical entry hash", %{root: root} do
+    assert {:ok, store} =
+             open_store(root,
+               streams: [:checkpoint],
+               file_system: TracingFileSystem
+             )
+
+    assert {:ok, entry, store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
+               entry_id: entry_id(1)
+             )
+
+    assert entry.payload_hash != entry.payload_checksum
+    TracingFileSystem.fail_snapshot_rename()
+
+    assert {:error, {:durability_uncertain, {:snapshot_rename, :simulated_rename_failure}}} =
+             Store.acknowledge(store, receipt_for(entry))
+
+    [segment] = segment_paths(root)
+    segment_bytes = File.read!(segment)
+
+    assert {:ok, %{kind: :entry} = entry_record, remainder, _encoded_size} =
+             Record.decode_next(segment_bytes)
+
+    assert {:ok, %{kind: :acknowledgement} = acknowledgement, <<>>, _encoded_size} =
+             Record.decode_next(remainder)
+
+    assert entry_record.payload_hash == entry.payload_checksum
+    assert acknowledgement.payload_hash == entry_record.payload_hash
+
+    assert {:ok, recovered} =
+             open_store(root,
+               streams: [:checkpoint],
+               file_system: TracingFileSystem
+             )
+
+    assert Store.pending(recovered) == []
+  end
+
+  test "semantic checkpoint resolution records from the split-identity transition still replay", %{root: root} do
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+
+    assert {:ok, entry, _store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
+               entry_id: entry_id(1)
+             )
+
+    assert entry.payload_hash != entry.payload_checksum
+    [segment] = segment_paths(root)
+
+    assert {:ok, acknowledgement} =
+             Record.encode(%{
+               kind: :acknowledgement,
+               stream: "checkpoint",
+               device_id: entry.device_id,
+               credential_epoch: entry.credential_epoch,
+               storage_epoch: entry.storage_epoch,
+               sequence: entry.sequence,
+               payload_hash: entry.payload_hash,
+               cumulative_sequence: 0
+             })
+
+    File.write!(segment, acknowledgement, [:append])
+
+    assert {:ok, recovered} = open_store(root, streams: [:checkpoint])
+    assert Store.pending(recovered) == []
+    assert Store.resolved_receipt?(recovered, receipt_for(entry))
+  end
+
+  test "semantic checkpoint loss records from the split-identity transition still replay", %{root: root} do
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+
+    assert {:ok, entry, _store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
+               entry_id: entry_id(1)
+             )
+
+    assert entry.payload_hash != entry.payload_checksum
+    [segment] = segment_paths(root)
+
+    assert {:ok, authorization} =
+             Record.encode(%{
+               kind: :loss_authorization,
+               stream: "checkpoint",
+               device_id: entry.device_id,
+               credential_epoch: entry.credential_epoch,
+               storage_epoch: entry.storage_epoch,
+               sequence: entry.sequence,
+               entry_id: entry.entry_id,
+               payload_hash: entry.payload_hash,
+               reason: "operator ticket"
+             })
+
+    File.write!(segment, authorization, [:append])
+
+    assert {:ok, recovered} = open_store(root, streams: [:checkpoint])
+    assert Store.pending(recovered) == []
+
+    assert [loss] = Store.loss_authorizations(recovered)
+    assert loss.payload_hash == entry.payload_hash
+  end
+
+  test "checkpoint cumulative acknowledgement retries retain the v2 physical anchor hash", %{root: root} do
+    assert {:ok, store} =
+             open_store(root,
+               streams: [:checkpoint],
+               file_system: TracingFileSystem
+             )
+
+    assert {:ok, first, store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
+               entry_id: entry_id(1)
+             )
+
+    assert {:ok, second, store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 2 -> checkpoint_delivery(2, first.payload_hash) end,
+               entry_id: entry_id(2)
+             )
+
+    assert {:ok, [^second], store} = Store.acknowledge(store, receipt_for(second))
+    TracingFileSystem.fail_snapshot_rename()
+
+    assert {:error, {:durability_uncertain, {:snapshot_rename, :simulated_rename_failure}}} =
+             Store.acknowledge(
+               store,
+               %{receipt_for(second) | cumulative_sequence: second.sequence}
+             )
+
+    [segment] = segment_paths(root)
+
+    assert {:ok, %{kind: :acknowledgement} = acknowledgement, <<>>, _encoded_size} =
+             segment
+             |> File.read!()
+             |> Record.decode_next()
+
+    assert acknowledgement.payload_hash == second.payload_checksum
+
+    assert {:ok, recovered} =
+             open_store(root,
+               streams: [:checkpoint],
+               file_system: TracingFileSystem
+             )
+
+    assert Store.pending(recovered) == []
+  end
+
+  test "checkpoint loss replay uses the v2 physical entry hash", %{root: root} do
+    assert {:ok, store} =
+             open_store(root,
+               streams: [:checkpoint],
+               file_system: TracingFileSystem
+             )
+
+    assert {:ok, entry, store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
+               entry_id: entry_id(1)
+             )
+
+    assert entry.payload_hash != entry.payload_checksum
+    TracingFileSystem.fail_snapshot_rename()
+
+    assert {:error, {:durability_uncertain, {:snapshot_rename, :simulated_rename_failure}}} =
+             Store.authorize_loss(store, receipt_for(entry), "operator ticket")
+
+    [segment] = segment_paths(root)
+    segment_bytes = File.read!(segment)
+
+    assert {:ok, %{kind: :entry} = entry_record, remainder, _encoded_size} =
+             Record.decode_next(segment_bytes)
+
+    assert {:ok, %{kind: :loss_authorization} = authorization, <<>>, _encoded_size} =
+             Record.decode_next(remainder)
+
+    assert entry_record.payload_hash == entry.payload_checksum
+    assert authorization.payload_hash == entry_record.payload_hash
+
+    assert {:ok, recovered} =
+             open_store(root,
+               streams: [:checkpoint],
+               file_system: TracingFileSystem
+             )
+
+    assert Store.pending(recovered) == []
   end
 
   test "run state requires committed byte floors for every active segment", %{root: root} do
@@ -3181,7 +3625,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
              Store.enqueue(reopened, :telemetry, "reused", entry_id: second.entry_id)
   end
 
-  test "snapshot-only legacy migration persists run state before activating schema v3", %{root: root} do
+  test "snapshot-only legacy migration persists run state before activating the current schema", %{
+    root: root
+  } do
     File.mkdir_p!(root)
     File.write!(Path.join(root, "snapshot.bin"), legacy_snapshot_v1())
     TracingFileSystem.fail_run_state_rename()
@@ -3459,7 +3905,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert Enum.map(Store.pending(recovered), & &1.sequence) == [3]
   end
 
-  test "schema-v3 snapshots require explicit entry-id history metadata", %{root: root} do
+  test "schema-v4 snapshots require explicit entry-id history metadata", %{root: root} do
     assert {:ok, store} = open_store(root)
     assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
     assert {:ok, [^entry], _store} = Store.acknowledge(store, receipt_for(entry))
@@ -3534,7 +3980,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     end
   end
 
-  test "schema-v3 snapshots require a complete valid acknowledged frontier", %{root: root} do
+  test "schema-v4 snapshots require a complete valid acknowledged frontier", %{root: root} do
     assert {:ok, store} = open_store(root)
     assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
     assert {:ok, [^entry], _store} = Store.acknowledge(store, receipt_for(entry))
@@ -3555,7 +4001,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     ]
 
     Enum.with_index(invalid_frontiers, fn frontier, index ->
-      case_root = root <> "_#{index}"
+      case_root = root <> "_frontier_#{index}"
       on_exit(fn -> File.rm_rf(case_root) end)
       File.mkdir_p!(case_root)
 
@@ -3574,7 +4020,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     end)
   end
 
-  test "schema-v3 snapshots reject contradictory resolved receipt proof", %{root: root} do
+  test "schema-v4 snapshots reject contradictory resolved receipt proof", %{root: root} do
     assert {:ok, store} = open_store(root)
 
     assert {:ok, live, store} =
@@ -3636,7 +4082,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     end)
   end
 
-  test "schema-v3 snapshots reject contradictory loss authorization proof", %{root: root} do
+  test "schema-v4 snapshots reject contradictory loss authorization proof", %{root: root} do
     assert {:ok, store} = open_store(root)
 
     assert {:ok, live, store} =
@@ -3696,7 +4142,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     end)
   end
 
-  test "schema-v3 acknowledged floors cannot cross an explicitly lost sequence", %{root: root} do
+  test "schema-v4 acknowledged floors cannot cross an explicitly lost sequence", %{root: root} do
     assert {:ok, store} = open_store(root)
     assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
 
@@ -3743,6 +4189,126 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert {:ok, encoded} = Snapshot.encode(%{"entries" => []})
     <<"RODS", 1, _payload_size::64, _checksum::binary-size(32), term::binary>> = encoded
     refute match?(<<131, 80, _rest::binary>>, term)
+  end
+
+  test "current snapshots require exact payload checksums", %{root: root} do
+    assert {:ok, store} = open_store(root)
+    assert {:ok, _first, store} = Store.enqueue(store, :telemetry, "first", entry_id: entry_id(1))
+    assert {:ok, second, store} = Store.enqueue(store, :telemetry, "second", entry_id: entry_id(2))
+    assert {:ok, [^second], _store} = Store.acknowledge(store, receipt_for(second))
+
+    snapshot_path = Path.join(root, "snapshot.bin")
+    assert {:ok, snapshot} = snapshot_path |> File.read!() |> Snapshot.decode()
+    assert snapshot["schema_version"] == 4
+
+    [entry] = snapshot["entries"]
+    assert {:ok, bytes} = Snapshot.encode(%{snapshot | "entries" => [Map.delete(entry, "payload_checksum")]})
+    File.write!(snapshot_path, bytes)
+
+    assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} = open_store(root)
+    assert File.exists?(quarantine_path)
+  end
+
+  test "current snapshots require checkpoint resolved receipt checksums", %{root: root} do
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+
+    assert {:ok, entry, store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
+               entry_id: entry_id(1)
+             )
+
+    assert {:ok, [^entry], _store} = Store.acknowledge(store, receipt_for(entry))
+
+    snapshot_path = Path.join(root, "snapshot.bin")
+    assert {:ok, snapshot} = snapshot_path |> File.read!() |> Snapshot.decode()
+    assert [receipt] = snapshot["resolved_receipts"]
+    assert receipt["payload_checksum"] == entry.payload_checksum
+
+    assert {:ok, bytes} =
+             snapshot
+             |> Map.put("resolved_receipts", [Map.delete(receipt, "payload_checksum")])
+             |> Snapshot.encode()
+
+    File.write!(snapshot_path, bytes)
+
+    assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} =
+             open_store(root, streams: [:checkpoint])
+
+    assert File.exists?(quarantine_path)
+  end
+
+  test "legacy snapshots cannot authorize split checkpoint identity", %{root: root} do
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+
+    assert {:ok, entry, store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
+               entry_id: entry_id(1)
+             )
+
+    assert {:ok, _resolved, _store} = Store.authorize_loss(store, receipt_for(entry), "force snapshot")
+
+    snapshot_path = Path.join(root, "snapshot.bin")
+    assert {:ok, snapshot} = snapshot_path |> File.read!() |> Snapshot.decode()
+
+    legacy_entry =
+      entry
+      |> then(fn pending ->
+        %{
+          "stream" => "checkpoint",
+          "device_id" => pending.device_id,
+          "credential_epoch" => pending.credential_epoch,
+          "storage_epoch" => pending.storage_epoch,
+          "sequence" => pending.sequence,
+          "entry_id" => pending.entry_id,
+          "payload_hash" => pending.payload_hash,
+          "payload_checksum" => pending.payload_checksum,
+          "payload" => pending.payload,
+          "priority" => pending.priority
+        }
+      end)
+
+    legacy =
+      snapshot
+      |> Map.put("schema_version", 3)
+      |> Map.put("next_sequences", [{"checkpoint", 2}])
+      |> Map.put("entries", [legacy_entry])
+      |> Map.put("loss_authorizations", [])
+      |> Map.put("entry_id_tombstones", [])
+      |> Map.put("resolved_receipts", [])
+      |> Map.put("acknowledged_floors", [{"checkpoint", 0}])
+
+    assert {:ok, bytes} = Snapshot.encode(legacy)
+    File.write!(snapshot_path, bytes)
+
+    assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} =
+             open_store(root, streams: [:checkpoint])
+
+    assert File.exists?(quarantine_path)
+  end
+
+  test "malformed snapshot payloads quarantine instead of crashing hydration", %{root: root} do
+    assert {:ok, store} = open_store(root)
+    assert {:ok, _first, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
+    assert {:ok, second, store} = Store.enqueue(store, :telemetry, "resolved", entry_id: entry_id(2))
+    assert {:ok, [^second], _store} = Store.acknowledge(store, receipt_for(second))
+
+    snapshot_path = Path.join(root, "snapshot.bin")
+    assert {:ok, snapshot} = snapshot_path |> File.read!() |> Snapshot.decode()
+    [entry] = Map.fetch!(snapshot, "entries")
+
+    assert {:ok, bytes} =
+             snapshot
+             |> Map.put("entries", [%{entry | "payload" => %{not: "binary"}}])
+             |> Snapshot.encode()
+
+    File.write!(snapshot_path, bytes)
+
+    assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} = open_store(root)
+    assert File.exists?(quarantine_path)
   end
 
   test "hostile sequence-list shapes fail closed instead of crashing hydration", %{root: root} do
@@ -4287,6 +4853,19 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert {:error, {:quarantined, _files}} = open_store(root)
   end
 
+  test "future record versions fail closed without quarantining intact durable data", %{root: root} do
+    File.mkdir_p!(root)
+    segment = Path.join(root, "segment-00000000000000000001.log")
+    body_length = 0
+    guard = Bitwise.bxor(body_length, 0xFFFFFFFF)
+    bytes = <<"RODO", 4, 1, body_length::32, guard::32>>
+    File.write!(segment, bytes)
+
+    assert {:error, :future_record_version} = open_store(root)
+    assert File.read!(segment) == bytes
+    refute File.exists?(Path.join(root, "quarantine"))
+  end
+
   test "quarantines checksum and semantic corruption instead of skipping entries", %{root: root} do
     assert {:ok, store} = open_store(root)
     assert {:ok, _entry, _store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
@@ -4322,6 +4901,47 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
     assert {:error, {:quarantined, :unknown_stream, semantic_quarantine}} = open_store(semantic_root)
     assert File.exists?(semantic_quarantine)
+  end
+
+  test "current snapshots cannot understate entry byte-capacity accounting", %{root: root} do
+    assert {:ok, store} = open_store(root)
+    assert {:ok, first, store} = Store.enqueue(store, :telemetry, "first", entry_id: entry_id(1))
+    assert {:ok, second, store} = Store.enqueue(store, :telemetry, "second", entry_id: entry_id(2))
+    assert {:ok, [^second], _store} = Store.acknowledge(store, receipt_for(second))
+
+    snapshot_path = Path.join(root, "snapshot.bin")
+    assert {:ok, snapshot} = snapshot_path |> File.read!() |> Snapshot.decode()
+    [entry] = snapshot["entries"]
+    assert entry["encoded_size"] == first.encoded_size
+
+    assert {:ok, bytes} =
+             snapshot
+             |> Map.put("entries", [%{entry | "encoded_size" => first.encoded_size - 1}])
+             |> Snapshot.encode()
+
+    File.write!(snapshot_path, bytes)
+
+    assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} = open_store(root)
+    assert File.exists?(quarantine_path)
+  end
+
+  test "legacy segment entries retain stable byte-capacity accounting through compaction", %{root: root} do
+    File.mkdir_p!(root)
+    segment = Path.join(root, "segment-00000000000000000001.log")
+    File.write!(segment, legacy_v2_encoded_entry(1, entry_id(1), "legacy"))
+
+    assert {:ok, replayed} = open_store(root)
+    %{bytes: replayed_bytes} = Store.usage(replayed)
+
+    assert {:ok, second, replayed} =
+             Store.enqueue(replayed, :telemetry, "second", entry_id: entry_id(2))
+
+    assert {:ok, [^second], compacted} = Store.acknowledge(replayed, receipt_for(second))
+    %{bytes: compacted_bytes} = Store.usage(compacted)
+    assert compacted_bytes == replayed_bytes
+
+    assert {:ok, reopened} = open_store(root)
+    assert Store.usage(reopened).bytes == replayed_bytes
   end
 
   test "enforces entry and byte capacity as explicit backpressure without eviction", %{root: root} do
@@ -4600,7 +5220,71 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     {first, second, third}
   end
 
+  defp checkpoint_delivery(sequence, parent_hash) do
+    assert {:ok, content} =
+             Checkpoint.encode_content(:calibration, 1, %{
+               "awa_estimators" => [],
+               "aws_estimators" => [],
+               "prev_applied" => [],
+               "seq" => 0,
+               "stw_estimators" => []
+             })
+
+    assert {:ok, content_hash} = Checkpoint.content_hash(:calibration, 1, content)
+
+    attrs = %{
+      device_id: @device_id,
+      credential_epoch: @credential_epoch,
+      storage_epoch: @storage_epoch,
+      sequence: sequence,
+      kind: :calibration,
+      schema_version: 1,
+      source_generation: 42,
+      parent_hash: parent_hash,
+      content_hash: content_hash
+    }
+
+    assert {:ok, checkpoint_hash} = Checkpoint.hash(attrs)
+
+    submission =
+      attrs
+      |> Map.put(:checkpoint_hash, checkpoint_hash)
+      |> Map.put(:content, content)
+
+    assert {:ok, payload} = Messages.encode(:checkpoint_submission, submission)
+    {:ok, %{payload: payload, payload_hash: checkpoint_hash}}
+  end
+
+  defp legacy_v2_encoded_entry(sequence, id, payload) do
+    stream = "telemetry"
+    sequence_bytes = :binary.encode_unsigned(sequence)
+    payload_hash = :crypto.hash(:sha256, payload)
+
+    prefix =
+      <<byte_size(stream)::16, stream::binary, @device_id, @credential_epoch::32, @storage_epoch,
+        byte_size(sequence_bytes)::16, sequence_bytes::binary, byte_size(id)::16, id::binary,
+        payload_hash::binary-size(32), byte_size(payload)::64>>
+
+    kind_code = 1
+
+    checksum =
+      :crypto.hash(:sha256, [
+        "RacingOrg-DurableOutboxRecordChecksum-v1",
+        <<2, kind_code>>,
+        prefix,
+        payload,
+        <<0>>
+      ])
+
+    body = prefix <> checksum <> payload <> <<0>>
+    body_length = byte_size(body)
+    guard = Bitwise.bxor(body_length, 0xFFFFFFFF)
+    <<"RODO", 2, kind_code, body_length::32, guard::32, body::binary>>
+  end
+
   defp encoded_entry(sequence, id, payload) do
+    payload_checksum = :crypto.hash(:sha256, payload)
+
     {:ok, encoded} =
       Record.encode(%{
         kind: :entry,
@@ -4610,7 +5294,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
         storage_epoch: @storage_epoch,
         sequence: sequence,
         entry_id: id,
-        payload_hash: :crypto.hash(:sha256, payload),
+        payload_hash: payload_checksum,
         payload: payload,
         priority: 0
       })

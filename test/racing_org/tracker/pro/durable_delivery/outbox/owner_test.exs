@@ -3,6 +3,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
 
   alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner
 
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{
+    Checkpoint,
+    Messages,
+    Receipt
+  }
+
   @storage_epoch Base.decode16!("00112233445566778899aabbccddeeff", case: :lower)
   @other_storage_epoch Base.decode16!("ffeeddccbbaa99887766554433221100", case: :lower)
   @device_id Base.decode16!("0f1e2d3c4b5a69788796a5b4c3d2e1f0", case: :lower)
@@ -442,42 +448,96 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       assert Owner.pending(owner, stream: :checkpoint) == []
     end
 
-    test "builds checkpoint payloads from authoritative sequences in parent-first order", %{root: root} do
+    test "persists the exact checkpoint submission under its semantic receipt hash", %{root: root} do
       assert {:ok, owner} = start_owner(root, streams: [:checkpoint])
+      parent_hash = <<0::256>>
+
+      builder = fn sequence -> checkpoint_delivery(sequence, parent_hash) end
+      assert {:ok, receipt} = Owner.enqueue_checkpoint(owner, builder)
+      assert [pending] = Owner.pending(owner, stream: :checkpoint)
+
+      assert {:ok, submission} = Messages.decode(:checkpoint_submission, pending.payload)
+      assert submission.sequence == 1
+      assert pending.payload_hash == submission.checkpoint_hash
+      assert pending.payload_checksum == :crypto.hash(:sha256, pending.payload)
+      assert pending.payload_hash != pending.payload_checksum
+      assert receipt.payload_hash == submission.checkpoint_hash
+
+      assert {:ok, receipt_hash} = Receipt.hash(receipt)
+
+      wire_receipt = Map.put(receipt, :receipt_hash, receipt_hash)
+      assert {:ok, receipt_bytes} = Messages.encode(:delivery_receipt, wire_receipt)
+      assert {:ok, decoded_receipt} = Messages.decode(:delivery_receipt, receipt_bytes)
+      assert {:ok, [^pending]} = Owner.acknowledge(owner, Map.delete(decoded_receipt, :receipt_hash))
+
+      assert Owner.pending(owner, stream: :checkpoint) == []
+    end
+
+    test "rejects checkpoint submissions outside the locked durable identity", %{root: root} do
+      assert {:ok, owner} = start_owner(root, streams: [:checkpoint])
+      parent_hash = <<0::256>>
+
+      invalid_builders = [
+        fn sequence ->
+          {:ok, delivery} = checkpoint_delivery(sequence, parent_hash)
+          {:ok, %{delivery | payload_hash: <<0xA5::256>>}}
+        end,
+        fn sequence -> checkpoint_delivery(sequence + 1, parent_hash) end,
+        fn sequence ->
+          {:ok, delivery} = checkpoint_delivery(sequence, parent_hash)
+          {:ok, submission} = Messages.decode(:checkpoint_submission, delivery.payload)
+
+          submission =
+            %{submission | credential_epoch: submission.credential_epoch + 1}
+
+          {:ok, checkpoint_hash} =
+            submission
+            |> Map.drop([:checkpoint_hash, :content])
+            |> Checkpoint.hash()
+
+          submission = %{submission | checkpoint_hash: checkpoint_hash}
+          {:ok, payload} = Messages.encode(:checkpoint_submission, submission)
+          {:ok, %{payload: payload, payload_hash: checkpoint_hash}}
+        end
+      ]
+
+      for builder <- invalid_builders do
+        assert {:error, :checkpoint_submission_mismatch} =
+                 Owner.enqueue_checkpoint(owner, builder)
+
+        assert Owner.pending(owner, stream: :checkpoint) == []
+      end
+    end
+
+    test "replays complete checkpoint submissions with both hashes intact", %{root: root} do
+      assert {:ok, owner} = start_owner(root, streams: [:checkpoint])
+      parent_hash = <<0::256>>
 
       assert {:ok, first} =
-               Owner.enqueue_checkpoint(owner, fn 1 ->
-                 {:ok, "parent-sequence-1"}
-               end)
+               Owner.enqueue_checkpoint(owner, fn sequence -> checkpoint_delivery(sequence, parent_hash) end)
+
+      assert [first_pending] = Owner.pending(owner, stream: :checkpoint)
 
       assert {:ok, second} =
-               Owner.enqueue_checkpoint(owner, fn 2 ->
-                 {:ok, "child-sequence-2"}
+               Owner.enqueue_checkpoint(owner, fn sequence ->
+                 checkpoint_delivery(sequence, first.payload_hash)
                end)
 
       assert first.sequence == 1
-      assert first.payload_hash == :crypto.hash(:sha256, "parent-sequence-1")
       assert second.sequence == 2
-      assert second.payload_hash == :crypto.hash(:sha256, "child-sequence-2")
-
-      assert Enum.map(
-               Owner.pending(owner, stream: :checkpoint),
-               &{&1.sequence, &1.payload, &1.priority}
-             ) == [
-               {1, "parent-sequence-1", 0},
-               {2, "child-sequence-2", 0}
-             ]
-
       assert :ok = stop_owner(owner)
       assert {:ok, restarted} = start_owner(root, streams: [:checkpoint])
 
-      assert Enum.map(
-               Owner.pending(restarted, stream: :checkpoint),
-               &{&1.sequence, &1.payload}
-             ) == [
-               {1, "parent-sequence-1"},
-               {2, "child-sequence-2"}
-             ]
+      assert [replayed_first, replayed_second] =
+               Owner.pending(restarted, stream: :checkpoint)
+
+      assert replayed_first.payload == first_pending.payload
+
+      for entry <- [replayed_first, replayed_second] do
+        assert {:ok, submission} = Messages.decode(:checkpoint_submission, entry.payload)
+        assert entry.payload_hash == submission.checkpoint_hash
+        assert entry.payload_checksum == :crypto.hash(:sha256, entry.payload)
+      end
     end
   end
 
@@ -733,6 +793,41 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
 
     @impl true
     def truncate(device), do: FileSystem.truncate(device)
+  end
+
+  defp checkpoint_delivery(sequence, parent_hash) do
+    assert {:ok, content} =
+             Checkpoint.encode_content(:calibration, 1, %{
+               "awa_estimators" => [],
+               "aws_estimators" => [],
+               "prev_applied" => [],
+               "seq" => 0,
+               "stw_estimators" => []
+             })
+
+    assert {:ok, content_hash} = Checkpoint.content_hash(:calibration, 1, content)
+
+    attrs = %{
+      device_id: @device_id,
+      credential_epoch: @credential_epoch,
+      storage_epoch: @storage_epoch,
+      sequence: sequence,
+      kind: :calibration,
+      schema_version: 1,
+      source_generation: 42,
+      parent_hash: parent_hash,
+      content_hash: content_hash
+    }
+
+    assert {:ok, checkpoint_hash} = Checkpoint.hash(attrs)
+
+    submission =
+      attrs
+      |> Map.put(:checkpoint_hash, checkpoint_hash)
+      |> Map.put(:content, content)
+
+    assert {:ok, payload} = Messages.encode(:checkpoint_submission, submission)
+    {:ok, %{payload: payload, payload_hash: checkpoint_hash}}
   end
 
   defp identity(overrides \\ []) do

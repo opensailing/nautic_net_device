@@ -31,13 +31,16 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     Snapshot
   }
 
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages
+
   @dir_mode 0o700
   @file_mode 0o600
   @segment_pattern ~r/^segment-(\d{20})\.log$/
   @snapshot_temp_pattern ~r/^snapshot\.bin\.tmp\.[0-9a-f]+$/
   @run_state_temp_pattern ~r/^run-state\.bin\.tmp\.[0-9a-f]+$/
   @run_state_marker "RODM\x01"
-  @snapshot_schema_version 3
+  @legacy_snapshot_schema_version 3
+  @snapshot_schema_version 4
   @default_max_loss_authorizations 128
   @default_max_entry_id_tombstones 4_096
   @default_max_resolved_receipts 4_096
@@ -277,8 +280,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   end
 
   @doc "Build and durably append one checkpoint payload under its exact locked sequence."
-  @spec enqueue_checkpoint(t(), (pos_integer() -> {:ok, binary()} | {:error, term()}), keyword()) ::
-          {:ok, Entry.t(), t()} | {:error, term()}
+  @spec enqueue_checkpoint(
+          t(),
+          (pos_integer() ->
+             {:ok, %{payload: binary(), payload_hash: <<_::256>>}} | {:error, term()}),
+          keyword()
+        ) :: {:ok, Entry.t(), t()} | {:error, term()}
   def enqueue_checkpoint(store, builder, opts \\ [])
 
   def enqueue_checkpoint(%__MODULE__{} = store, builder, opts) when is_function(builder, 1) do
@@ -296,7 +303,16 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          {:ok, entry_id} <- entry_id(store, opts),
          :ok <- unique_entry_id(store, entry_id),
          sequence <- Map.fetch!(store.next_sequences, stream) do
-      append_entry(store, stream, stream_name, sequence, entry_id, payload, priority)
+      append_entry(
+        store,
+        stream,
+        stream_name,
+        sequence,
+        entry_id,
+        payload,
+        :crypto.hash(:sha256, payload),
+        priority
+      )
     end
   end
 
@@ -307,8 +323,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          {:ok, entry_id} <- entry_id(store, opts),
          :ok <- unique_entry_id(store, entry_id),
          sequence <- Map.fetch!(store.next_sequences, :checkpoint),
-         {:ok, payload} <- checkpoint_payload(builder, sequence),
-         :ok <- validate_payload(payload) do
+         {:ok, payload, payload_hash} <- checkpoint_payload(store, builder, sequence) do
       append_entry(
         store,
         :checkpoint,
@@ -316,13 +331,23 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
         sequence,
         entry_id,
         payload,
+        payload_hash,
         @checkpoint_priority
       )
     end
   end
 
-  defp append_entry(store, stream, stream_name, sequence, entry_id, payload, priority) do
-    payload_hash = :crypto.hash(:sha256, payload)
+  defp append_entry(
+         store,
+         stream,
+         stream_name,
+         sequence,
+         entry_id,
+         payload,
+         payload_hash,
+         priority
+       ) do
+    payload_checksum = :crypto.hash(:sha256, payload)
 
     with {:ok, encoded} <-
            Record.encode(%{
@@ -333,7 +358,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
              storage_epoch: store.storage_epoch,
              sequence: sequence,
              entry_id: entry_id,
-             payload_hash: payload_hash,
+             payload_hash: payload_checksum,
              payload: payload,
              priority: priority
            }),
@@ -346,6 +371,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
            sequence: sequence,
            entry_id: entry_id,
            payload_hash: payload_hash,
+           payload_checksum: payload_checksum,
            payload: payload,
            priority: priority,
            encoded_size: byte_size(encoded),
@@ -428,23 +454,24 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp do_acknowledge(store, receipt) do
     with {:ok, normalized} <- validate_receipt(store, receipt),
          {:ok, removed} <- acknowledged_entries(store, normalized),
-         {:ok, stream_name} <- configured_stream_name(store, normalized.stream),
+         {:ok, durable_receipt} <- acknowledgement_with_payload_checksum(store, normalized),
+         {:ok, stream_name} <- configured_stream_name(store, durable_receipt.stream),
          {:ok, encoded} <-
            Record.encode(%{
              kind: :acknowledgement,
              stream: stream_name,
-             device_id: normalized.device_id,
-             credential_epoch: normalized.credential_epoch,
-             storage_epoch: normalized.storage_epoch,
-             sequence: normalized.sequence,
-             payload_hash: normalized.payload_hash,
-             cumulative_sequence: normalized.cumulative_sequence
+             device_id: durable_receipt.device_id,
+             credential_epoch: durable_receipt.credential_epoch,
+             storage_epoch: durable_receipt.storage_epoch,
+             sequence: durable_receipt.sequence,
+             payload_hash: durable_receipt.payload_checksum,
+             cumulative_sequence: durable_receipt.cumulative_sequence
            }),
          covered_segment_id <- append_segment_id(store, byte_size(encoded)),
-         resolved = apply_acknowledgement_state(store, removed, normalized),
+         resolved = apply_acknowledgement_state(store, removed, durable_receipt),
          {:ok, snapshot_bytes} <- encode_snapshot(resolved, covered_segment_id),
          {:ok, appended} <- append_encoded(store, encoded, byte_size(snapshot_bytes)),
-         resolved = apply_acknowledgement_state(appended, removed, normalized),
+         resolved = apply_acknowledgement_state(appended, removed, durable_receipt),
          {:ok, resolved} <- persist_run_state_after_append(resolved),
          {:ok, compacted} <- compact_store(resolved, snapshot_bytes) do
       {:ok, removed, compacted}
@@ -473,7 +500,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
              storage_epoch: entry.storage_epoch,
              sequence: entry.sequence,
              entry_id: entry.entry_id,
-             payload_hash: entry.payload_hash,
+             payload_hash: entry.payload_checksum,
              reason: reason
            }),
          authorization = authorization_from_entry(entry, reason),
@@ -1096,7 +1123,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
   defp hydrate_snapshot(store, snapshot, snapshot_bytes) when is_map(snapshot) do
     case Map.get(snapshot, "schema_version", 1) do
-      version when version in [1, 2, @snapshot_schema_version] ->
+      version when version in [1, 2, @legacy_snapshot_schema_version, @snapshot_schema_version] ->
         do_hydrate_snapshot(store, snapshot, snapshot_bytes, version)
 
       _version ->
@@ -1126,7 +1153,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          :ok <- exact_storage_epoch(store, storage_epoch),
          {:ok, next_sequences} <- hydrate_next_sequences(store, next_sequences, :invalid_snapshot),
          {:ok, entries, live_bytes, live_entry_ids} <-
-           hydrate_entries(store, entries, next_sequences),
+           hydrate_entries(store, entries, next_sequences, schema_version),
          {:ok, loss_authorizations} <- hydrate_loss_authorizations(store, loss_authorizations),
          :ok <-
            validate_loss_authorizations(
@@ -1262,12 +1289,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
        ),
        do: {:error, invalid_reason}
 
-  defp hydrate_entries(store, values, next_sequences) when is_list(values) do
+  defp hydrate_entries(store, values, next_sequences, schema_version) when is_list(values) do
     result =
       Enum.reduce_while(values, {:ok, [], 0, MapSet.new(), MapSet.new(), 1}, fn value,
                                                                                 {:ok, entries, live_bytes, entry_ids,
                                                                                  identities, ordinal} ->
-        with {:ok, entry, encoded_size} <- hydrate_entry(store, value, next_sequences, ordinal),
+        with {:ok, entry, encoded_size} <-
+               hydrate_entry(store, value, next_sequences, schema_version, ordinal),
              entry_id_hash = entry_id_hash(entry.entry_id),
              false <- MapSet.member?(entry_ids, entry_id_hash),
              identity = {entry.stream, entry.sequence},
@@ -1292,7 +1320,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     end
   end
 
-  defp hydrate_entries(_store, _values, _next_sequences), do: {:error, :invalid_snapshot}
+  defp hydrate_entries(_store, _values, _next_sequences, _schema_version),
+    do: {:error, :invalid_snapshot}
 
   defp hydrate_entry(
          store,
@@ -1306,21 +1335,34 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
            "payload_hash" => payload_hash,
            "payload" => payload,
            "priority" => priority
-         },
+         } = value,
          next_sequences,
+         schema_version,
          ordinal
        ) do
-    with {:ok, stream} <- configured_stream(store, stream_name),
+    with {:ok, payload_checksum} <- snapshot_payload_checksum(value, payload, schema_version),
+         {:ok, stream} <- configured_stream(store, stream_name),
          :ok <- exact_device_id(store, device_id),
          :ok <- exact_credential_epoch(store, credential_epoch),
          :ok <- exact_storage_epoch(store, storage_epoch),
          true <- is_integer(sequence) and sequence > 0 and sequence < Map.fetch!(next_sequences, stream),
          true <- is_binary(entry_id) and byte_size(entry_id) > 0 and byte_size(entry_id) <= 65_535,
          true <- is_binary(payload_hash) and byte_size(payload_hash) == 32,
-         true <- is_binary(payload) and :crypto.hash(:sha256, payload) == payload_hash,
+         true <- is_binary(payload_checksum) and byte_size(payload_checksum) == 32,
+         true <- is_binary(payload) and :crypto.hash(:sha256, payload) == payload_checksum,
+         true <- legacy_or_stream_hashes_match?(schema_version, stream, payload_hash, payload_checksum),
+         :ok <-
+           validate_recovered_checkpoint_submission(
+             store,
+             stream,
+             sequence,
+             payload,
+             payload_hash,
+             payload_checksum
+           ),
          true <- is_integer(priority) and priority in 0..255,
-         {:ok, encoded} <-
-           Record.encode(%{
+         {:ok, encoded_size} <-
+           snapshot_entry_encoded_size(value, schema_version, %{
              kind: :entry,
              stream: stream_name,
              device_id: device_id,
@@ -1328,7 +1370,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
              storage_epoch: storage_epoch,
              sequence: sequence,
              entry_id: entry_id,
-             payload_hash: payload_hash,
+             payload_hash: payload_checksum,
              payload: payload,
              priority: priority
            }) do
@@ -1340,20 +1382,67 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
         sequence: sequence,
         entry_id: entry_id,
         payload_hash: payload_hash,
+        payload_checksum: payload_checksum,
         payload: payload,
         priority: priority,
         encoded_size: 0,
         ordinal: ordinal
       }
 
-      {:ok, entry, byte_size(encoded)}
+      {:ok, entry, encoded_size}
     else
       false -> {:error, :invalid_snapshot}
       error -> error
     end
   end
 
-  defp hydrate_entry(_store, _value, _next_sequences, _ordinal), do: {:error, :invalid_snapshot}
+  defp hydrate_entry(_store, _value, _next_sequences, _schema_version, _ordinal),
+    do: {:error, :invalid_snapshot}
+
+  defp snapshot_entry_encoded_size(value, schema_version, record) do
+    with {:ok, encoded} <- Record.encode(record) do
+      current_size = byte_size(encoded)
+
+      case Map.fetch(value, "encoded_size") do
+        {:ok, encoded_size}
+        when schema_version == @snapshot_schema_version and encoded_size == current_size ->
+          {:ok, encoded_size}
+
+        :error when schema_version in [1, 2, @legacy_snapshot_schema_version] ->
+          {:ok, current_size}
+
+        {:ok, _encoded_size} when schema_version in [1, 2, @legacy_snapshot_schema_version] ->
+          {:ok, current_size}
+
+        _result ->
+          {:error, :invalid_snapshot}
+      end
+    end
+  end
+
+  defp legacy_or_stream_hashes_match?(schema_version, _stream, payload_hash, payload_checksum)
+       when schema_version in [1, 2, @legacy_snapshot_schema_version],
+       do: payload_hash == payload_checksum
+
+  defp legacy_or_stream_hashes_match?(@snapshot_schema_version, :checkpoint, _payload_hash, _payload_checksum),
+    do: true
+
+  defp legacy_or_stream_hashes_match?(@snapshot_schema_version, _stream, payload_hash, payload_checksum),
+    do: payload_hash == payload_checksum
+
+  defp snapshot_payload_checksum(value, payload, @snapshot_schema_version) when is_binary(payload) do
+    case Map.fetch(value, "payload_checksum") do
+      {:ok, checksum} -> {:ok, checksum}
+      :error -> {:error, :invalid_snapshot}
+    end
+  end
+
+  defp snapshot_payload_checksum(_value, payload, schema_version)
+       when is_binary(payload) and schema_version in [1, 2, @legacy_snapshot_schema_version],
+       do: {:ok, :crypto.hash(:sha256, payload)}
+
+  defp snapshot_payload_checksum(_value, _payload, _schema_version),
+    do: {:error, :invalid_snapshot}
 
   defp hydrate_loss_authorizations(store, values) when is_list(values) do
     Enum.reduce_while(values, {:ok, []}, fn value, {:ok, acc} ->
@@ -1506,11 +1595,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
 
   defp hydrate_entry_id_history_complete(
          snapshot,
-         @snapshot_schema_version,
+         schema_version,
          _next,
          _entries,
          _losses
-       ) do
+       )
+       when schema_version in [@legacy_snapshot_schema_version, @snapshot_schema_version] do
     case Map.fetch(
            snapshot,
            "entry_id_history_complete"
@@ -1556,9 +1646,10 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp hydrate_entry_id_tombstones(
          store,
          snapshot,
-         @snapshot_schema_version,
+         schema_version,
          live_entry_ids
-       ) do
+       )
+       when schema_version in [@legacy_snapshot_schema_version, @snapshot_schema_version] do
     case Map.fetch(
            snapshot,
            "entry_id_tombstones"
@@ -1597,12 +1688,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp hydrate_resolved_receipts(_store, _snapshot, 1), do: {:ok, []}
 
   defp hydrate_resolved_receipts(store, snapshot, schema_version)
-       when schema_version in [2, @snapshot_schema_version] do
+       when schema_version in [2, @legacy_snapshot_schema_version, @snapshot_schema_version] do
     case Map.fetch(snapshot, "resolved_receipts") do
       {:ok, values} when is_list(values) ->
         values
         |> Enum.reduce_while({:ok, []}, fn value, {:ok, acc} ->
-          case hydrate_resolved_receipt(store, value) do
+          case hydrate_resolved_receipt(store, value, schema_version) do
             {:ok, receipt} -> {:cont, {:ok, acc ++ [receipt]}}
             {:error, reason} -> {:halt, {:error, reason}}
           end
@@ -1626,14 +1717,17 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
            "storage_epoch" => storage_epoch,
            "sequence" => sequence,
            "payload_hash" => payload_hash
-         }
+         } = value,
+         schema_version
        ) do
     with {:ok, stream} <- configured_stream(store, stream_name),
          :ok <- exact_device_id(store, device_id),
          :ok <- exact_credential_epoch(store, credential_epoch),
          :ok <- exact_storage_epoch(store, storage_epoch),
          true <- is_integer(sequence) and sequence > 0,
-         true <- is_binary(payload_hash) and byte_size(payload_hash) == 32 do
+         true <- is_binary(payload_hash) and byte_size(payload_hash) == 32,
+         {:ok, payload_checksum} <-
+           resolved_receipt_payload_checksum(value, stream, payload_hash, schema_version) do
       {:ok,
        %{
          stream: stream,
@@ -1641,7 +1735,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          credential_epoch: credential_epoch,
          storage_epoch: storage_epoch,
          sequence: sequence,
-         payload_hash: payload_hash
+         payload_hash: payload_hash,
+         payload_checksum: payload_checksum
        }}
     else
       false -> {:error, :invalid_snapshot}
@@ -1649,7 +1744,26 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     end
   end
 
-  defp hydrate_resolved_receipt(_store, _value), do: {:error, :invalid_snapshot}
+  defp hydrate_resolved_receipt(_store, _value, _schema_version), do: {:error, :invalid_snapshot}
+
+  defp resolved_receipt_payload_checksum(value, :checkpoint, _payload_hash, @snapshot_schema_version) do
+    case Map.fetch(value, "payload_checksum") do
+      {:ok, <<_::256>> = payload_checksum} -> {:ok, payload_checksum}
+      _result -> {:error, :invalid_snapshot}
+    end
+  end
+
+  defp resolved_receipt_payload_checksum(value, _stream, payload_hash, @snapshot_schema_version) do
+    case Map.fetch(value, "payload_checksum") do
+      {:ok, <<_::256>> = ^payload_hash} -> {:ok, payload_hash}
+      :error -> {:ok, payload_hash}
+      _result -> {:error, :invalid_snapshot}
+    end
+  end
+
+  defp resolved_receipt_payload_checksum(_value, _stream, payload_hash, schema_version)
+       when schema_version in [2, @legacy_snapshot_schema_version],
+       do: {:ok, payload_hash}
 
   defp validate_resolved_receipts(
          receipts,
@@ -1755,12 +1869,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp hydrate_acknowledged_floors(
          store,
          snapshot,
-         @snapshot_schema_version,
+         schema_version,
          next_sequences,
          entries,
          loss_authorizations,
          resolved_receipts
-       ) do
+       )
+       when schema_version in [@legacy_snapshot_schema_version, @snapshot_schema_version] do
     with {:ok, values} <- Map.fetch(snapshot, "acknowledged_floors"),
          {:ok, floors} <-
            hydrate_stream_counters(
@@ -1956,6 +2071,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       {:incomplete, _expected_size} ->
         {:corrupt, {:incomplete_record, offset}}
 
+      {:error, :future_record_version} ->
+        {:error, :future_record_version}
+
       {:error, reason} ->
         if final? and recoverable_zero_padded_tail?(store, path, bytes, offset),
           do: {:ok, store, offset, {path, offset}},
@@ -2049,7 +2167,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          :ok <- exact_storage_epoch(store, record.storage_epoch),
          {:ok, stream} <- configured_stream(store, record.stream),
          :ok <- expected_sequence(store, stream, record.sequence),
-         :ok <- unique_replayed_entry_id(store, record.entry_id) do
+         :ok <- unique_replayed_entry_id(store, record.entry_id),
+         {:ok, payload_hash} <- recovered_payload_hash(store, stream, record) do
       entry = %Entry{
         stream: stream,
         device_id: record.device_id,
@@ -2057,7 +2176,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
         storage_epoch: record.storage_epoch,
         sequence: record.sequence,
         entry_id: record.entry_id,
-        payload_hash: record.payload_hash,
+        payload_hash: payload_hash,
+        payload_checksum: record.payload_hash,
         payload: record.payload,
         priority: record.priority,
         encoded_size: encoded_size,
@@ -2074,6 +2194,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          :ok <- exact_storage_epoch(store, record.storage_epoch),
          {:ok, stream} <- configured_stream(store, record.stream),
          normalized = %{record | stream: stream},
+         {:ok, normalized} <- acknowledgement_with_semantic_payload_hash(store, normalized),
          {:ok, removed} <- acknowledged_entries(store, normalized),
          {:ok, replayed} <- apply_replayed_acknowledgement_state(store, removed, normalized) do
       {:ok, replayed}
@@ -2086,7 +2207,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          :ok <- exact_storage_epoch(store, record.storage_epoch),
          {:ok, stream} <- configured_stream(store, record.stream),
          normalized = %{record | stream: stream},
-         {:ok, entry} <- matching_entry(store, normalized),
+         {:ok, entry} <- matching_replayed_entry(store, normalized),
          true <- entry.entry_id == record.entry_id,
          {:ok, resolved} <- resolve_replayed_entries(store, [entry]) do
       authorization = authorization_from_entry(entry, record.reason)
@@ -2229,10 +2350,15 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp generic_enqueue_stream(_stream),
     do: :ok
 
-  defp checkpoint_payload(builder, sequence) do
+  defp checkpoint_payload(store, builder, sequence) do
     case builder.(sequence) do
-      {:ok, payload} ->
-        {:ok, payload}
+      {:ok, %{payload: payload, payload_hash: <<_::256>> = payload_hash} = built}
+      when map_size(built) == 2 and is_binary(payload) ->
+        validate_checkpoint_submission(store, sequence, payload, payload_hash)
+
+      {:ok, %{payload: _payload, payload_hash: <<_::256>>} = built}
+      when map_size(built) == 2 ->
+        {:error, :invalid_payload}
 
       {:error, _reason} = error ->
         error
@@ -2246,6 +2372,89 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   catch
     _kind, _reason ->
       {:error, :checkpoint_builder_failed}
+  end
+
+  defp validate_checkpoint_submission(store, sequence, payload, payload_hash) do
+    case validate_checkpoint_submission_identity(store, sequence, payload, payload_hash) do
+      :ok -> {:ok, payload, payload_hash}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  defp recovered_payload_hash(_store, stream, record) when stream != :checkpoint,
+    do: {:ok, record.payload_hash}
+
+  defp recovered_payload_hash(store, :checkpoint, record) do
+    case Messages.decode(:checkpoint_submission, record.payload) do
+      {:ok, submission} ->
+        with :ok <-
+               validate_decoded_checkpoint_submission_identity(
+                 store,
+                 record.sequence,
+                 submission
+               ) do
+          {:ok, submission.checkpoint_hash}
+        end
+
+      {:error, _reason} ->
+        {:ok, record.payload_hash}
+    end
+  end
+
+  defp validate_recovered_checkpoint_submission(
+         _store,
+         stream,
+         _sequence,
+         _payload,
+         _payload_hash,
+         _payload_checksum
+       )
+       when stream != :checkpoint,
+       do: :ok
+
+  defp validate_recovered_checkpoint_submission(
+         store,
+         :checkpoint,
+         sequence,
+         payload,
+         payload_hash,
+         payload_checksum
+       ) do
+    case Messages.decode(:checkpoint_submission, payload) do
+      {:ok, submission} ->
+        with :ok <- validate_decoded_checkpoint_submission_identity(store, sequence, submission),
+             true <- submission.checkpoint_hash == payload_hash do
+          :ok
+        else
+          _mismatch -> {:error, :checkpoint_submission_mismatch}
+        end
+
+      {:error, _reason} ->
+        if payload_hash == payload_checksum,
+          do: :ok,
+          else: {:error, :checkpoint_submission_mismatch}
+    end
+  end
+
+  defp validate_checkpoint_submission_identity(store, sequence, payload, payload_hash) do
+    with {:ok, submission} <- Messages.decode(:checkpoint_submission, payload),
+         :ok <- validate_decoded_checkpoint_submission_identity(store, sequence, submission),
+         true <- submission.checkpoint_hash == payload_hash do
+      :ok
+    else
+      _mismatch -> {:error, :checkpoint_submission_mismatch}
+    end
+  end
+
+  defp validate_decoded_checkpoint_submission_identity(store, sequence, submission) do
+    with true <- submission.device_id == store.device_id,
+         true <- submission.credential_epoch == store.credential_epoch,
+         true <- submission.storage_epoch == store.storage_epoch,
+         true <- submission.sequence == sequence do
+      :ok
+    else
+      _mismatch -> {:error, :checkpoint_submission_mismatch}
+    end
   end
 
   defp validate_payload(payload) when is_binary(payload), do: :ok
@@ -2864,13 +3073,15 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       "sequence" => entry.sequence,
       "entry_id" => entry.entry_id,
       "payload_hash" => entry.payload_hash,
+      "payload_checksum" => entry.payload_checksum,
       "payload" => entry.payload,
+      "encoded_size" => entry.encoded_size,
       "priority" => entry.priority
     }
   end
 
   defp snapshot_resolved_receipt(store, receipt) do
-    %{
+    snapshot = %{
       "stream" => Map.fetch!(store.stream_names, receipt.stream),
       "device_id" => receipt.device_id,
       "credential_epoch" => receipt.credential_epoch,
@@ -2878,6 +3089,10 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       "sequence" => receipt.sequence,
       "payload_hash" => receipt.payload_hash
     }
+
+    if receipt.payload_checksum == receipt.payload_hash,
+      do: snapshot,
+      else: Map.put(snapshot, "payload_checksum", receipt.payload_checksum)
   end
 
   defp snapshot_loss_authorization(store, authorization) do
@@ -3215,7 +3430,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     do: receipt_identity(left) == receipt_identity(right)
 
   defp receipt_identity_map(receipt) do
-    Map.take(receipt, [
+    receipt
+    |> Map.take([
       :stream,
       :device_id,
       :credential_epoch,
@@ -3223,6 +3439,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       :sequence,
       :payload_hash
     ])
+    |> Map.put(:payload_checksum, Map.get(receipt, :payload_checksum, receipt.payload_hash))
   end
 
   defp receipt_identity(receipt) do
@@ -3345,18 +3562,102 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   defp exact_credential_epoch(_store, _epoch), do: {:error, :credential_epoch_mismatch}
 
   defp matching_entry(store, identity) do
+    matching_entry(store, identity, :semantic)
+  end
+
+  defp matching_replayed_entry(store, identity) do
+    matching_entry(store, identity, :durable)
+  end
+
+  defp matching_entry(store, identity, hash_kind) do
     case Enum.find(store.entries, &(&1.stream == identity.stream and &1.sequence == identity.sequence)) do
       nil ->
         {:error, :receipt_entry_not_found}
 
       entry ->
         cond do
-          entry.device_id != identity.device_id -> {:error, :device_id_mismatch}
-          entry.credential_epoch != identity.credential_epoch -> {:error, :credential_epoch_mismatch}
-          entry.storage_epoch != identity.storage_epoch -> {:error, :storage_epoch_mismatch}
-          entry.payload_hash != identity.payload_hash -> {:error, :payload_hash_mismatch}
-          true -> {:ok, entry}
+          entry.device_id != identity.device_id ->
+            {:error, :device_id_mismatch}
+
+          entry.credential_epoch != identity.credential_epoch ->
+            {:error, :credential_epoch_mismatch}
+
+          entry.storage_epoch != identity.storage_epoch ->
+            {:error, :storage_epoch_mismatch}
+
+          not entry_hash_matches?(entry, identity.payload_hash, hash_kind) ->
+            {:error, :payload_hash_mismatch}
+
+          true ->
+            {:ok, entry}
         end
+    end
+  end
+
+  defp entry_hash_matches?(entry, payload_hash, :semantic), do: entry.payload_hash == payload_hash
+
+  defp entry_hash_matches?(entry, payload_hash, :durable),
+    do: entry.payload_checksum == payload_hash or entry.payload_hash == payload_hash
+
+  defp acknowledgement_with_payload_checksum(store, receipt) do
+    case matching_entry(store, receipt) do
+      {:ok, entry} ->
+        {:ok, Map.put(receipt, :payload_checksum, entry.payload_checksum)}
+
+      {:error, :receipt_entry_not_found} ->
+        case resolved_receipt(store, receipt) do
+          {:ok, resolved} -> {:ok, Map.put(receipt, :payload_checksum, resolved.payload_checksum)}
+          :error -> {:error, :receipt_entry_not_found}
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp acknowledgement_with_semantic_payload_hash(store, receipt) do
+    case matching_replayed_entry(store, receipt) do
+      {:ok, entry} ->
+        {:ok,
+         receipt
+         |> Map.put(:payload_checksum, entry.payload_checksum)
+         |> Map.put(:payload_hash, entry.payload_hash)}
+
+      {:error, :receipt_entry_not_found} ->
+        case resolved_receipt_by_checksum(store, receipt) do
+          {:ok, resolved} ->
+            {:ok,
+             receipt
+             |> Map.put(:payload_checksum, resolved.payload_checksum)
+             |> Map.put(:payload_hash, resolved.payload_hash)}
+
+          :error ->
+            {:error, :receipt_entry_not_found}
+        end
+
+      error ->
+        error
+    end
+  end
+
+  defp resolved_receipt(store, identity) do
+    case Enum.find(store.resolved_receipts, &same_receipt_identity?(&1, identity)) do
+      nil -> :error
+      receipt -> {:ok, receipt}
+    end
+  end
+
+  defp resolved_receipt_by_checksum(store, identity) do
+    case Enum.find(store.resolved_receipts, fn receipt ->
+           receipt.stream == identity.stream and receipt.device_id == identity.device_id and
+             receipt.credential_epoch == identity.credential_epoch and
+             receipt.storage_epoch == identity.storage_epoch and
+             receipt.sequence == identity.sequence and
+             (receipt.payload_checksum == identity.payload_hash or
+                receipt.payload_hash == identity.payload_hash)
+         end) do
+      nil -> :error
+      receipt -> {:ok, receipt}
     end
   end
 
