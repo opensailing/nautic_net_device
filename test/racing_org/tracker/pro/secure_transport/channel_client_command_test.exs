@@ -14,7 +14,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
   alias RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: DesiredStateV1
-  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{Canonical, Command, Control, Messages, Negotiation}
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{
+    Canonical,
+    Command,
+    Control,
+    Messages,
+    Negotiation,
+    Receipt
+  }
 
   @logical_device_id <<0xD1::128>>
   @boot_id <<0xD2::128>>
@@ -46,6 +54,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
   end
 
   # --- collaborators ---
+
+  defmodule FakeOutbox do
+    def acknowledge(server, receipt, opts) do
+      send(server, {:acknowledge, receipt, opts})
+      {:ok, []}
+    end
+  end
 
   # Stands in for the production executor: it records every delivery and, unless
   # scripted otherwise, produces a real encodable ACK — applied the first time a
@@ -230,9 +245,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
     end
   end
 
-  describe "explicitly unimplemented control types" do
-    test "a durable delivery receipt is not silently treated as handled", ctx do
-      {client, topic, server_control, _executor} = start_command_client(ctx)
+  describe "authenticated durable delivery receipts" do
+    test "dispatches the exact authenticated receipt idempotently without a wire reply", ctx do
+      {client, topic, server_control, _executor} =
+        start_command_client(ctx, outbox: self(), outbox_module: FakeOutbox)
 
       receipt = %{
         device_id: @logical_device_id,
@@ -241,22 +257,18 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
         stream: :telemetry,
         sequence: 1,
         payload_hash: :binary.copy(<<0x21>>, 32),
-        cumulative_sequence: 1,
-        receipt_hash: :binary.copy(<<0x22>>, 32)
+        cumulative_sequence: 1
       }
 
-      case Messages.encode(:delivery_receipt, receipt) do
-        {:ok, bytes} ->
-          {:ok, frame, _control} = Control.seal(server_control, :delivery_receipt, bytes)
-          push(client, topic, "control_v1", Control.encode_carrier(frame))
-          refute_push(^topic, "control_v1", _response, 50)
-          assert Process.alive?(client)
+      assert {:ok, receipt_hash} = Receipt.hash(receipt)
+      wire_receipt = Map.put(receipt, :receipt_hash, receipt_hash)
+      assert {:ok, bytes} = Messages.encode(:delivery_receipt, wire_receipt)
+      assert {:ok, frame, _control} = Control.seal(server_control, :delivery_receipt, bytes)
+      push(client, topic, "control_v1", Control.encode_carrier(frame))
 
-        {:error, _reason} ->
-          # The receipt contract binds its own hash; an unencodable synthetic
-          # receipt still proves the client survives an unhandled type.
-          assert Process.alive?(client)
-      end
+      assert_receive {:acknowledge, ^receipt, [idempotent: true]}, 1_000
+      refute_push(^topic, "control_v1", _response, 50)
+      assert Process.alive?(client)
     end
   end
 
@@ -284,6 +296,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
          firmware_validator: fn -> :ok end,
          command_executor: Keyword.get(opts, :executor, executor),
          command_executor_module: FakeExecutor,
+         outbox: Keyword.get(opts, :outbox, :unused_outbox),
+         outbox_module: Keyword.get(opts, :outbox_module, FakeOutbox),
          desired_state_identity: fn -> {:ok, control_identity()} end,
          desired_state_compatibility: fn ->
            %{

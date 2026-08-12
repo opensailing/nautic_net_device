@@ -72,6 +72,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   alias RacingOrg.Tracker.Pro.Commands.Ledger.Executor, as: CommandExecutor
   alias RacingOrg.Tracker.Pro.DesiredState.{Manager, Runtime}
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner, as: OutboxOwner
   alias RacingOrg.Tracker.Pro.SecureTransport.Backoff
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapState
@@ -342,6 +343,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       # a stand-in without a real ledger on disk.
       command_executor: Keyword.get(opts, :command_executor, CommandExecutor),
       command_executor_module: Keyword.get(opts, :command_executor_module, CommandExecutor),
+      outbox: Keyword.get(opts, :outbox, OutboxOwner),
+      outbox_module: Keyword.get(opts, :outbox_module, OutboxOwner),
       desired_state_identity: Keyword.get(opts, :desired_state_identity, &Runtime.identity/0),
       desired_state_compatibility: Keyword.get(opts, :desired_state_compatibility, &Runtime.compatibility/0),
       desired_state_status:
@@ -819,19 +822,33 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     {:ok, socket}
   end
 
-  # Durable receipts and checkpoint hydration are registered, authenticated types
-  # whose runtime dispatch is a separate seam. They are named explicitly rather
-  # than folded into a catch-all so an unimplemented type can never be mistaken
-  # for one that was handled.
-  defp handle_control_message(_topic, type, _attrs, socket)
-       when type in [:delivery_receipt, :checkpoint_hydration] do
-    Logger.debug("[ChannelClient] #{type} received; runtime dispatch not wired in this stage")
+  defp handle_control_message(_topic, :delivery_receipt, attrs, socket) do
+    case acknowledge_delivery(socket, Map.delete(attrs, :receipt_hash)) do
+      {:ok, _removed} -> :ok
+      {:error, reason} -> Logger.warning("[ChannelClient] durable receipt refused: #{inspect(reason)}")
+    end
+
+    {:ok, socket}
+  end
+
+  # Checkpoint hydration is a registered, authenticated type whose runtime
+  # dispatch remains an explicit seam rather than being folded into the catch-all.
+  defp handle_control_message(_topic, :checkpoint_hydration, _attrs, socket) do
+    Logger.debug("[ChannelClient] checkpoint hydration received; runtime dispatch not wired in this stage")
     {:ok, socket}
   end
 
   defp handle_control_message(_topic, type, _attrs, socket) do
     Logger.debug("[ChannelClient] ignoring unhandled control message #{inspect(type)}")
     {:ok, socket}
+  end
+
+  defp acknowledge_delivery(socket, receipt) do
+    socket.assigns.outbox_module.acknowledge(socket.assigns.outbox, receipt, idempotent: true)
+  rescue
+    _exception -> {:error, :outbox_owner_unavailable}
+  catch
+    :exit, _reason -> {:error, :outbox_owner_unavailable}
   end
 
   defp deliver_command(socket, attrs) do
