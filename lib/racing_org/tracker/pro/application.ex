@@ -177,6 +177,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
         desired_state_manager_children(product, controller_capability) ++
         operational_gate_children(product, controller_capability) ++
         command_executor_children(product) ++
+        outbox_owner_children(product) ++
         [
           RacingOrg.Tracker.Pro.SecureTransport.ChannelClient,
           RacingOrg.Tracker.Pro.Race.BulkUploader
@@ -204,6 +205,24 @@ defmodule RacingOrg.Tracker.Pro.Application do
   end
 
   defp command_executor_children(:uplink), do: []
+
+  defp outbox_owner_children(:logger) do
+    [
+      {RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner,
+       name: RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner,
+       root: outbox_root(),
+       identity: &RacingOrg.Tracker.Pro.DesiredState.Runtime.identity/0}
+    ]
+  end
+
+  defp outbox_owner_children(:uplink), do: []
+
+  defp outbox_root do
+    Application.get_env(:racing_org_tracker_pro, :durable_outbox_root) ||
+      RacingOrg.Tracker.Pro.DesiredState.RuntimeIdentity.storage_epoch_path()
+      |> Path.dirname()
+      |> Path.join("outbox")
+  end
 
   defp command_ledger_path do
     Application.get_env(:racing_org_tracker_pro, :command_ledger_path) ||

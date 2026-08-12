@@ -28,6 +28,7 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
   }
 
   alias RacingOrg.Tracker.Pro.Commands.Ledger.Executor, as: CommandExecutor
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner, as: OutboxOwner
   alias RacingOrg.Tracker.Pro.Race.BulkUploader
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
@@ -123,6 +124,7 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
     refute Applier in ids
     refute Manager in ids
     refute CommandExecutor in ids
+    refute OutboxOwner in ids
   end
 
   describe "secure_transport_configured?/1 gate predicate" do
@@ -200,6 +202,7 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
         Manager,
         OperationalGate,
         CommandExecutor,
+        OutboxOwner,
         ChannelClient,
         BulkUploader
       ]
@@ -236,6 +239,29 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
       refute Keyword.has_key?(opts, :boot_id)
     end
 
+    test "the durable outbox is bound to persistent storage and starts before receipt dispatch" do
+      Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+
+      specs =
+        :logger
+        |> RacingOrg.Tracker.Pro.Application.child_specs(:racing_org_rpi3)
+        |> Enum.map(&Supervisor.child_spec(&1, []))
+
+      outbox_spec = Enum.find(specs, &(&1.id == OutboxOwner))
+      assert {OutboxOwner, :start_link, [opts]} = outbox_spec.start
+      assert outbox_spec.restart == :permanent
+      assert Keyword.fetch!(opts, :name) == OutboxOwner
+
+      root = Keyword.fetch!(opts, :root)
+      assert Path.type(root) == :absolute
+      refute String.contains?(root, "boot")
+      assert is_function(Keyword.fetch!(opts, :identity), 0)
+
+      ids = spec_ids(specs)
+      assert Enum.find_index(ids, &(&1 == CommandExecutor)) < Enum.find_index(ids, &(&1 == OutboxOwner))
+      assert Enum.find_index(ids, &(&1 == OutboxOwner)) < Enum.find_index(ids, &(&1 == ChannelClient))
+    end
+
     test "the command executor starts before the channel that routes deliveries into it" do
       Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
 
@@ -268,6 +294,7 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
       refute Applier in ids
       refute Manager in ids
       refute CommandExecutor in ids
+      refute OutboxOwner in ids
     end
   end
 
