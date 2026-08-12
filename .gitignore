@@ -22,6 +22,9 @@ erl_crash.dump
 # macOS Finder
 .DS_Store
 
+# Target-specific native artifacts are written through Mix's priv symlink.
+/priv/native/
+
 /tmp/
 
 # editor swap files

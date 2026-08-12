@@ -19,6 +19,10 @@ defmodule RacingOrg.Tracker.Pro.Device.MixProject do
       archives: [nerves_bootstrap: "~> 1.13"],
       start_permanent: Mix.env() == :prod,
       build_embedded: true,
+      compilers: [:elixir_make] ++ Mix.compilers(),
+      make_cwd: "c_src",
+      make_targets: ["all"],
+      make_clean: ["clean"],
       deps: deps(),
       releases: [{@app, release()}],
       aliases: aliases()
@@ -42,6 +46,7 @@ defmodule RacingOrg.Tracker.Pro.Device.MixProject do
     [
       # Dependencies for all targets
       {:nerves, "~> 1.14", runtime: false},
+      {:elixir_make, "~> 0.10", runtime: false},
       {:shoehorn, "~> 0.9"},
       {:ring_logger, "~> 0.11"},
       {:toolshed, "~> 0.4"},

@@ -339,6 +339,21 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
   end
 
   describe "quarantine latch" do
+    test "latches a first-segment sync failure through the segment filesystem", %{root: root} do
+      assert {:ok, owner} =
+               start_owner(root,
+                 segment_file_system: __MODULE__.FailingSyncSegmentFileSystem
+               )
+
+      __MODULE__.FailingSyncSegmentFileSystem.fail_next_sync(owner)
+
+      assert {:error, {:durability_uncertain, {:file_sync, :simulated_sync_failure}}} =
+               Owner.enqueue(owner, :telemetry, "first")
+
+      assert %{quarantined: true, accepting: false} = Owner.status(owner)
+      assert {:error, :quarantined} = Owner.enqueue(owner, :telemetry, "second")
+    end
+
     test "latches durability uncertainty and fails closed thereafter", %{root: root} do
       assert {:ok, owner} = start_owner(root, file_system: __MODULE__.FailingSyncFileSystem)
       assert {:ok, _receipt} = Owner.enqueue(owner, :telemetry, "first")
@@ -570,6 +585,67 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       assert File.dir?(root)
       assert :ok = stop_owner(owner)
     end
+  end
+
+  defmodule FailingSyncSegmentFileSystem do
+    @moduledoc false
+    @behaviour RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem
+
+    alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem
+
+    def fail_next_sync(owner) do
+      :persistent_term.put({__MODULE__, owner_pid(owner)}, true)
+    end
+
+    defp owner_pid(owner) when is_pid(owner), do: owner
+    defp owner_pid(owner), do: GenServer.whereis(owner)
+
+    defp fail_now? do
+      key = {__MODULE__, self()}
+
+      case :persistent_term.get(key, false) do
+        true ->
+          :persistent_term.erase(key)
+          true
+
+        false ->
+          false
+      end
+    end
+
+    @impl true
+    def open_root(file_system, path, identity), do: SegmentFileSystem.open_root(file_system, path, identity)
+
+    @impl true
+    def close_root(root), do: SegmentFileSystem.close_root(root)
+
+    @impl true
+    def create(root, basename, mode), do: SegmentFileSystem.create(root, basename, mode)
+
+    @impl true
+    def chmod(segment, mode), do: SegmentFileSystem.chmod(segment, mode)
+
+    @impl true
+    def write(segment, contents), do: SegmentFileSystem.write(segment, contents)
+
+    @impl true
+    def sync_file(segment) do
+      if fail_now?(),
+        do: {:error, :simulated_sync_failure},
+        else: SegmentFileSystem.sync_file(segment)
+    end
+
+    @impl true
+    def sync_directory(segment), do: SegmentFileSystem.sync_directory(segment)
+
+    @impl true
+    def unlink_empty(segment), do: SegmentFileSystem.unlink_empty(segment)
+
+    @impl true
+    def file_info(segment), do: SegmentFileSystem.file_info(segment)
+
+    @impl true
+    def close(segment), do: SegmentFileSystem.close(segment)
   end
 
   defmodule FailingSyncFileSystem do

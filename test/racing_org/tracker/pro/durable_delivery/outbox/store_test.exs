@@ -1,7 +1,14 @@
 defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
   use ExUnit.Case, async: true
 
-  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.{FileSystem, Record, RunState, Snapshot, Store}
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.{
+    FileSystem,
+    Record,
+    RunState,
+    SegmentFileSystem,
+    Snapshot,
+    Store
+  }
 
   @storage_epoch Base.decode16!("00112233445566778899aabbccddeeff", case: :lower)
   @device_id Base.decode16!("0f1e2d3c4b5a69788796a5b4c3d2e1f0", case: :lower)
@@ -14,9 +21,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     def attach(owner), do: Process.put({__MODULE__, :owner}, owner)
     def fail_segment_sync, do: Process.put({__MODULE__, :fail_segment_sync}, true)
     def fail_segment_append_open, do: Process.put({__MODULE__, :fail_segment_append_open}, true)
-    def fail_segment_chmod, do: Process.put({__MODULE__, :fail_segment_chmod}, true)
     def fail_snapshot_read, do: Process.put({__MODULE__, :fail_snapshot_read}, true)
-    def fail_run_state_rename, do: Process.put({__MODULE__, :fail_run_state_rename}, true)
+    def fail_run_state_rename, do: fail_run_state_rename_after(0)
+
+    def fail_run_state_rename_after(successful_renames)
+        when is_integer(successful_renames) and successful_renames >= 0,
+        do: Process.put({__MODULE__, :fail_run_state_rename_after}, successful_renames)
+
     def fail_snapshot_rename, do: Process.put({__MODULE__, :fail_snapshot_rename}, true)
 
     def fail_snapshot_temp_remove,
@@ -45,14 +56,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     def mkdir_p(path), do: FileSystem.mkdir_p(path)
 
     @impl true
-    def chmod(path, mode) do
-      if Process.get({__MODULE__, :fail_segment_chmod}, false) and segment_path?(path) do
-        Process.delete({__MODULE__, :fail_segment_chmod})
-        {:error, :simulated_chmod_failure}
-      else
-        FileSystem.chmod(path, mode)
-      end
-    end
+    def chmod(path, mode), do: FileSystem.chmod(path, mode)
 
     @impl true
     def open(path, modes) do
@@ -108,10 +112,17 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     @impl true
     def rename(source, destination) do
       cond do
-        Process.get({__MODULE__, :fail_run_state_rename}, false) and
+        is_integer(Process.get({__MODULE__, :fail_run_state_rename_after})) and
             Path.basename(destination) == "run-state.bin" ->
-          Process.delete({__MODULE__, :fail_run_state_rename})
-          {:error, :simulated_rename_failure}
+          case Process.get({__MODULE__, :fail_run_state_rename_after}) do
+            0 ->
+              Process.delete({__MODULE__, :fail_run_state_rename_after})
+              {:error, :simulated_rename_failure}
+
+            remaining ->
+              Process.put({__MODULE__, :fail_run_state_rename_after}, remaining - 1)
+              FileSystem.rename(source, destination)
+          end
 
         Process.get({__MODULE__, :fail_snapshot_rename}, false) and
             Path.basename(destination) == "snapshot.bin" ->
@@ -145,6 +156,153 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
     defp report(event) do
       if owner = Process.get({__MODULE__, :owner}), do: send(owner, {:outbox_file_system, event})
+    end
+  end
+
+  defmodule TracingSegmentFileSystem do
+    @behaviour SegmentFileSystem
+
+    def attach(owner), do: Process.put({__MODULE__, :owner}, owner)
+
+    def fail(operations) when is_list(operations) do
+      Process.put({__MODULE__, :failures}, MapSet.new(operations))
+    end
+
+    def fail(operation), do: fail([operation])
+
+    @impl true
+    def open_root(file_system, path, identity) do
+      report({:open_root, path, identity})
+
+      cond do
+        fail?(:stale_root) ->
+          {:error, :stale_root}
+
+        fail?(:open_root) ->
+          {:error, :simulated_open_root_failure}
+
+        true ->
+          open_root(file_system, path, identity, SegmentFileSystem.open_root(file_system, path, identity))
+      end
+    end
+
+    defp open_root(_file_system, path, _identity, result) do
+      case result do
+        {:ok, root} = result ->
+          Process.put({__MODULE__, :root_path, root}, path)
+          result
+
+        error ->
+          error
+      end
+    end
+
+    @impl true
+    def close_root(root) do
+      report({:close_root, root_path(root)})
+      result = SegmentFileSystem.close_root(root)
+      Process.delete({__MODULE__, :root_path, root})
+
+      if fail?(:close_root),
+        do: {:error, :simulated_close_root_failure},
+        else: result
+    end
+
+    @impl true
+    def create(root, basename, mode) do
+      path = Path.join(root_path(root), basename)
+      report({:create, path, mode})
+
+      result =
+        if fail?(:create),
+          do: {:error, :simulated_open_failure},
+          else: SegmentFileSystem.create(root, basename, mode)
+
+      case result do
+        {:ok, segment} = success ->
+          Process.put({__MODULE__, :segment_path, segment}, path)
+          success
+
+        error ->
+          error
+      end
+    end
+
+    @impl true
+    def chmod(segment, mode) do
+      report({:chmod, segment_path(segment), mode})
+
+      if fail?(:chmod),
+        do: {:error, :simulated_chmod_failure},
+        else: SegmentFileSystem.chmod(segment, mode)
+    end
+
+    @impl true
+    def write(segment, contents) do
+      report({:write, segment_path(segment), IO.iodata_length(contents)})
+
+      if fail?(:write),
+        do: {:error, :simulated_write_failure},
+        else: SegmentFileSystem.write(segment, contents)
+    end
+
+    @impl true
+    def sync_file(segment) do
+      report({:sync_file, segment_path(segment)})
+
+      if fail?(:sync_file),
+        do: {:error, :simulated_sync_file_failure},
+        else: SegmentFileSystem.sync_file(segment)
+    end
+
+    @impl true
+    def sync_directory(segment) do
+      report({:sync_directory, segment_path(segment)})
+
+      if fail?(:sync_directory),
+        do: {:error, :simulated_sync_directory_failure},
+        else: SegmentFileSystem.sync_directory(segment)
+    end
+
+    @impl true
+    def unlink_empty(segment) do
+      report({:unlink_empty, segment_path(segment)})
+
+      if fail?(:unlink_empty),
+        do: {:error, :simulated_unlink_failure},
+        else: SegmentFileSystem.unlink_empty(segment)
+    end
+
+    @impl true
+    def file_info(segment), do: SegmentFileSystem.file_info(segment)
+
+    @impl true
+    def close(segment) do
+      report({:close, segment_path(segment)})
+      result = SegmentFileSystem.close(segment)
+      Process.delete({__MODULE__, :segment_path, segment})
+
+      if fail?(:close),
+        do: {:error, :simulated_close_failure},
+        else: result
+    end
+
+    defp fail?(operation) do
+      failures = Process.get({__MODULE__, :failures}, MapSet.new())
+
+      if MapSet.member?(failures, operation) do
+        Process.put({__MODULE__, :failures}, MapSet.delete(failures, operation))
+        true
+      else
+        false
+      end
+    end
+
+    defp root_path(root), do: Process.get({__MODULE__, :root_path, root})
+    defp segment_path(segment), do: Process.get({__MODULE__, :segment_path, segment})
+
+    defp report(event) do
+      if owner = Process.get({__MODULE__, :owner}), do: send(owner, {:outbox_segment_file_system, event})
     end
   end
 
@@ -182,6 +340,582 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
         receive do
           :continue_recovery -> :persistent_term.erase({__MODULE__, root})
         end
+      end
+
+      FileSystem.open(path, modes)
+    end
+
+    @impl true
+    def write(device, contents), do: FileSystem.write(device, contents)
+
+    @impl true
+    def sync(device), do: FileSystem.sync(device)
+
+    @impl true
+    def close(device), do: FileSystem.close(device)
+
+    @impl true
+    def rename(source, destination), do: FileSystem.rename(source, destination)
+
+    @impl true
+    def remove(path), do: FileSystem.remove(path)
+
+    @impl true
+    def position(device, location), do: FileSystem.position(device, location)
+
+    @impl true
+    def truncate(device), do: FileSystem.truncate(device)
+  end
+
+  defmodule BlockingMkdirFileSystem do
+    @behaviour FileSystem
+
+    def arm(owner) do
+      counter = :atomics.new(1, signed: false)
+      :persistent_term.put({__MODULE__, :state}, {owner, counter})
+    end
+
+    def disarm, do: :persistent_term.erase({__MODULE__, :state})
+
+    @impl true
+    def read(path), do: FileSystem.read(path)
+
+    @impl true
+    def stat(path), do: FileSystem.stat(path)
+
+    @impl true
+    def list_dir(path), do: FileSystem.list_dir(path)
+
+    @impl true
+    def mkdir_p(path) do
+      case :persistent_term.get({__MODULE__, :state}, nil) do
+        {owner, counter} ->
+          call = :atomics.add_get(counter, 1, 1)
+          send(owner, {:mkdir_entered, call, self()})
+
+          if call == 1 do
+            receive do
+              :continue_mkdir -> :ok
+            end
+          end
+
+        nil ->
+          :ok
+      end
+
+      FileSystem.mkdir_p(path)
+    end
+
+    @impl true
+    def chmod(path, mode), do: FileSystem.chmod(path, mode)
+
+    @impl true
+    def open(path, modes), do: FileSystem.open(path, modes)
+
+    @impl true
+    def write(device, contents), do: FileSystem.write(device, contents)
+
+    @impl true
+    def sync(device), do: FileSystem.sync(device)
+
+    @impl true
+    def close(device), do: FileSystem.close(device)
+
+    @impl true
+    def rename(source, destination), do: FileSystem.rename(source, destination)
+
+    @impl true
+    def remove(path), do: FileSystem.remove(path)
+
+    @impl true
+    def position(device, location), do: FileSystem.position(device, location)
+
+    @impl true
+    def truncate(device), do: FileSystem.truncate(device)
+  end
+
+  defmodule BlockingEveryMkdirFileSystem do
+    @behaviour FileSystem
+
+    def arm(owner), do: :persistent_term.put({__MODULE__, :owner}, owner)
+    def disarm, do: :persistent_term.erase({__MODULE__, :owner})
+
+    @impl true
+    def read(path), do: FileSystem.read(path)
+
+    @impl true
+    def stat(path), do: FileSystem.stat(path)
+
+    @impl true
+    def list_dir(path), do: FileSystem.list_dir(path)
+
+    @impl true
+    def mkdir_p(path) do
+      if owner = :persistent_term.get({__MODULE__, :owner}, nil) do
+        send(owner, {:every_mkdir_blocked, self(), path})
+
+        receive do
+          :continue_every_mkdir -> :ok
+        end
+      end
+
+      FileSystem.mkdir_p(path)
+    end
+
+    @impl true
+    def chmod(path, mode), do: FileSystem.chmod(path, mode)
+
+    @impl true
+    def open(path, modes), do: FileSystem.open(path, modes)
+
+    @impl true
+    def write(device, contents), do: FileSystem.write(device, contents)
+
+    @impl true
+    def sync(device), do: FileSystem.sync(device)
+
+    @impl true
+    def close(device), do: FileSystem.close(device)
+
+    @impl true
+    def rename(source, destination), do: FileSystem.rename(source, destination)
+
+    @impl true
+    def remove(path), do: FileSystem.remove(path)
+
+    @impl true
+    def position(device, location), do: FileSystem.position(device, location)
+
+    @impl true
+    def truncate(device), do: FileSystem.truncate(device)
+  end
+
+  defmodule BlockingAfterMkdirFileSystem do
+    @behaviour FileSystem
+
+    def arm(owner) do
+      counter = :atomics.new(1, signed: false)
+      :persistent_term.put({__MODULE__, :state}, {owner, counter})
+    end
+
+    def disarm, do: :persistent_term.erase({__MODULE__, :state})
+
+    @impl true
+    def read(path), do: FileSystem.read(path)
+
+    @impl true
+    def stat(path), do: FileSystem.stat(path)
+
+    @impl true
+    def list_dir(path), do: FileSystem.list_dir(path)
+
+    @impl true
+    def mkdir_p(path) do
+      with :ok <- FileSystem.mkdir_p(path) do
+        case :persistent_term.get({__MODULE__, :state}, nil) do
+          {owner, counter} ->
+            if :atomics.add_get(counter, 1, 1) <= 2 do
+              send(owner, {:mkdir_completed, self(), path})
+
+              receive do
+                :continue_completed_mkdir -> :ok
+              end
+            else
+              :ok
+            end
+
+          nil ->
+            :ok
+        end
+      end
+    end
+
+    @impl true
+    def chmod(path, mode), do: FileSystem.chmod(path, mode)
+
+    @impl true
+    def open(path, modes), do: FileSystem.open(path, modes)
+
+    @impl true
+    def write(device, contents), do: FileSystem.write(device, contents)
+
+    @impl true
+    def sync(device), do: FileSystem.sync(device)
+
+    @impl true
+    def close(device), do: FileSystem.close(device)
+
+    @impl true
+    def rename(source, destination), do: FileSystem.rename(source, destination)
+
+    @impl true
+    def remove(path), do: FileSystem.remove(path)
+
+    @impl true
+    def position(device, location), do: FileSystem.position(device, location)
+
+    @impl true
+    def truncate(device), do: FileSystem.truncate(device)
+  end
+
+  defmodule BlockingAppendOpenFileSystem do
+    @behaviour FileSystem
+
+    def arm(owner) do
+      counter = :atomics.new(1, signed: false)
+      :persistent_term.put({__MODULE__, :state}, {owner, counter})
+    end
+
+    def disarm, do: :persistent_term.erase({__MODULE__, :state})
+
+    @impl true
+    def read(path), do: FileSystem.read(path)
+
+    @impl true
+    def stat(path), do: FileSystem.stat(path)
+
+    @impl true
+    def list_dir(path), do: FileSystem.list_dir(path)
+
+    @impl true
+    def mkdir_p(path), do: FileSystem.mkdir_p(path)
+
+    @impl true
+    def chmod(path, mode), do: FileSystem.chmod(path, mode)
+
+    @impl true
+    def open(path, modes) do
+      case :persistent_term.get({__MODULE__, :state}, nil) do
+        {owner, counter} when is_binary(path) ->
+          if String.ends_with?(path, ".log") and :append in modes and
+               :atomics.add_get(counter, 1, 1) == 1 do
+            send(owner, {:append_open_blocked, self()})
+
+            receive do
+              :continue_append_open -> :ok
+            end
+          end
+
+        _state ->
+          :ok
+      end
+
+      FileSystem.open(path, modes)
+    end
+
+    @impl true
+    def write(device, contents), do: FileSystem.write(device, contents)
+
+    @impl true
+    def sync(device), do: FileSystem.sync(device)
+
+    @impl true
+    def close(device), do: FileSystem.close(device)
+
+    @impl true
+    def rename(source, destination), do: FileSystem.rename(source, destination)
+
+    @impl true
+    def remove(path), do: FileSystem.remove(path)
+
+    @impl true
+    def position(device, location), do: FileSystem.position(device, location)
+
+    @impl true
+    def truncate(device), do: FileSystem.truncate(device)
+  end
+
+  defmodule MutateAfterAppendOpenFileSystem do
+    @behaviour FileSystem
+
+    def arm, do: Process.put({__MODULE__, :armed}, true)
+
+    @impl true
+    def read(path), do: FileSystem.read(path)
+
+    @impl true
+    def stat(path), do: FileSystem.stat(path)
+
+    @impl true
+    def list_dir(path), do: FileSystem.list_dir(path)
+
+    @impl true
+    def mkdir_p(path), do: FileSystem.mkdir_p(path)
+
+    @impl true
+    def chmod(path, mode), do: FileSystem.chmod(path, mode)
+
+    @impl true
+    def open(path, modes) do
+      result = FileSystem.open(path, modes)
+
+      if Process.get({__MODULE__, :armed}, false) and is_binary(path) and :append in modes do
+        Process.delete({__MODULE__, :armed})
+        File.write!(path, "X", [:append])
+      end
+
+      result
+    end
+
+    @impl true
+    def write(device, contents), do: FileSystem.write(device, contents)
+
+    @impl true
+    def sync(device), do: FileSystem.sync(device)
+
+    @impl true
+    def close(device), do: FileSystem.close(device)
+
+    @impl true
+    def rename(source, destination), do: FileSystem.rename(source, destination)
+
+    @impl true
+    def remove(path), do: FileSystem.remove(path)
+
+    @impl true
+    def position(device, location), do: FileSystem.position(device, location)
+
+    @impl true
+    def truncate(device), do: FileSystem.truncate(device)
+  end
+
+  defmodule AppendDescriptorRootAbaFileSystem do
+    @behaviour FileSystem
+
+    def arm(root, replacement, displaced) do
+      :persistent_term.put({__MODULE__, :swap}, {root, replacement, displaced})
+    end
+
+    def disarm, do: :persistent_term.erase({__MODULE__, :swap})
+
+    @impl true
+    def read(path), do: FileSystem.read(path)
+
+    @impl true
+    def stat(path), do: FileSystem.stat(path)
+
+    @impl true
+    def list_dir(path), do: FileSystem.list_dir(path)
+
+    @impl true
+    def mkdir_p(path), do: FileSystem.mkdir_p(path)
+
+    @impl true
+    def chmod(path, mode), do: FileSystem.chmod(path, mode)
+
+    @impl true
+    def open(path, modes) do
+      case :persistent_term.get({__MODULE__, :swap}, nil) do
+        {root, replacement, displaced} ->
+          if is_binary(path) and :append in modes and Path.dirname(path) == root do
+            disarm()
+            File.rename!(root, displaced)
+            File.rename!(replacement, root)
+
+            try do
+              FileSystem.open(path, modes)
+            after
+              File.rename!(root, replacement)
+              File.rename!(displaced, root)
+            end
+          else
+            FileSystem.open(path, modes)
+          end
+
+        nil ->
+          FileSystem.open(path, modes)
+      end
+    end
+
+    @impl true
+    def write(device, contents), do: FileSystem.write(device, contents)
+
+    @impl true
+    def sync(device), do: FileSystem.sync(device)
+
+    @impl true
+    def close(device), do: FileSystem.close(device)
+
+    @impl true
+    def rename(source, destination), do: FileSystem.rename(source, destination)
+
+    @impl true
+    def remove(path), do: FileSystem.remove(path)
+
+    @impl true
+    def position(device, location), do: FileSystem.position(device, location)
+
+    @impl true
+    def truncate(device), do: FileSystem.truncate(device)
+  end
+
+  defmodule CreateSegmentRootAbaFileSystem do
+    @behaviour SegmentFileSystem
+
+    def arm(owner, root, replacement, displaced) do
+      Process.put({__MODULE__, :swap}, {owner, root, replacement, displaced})
+    end
+
+    def disarm, do: Process.delete({__MODULE__, :swap})
+
+    @impl true
+    def open_root(file_system, path, identity), do: SegmentFileSystem.open_root(file_system, path, identity)
+
+    @impl true
+    def close_root(root), do: SegmentFileSystem.close_root(root)
+
+    @impl true
+    def create(root_resource, basename, mode) do
+      case Process.get({__MODULE__, :swap}) do
+        {owner, root, replacement, displaced} ->
+          disarm()
+          File.rename!(root, displaced)
+          File.rename!(replacement, root)
+
+          try do
+            result = SegmentFileSystem.create(root_resource, basename, mode)
+            send(owner, {:create_segment_root_aba_fired, basename})
+            result
+          after
+            File.rename!(root, replacement)
+            File.rename!(displaced, root)
+          end
+
+        nil ->
+          SegmentFileSystem.create(root_resource, basename, mode)
+      end
+    end
+
+    @impl true
+    def chmod(segment, mode), do: SegmentFileSystem.chmod(segment, mode)
+
+    @impl true
+    def write(segment, contents), do: SegmentFileSystem.write(segment, contents)
+
+    @impl true
+    def sync_file(segment), do: SegmentFileSystem.sync_file(segment)
+
+    @impl true
+    def sync_directory(segment), do: SegmentFileSystem.sync_directory(segment)
+
+    @impl true
+    def unlink_empty(segment), do: SegmentFileSystem.unlink_empty(segment)
+
+    @impl true
+    def file_info(segment), do: SegmentFileSystem.file_info(segment)
+
+    @impl true
+    def close(segment), do: SegmentFileSystem.close(segment)
+  end
+
+  defmodule SwapAfterDirectoryCloseFileSystem do
+    @behaviour FileSystem
+
+    def arm(root, replacement, displaced) do
+      :persistent_term.put({__MODULE__, :swap}, {root, replacement, displaced})
+    end
+
+    def disarm, do: :persistent_term.erase({__MODULE__, :swap})
+
+    @impl true
+    def read(path), do: FileSystem.read(path)
+
+    @impl true
+    def stat(path), do: FileSystem.stat(path)
+
+    @impl true
+    def list_dir(path), do: FileSystem.list_dir(path)
+
+    @impl true
+    def mkdir_p(path), do: FileSystem.mkdir_p(path)
+
+    @impl true
+    def chmod(path, mode), do: FileSystem.chmod(path, mode)
+
+    @impl true
+    def open(path, modes) do
+      case FileSystem.open(path, modes) do
+        {:ok, device} = result ->
+          Process.put({__MODULE__, :path, device}, path)
+          result
+
+        error ->
+          error
+      end
+    end
+
+    @impl true
+    def write(device, contents), do: FileSystem.write(device, contents)
+
+    @impl true
+    def sync(device), do: FileSystem.sync(device)
+
+    @impl true
+    def close(device) do
+      path = Process.get({__MODULE__, :path, device})
+      result = FileSystem.close(device)
+      Process.delete({__MODULE__, :path, device})
+
+      case :persistent_term.get({__MODULE__, :swap}, nil) do
+        {^path, replacement, displaced} when result == :ok ->
+          disarm()
+          File.rename!(path, displaced)
+          File.rename!(replacement, path)
+          :ok
+
+        _state ->
+          result
+      end
+    end
+
+    @impl true
+    def rename(source, destination), do: FileSystem.rename(source, destination)
+
+    @impl true
+    def remove(path), do: FileSystem.remove(path)
+
+    @impl true
+    def position(device, location), do: FileSystem.position(device, location)
+
+    @impl true
+    def truncate(device), do: FileSystem.truncate(device)
+  end
+
+  defmodule ReentrantAppendFileSystem do
+    @behaviour FileSystem
+
+    def arm(store, owner, entry_id) do
+      Process.put({__MODULE__, :store}, store)
+      Process.put({__MODULE__, :owner}, owner)
+      Process.put({__MODULE__, :entry_id}, entry_id)
+      Process.put({__MODULE__, :armed}, true)
+    end
+
+    @impl true
+    def read(path), do: FileSystem.read(path)
+
+    @impl true
+    def stat(path), do: FileSystem.stat(path)
+
+    @impl true
+    def list_dir(path), do: FileSystem.list_dir(path)
+
+    @impl true
+    def mkdir_p(path), do: FileSystem.mkdir_p(path)
+
+    @impl true
+    def chmod(path, mode), do: FileSystem.chmod(path, mode)
+
+    @impl true
+    def open(path, modes) do
+      if Process.get({__MODULE__, :armed}, false) and String.ends_with?(path, ".log") and
+           :append in modes do
+        Process.delete({__MODULE__, :armed})
+        store = Process.get({__MODULE__, :store})
+        owner = Process.get({__MODULE__, :owner})
+        entry_id = Process.get({__MODULE__, :entry_id})
+        result = Store.enqueue(store, :telemetry, "nested-append", entry_id: entry_id)
+        send(owner, {:reentrant_append, result})
       end
 
       FileSystem.open(path, modes)
@@ -268,14 +1002,18 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
   end
 
   test "appends and fsyncs before enqueue succeeds, then recovers entries and sequences", %{root: root} do
-    TracingFileSystem.attach(self())
-    assert {:ok, store} = open_store(root, file_system: TracingFileSystem)
+    TracingSegmentFileSystem.attach(self())
+
+    assert {:ok, store} =
+             open_store(root,
+               segment_file_system: TracingSegmentFileSystem
+             )
 
     assert {:ok, first, store} =
              Store.enqueue(store, :telemetry, "first", entry_id: entry_id(1), priority: 7)
 
-    events = drain_file_events([])
-    segment_path = Enum.find_value(events, &segment_open_path/1)
+    events = drain_segment_events([])
+    segment_path = Enum.find_value(events, &created_segment_path/1)
 
     write_index =
       event_index(events, fn
@@ -283,14 +1021,27 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
         _event -> false
       end)
 
-    sync_index =
+    file_sync_index =
       event_index(events, fn
-        {:sync, path} -> path == segment_path
+        {:sync_file, path} -> path == segment_path
         _event -> false
       end)
 
-    assert write_index < sync_index
-    assert Enum.at(events, sync_index + 1) == {:close, segment_path}
+    directory_sync_index =
+      event_index(events, fn
+        {:sync_directory, path} -> path == segment_path
+        _event -> false
+      end)
+
+    close_index =
+      event_index(events, fn
+        {:close, path} -> path == segment_path
+        _event -> false
+      end)
+
+    assert write_index < file_sync_index
+    assert file_sync_index < directory_sync_index
+    assert directory_sync_index < close_index
     assert first.sequence == 1
     assert first.storage_epoch == @storage_epoch
     assert first.payload_hash == :crypto.hash(:sha256, "first")
@@ -553,21 +1304,21 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert Store.next_sequence(recovered, :telemetry) == {:ok, 21}
   end
 
-  test "cleans a newly created segment when append-open or chmod fails", %{root: root} do
-    TracingFileSystem.attach(self())
+  test "cleans a newly created segment when create or chmod fails", %{root: root} do
+    TracingSegmentFileSystem.attach(self())
 
     assert {:ok, store} =
              open_store(root,
-               file_system: TracingFileSystem,
+               segment_file_system: TracingSegmentFileSystem,
                segment_max_bytes: 260
              )
 
     assert {:ok, _first, store} =
              Store.enqueue(store, :telemetry, String.duplicate("a", 40), entry_id: entry_id(1))
 
-    TracingFileSystem.fail_segment_append_open()
+    TracingSegmentFileSystem.fail(:create)
 
-    assert {:error, {:append_open, :simulated_open_failure}} =
+    assert {:error, {:segment_open, :simulated_open_failure}} =
              Store.enqueue(store, :telemetry, String.duplicate("b", 40), entry_id: entry_id(2))
 
     assert length(segment_paths(root)) == 1
@@ -580,17 +1331,293 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
     assert {:ok, chmod_store} =
              open_store(chmod_root,
-               file_system: TracingFileSystem,
+               segment_file_system: TracingSegmentFileSystem,
                segment_max_bytes: 260
              )
 
-    TracingFileSystem.fail_segment_chmod()
+    TracingSegmentFileSystem.fail(:chmod)
 
     assert {:error, {:chmod_segment, :simulated_chmod_failure}} =
              Store.enqueue(chmod_store, :telemetry, "payload", entry_id: entry_id(3))
 
     assert segment_paths(chmod_root) == []
     assert {:ok, _entry, _store} = Store.enqueue(chmod_store, :telemetry, "payload", entry_id: entry_id(3))
+  end
+
+  test "fails closed on new-segment write and synchronization failures without cleaning the segment", %{
+    root: root
+  } do
+    failures = [
+      {:write, {:write, :simulated_write_failure}},
+      {:sync_file, {:file_sync, :simulated_sync_file_failure}},
+      {:sync_directory, {:directory_sync, :simulated_sync_directory_failure}}
+    ]
+
+    Enum.each(failures, fn {operation, expected} ->
+      case_root = root <> "_#{operation}"
+      on_exit(fn -> File.rm_rf(case_root) end)
+
+      assert {:ok, store} =
+               open_store(case_root,
+                 segment_file_system: TracingSegmentFileSystem
+               )
+
+      TracingSegmentFileSystem.fail(operation)
+
+      assert {:error, {:durability_uncertain, ^expected}} =
+               Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(10))
+
+      assert [_segment] = segment_paths(case_root)
+    end)
+  end
+
+  test "fails durability closed when pre-write cleanup cannot unlink or synchronize", %{root: root} do
+    failures = [
+      {[:chmod, :unlink_empty],
+       {:segment_cleanup_failed, {:chmod_segment, :simulated_chmod_failure},
+        {:remove_segment, :simulated_unlink_failure}}},
+      {[:chmod, :sync_directory],
+       {:segment_cleanup_failed, {:chmod_segment, :simulated_chmod_failure},
+        {:directory_sync, :simulated_sync_directory_failure}}}
+    ]
+
+    Enum.each(failures, fn {operations, expected} ->
+      case_root = root <> "_#{Enum.join(operations, "_")}"
+      on_exit(fn -> File.rm_rf(case_root) end)
+
+      assert {:ok, store} =
+               open_store(case_root,
+                 segment_file_system: TracingSegmentFileSystem
+               )
+
+      TracingSegmentFileSystem.fail(operations)
+
+      assert {:error, {:durability_uncertain, ^expected}} =
+               Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(11))
+    end)
+  end
+
+  test "fails durability closed when segment or root close fails", %{root: root} do
+    cases = [
+      {:close, {:close, :simulated_close_failure}},
+      {:close_root, {:segment_root_close, :simulated_close_root_failure}}
+    ]
+
+    Enum.each(cases, fn {operation, expected} ->
+      case_root = root <> "_#{operation}"
+      on_exit(fn -> File.rm_rf(case_root) end)
+
+      assert {:ok, store} =
+               open_store(case_root,
+                 segment_file_system: TracingSegmentFileSystem
+               )
+
+      TracingSegmentFileSystem.fail(operation)
+
+      assert {:error, {:durability_uncertain, ^expected}} =
+               Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(12))
+
+      assert [_segment] = segment_paths(case_root)
+    end)
+  end
+
+  test "combines create and root-close failures as durability uncertainty", %{root: root} do
+    assert {:ok, store} =
+             open_store(root,
+               segment_file_system: TracingSegmentFileSystem
+             )
+
+    TracingSegmentFileSystem.fail([:create, :close_root])
+
+    assert {:error,
+            {:durability_uncertain,
+             {:segment_root_close_failed, {:segment_open, :simulated_open_failure},
+              {:segment_root_close, :simulated_close_root_failure}}}} =
+             Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(13))
+  end
+
+  test "maps a stale native root binding to a stale store", %{root: root} do
+    assert {:ok, store} =
+             open_store(root,
+               segment_file_system: TracingSegmentFileSystem
+             )
+
+    TracingSegmentFileSystem.fail(:stale_root)
+
+    assert {:error, :stale_store} =
+             Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(14))
+  end
+
+  test "surfaces ordinary native root open failures", %{root: root} do
+    assert {:ok, store} =
+             open_store(root,
+               segment_file_system: TracingSegmentFileSystem
+             )
+
+    TracingSegmentFileSystem.fail(:open_root)
+
+    assert {:error, {:segment_root_open, :simulated_open_root_failure}} =
+             Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(15))
+  end
+
+  test "creates a rotated segment in the bound root across a pathname ABA", %{root: root} do
+    replacement_root = root <> "_replacement"
+    displaced_root = root <> "_displaced"
+    on_exit(fn -> File.rm_rf(replacement_root) end)
+    on_exit(fn -> File.rm_rf(displaced_root) end)
+    on_exit(&CreateSegmentRootAbaFileSystem.disarm/0)
+
+    assert {:ok, original} = open_store(root, segment_max_bytes: 260)
+    assert {:ok, replacement} = open_store(replacement_root, segment_max_bytes: 260)
+
+    assert {:ok, _first, original} =
+             Store.enqueue(
+               original,
+               :telemetry,
+               String.duplicate("a", 80),
+               entry_id: entry_id(1)
+             )
+
+    assert {:ok, _replacement_entry, replacement} =
+             Store.enqueue(
+               replacement,
+               :telemetry,
+               String.duplicate("r", 80),
+               entry_id: entry_id(2)
+             )
+
+    assert original.current_segment_bytes * 2 > original.segment_max_bytes
+    replacement_next_id = replacement.current_segment_id + 1
+
+    replacement_foreign_segment_path =
+      Path.join(
+        replacement.root_path,
+        "segment-" <> String.pad_leading(Integer.to_string(replacement_next_id), 20, "0") <> ".log"
+      )
+
+    assert {:ok, original} =
+             open_store(root,
+               segment_file_system: CreateSegmentRootAbaFileSystem,
+               segment_max_bytes: 260
+             )
+
+    canonical_root = original.root_path
+    assert {:ok, canonical_replacement} = Store.canonical_root(replacement_root)
+    canonical_displaced = Path.join(Path.dirname(canonical_root), Path.basename(displaced_root))
+
+    CreateSegmentRootAbaFileSystem.arm(
+      self(),
+      canonical_root,
+      canonical_replacement,
+      canonical_displaced
+    )
+
+    assert {:ok, %{sequence: 2}, _store} =
+             Store.enqueue(
+               original,
+               :telemetry,
+               String.duplicate("b", 80),
+               entry_id: entry_id(3)
+             )
+
+    assert_receive {:create_segment_root_aba_fired, "segment-00000000000000000002.log"}
+    assert length(segment_paths(root)) == 2
+    assert length(segment_paths(replacement_root)) == 1
+    refute File.exists?(replacement_foreign_segment_path)
+
+    assert {:ok, recovered_original} = open_store(root, segment_max_bytes: 260)
+
+    assert Enum.map(Store.pending(recovered_original), & &1.payload) == [
+             String.duplicate("a", 80),
+             String.duplicate("b", 80)
+           ]
+
+    assert {:ok, recovered_replacement} = open_store(replacement_root, segment_max_bytes: 260)
+    assert Enum.map(Store.pending(recovered_replacement), & &1.payload) == [String.duplicate("r", 80)]
+  end
+
+  test "creates a rotated segment in the bound root when the replacement has the same name", %{
+    root: root
+  } do
+    replacement_root = root <> "_replacement_collision"
+    displaced_root = root <> "_displaced_collision"
+    on_exit(fn -> File.rm_rf(replacement_root) end)
+    on_exit(fn -> File.rm_rf(displaced_root) end)
+    on_exit(&CreateSegmentRootAbaFileSystem.disarm/0)
+
+    assert {:ok, original} = open_store(root, segment_max_bytes: 260)
+    assert {:ok, replacement} = open_store(replacement_root, segment_max_bytes: 260)
+
+    assert {:ok, _first, original} =
+             Store.enqueue(
+               original,
+               :telemetry,
+               String.duplicate("a", 80),
+               entry_id: entry_id(1)
+             )
+
+    assert original.current_segment_bytes * 2 > original.segment_max_bytes
+
+    assert {:ok, _replacement_first, replacement} =
+             Store.enqueue(
+               replacement,
+               :telemetry,
+               String.duplicate("r", 80),
+               entry_id: entry_id(2)
+             )
+
+    assert {:ok, _replacement_second, replacement} =
+             Store.enqueue(
+               replacement,
+               :telemetry,
+               String.duplicate("s", 80),
+               entry_id: entry_id(3)
+             )
+
+    assert replacement.current_segment_id == 2
+
+    assert {:ok, original} =
+             open_store(root,
+               segment_file_system: CreateSegmentRootAbaFileSystem,
+               segment_max_bytes: 260
+             )
+
+    canonical_root = original.root_path
+    assert {:ok, canonical_replacement} = Store.canonical_root(replacement_root)
+    canonical_displaced = Path.join(Path.dirname(canonical_root), Path.basename(displaced_root))
+
+    CreateSegmentRootAbaFileSystem.arm(
+      self(),
+      canonical_root,
+      canonical_replacement,
+      canonical_displaced
+    )
+
+    assert {:ok, %{sequence: 2}, _store} =
+             Store.enqueue(
+               original,
+               :telemetry,
+               String.duplicate("b", 80),
+               entry_id: entry_id(4)
+             )
+
+    assert_receive {:create_segment_root_aba_fired, "segment-00000000000000000002.log"}
+    assert length(segment_paths(root)) == 2
+    assert length(segment_paths(replacement_root)) == 2
+
+    assert {:ok, recovered_original} = open_store(root, segment_max_bytes: 260)
+
+    assert Enum.map(Store.pending(recovered_original), & &1.payload) == [
+             String.duplicate("a", 80),
+             String.duplicate("b", 80)
+           ]
+
+    assert {:ok, recovered_replacement} = open_store(replacement_root, segment_max_bytes: 260)
+
+    assert Enum.map(Store.pending(recovered_replacement), & &1.payload) == [
+             String.duplicate("r", 80),
+             String.duplicate("s", 80)
+           ]
   end
 
   test "rejects a stale second handle before it can append a duplicate sequence", %{root: root} do
@@ -640,6 +1667,468 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
              )
 
     refute_receive :stale_builder_ran
+  end
+
+  test "rejects a handle after its root directory is replaced", %{root: root} do
+    replacement_root = root <> "_replacement"
+    displaced_root = root <> "_displaced"
+    on_exit(fn -> File.rm_rf(replacement_root) end)
+    on_exit(fn -> File.rm_rf(displaced_root) end)
+
+    assert {:ok, original} = open_store(root)
+    assert {:ok, replacement} = open_store(replacement_root)
+
+    assert {:ok, _original_entry, original} =
+             Store.enqueue(original, :telemetry, "AAAA", entry_id: entry_id(1))
+
+    assert {:ok, _replacement_entry, _replacement} =
+             Store.enqueue(replacement, :telemetry, "BBBB", entry_id: entry_id(2))
+
+    [original_segment] = segment_paths(root)
+    [replacement_segment] = segment_paths(replacement_root)
+    assert File.stat!(original_segment).size == File.stat!(replacement_segment).size
+
+    File.rename!(root, displaced_root)
+    File.rename!(replacement_root, root)
+
+    assert {:error, :stale_store} =
+             Store.enqueue(original, :telemetry, "CCCC", entry_id: entry_id(3))
+
+    assert {:ok, recovered_replacement} = open_store(root)
+    assert Enum.map(Store.pending(recovered_replacement), & &1.payload) == ["BBBB"]
+
+    assert {:ok, recovered_original} = open_store(displaced_root)
+    assert Enum.map(Store.pending(recovered_original), & &1.payload) == ["AAAA"]
+  end
+
+  test "serializes root replacement against an in-flight mutation", %{root: root} do
+    displaced_root = root <> "_displaced"
+    on_exit(fn -> File.rm_rf(displaced_root) end)
+
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+
+    assert {:ok, _seed, store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> {:ok, "seed"} end,
+               entry_id: entry_id(1)
+             )
+
+    owner = self()
+
+    in_flight =
+      Task.async(fn ->
+        Store.enqueue_checkpoint(
+          store,
+          fn 2 ->
+            send(owner, {:replacement_builder_waiting, self()})
+
+            receive do
+              :continue_replaced_builder -> {:ok, "stale-root"}
+            end
+          end,
+          entry_id: entry_id(2)
+        )
+      end)
+
+    assert_receive {:replacement_builder_waiting, in_flight_pid}
+    File.rename!(root, displaced_root)
+    File.cp_r!(displaced_root, root)
+
+    replacement =
+      Task.async(fn ->
+        with {:ok, replacement_store} <- open_store(root, streams: [:checkpoint]) do
+          send(owner, {:replacement_opened, self()})
+
+          receive do
+            :continue_replacement ->
+              Store.enqueue_checkpoint(
+                replacement_store,
+                fn 2 -> {:ok, "replacement-root"} end,
+                entry_id: entry_id(3)
+              )
+          end
+        end
+      end)
+
+    replacement_entered_while_locked =
+      receive do
+        {:replacement_opened, replacement_pid} -> replacement_pid
+      after
+        100 -> nil
+      end
+
+    send(in_flight_pid, :continue_replaced_builder)
+    in_flight_result = Task.await(in_flight)
+
+    replacement_pid =
+      replacement_entered_while_locked ||
+        receive do
+          {:replacement_opened, replacement_pid} -> replacement_pid
+        end
+
+    send(replacement_pid, :continue_replacement)
+    replacement_result = Task.await(replacement)
+
+    refute replacement_entered_while_locked
+    assert {:error, :stale_store} = in_flight_result
+    assert {:ok, %{sequence: 2, payload: "replacement-root"}, _store} = replacement_result
+
+    assert {:ok, recovered_replacement} = open_store(root, streams: [:checkpoint])
+
+    assert Enum.map(Store.pending(recovered_replacement), &{&1.sequence, &1.payload}) == [
+             {1, "seed"},
+             {2, "replacement-root"}
+           ]
+
+    assert {:ok, recovered_original} = open_store(displaced_root, streams: [:checkpoint])
+    assert Enum.map(Store.pending(recovered_original), &{&1.sequence, &1.payload}) == [{1, "seed"}]
+  end
+
+  test "revalidates root identity after append open before writing", %{root: root} do
+    replacement_root = root <> "_replacement"
+    displaced_root = root <> "_displaced"
+    on_exit(fn -> File.rm_rf(replacement_root) end)
+    on_exit(fn -> File.rm_rf(displaced_root) end)
+    on_exit(&BlockingAppendOpenFileSystem.disarm/0)
+
+    assert {:ok, original} = open_store(root)
+    assert {:ok, replacement} = open_store(replacement_root)
+
+    assert {:ok, _original_entry, _original} =
+             Store.enqueue(original, :telemetry, "AAAA", entry_id: entry_id(1))
+
+    assert {:ok, _replacement_entry, _replacement} =
+             Store.enqueue(replacement, :telemetry, "BBBB", entry_id: entry_id(2))
+
+    assert {:ok, original} = open_store(root, file_system: BlockingAppendOpenFileSystem)
+    BlockingAppendOpenFileSystem.arm(self())
+
+    stale_append =
+      Task.async(fn ->
+        Store.enqueue(original, :telemetry, "CCCC", entry_id: entry_id(3))
+      end)
+
+    assert_receive {:append_open_blocked, stale_append_pid}
+    File.rename!(root, displaced_root)
+    File.rename!(replacement_root, root)
+    owner = self()
+
+    replacement_append =
+      Task.async(fn ->
+        with {:ok, replacement} <- open_store(root) do
+          send(owner, :post_open_replacement_opened)
+          Store.enqueue(replacement, :telemetry, "DDDD", entry_id: entry_id(4))
+        end
+      end)
+
+    refute_receive :post_open_replacement_opened, 100
+    send(stale_append_pid, :continue_append_open)
+
+    assert {:error, :stale_store} = Task.await(stale_append)
+    assert {:ok, %{sequence: 2, payload: "DDDD"}, _store} = Task.await(replacement_append)
+    assert_receive :post_open_replacement_opened
+
+    assert {:ok, recovered_replacement} = open_store(root)
+    assert Enum.map(Store.pending(recovered_replacement), & &1.payload) == ["BBBB", "DDDD"]
+
+    assert {:ok, recovered_original} = open_store(displaced_root)
+    assert Enum.map(Store.pending(recovered_original), & &1.payload) == ["AAAA"]
+  end
+
+  test "rejects an append descriptor whose file changed after the pre-open stat", %{root: root} do
+    assert {:ok, store} = open_store(root)
+
+    assert {:ok, _entry, _store} =
+             Store.enqueue(store, :telemetry, "AAAA", entry_id: entry_id(1))
+
+    assert {:ok, store} = open_store(root, file_system: MutateAfterAppendOpenFileSystem)
+    segment_path = store.current_segment_path
+    size_before = File.stat!(segment_path).size
+    MutateAfterAppendOpenFileSystem.arm()
+
+    assert {:error, :stale_store} =
+             Store.enqueue(store, :telemetry, "BBBB", entry_id: entry_id(2))
+
+    assert File.stat!(segment_path).size == size_before + 1
+  end
+
+  test "rejects an append descriptor redirected through a root ABA", %{root: root} do
+    replacement_root = root <> "_replacement"
+    displaced_root = root <> "_displaced"
+    on_exit(fn -> File.rm_rf(replacement_root) end)
+    on_exit(fn -> File.rm_rf(displaced_root) end)
+    on_exit(&AppendDescriptorRootAbaFileSystem.disarm/0)
+
+    assert {:ok, original} = open_store(root)
+    assert {:ok, replacement} = open_store(replacement_root)
+
+    assert {:ok, _original_entry, _original} =
+             Store.enqueue(original, :telemetry, "AAAA", entry_id: entry_id(1))
+
+    assert {:ok, _replacement_entry, _replacement} =
+             Store.enqueue(replacement, :telemetry, "BBBB", entry_id: entry_id(2))
+
+    assert {:ok, original} = open_store(root, file_system: AppendDescriptorRootAbaFileSystem)
+    canonical_root = original.root_path
+    assert {:ok, canonical_replacement} = Store.canonical_root(replacement_root)
+    canonical_displaced = Path.join(Path.dirname(canonical_root), Path.basename(displaced_root))
+
+    AppendDescriptorRootAbaFileSystem.arm(
+      canonical_root,
+      canonical_replacement,
+      canonical_displaced
+    )
+
+    assert {:error, :stale_store} =
+             Store.enqueue(original, :telemetry, "CCCC", entry_id: entry_id(3))
+
+    assert {:ok, recovered_original} = open_store(root)
+    assert Enum.map(Store.pending(recovered_original), & &1.payload) == ["AAAA"]
+
+    assert {:ok, recovered_replacement} = open_store(replacement_root)
+    assert Enum.map(Store.pending(recovered_replacement), & &1.payload) == ["BBBB"]
+  end
+
+  test "fails durability closed if the root changes after the durable write", %{root: root} do
+    replacement_root = root <> "_replacement"
+    displaced_root = root <> "_displaced"
+    on_exit(fn -> File.rm_rf(replacement_root) end)
+    on_exit(fn -> File.rm_rf(displaced_root) end)
+    on_exit(&SwapAfterDirectoryCloseFileSystem.disarm/0)
+
+    assert {:ok, original} = open_store(root)
+    assert {:ok, replacement} = open_store(replacement_root)
+
+    assert {:ok, _original_entry, _original} =
+             Store.enqueue(original, :telemetry, "AAAA", entry_id: entry_id(1))
+
+    assert {:ok, _replacement_entry, _replacement} =
+             Store.enqueue(replacement, :telemetry, "BBBB", entry_id: entry_id(2))
+
+    assert {:ok, original} = open_store(root, file_system: SwapAfterDirectoryCloseFileSystem)
+    canonical_root = original.root_path
+    assert {:ok, canonical_replacement} = Store.canonical_root(replacement_root)
+    canonical_displaced = Path.join(Path.dirname(canonical_root), Path.basename(displaced_root))
+
+    SwapAfterDirectoryCloseFileSystem.arm(
+      canonical_root,
+      canonical_replacement,
+      canonical_displaced
+    )
+
+    assert {:error, {:durability_uncertain, :stale_store}} =
+             Store.enqueue(original, :telemetry, "CCCC", entry_id: entry_id(3))
+
+    assert {:ok, recovered_replacement} = open_store(root)
+    assert Enum.map(Store.pending(recovered_replacement), & &1.payload) == ["BBBB"]
+
+    assert {:ok, recovered_original} = open_store(displaced_root)
+    assert Enum.map(Store.pending(recovered_original), & &1.payload) == ["AAAA", "CCCC"]
+  end
+
+  test "rebinds an open if the root changes after its final durable write", %{root: root} do
+    replacement_root = root <> "_replacement"
+    displaced_root = root <> "_displaced"
+    on_exit(fn -> File.rm_rf(replacement_root) end)
+    on_exit(fn -> File.rm_rf(displaced_root) end)
+    on_exit(&SwapAfterDirectoryCloseFileSystem.disarm/0)
+
+    assert {:ok, replacement} = open_store(replacement_root)
+
+    assert {:ok, _replacement_entry, _replacement} =
+             Store.enqueue(replacement, :telemetry, "replacement", entry_id: entry_id(1))
+
+    assert {:ok, canonical_root} = Store.canonical_root(root)
+    assert {:ok, canonical_replacement} = Store.canonical_root(replacement_root)
+    canonical_displaced = Path.join(Path.dirname(canonical_root), Path.basename(displaced_root))
+
+    SwapAfterDirectoryCloseFileSystem.arm(
+      canonical_root,
+      canonical_replacement,
+      canonical_displaced
+    )
+
+    assert {:ok, opened} =
+             open_store(root, file_system: SwapAfterDirectoryCloseFileSystem)
+
+    assert Enum.map(Store.pending(opened), & &1.payload) == ["replacement"]
+
+    assert {:ok, displaced} = open_store(displaced_root)
+    assert Store.pending(displaced) == []
+  end
+
+  test "allows a callback to mutate an independent root", %{root: root} do
+    independent_root = root <> "_independent"
+    on_exit(fn -> File.rm_rf(independent_root) end)
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+    owner = self()
+
+    assert {:ok, %{sequence: 1, payload: "outer-checkpoint"}, _store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 ->
+                 result =
+                   with {:ok, independent} <- open_store(independent_root),
+                        {:ok, entry, _independent} <-
+                          Store.enqueue(
+                            independent,
+                            :telemetry,
+                            "independent-payload",
+                            entry_id: entry_id(2)
+                          ) do
+                     {:ok, entry}
+                   end
+
+                 send(owner, {:independent_mutation, result})
+
+                 case result do
+                   {:ok, _entry} -> {:ok, "outer-checkpoint"}
+                   {:error, reason} -> {:error, {:side_effect_failed, reason}}
+                 end
+               end,
+               entry_id: entry_id(1)
+             )
+
+    assert_receive {:independent_mutation, {:ok, %{sequence: 1, payload: "independent-payload"}}}
+    assert {:ok, recovered} = open_store(independent_root)
+    assert Enum.map(Store.pending(recovered), & &1.payload) == ["independent-payload"]
+  end
+
+  test "does not deadlock opposing independent-root callback mutations", %{root: root} do
+    independent_root = root <> "_independent"
+    on_exit(fn -> File.rm_rf(independent_root) end)
+
+    assert {:ok, first_store} = open_store(root, streams: [:checkpoint, :telemetry])
+
+    assert {:ok, second_store} =
+             open_store(independent_root, streams: [:checkpoint, :telemetry])
+
+    owner = self()
+
+    start_outer = fn label, outer_store, inner_store, outer_id, inner_id ->
+      Task.async(fn ->
+        Store.enqueue_checkpoint(
+          outer_store,
+          fn 1 ->
+            send(owner, {:opposing_mutation_ready, label, self()})
+
+            receive do
+              :attempt_opposing_mutation ->
+                case Store.enqueue(
+                       inner_store,
+                       :telemetry,
+                       "nested-#{label}",
+                       entry_id: entry_id(inner_id)
+                     ) do
+                  {:ok, _entry, _store} -> {:ok, "outer-#{label}"}
+                  {:error, reason} -> {:error, {:nested_failed, reason}}
+                end
+            end
+          end,
+          entry_id: entry_id(outer_id)
+        )
+      end)
+    end
+
+    first = start_outer.(:first, first_store, second_store, 1, 2)
+    second = start_outer.(:second, second_store, first_store, 3, 4)
+
+    assert_receive {:opposing_mutation_ready, :first, first_pid}
+    assert_receive {:opposing_mutation_ready, :second, second_pid}
+    send(first_pid, :attempt_opposing_mutation)
+    send(second_pid, :attempt_opposing_mutation)
+
+    yielded = Task.yield_many([first, second], 1_000)
+
+    Enum.each(yielded, fn
+      {task, nil} -> Task.shutdown(task, :brutal_kill)
+      {_task, _result} -> :ok
+    end)
+
+    assert Enum.all?(yielded, fn {_task, result} -> result != nil end)
+
+    results = Enum.map(yielded, fn {_task, {:ok, result}} -> result end)
+
+    assert Enum.any?(results, fn
+             {:error, {:nested_failed, {:mutation_lock, :contended}}} -> true
+             _result -> false
+           end)
+  end
+
+  test "a nested same-root mutation cannot release the outer checkpoint lock", %{root: root} do
+    assert {:ok, outer_handle} = open_store(root, streams: [:checkpoint])
+    assert {:ok, second_handle} = open_store(root, streams: [:checkpoint])
+    owner = self()
+
+    outer =
+      Task.async(fn ->
+        Store.enqueue_checkpoint(
+          outer_handle,
+          fn 1 ->
+            assert {:error, :reentrant_mutation} =
+                     Store.enqueue(
+                       outer_handle,
+                       :checkpoint,
+                       "nested-rejected-mutation",
+                       entry_id: entry_id(99)
+                     )
+
+            send(owner, {:outer_builder_waiting, self()})
+
+            receive do
+              :continue_outer_builder -> {:ok, "outer-checkpoint"}
+            end
+          end,
+          entry_id: entry_id(1)
+        )
+      end)
+
+    assert_receive {:outer_builder_waiting, outer_pid}
+
+    second =
+      Task.async(fn ->
+        send(owner, :second_task_started)
+
+        Store.enqueue_checkpoint(
+          second_handle,
+          fn 1 ->
+            send(owner, :second_builder_ran)
+            {:ok, "second-checkpoint"}
+          end,
+          entry_id: entry_id(2)
+        )
+      end)
+
+    assert_receive :second_task_started
+    refute_receive :second_builder_ran, 100
+    send(outer_pid, :continue_outer_builder)
+
+    assert {:ok, %{sequence: 1, payload: "outer-checkpoint"}, _store} = Task.await(outer)
+    assert {:error, :stale_store} = Task.await(second)
+    refute_receive :second_builder_ran
+  end
+
+  test "rejects a same-root mutation reentered from an append callback", %{root: root} do
+    assert {:ok, store} = open_store(root, file_system: ReentrantAppendFileSystem)
+
+    assert {:ok, _first, store} =
+             Store.enqueue(store, :telemetry, "first", entry_id: entry_id(1))
+
+    ReentrantAppendFileSystem.arm(store, self(), entry_id(3))
+
+    assert {:ok, outer, _store} =
+             Store.enqueue(store, :telemetry, "outer-append", entry_id: entry_id(2))
+
+    assert outer.sequence == 2
+    assert_receive {:reentrant_append, {:error, :reentrant_mutation}}
+
+    assert {:ok, recovered} = open_store(root)
+
+    assert Enum.map(Store.pending(recovered), &{&1.sequence, &1.payload}) == [
+             {1, "first"},
+             {2, "outer-append"}
+           ]
   end
 
   test "serializes simultaneous handles so only one sequence append succeeds", %{root: root} do
@@ -707,6 +2196,303 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
     assert Enum.count(results, &match?({:ok, _entry, _store}, &1)) == 1
     assert Enum.count(results, &(&1 == {:error, :stale_store})) == 1
+  end
+
+  test "canonicalizes case aliases before taking the per-root mutation lock", %{root: root} do
+    assert {:ok, real_handle} = open_store(root, streams: [:checkpoint])
+    alias_root = case_variant(root)
+
+    if same_file?(root, alias_root) do
+      assert {:ok, alias_handle} = open_store(alias_root, streams: [:checkpoint])
+      owner = self()
+
+      first =
+        Task.async(fn ->
+          Store.enqueue_checkpoint(
+            real_handle,
+            fn 1 ->
+              send(owner, {:case_builder_waiting, self()})
+
+              receive do
+                :continue_case_builder -> {:ok, "first-checkpoint"}
+              end
+            end,
+            entry_id: entry_id(1)
+          )
+        end)
+
+      assert_receive {:case_builder_waiting, first_pid}
+
+      aliased =
+        Task.async(fn ->
+          send(owner, :aliased_case_task_started)
+
+          Store.enqueue_checkpoint(
+            alias_handle,
+            fn 1 ->
+              send(owner, :aliased_case_builder_ran)
+              {:ok, "aliased-checkpoint"}
+            end,
+            entry_id: entry_id(2)
+          )
+        end)
+
+      assert_receive :aliased_case_task_started
+      refute_receive :aliased_case_builder_ran, 100
+      send(first_pid, :continue_case_builder)
+
+      assert {:ok, %{sequence: 1, payload: "first-checkpoint"}, _store} = Task.await(first)
+      assert {:error, :stale_store} = Task.await(aliased)
+      refute_receive :aliased_case_builder_ran
+      assert real_handle.root_path == alias_handle.root_path
+    end
+  end
+
+  test "canonicalizes Unicode case aliases to one mutation-lock root", %{root: root} do
+    unicode_root = root <> "_É"
+    alias_root = root <> "_é"
+    on_exit(fn -> File.rm_rf(unicode_root) end)
+
+    assert {:ok, real_handle} = open_store(unicode_root)
+
+    if same_file?(unicode_root, alias_root) do
+      assert {:ok, alias_handle} = open_store(alias_root)
+      assert real_handle.root_path == alias_handle.root_path
+    end
+  end
+
+  test "canonicalizes full Unicode case folds to one mutation-lock root", %{root: root} do
+    sigma_root = root <> "_σ"
+    alias_root = root <> "_ς"
+    on_exit(fn -> File.rm_rf(sigma_root) end)
+
+    assert {:ok, real_handle} = open_store(sigma_root)
+
+    if same_file?(sigma_root, alias_root) do
+      assert {:ok, alias_handle} = open_store(alias_root)
+      assert real_handle.root_path == alias_handle.root_path
+    end
+  end
+
+  test "keys mutations by filesystem identity across firmlink aliases" do
+    real_parent = "/private/tmp"
+    alias_parent = "/System/Volumes/Data/private/tmp"
+
+    if same_file?(real_parent, alias_parent) do
+      name = "durable_outbox_firmlink_#{System.unique_integer([:positive])}"
+      root = Path.join(real_parent, name)
+      alias_root = Path.join(alias_parent, name)
+      on_exit(fn -> File.rm_rf(root) end)
+
+      assert {:ok, real_handle} = open_store(root, streams: [:checkpoint])
+
+      assert {:ok, _first, real_handle} =
+               Store.enqueue_checkpoint(
+                 real_handle,
+                 fn 1 -> {:ok, "first-checkpoint"} end,
+                 entry_id: entry_id(1)
+               )
+
+      assert {:ok, alias_handle} = open_store(alias_root, streams: [:checkpoint])
+      owner = self()
+
+      first =
+        Task.async(fn ->
+          Store.enqueue_checkpoint(
+            real_handle,
+            fn 2 ->
+              send(owner, {:firmlink_builder_waiting, self()})
+
+              receive do
+                :continue_firmlink_builder -> {:ok, "second-checkpoint"}
+              end
+            end,
+            entry_id: entry_id(2)
+          )
+        end)
+
+      assert_receive {:firmlink_builder_waiting, first_pid}
+
+      aliased =
+        Task.async(fn ->
+          send(owner, :firmlink_alias_task_started)
+
+          Store.enqueue_checkpoint(
+            alias_handle,
+            fn 2 ->
+              send(owner, :firmlink_alias_builder_ran)
+              {:ok, "duplicate-second-checkpoint"}
+            end,
+            entry_id: entry_id(3)
+          )
+        end)
+
+      assert_receive :firmlink_alias_task_started
+      refute_receive :firmlink_alias_builder_ran, 100
+      send(first_pid, :continue_firmlink_builder)
+
+      assert {:ok, %{sequence: 2}, _store} = Task.await(first)
+      assert {:error, :stale_store} = Task.await(aliased)
+      refute_receive :firmlink_alias_builder_ran
+    end
+  end
+
+  test "binds the final namespace when opening a root with missing parent directories", %{root: root} do
+    tree_root = root <> "_tree"
+    nested_root = Path.join([tree_root, "missing", "parents", "outbox"])
+    on_exit(fn -> File.rm_rf(tree_root) end)
+
+    assert {:ok, store} = open_store(nested_root)
+
+    assert {:ok, %{sequence: 1}, _store} =
+             Store.enqueue(store, :telemetry, "nested-root", entry_id: entry_id(1))
+
+    assert {:ok, recovered} = open_store(nested_root)
+    assert Enum.map(Store.pending(recovered), & &1.payload) == ["nested-root"]
+  end
+
+  test "rebinds a queued open after missing parent directories are created", %{root: root} do
+    tree_root = root <> "_queued_tree"
+    nested_root = Path.join([tree_root, "missing", "parents", "outbox"])
+    on_exit(fn -> File.rm_rf(tree_root) end)
+    on_exit(&BlockingMkdirFileSystem.disarm/0)
+    BlockingMkdirFileSystem.arm(self())
+
+    first = Task.async(fn -> open_store(nested_root, file_system: BlockingMkdirFileSystem) end)
+    assert_receive {:mkdir_entered, 1, first_pid}
+    owner = self()
+
+    second =
+      Task.async(fn ->
+        send(owner, :queued_nested_open_started)
+        open_store(nested_root, file_system: BlockingMkdirFileSystem)
+      end)
+
+    assert_receive :queued_nested_open_started
+    refute_receive {:mkdir_entered, 2, _pid}, 100
+    send(first_pid, :continue_mkdir)
+
+    assert {:ok, _store} = Task.await(first)
+    assert {:ok, _store} = Task.await(second)
+    assert_receive {:mkdir_entered, 2, _second_pid}
+  end
+
+  test "does not deadlock concurrent opens when root directories are swapped", %{root: root} do
+    left_root = root <> "_left"
+    right_root = root <> "_right"
+    swap_root = root <> "_swap"
+    on_exit(fn -> File.rm_rf(left_root) end)
+    on_exit(fn -> File.rm_rf(right_root) end)
+    on_exit(fn -> File.rm_rf(swap_root) end)
+    on_exit(&BlockingEveryMkdirFileSystem.disarm/0)
+
+    assert {:ok, left} = open_store(left_root)
+    assert {:ok, right} = open_store(right_root)
+    assert {:ok, _entry, _left} = Store.enqueue(left, :telemetry, "left", entry_id: entry_id(1))
+    assert {:ok, _entry, _right} = Store.enqueue(right, :telemetry, "right", entry_id: entry_id(2))
+    assert {:ok, canonical_left_root} = Store.canonical_root(left_root)
+    assert {:ok, canonical_right_root} = Store.canonical_root(right_root)
+
+    BlockingEveryMkdirFileSystem.arm(self())
+
+    left_open =
+      Task.async(fn -> open_store(left_root, file_system: BlockingEveryMkdirFileSystem) end)
+
+    right_open =
+      Task.async(fn -> open_store(right_root, file_system: BlockingEveryMkdirFileSystem) end)
+
+    assert_receive {:every_mkdir_blocked, left_pid, ^canonical_left_root}
+    assert_receive {:every_mkdir_blocked, right_pid, ^canonical_right_root}
+
+    File.rename!(left_root, swap_root)
+    File.rename!(right_root, left_root)
+    File.rename!(swap_root, right_root)
+    send(left_pid, :continue_every_mkdir)
+    send(right_pid, :continue_every_mkdir)
+
+    assert {:ok, opened_left} = Task.await(left_open)
+    assert {:ok, opened_right} = Task.await(right_open)
+    assert Enum.map(Store.pending(opened_left), & &1.payload) == ["right"]
+    assert Enum.map(Store.pending(opened_right), & &1.payload) == ["left"]
+  end
+
+  test "does not deadlock when parent namespaces are swapped during open", %{root: root} do
+    tree_root = root <> "_parent_swap"
+    left_parent = Path.join(tree_root, "left")
+    right_parent = Path.join(tree_root, "right")
+    left_root = Path.join(left_parent, "outbox")
+    right_root = Path.join(right_parent, "outbox")
+    swap_parent = Path.join(tree_root, "swap")
+    on_exit(fn -> File.rm_rf(tree_root) end)
+    on_exit(&BlockingAfterMkdirFileSystem.disarm/0)
+
+    assert {:ok, left} = open_store(left_root)
+    assert {:ok, right} = open_store(right_root)
+    assert {:ok, _entry, _left} = Store.enqueue(left, :telemetry, "left", entry_id: entry_id(1))
+    assert {:ok, _entry, _right} = Store.enqueue(right, :telemetry, "right", entry_id: entry_id(2))
+    assert {:ok, canonical_left_root} = Store.canonical_root(left_root)
+    assert {:ok, canonical_right_root} = Store.canonical_root(right_root)
+
+    BlockingAfterMkdirFileSystem.arm(self())
+
+    left_open =
+      Task.async(fn -> open_store(left_root, file_system: BlockingAfterMkdirFileSystem) end)
+
+    right_open =
+      Task.async(fn -> open_store(right_root, file_system: BlockingAfterMkdirFileSystem) end)
+
+    assert_receive {:mkdir_completed, left_pid, ^canonical_left_root}
+    assert_receive {:mkdir_completed, right_pid, ^canonical_right_root}
+
+    File.rename!(left_parent, swap_parent)
+    File.rename!(right_parent, left_parent)
+    File.rename!(swap_parent, right_parent)
+    send(left_pid, :continue_completed_mkdir)
+    send(right_pid, :continue_completed_mkdir)
+
+    left_result = Task.yield(left_open, 1_000)
+    right_result = Task.yield(right_open, 1_000)
+    if is_nil(left_result), do: Task.shutdown(left_open, :brutal_kill)
+    if is_nil(right_result), do: Task.shutdown(right_open, :brutal_kill)
+
+    assert {:ok, {:ok, opened_left}} = left_result
+    assert {:ok, {:ok, opened_right}} = right_result
+    assert Enum.map(Store.pending(opened_left), & &1.payload) == ["right"]
+    assert Enum.map(Store.pending(opened_right), & &1.payload) == ["left"]
+  end
+
+  test "serializes missing-root creation across firmlink aliases" do
+    real_parent = "/private/tmp"
+    alias_parent = "/System/Volumes/Data/private/tmp"
+
+    if same_file?(real_parent, alias_parent) do
+      name = "durable_outbox_missing_firmlink_#{System.unique_integer([:positive])}"
+      root = Path.join(real_parent, name)
+      alias_root = Path.join(alias_parent, name)
+      on_exit(fn -> File.rm_rf(root) end)
+      on_exit(&BlockingMkdirFileSystem.disarm/0)
+      BlockingMkdirFileSystem.arm(self())
+
+      first =
+        Task.async(fn -> open_store(root, file_system: BlockingMkdirFileSystem) end)
+
+      assert_receive {:mkdir_entered, 1, first_pid}
+      owner = self()
+
+      aliased =
+        Task.async(fn ->
+          send(owner, :aliased_open_started)
+          open_store(alias_root, file_system: BlockingMkdirFileSystem)
+        end)
+
+      assert_receive :aliased_open_started
+      refute_receive {:mkdir_entered, 2, _pid}, 100
+      send(first_pid, :continue_mkdir)
+
+      assert {:ok, _store} = Task.await(first)
+      assert {:ok, _store} = Task.await(aliased)
+      assert_receive {:mkdir_entered, 2, _second_pid}
+    end
   end
 
   test "rotates bounded segments and truncates only a torn final record", %{root: root} do
@@ -882,6 +2668,268 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert committed_bytes > before_ack
   end
 
+  test "run state requires committed byte floors for every active segment", %{root: root} do
+    assert {:ok, store} =
+             open_store(root, file_system: TracingFileSystem)
+
+    assert {:ok, entry, store} =
+             Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
+
+    [segment] = segment_paths(root)
+    before_ack = File.stat!(segment).size
+    TracingFileSystem.fail_snapshot_rename()
+
+    assert {:error, {:durability_uncertain, {:snapshot_rename, :simulated_rename_failure}}} =
+             Store.acknowledge(store, receipt_for(entry))
+
+    run_state_path = Path.join(root, "run-state.bin")
+    assert {:ok, run_state} = run_state_path |> File.read!() |> RunState.decode()
+    assert [{1, committed_size}] = Map.fetch!(run_state, "committed_segment_sizes")
+    assert committed_size > before_ack
+
+    assert {:ok, bytes} =
+             run_state
+             |> Map.put("committed_segment_sizes", [])
+             |> RunState.encode()
+
+    File.write!(run_state_path, bytes)
+    truncate_file!(segment, before_ack)
+
+    assert {:error, :invalid_run_state} =
+             open_store(root, file_system: TracingFileSystem)
+  end
+
+  test "legacy run state requires an explicit byte floor for exactly one active segment", %{root: root} do
+    assert {:ok, store} = open_store(root)
+
+    assert {:ok, _entry, _store} =
+             Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
+
+    run_state_path = Path.join(root, "run-state.bin")
+    assert {:ok, run_state} = run_state_path |> File.read!() |> RunState.decode()
+
+    assert {:ok, missing_floor_bytes} =
+             run_state
+             |> Map.delete("committed_segment_sizes")
+             |> Map.delete("committed_segment_bytes")
+             |> RunState.encode()
+
+    File.write!(run_state_path, missing_floor_bytes)
+    assert {:error, :invalid_run_state} = open_store(root)
+
+    single_root = root <> "_single_legacy_floor"
+    on_exit(fn -> File.rm_rf(single_root) end)
+    assert {:ok, single_store} = open_store(single_root)
+
+    assert {:ok, _entry, _single_store} =
+             Store.enqueue(single_store, :telemetry, "payload", entry_id: entry_id(2))
+
+    [single_segment] = segment_paths(single_root)
+    single_run_state_path = Path.join(single_root, "run-state.bin")
+    assert {:ok, single_run_state} = single_run_state_path |> File.read!() |> RunState.decode()
+
+    assert {:ok, single_legacy_bytes} =
+             single_run_state
+             |> Map.delete("committed_segment_sizes")
+             |> Map.put("committed_segment_bytes", File.stat!(single_segment).size)
+             |> RunState.encode()
+
+    File.write!(single_run_state_path, single_legacy_bytes)
+    assert {:ok, _recovered} = open_store(single_root)
+
+    multiple_root = root <> "_multiple_legacy_floors"
+    on_exit(fn -> File.rm_rf(multiple_root) end)
+    assert {:ok, multiple_store} = open_store(multiple_root, segment_max_bytes: 260)
+
+    assert {:ok, _first, multiple_store} =
+             Store.enqueue(
+               multiple_store,
+               :telemetry,
+               String.duplicate("a", 40),
+               entry_id: entry_id(3)
+             )
+
+    assert {:ok, _second, _multiple_store} =
+             Store.enqueue(
+               multiple_store,
+               :telemetry,
+               String.duplicate("b", 40),
+               entry_id: entry_id(4)
+             )
+
+    [_first_segment, final_segment] = segment_paths(multiple_root)
+    multiple_run_state_path = Path.join(multiple_root, "run-state.bin")
+    assert {:ok, multiple_run_state} = multiple_run_state_path |> File.read!() |> RunState.decode()
+
+    assert {:ok, multiple_legacy_bytes} =
+             multiple_run_state
+             |> Map.delete("committed_segment_sizes")
+             |> Map.put("committed_segment_bytes", File.stat!(final_segment).size)
+             |> RunState.encode()
+
+    File.write!(multiple_run_state_path, multiple_legacy_bytes)
+    assert {:error, :invalid_run_state} = open_store(multiple_root, segment_max_bytes: 260)
+  end
+
+  test "legacy byte floors covered by the active snapshot are safely superseded", %{root: root} do
+    assert {:ok, store} = open_store(root)
+    assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
+    assert {:ok, [^entry], _store} = Store.acknowledge(store, receipt_for(entry))
+    assert segment_paths(root) == []
+
+    snapshot_path = Path.join(root, "snapshot.bin")
+    assert {:ok, snapshot} = snapshot_path |> File.read!() |> Snapshot.decode()
+    assert snapshot["covered_segment_id"] > 0
+
+    run_state_path = Path.join(root, "run-state.bin")
+    assert {:ok, run_state} = run_state_path |> File.read!() |> RunState.decode()
+    assert run_state["segment_high_water"] == snapshot["covered_segment_id"]
+
+    assert {:ok, legacy_bytes} =
+             run_state
+             |> Map.delete("committed_segment_sizes")
+             |> Map.put("committed_segment_bytes", 1)
+             |> RunState.encode()
+
+    File.write!(run_state_path, legacy_bytes)
+
+    assert {:ok, recovered} = open_store(root)
+    assert Store.pending(recovered) == []
+  end
+
+  test "run state requires positive historical exact-history limits", %{root: root} do
+    assert {:ok, _store} = open_store(root)
+    run_state_path = Path.join(root, "run-state.bin")
+    assert {:ok, run_state} = run_state_path |> File.read!() |> RunState.decode()
+
+    for {field, invalid_limit, index} <-
+          Enum.with_index(
+            for field <- ["entry_id_tombstone_limit", "resolved_receipt_limit"],
+                invalid_limit <- [0, -1, "1", nil],
+                do: {field, invalid_limit}
+          )
+          |> Enum.map(fn {{field, invalid_limit}, index} -> {field, invalid_limit, index} end) do
+      case_root = root <> "_invalid_history_limit_#{index}"
+      on_exit(fn -> File.rm_rf(case_root) end)
+      File.mkdir_p!(case_root)
+
+      assert {:ok, bytes} =
+               run_state
+               |> Map.put(field, invalid_limit)
+               |> RunState.encode()
+
+      File.write!(Path.join(case_root, "run-state.bin"), bytes)
+      File.write!(Path.join(case_root, "run-state.required"), "RODM\x01")
+
+      assert {:error, :invalid_run_state} = open_store(case_root)
+    end
+
+    for {missing_field, index} <-
+          Enum.with_index(["entry_id_tombstone_limit", "resolved_receipt_limit"]) do
+      case_root = root <> "_missing_history_limit_#{index}"
+      on_exit(fn -> File.rm_rf(case_root) end)
+      File.mkdir_p!(case_root)
+
+      assert {:ok, bytes} = run_state |> Map.delete(missing_field) |> RunState.encode()
+      File.write!(Path.join(case_root, "run-state.bin"), bytes)
+      File.write!(Path.join(case_root, "run-state.required"), "RODM\x01")
+
+      assert {:error, :invalid_run_state} = open_store(case_root)
+    end
+  end
+
+  test "a legacy segment without run state cannot borrow the current receipt limit", %{root: root} do
+    File.mkdir_p!(root)
+    payload = "legacy"
+    entry_bytes = encoded_entry(1, entry_id(1), payload)
+
+    assert {:ok, acknowledgement_bytes} =
+             Record.encode(%{
+               kind: :acknowledgement,
+               stream: "telemetry",
+               device_id: @device_id,
+               credential_epoch: @credential_epoch,
+               storage_epoch: @storage_epoch,
+               sequence: 1,
+               payload_hash: :crypto.hash(:sha256, payload),
+               cumulative_sequence: 0
+             })
+
+    segment = Path.join(root, "segment-00000000000000000001.log")
+    File.write!(segment, entry_bytes <> acknowledgement_bytes)
+
+    assert {:error, :legacy_resolved_receipt_limit_unknown} =
+             open_store(root, max_resolved_receipts: 3)
+
+    assert File.exists?(segment)
+    refute File.exists?(Path.join(root, "quarantine"))
+    refute File.exists?(Path.join(root, "run-state.bin"))
+  end
+
+  test "a legacy loss record without run state cannot borrow the current tombstone limit", %{
+    root: root
+  } do
+    File.mkdir_p!(root)
+    payload = "legacy"
+    entry_bytes = encoded_entry(1, entry_id(1), payload)
+
+    assert {:ok, loss_bytes} =
+             Record.encode(%{
+               kind: :loss_authorization,
+               stream: "telemetry",
+               device_id: @device_id,
+               credential_epoch: @credential_epoch,
+               storage_epoch: @storage_epoch,
+               sequence: 1,
+               entry_id: entry_id(1),
+               payload_hash: :crypto.hash(:sha256, payload),
+               reason: "operator ticket"
+             })
+
+    segment = Path.join(root, "segment-00000000000000000001.log")
+    File.write!(segment, entry_bytes <> loss_bytes)
+
+    assert {:error, :legacy_entry_id_tombstone_limit_unknown} =
+             open_store(root, max_entry_id_tombstones: 3)
+
+    assert File.exists?(segment)
+    refute File.exists?(Path.join(root, "quarantine"))
+    refute File.exists?(Path.join(root, "run-state.bin"))
+  end
+
+  test "legacy run state fails closed when an active acknowledgement needs an unknown limit", %{
+    root: root
+  } do
+    assert {:ok, store} = open_store(root, file_system: TracingFileSystem)
+
+    assert {:ok, entry, store} =
+             Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
+
+    TracingFileSystem.fail_snapshot_rename()
+
+    assert {:error, {:durability_uncertain, {:snapshot_rename, :simulated_rename_failure}}} =
+             Store.acknowledge(store, receipt_for(entry))
+
+    run_state_path = Path.join(root, "run-state.bin")
+    assert {:ok, run_state} = run_state_path |> File.read!() |> RunState.decode()
+
+    assert {:ok, legacy_bytes} =
+             run_state
+             |> Map.delete("entry_id_tombstone_limit")
+             |> Map.delete("resolved_receipt_limit")
+             |> RunState.encode()
+
+    File.write!(run_state_path, legacy_bytes)
+
+    [segment] = segment_paths(root)
+
+    assert {:error, :legacy_resolved_receipt_limit_unknown} =
+             open_store(root, file_system: TracingFileSystem)
+
+    assert File.exists?(segment)
+    refute File.exists?(Path.join(root, "quarantine"))
+  end
+
   test "requires durable run state once a schema-v2 snapshot marks the root", %{root: root} do
     assert {:ok, store} = open_store(root)
     assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
@@ -894,6 +2942,461 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert File.exists?(Path.join(root, "snapshot.bin"))
     refute File.exists?(Path.join(root, "quarantine"))
     refute File.exists?(run_state)
+  end
+
+  test "replays stronger cumulative retries after the exact-history bound shrinks", %{root: root} do
+    assert {:ok, store} =
+             open_store(
+               root,
+               file_system: TracingFileSystem,
+               max_resolved_receipts: 3
+             )
+
+    assert {:ok, telemetry_first, store} =
+             Store.enqueue(store, :telemetry, "telemetry-1", entry_id: entry_id(1))
+
+    assert {:ok, telemetry_second, store} =
+             Store.enqueue(store, :telemetry, "telemetry-2", entry_id: entry_id(2))
+
+    assert {:ok, telemetry_third, store} =
+             Store.enqueue(store, :telemetry, "telemetry-3", entry_id: entry_id(3))
+
+    assert {:ok, health_first, store} =
+             Store.enqueue(store, :health, "health-1", entry_id: entry_id(4))
+
+    assert {:ok, [^telemetry_first], store} =
+             Store.acknowledge(store, receipt_for(telemetry_first))
+
+    assert {:ok, [^telemetry_third], store} =
+             Store.acknowledge(store, receipt_for(telemetry_third))
+
+    assert {:ok, [^health_first], store} =
+             Store.acknowledge(store, receipt_for(health_first))
+
+    TracingFileSystem.fail_snapshot_rename()
+
+    assert {:error, {:durability_uncertain, {:snapshot_rename, :simulated_rename_failure}}} =
+             Store.acknowledge(
+               store,
+               %{receipt_for(telemetry_third) | cumulative_sequence: 3}
+             )
+
+    assert {:ok, recovered} =
+             open_store(
+               root,
+               file_system: TracingFileSystem,
+               max_resolved_receipts: 1
+             )
+
+    assert Store.pending(recovered) == []
+    assert Store.next_sequence(recovered, :telemetry) == {:ok, telemetry_second.sequence + 2}
+    assert segment_paths(root) == []
+
+    assert {:ok, transitioned_run_state} =
+             root
+             |> Path.join("run-state.bin")
+             |> File.read!()
+             |> RunState.decode()
+
+    assert transitioned_run_state["resolved_receipt_limit"] == 1
+    assert transitioned_run_state["committed_segment_sizes"] == []
+
+    assert {:ok, recovered} =
+             open_store(
+               root,
+               file_system: TracingFileSystem,
+               max_resolved_receipts: 1
+             )
+
+    assert Store.pending(recovered) == []
+    assert recovered.acknowledged_floors.telemetry == 3
+
+    assert {:ok, telemetry_fourth, recovered} =
+             Store.enqueue(recovered, :telemetry, "telemetry-4", entry_id: entry_id(5))
+
+    assert {:ok, [^telemetry_fourth], empty} =
+             Store.acknowledge(
+               recovered,
+               %{receipt_for(telemetry_fourth) | cumulative_sequence: 4}
+             )
+
+    assert Store.pending(empty) == []
+  end
+
+  test "replay rejects a cumulative record without exact allocated receipt proof", %{root: root} do
+    assert {:ok, store} = open_store(root)
+
+    assert {:ok, _first, store} =
+             Store.enqueue(store, :telemetry, "first", entry_id: entry_id(1))
+
+    assert {:ok, _second, _store} =
+             Store.enqueue(store, :telemetry, "second", entry_id: entry_id(2))
+
+    assert {:ok, encoded} =
+             Record.encode(%{
+               kind: :acknowledgement,
+               stream: "telemetry",
+               device_id: @device_id,
+               credential_epoch: @credential_epoch,
+               storage_epoch: @storage_epoch,
+               sequence: 99,
+               payload_hash: <<7::256>>,
+               cumulative_sequence: 2
+             })
+
+    [segment] = segment_paths(root)
+    File.write!(segment, encoded, [:append])
+
+    assert {:error, {:quarantined, :receipt_entry_not_found, quarantine_path}} =
+             open_store(root)
+
+    assert File.exists?(quarantine_path)
+  end
+
+  test "replay rejects a cumulative record anchored by explicit loss", %{root: root} do
+    assert {:ok, store} = open_store(root)
+
+    assert {:ok, lost, store} =
+             Store.enqueue(store, :telemetry, "lost", entry_id: entry_id(1))
+
+    loss_identity =
+      Map.take(lost, [
+        :stream,
+        :device_id,
+        :credential_epoch,
+        :storage_epoch,
+        :sequence,
+        :payload_hash
+      ])
+
+    assert {:ok, ^lost, store} =
+             Store.authorize_loss(store, loss_identity, "operator ticket")
+
+    assert {:ok, _pending, _store} =
+             Store.enqueue(store, :telemetry, "pending", entry_id: entry_id(2))
+
+    assert {:ok, encoded} =
+             Record.encode(%{
+               kind: :acknowledgement,
+               stream: "telemetry",
+               device_id: lost.device_id,
+               credential_epoch: lost.credential_epoch,
+               storage_epoch: lost.storage_epoch,
+               sequence: lost.sequence,
+               payload_hash: lost.payload_hash,
+               cumulative_sequence: 2
+             })
+
+    [segment] = segment_paths(root)
+    File.write!(segment, encoded, [:append])
+
+    assert {:error, {:quarantined, :receipt_entry_not_found, quarantine_path}} =
+             open_store(root)
+
+    assert File.exists?(quarantine_path)
+  end
+
+  test "replay preserves fail-closed receipt eviction semantics", %{root: root} do
+    assert {:ok, store} = open_store(root, max_resolved_receipts: 1)
+
+    {[first, second, third, fourth], _store} =
+      Enum.map_reduce(1..4, store, fn n, acc ->
+        {:ok, entry, acc} =
+          Store.enqueue(acc, :telemetry, "payload-#{n}", entry_id: entry_id(n))
+
+        {entry, acc}
+      end)
+
+    append_acknowledgement_record!(root, receipt_for(second))
+    append_acknowledgement_record!(root, receipt_for(third))
+
+    append_acknowledgement_record!(
+      root,
+      %{receipt_for(fourth) | cumulative_sequence: 3}
+    )
+
+    assert {:error, {:quarantined, :non_contiguous_cumulative_prefix, quarantine_path}} =
+             open_store(root, max_resolved_receipts: 1)
+
+    assert File.exists?(quarantine_path)
+    assert first.sequence == 1
+  end
+
+  test "no-segment limit transitions durably canonicalize exact histories", %{root: root} do
+    assert {:ok, store} =
+             open_store(root,
+               max_entry_id_tombstones: 3,
+               max_resolved_receipts: 3
+             )
+
+    {[first, second, third], store} =
+      Enum.map_reduce(1..3, store, fn n, acc ->
+        {:ok, entry, acc} =
+          Store.enqueue(acc, :telemetry, "payload-#{n}", entry_id: entry_id(n))
+
+        {entry, acc}
+      end)
+
+    assert {:ok, [^first], store} = Store.acknowledge(store, receipt_for(first))
+    assert {:ok, [^second], store} = Store.acknowledge(store, receipt_for(second))
+    assert {:ok, [^third], _store} = Store.acknowledge(store, receipt_for(third))
+    assert segment_paths(root) == []
+
+    assert {:ok, shrunk} =
+             open_store(root,
+               max_entry_id_tombstones: 1,
+               max_resolved_receipts: 1
+             )
+
+    assert length(shrunk.entry_id_tombstones) == 1
+    refute Store.resolved_receipt?(shrunk, receipt_for(first))
+    assert Store.resolved_receipt?(shrunk, receipt_for(third))
+
+    assert {:ok, reused_first, _shrunk} =
+             Store.enqueue(shrunk, :telemetry, "reused-first", entry_id: first.entry_id)
+
+    assert reused_first.sequence == 4
+
+    assert {:ok, expanded} =
+             open_store(root,
+               max_entry_id_tombstones: 3,
+               max_resolved_receipts: 3
+             )
+
+    assert length(expanded.entry_id_tombstones) == 1
+    refute Store.resolved_receipt?(expanded, receipt_for(first))
+
+    assert {:ok, reopened} =
+             open_store(root,
+               max_entry_id_tombstones: 3,
+               max_resolved_receipts: 3
+             )
+
+    assert length(reopened.entry_id_tombstones) == 1
+    refute Store.resolved_receipt?(reopened, receipt_for(first))
+    refute Store.resolved_receipt?(reopened, receipt_for(second))
+    assert Store.resolved_receipt?(reopened, receipt_for(third))
+
+    assert {:ok, _reused, _store} =
+             Store.enqueue(reopened, :telemetry, "reused", entry_id: second.entry_id)
+  end
+
+  test "snapshot-only legacy migration persists run state before activating schema v3", %{root: root} do
+    File.mkdir_p!(root)
+    File.write!(Path.join(root, "snapshot.bin"), legacy_snapshot_v1())
+    TracingFileSystem.fail_run_state_rename()
+
+    assert {:error, {:run_state_rename, :simulated_rename_failure}} =
+             open_store(root, file_system: TracingFileSystem)
+
+    assert {:ok, legacy_snapshot} =
+             root
+             |> Path.join("snapshot.bin")
+             |> File.read!()
+             |> Snapshot.decode()
+
+    assert Map.get(legacy_snapshot, "schema_version", 1) == 1
+    refute File.exists?(Path.join(root, "run-state.bin"))
+
+    assert {:ok, recovered} = open_store(root, file_system: TracingFileSystem)
+    assert Store.pending(recovered) == []
+  end
+
+  test "receipt-limit transition crash points preserve one replay regime", %{root: root} do
+    cases = [
+      {:snapshot_rename, &TracingFileSystem.fail_snapshot_rename/0, true},
+      {:run_state_rename, fn -> TracingFileSystem.fail_run_state_rename_after(1) end, false}
+    ]
+
+    for {operation, fail_next, segment_survives?} <- cases do
+      case_root = root <> "_limit_transition_#{operation}"
+      on_exit(fn -> File.rm_rf(case_root) end)
+      {first, _second, _third} = prepare_active_limit_three_retry!(case_root)
+      fail_next.()
+
+      expected_error =
+        case operation do
+          :snapshot_rename ->
+            {:error, {:durability_uncertain, {:snapshot_rename, :simulated_rename_failure}}}
+
+          :run_state_rename ->
+            {:error, {:run_state_rename, :simulated_rename_failure}}
+        end
+
+      assert ^expected_error =
+               open_store(
+                 case_root,
+                 file_system: TracingFileSystem,
+                 max_entry_id_tombstones: 1,
+                 max_resolved_receipts: 1
+               )
+
+      assert segment_paths(case_root) != [] == segment_survives?
+
+      assert {:ok, old_run_state} =
+               case_root
+               |> Path.join("run-state.bin")
+               |> File.read!()
+               |> RunState.decode()
+
+      assert old_run_state["entry_id_tombstone_limit"] == 3
+      assert old_run_state["resolved_receipt_limit"] == 3
+
+      assert {:ok, old_regime} =
+               open_store(
+                 case_root,
+                 file_system: TracingFileSystem,
+                 max_entry_id_tombstones: 3,
+                 max_resolved_receipts: 3
+               )
+
+      assert Store.resolved_receipt?(old_regime, receipt_for(first))
+
+      assert {:error, :duplicate_entry_id} =
+               Store.enqueue(old_regime, :telemetry, "duplicate", entry_id: first.entry_id)
+
+      assert {:ok, recovered} =
+               open_store(
+                 case_root,
+                 file_system: TracingFileSystem,
+                 max_entry_id_tombstones: 1,
+                 max_resolved_receipts: 1
+               )
+
+      assert Store.pending(recovered) == []
+      assert segment_paths(case_root) == []
+
+      assert {:ok, transitioned_run_state} =
+               case_root
+               |> Path.join("run-state.bin")
+               |> File.read!()
+               |> RunState.decode()
+
+      assert transitioned_run_state["entry_id_tombstone_limit"] == 1
+      assert transitioned_run_state["resolved_receipt_limit"] == 1
+      refute Store.resolved_receipt?(recovered, receipt_for(first))
+
+      assert {:ok, _reused, _store} =
+               Store.enqueue(recovered, :telemetry, "reused", entry_id: first.entry_id)
+    end
+  end
+
+  test "transition recovery publishes a rotated high-water before snapshot activation", %{root: root} do
+    opts = [
+      file_system: TracingFileSystem,
+      max_resolved_receipts: 3,
+      segment_max_bytes: 260,
+      max_disk_bytes: 10_000
+    ]
+
+    assert {:ok, store} = open_store(root, opts)
+
+    assert {:ok, entry, store} =
+             Store.enqueue(
+               store,
+               :telemetry,
+               String.duplicate("payload", 6),
+               entry_id: entry_id(1)
+             )
+
+    assert length(segment_paths(root)) == 1
+    TracingFileSystem.fail_run_state_rename()
+
+    assert {:error, {:durability_uncertain, {:run_state_rename, :simulated_rename_failure}}} =
+             Store.acknowledge(store, receipt_for(entry))
+
+    assert length(segment_paths(root)) == 2
+
+    run_state_path = Path.join(root, "run-state.bin")
+    assert {:ok, stale_run_state} = run_state_path |> File.read!() |> RunState.decode()
+    assert stale_run_state["segment_high_water"] == 1
+
+    TracingFileSystem.fail_run_state_rename_after(1)
+
+    assert {:error, {:run_state_rename, :simulated_rename_failure}} =
+             open_store(
+               root,
+               Keyword.put(opts, :max_resolved_receipts, 1)
+             )
+
+    assert segment_paths(root) == []
+    assert {:ok, recovered_run_state} = run_state_path |> File.read!() |> RunState.decode()
+    assert recovered_run_state["segment_high_water"] == 2
+    assert recovered_run_state["resolved_receipt_limit"] == 3
+
+    assert {:ok, recovered} =
+             open_store(
+               root,
+               Keyword.put(opts, :max_resolved_receipts, 1)
+             )
+
+    assert Store.pending(recovered) == []
+    assert recovered.acknowledged_floors.telemetry == 1
+  end
+
+  test "a receipt-limit transition governs every future active acknowledgement", %{root: root} do
+    assert {:ok, store} =
+             open_store(
+               root,
+               file_system: TracingFileSystem,
+               max_resolved_receipts: 3
+             )
+
+    {[first, second, third], store} =
+      Enum.map_reduce(1..3, store, fn n, acc ->
+        {:ok, entry, acc} =
+          Store.enqueue(acc, :telemetry, "old-#{n}", entry_id: entry_id(n))
+
+        {entry, acc}
+      end)
+
+    assert {:ok, [^third], store} = Store.acknowledge(store, receipt_for(third))
+    TracingFileSystem.fail_snapshot_rename()
+
+    assert {:error, {:durability_uncertain, {:snapshot_rename, :simulated_rename_failure}}} =
+             Store.acknowledge(
+               store,
+               %{receipt_for(third) | cumulative_sequence: 3}
+             )
+
+    assert first.sequence == 1
+    assert second.sequence == 2
+
+    assert {:ok, transitioned} =
+             open_store(
+               root,
+               file_system: TracingFileSystem,
+               max_resolved_receipts: 1
+             )
+
+    assert Store.pending(transitioned) == []
+    assert segment_paths(root) == []
+
+    {[fourth, fifth, sixth, seventh], _store} =
+      Enum.map_reduce(4..7, transitioned, fn n, acc ->
+        {:ok, entry, acc} =
+          Store.enqueue(acc, :telemetry, "new-#{n}", entry_id: entry_id(n))
+
+        {entry, acc}
+      end)
+
+    append_acknowledgement_record!(root, receipt_for(fifth))
+    append_acknowledgement_record!(root, receipt_for(sixth))
+
+    append_acknowledgement_record!(
+      root,
+      %{receipt_for(seventh) | cumulative_sequence: 6}
+    )
+
+    assert {:error, {:quarantined, :non_contiguous_cumulative_prefix, quarantine_path}} =
+             open_store(
+               root,
+               file_system: TracingFileSystem,
+               max_resolved_receipts: 1
+             )
+
+    assert File.exists?(quarantine_path)
+    assert fourth.sequence == 4
   end
 
   test "migrates schema-v2 contiguous proof before applying a smaller history bound", %{root: root} do
@@ -956,6 +3459,81 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert Enum.map(Store.pending(recovered), & &1.sequence) == [3]
   end
 
+  test "schema-v3 snapshots require explicit entry-id history metadata", %{root: root} do
+    assert {:ok, store} = open_store(root)
+    assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
+    assert {:ok, [^entry], _store} = Store.acknowledge(store, receipt_for(entry))
+
+    assert {:ok, valid_snapshot} =
+             root
+             |> Path.join("snapshot.bin")
+             |> File.read!()
+             |> Snapshot.decode()
+
+    for {field, index} <-
+          Enum.with_index([
+            "entry_id_history_complete",
+            "entry_id_tombstones",
+            "resolved_receipts"
+          ]) do
+      case_root = root <> "_entry_id_metadata_#{index}"
+      on_exit(fn -> File.rm_rf(case_root) end)
+      File.mkdir_p!(case_root)
+
+      assert {:ok, bytes} =
+               valid_snapshot
+               |> Map.delete(field)
+               |> Snapshot.encode()
+
+      File.write!(Path.join(case_root, "snapshot.bin"), bytes)
+
+      assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} =
+               open_store(case_root)
+
+      assert File.exists?(quarantine_path)
+    end
+  end
+
+  test "schema-v2 snapshots require explicit bounded-history metadata", %{root: root} do
+    assert {:ok, store} = open_store(root)
+    assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
+    assert {:ok, [^entry], _store} = Store.acknowledge(store, receipt_for(entry))
+
+    assert {:ok, valid_snapshot} =
+             root
+             |> Path.join("snapshot.bin")
+             |> File.read!()
+             |> Snapshot.decode()
+
+    valid_snapshot =
+      valid_snapshot
+      |> Map.put("schema_version", 2)
+      |> Map.delete("acknowledged_floors")
+
+    for {field, index} <-
+          Enum.with_index([
+            "entry_id_history_complete",
+            "entry_id_tombstones",
+            "resolved_receipts"
+          ]) do
+      case_root = root <> "_v2_history_metadata_#{index}"
+      on_exit(fn -> File.rm_rf(case_root) end)
+      File.mkdir_p!(case_root)
+
+      assert {:ok, bytes} =
+               valid_snapshot
+               |> Map.delete(field)
+               |> Snapshot.encode()
+
+      File.write!(Path.join(case_root, "snapshot.bin"), bytes)
+
+      assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} =
+               open_store(case_root)
+
+      assert File.exists?(quarantine_path)
+    end
+  end
+
   test "schema-v3 snapshots require a complete valid acknowledged frontier", %{root: root} do
     assert {:ok, store} = open_store(root)
     assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
@@ -972,7 +3550,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
       [{"health", 0}, {"telemetry", -1}],
       [{"health", 0}, {"health", 0}, {"telemetry", 1}],
       [{"telemetry", 1}],
-      [{"health", 0}, {"other", 0}]
+      [{"health", 0}, {"other", 0}],
+      [{"health", 0}, {"telemetry", 0}]
     ]
 
     Enum.with_index(invalid_frontiers, fn frontier, index ->
@@ -1046,6 +3625,66 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
       assert {:ok, bytes} =
                valid_snapshot
                |> Map.put("resolved_receipts", receipts)
+               |> Snapshot.encode()
+
+      File.write!(Path.join(case_root, "snapshot.bin"), bytes)
+
+      assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} =
+               open_store(case_root)
+
+      assert File.exists?(quarantine_path)
+    end)
+  end
+
+  test "schema-v3 snapshots reject contradictory loss authorization proof", %{root: root} do
+    assert {:ok, store} = open_store(root)
+
+    assert {:ok, live, store} =
+             Store.enqueue(store, :telemetry, "live", entry_id: entry_id(1))
+
+    assert {:ok, resolved, store} =
+             Store.enqueue(store, :health, "resolved", entry_id: entry_id(2))
+
+    assert {:ok, [^resolved], store} = Store.acknowledge(store, receipt_for(resolved))
+
+    assert {:ok, lost, store} =
+             Store.enqueue(store, :health, "lost", entry_id: entry_id(3))
+
+    loss_identity =
+      Map.take(lost, [
+        :stream,
+        :device_id,
+        :credential_epoch,
+        :storage_epoch,
+        :sequence,
+        :payload_hash
+      ])
+
+    assert {:ok, ^lost, _store} =
+             Store.authorize_loss(store, loss_identity, "operator ticket")
+
+    assert {:ok, valid_snapshot} =
+             root
+             |> Path.join("snapshot.bin")
+             |> File.read!()
+             |> Snapshot.decode()
+
+    valid_losses = Map.fetch!(valid_snapshot, "loss_authorizations")
+
+    contradictions = [
+      [snapshot_loss_authorization(live)],
+      [snapshot_loss_authorization(%{live | sequence: 2})],
+      valid_losses ++ [snapshot_loss_authorization(lost)]
+    ]
+
+    Enum.with_index(contradictions, fn losses, index ->
+      case_root = root <> "_loss_#{index}"
+      on_exit(fn -> File.rm_rf(case_root) end)
+      File.mkdir_p!(case_root)
+
+      assert {:ok, bytes} =
+               valid_snapshot
+               |> Map.put("loss_authorizations", losses)
                |> Snapshot.encode()
 
       File.write!(Path.join(case_root, "snapshot.bin"), bytes)
@@ -1333,6 +3972,110 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert reused.sequence == 4
   end
 
+  test "entry-id tombstone transitions replay under the historical bound", %{root: root} do
+    opts = [max_disk_bytes: 100_000, max_entry_id_tombstones: 3, max_resolved_receipts: 3]
+    assert {:ok, store} = open_store(root, opts)
+
+    store =
+      Enum.reduce(1..3, store, fn n, acc ->
+        assert {:ok, entry, acc} =
+                 Store.enqueue(acc, :telemetry, "payload-#{n}", entry_id: entry_id(n))
+
+        assert {:ok, [^entry], acc} = Store.acknowledge(acc, receipt_for(entry))
+        acc
+      end)
+
+    assert length(store.entry_id_tombstones) == 3
+    assert segment_paths(root) == []
+
+    assert {:ok, snapshot} =
+             root
+             |> Path.join("snapshot.bin")
+             |> File.read!()
+             |> Snapshot.decode()
+
+    segment_id = Map.fetch!(snapshot, "covered_segment_id") + 1
+
+    segment =
+      Path.join(
+        root,
+        "segment-" <> String.pad_leading(Integer.to_string(segment_id), 20, "0") <> ".log"
+      )
+
+    File.write!(segment, encoded_entry(4, entry_id(1), "reused"))
+
+    assert {:error, {:quarantined, :duplicate_entry_id, quarantine_path}} =
+             open_store(
+               root,
+               Keyword.merge(opts,
+                 max_entry_id_tombstones: 2,
+                 max_resolved_receipts: 2
+               )
+             )
+
+    assert File.exists?(quarantine_path)
+  end
+
+  test "legacy entry-id reuse with an unknown historical limit fails closed without quarantine", %{
+    root: root
+  } do
+    opts = [max_disk_bytes: 100_000, max_entry_id_tombstones: 3, max_resolved_receipts: 3]
+    assert {:ok, store} = open_store(root, opts)
+
+    store =
+      Enum.reduce(1..3, store, fn n, acc ->
+        assert {:ok, entry, acc} =
+                 Store.enqueue(acc, :telemetry, "payload-#{n}", entry_id: entry_id(n))
+
+        assert {:ok, [^entry], acc} = Store.acknowledge(acc, receipt_for(entry))
+        acc
+      end)
+
+    assert length(store.entry_id_tombstones) == 3
+    assert segment_paths(root) == []
+
+    assert {:ok, snapshot} =
+             root
+             |> Path.join("snapshot.bin")
+             |> File.read!()
+             |> Snapshot.decode()
+
+    segment_id = Map.fetch!(snapshot, "covered_segment_id") + 1
+    encoded = encoded_entry(4, entry_id(1), "valid-under-the-legacy-limit")
+
+    segment =
+      Path.join(
+        root,
+        "segment-" <> String.pad_leading(Integer.to_string(segment_id), 20, "0") <> ".log"
+      )
+
+    File.write!(segment, encoded)
+
+    run_state_path = Path.join(root, "run-state.bin")
+    assert {:ok, run_state} = run_state_path |> File.read!() |> RunState.decode()
+
+    assert {:ok, legacy_run_state} =
+             run_state
+             |> Map.delete("entry_id_tombstone_limit")
+             |> Map.delete("resolved_receipt_limit")
+             |> Map.put("segment_high_water", segment_id)
+             |> Map.put("committed_segment_sizes", [{segment_id, byte_size(encoded)}])
+             |> Map.put("sequence_floors", [{"health", 1}, {"telemetry", 5}])
+             |> RunState.encode()
+
+    File.write!(run_state_path, legacy_run_state)
+
+    assert {:error, :legacy_entry_id_tombstone_limit_unknown} =
+             open_store(root,
+               max_disk_bytes: 100_000,
+               max_entry_id_tombstones: 2,
+               max_resolved_receipts: 2
+             )
+
+    assert File.exists?(segment)
+    refute File.exists?(Path.join(root, "quarantine"))
+  end
+
   test "legacy migration checks huge allocated spans without expanding every sequence", %{root: root} do
     File.mkdir_p!(root)
 
@@ -1397,10 +4140,40 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     )
 
     assert {:ok, migrated} = open_store(root)
-    assert length(Store.loss_authorizations(migrated)) == 2
+    assert length(Store.loss_authorizations(migrated)) == 1
     assert {:error, :duplicate_entry_id} = Store.enqueue(migrated, :telemetry, "duplicate", entry_id: entry_id(9))
-    assert {:ok, entry, _store} = Store.enqueue(migrated, :telemetry, "novel", entry_id: entry_id(10))
+    assert {:ok, entry, migrated} = Store.enqueue(migrated, :telemetry, "novel", entry_id: entry_id(10))
     assert entry.sequence == 2
+    assert {:ok, [^entry], _store} = Store.acknowledge(migrated, receipt_for(entry))
+
+    assert {:ok, recovered} = open_store(root)
+    assert length(Store.loss_authorizations(recovered)) == 1
+  end
+
+  test "legacy migration rejects conflicting loss claims for one durable sequence", %{root: root} do
+    loss = %{
+      "stream" => "telemetry",
+      "device_id" => @device_id,
+      "credential_epoch" => @credential_epoch,
+      "storage_epoch" => @storage_epoch,
+      "sequence" => 1,
+      "entry_id" => entry_id(9),
+      "payload_hash" => :crypto.hash(:sha256, "lost"),
+      "reason" => "legacy retry"
+    }
+
+    File.mkdir_p!(root)
+
+    File.write!(
+      Path.join(root, "snapshot.bin"),
+      legacy_snapshot_v1(%{
+        "next_sequences" => [{"health", 1}, {"telemetry", 2}],
+        "loss_authorizations" => [loss, %{loss | "entry_id" => entry_id(10)}]
+      })
+    )
+
+    assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} = open_store(root)
+    assert File.exists?(quarantine_path)
   end
 
   test "legacy migration tolerates a historical loss ID that is currently live again", %{root: root} do
@@ -1631,6 +4404,47 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert Store.pending(gap_store) == []
   end
 
+  test "stronger cumulative retries refresh their retained exact anchor", %{root: root} do
+    assert {:ok, store} = open_store(root, max_resolved_receipts: 1)
+
+    {[first, second, third, anchor], store} =
+      Enum.map_reduce(1..4, store, fn n, acc ->
+        {:ok, entry, acc} =
+          Store.enqueue(acc, :telemetry, "payload-#{n}", entry_id: entry_id(n))
+
+        {entry, acc}
+      end)
+
+    assert {:ok, [^anchor], store} = Store.acknowledge(store, receipt_for(anchor))
+
+    assert {:ok, [^first], store} =
+             Store.acknowledge(
+               store,
+               %{receipt_for(anchor) | cumulative_sequence: 1}
+             )
+
+    assert Store.resolved_receipt?(store, receipt_for(anchor))
+
+    assert {:ok, [^second], store} =
+             Store.acknowledge(
+               store,
+               %{receipt_for(anchor) | cumulative_sequence: 2}
+             )
+
+    assert Store.resolved_receipt?(store, receipt_for(anchor))
+
+    assert {:ok, recovered} = open_store(root, max_resolved_receipts: 1)
+
+    assert {:ok, [removed_third], empty} =
+             Store.acknowledge(
+               recovered,
+               %{receipt_for(anchor) | cumulative_sequence: 3}
+             )
+
+    assert receipt_for(removed_third) == receipt_for(third)
+    assert Store.pending(empty) == []
+  end
+
   test "persists a contiguous acknowledged floor beyond bounded exact receipt history", %{root: root} do
     opts = [max_resolved_receipts: 1]
     assert {:ok, store} = open_store(root, opts)
@@ -1754,6 +4568,38 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert Store.loss_authorizations(recovered) == Store.loss_authorizations(empty)
   end
 
+  defp prepare_active_limit_three_retry!(root) do
+    assert {:ok, store} =
+             open_store(
+               root,
+               file_system: TracingFileSystem,
+               max_entry_id_tombstones: 3,
+               max_resolved_receipts: 3
+             )
+
+    {[first, second, third], store} =
+      Enum.map_reduce(1..3, store, fn n, acc ->
+        {:ok, entry, acc} =
+          Store.enqueue(acc, :telemetry, "payload-#{n}", entry_id: entry_id(n))
+
+        {entry, acc}
+      end)
+
+    assert {:ok, [^third], store} = Store.acknowledge(store, receipt_for(third))
+    TracingFileSystem.fail_snapshot_rename()
+
+    assert {:error, {:durability_uncertain, {:snapshot_rename, :simulated_rename_failure}}} =
+             Store.acknowledge(
+               store,
+               %{receipt_for(third) | cumulative_sequence: 3}
+             )
+
+    assert first.sequence == 1
+    assert second.sequence == 2
+    assert segment_paths(root) != []
+    {first, second, third}
+  end
+
   defp encoded_entry(sequence, id, payload) do
     {:ok, encoded} =
       Record.encode(%{
@@ -1824,6 +4670,39 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     :ok = :file.close(device)
   end
 
+  defp append_acknowledgement_record!(
+         root,
+         receipt
+       ) do
+    assert {:ok, encoded} =
+             Record.encode(%{
+               kind: :acknowledgement,
+               stream: Atom.to_string(receipt.stream),
+               device_id: receipt.device_id,
+               credential_epoch: receipt.credential_epoch,
+               storage_epoch: receipt.storage_epoch,
+               sequence: receipt.sequence,
+               payload_hash: receipt.payload_hash,
+               cumulative_sequence: receipt.cumulative_sequence
+             })
+
+    [segment] = segment_paths(root)
+    File.write!(segment, encoded, [:append])
+  end
+
+  defp snapshot_loss_authorization(entry) do
+    %{
+      "stream" => Atom.to_string(entry.stream),
+      "device_id" => entry.device_id,
+      "credential_epoch" => entry.credential_epoch,
+      "storage_epoch" => entry.storage_epoch,
+      "sequence" => entry.sequence,
+      "entry_id" => entry.entry_id,
+      "payload_hash" => entry.payload_hash,
+      "reason" => "operator ticket"
+    }
+  end
+
   defp snapshot_resolved_receipt(entry) do
     %{
       "stream" => Atom.to_string(entry.stream),
@@ -1874,6 +4753,33 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
   defp entry_id(n), do: <<n::128>>
 
+  defp case_variant(path) do
+    Path.join(Path.dirname(path), toggle_first_ascii_case(Path.basename(path)))
+  end
+
+  defp toggle_first_ascii_case(<<character, rest::binary>>)
+       when character >= ?a and character <= ?z,
+       do: <<character - 32, rest::binary>>
+
+  defp toggle_first_ascii_case(<<character, rest::binary>>)
+       when character >= ?A and character <= ?Z,
+       do: <<character + 32, rest::binary>>
+
+  defp toggle_first_ascii_case(<<character, rest::binary>>),
+    do: <<character>> <> toggle_first_ascii_case(rest)
+
+  defp toggle_first_ascii_case(<<>>), do: <<>>
+
+  defp same_file?(left_path, right_path) do
+    with {:ok, left} <- File.stat(left_path),
+         {:ok, right} <- File.stat(right_path) do
+      {left.major_device, left.minor_device, left.inode, left.type} ==
+        {right.major_device, right.minor_device, right.inode, right.type}
+    else
+      _error -> false
+    end
+  end
+
   defp segment_paths(root) do
     root
     |> File.ls!()
@@ -1882,11 +4788,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     |> Enum.map(&Path.join(root, &1))
   end
 
-  defp segment_open_path({:open, path, modes}) do
-    if String.ends_with?(path, ".log") and :append in modes, do: path
-  end
-
-  defp segment_open_path(_event), do: nil
+  defp created_segment_path({:create, path, _mode}), do: path
+  defp created_segment_path(_event), do: nil
 
   defp event_index(events, predicate) do
     Enum.find_index(events, predicate) || flunk("expected event in #{inspect(events)}")
@@ -1895,6 +4798,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
   defp drain_file_events(acc) do
     receive do
       {:outbox_file_system, event} -> drain_file_events([event | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp drain_segment_events(acc) do
+    receive do
+      {:outbox_segment_file_system, event} -> drain_segment_events([event | acc])
     after
       0 -> Enum.reverse(acc)
     end

@@ -351,6 +351,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
           :max_entry_id_tombstones,
           :max_resolved_receipts,
           :file_system,
+          :segment_file_system,
           :entry_id_generator
         ])
 
