@@ -35,7 +35,7 @@ typedef struct {
   _Atomic(cleanup_job *) pending;
   pthread_t thread;
   int wake_read_fd;
-  int wake_write_fd;
+  _Atomic(int) wake_write_fd;
 } cleanup_worker;
 
 typedef struct {
@@ -144,10 +144,15 @@ static void cleanup_jobs_run(cleanup_job *jobs) {
 
 static void cleanup_worker_signal(cleanup_worker *state) {
   unsigned char byte = 0;
+  int wake_write_fd = atomic_load(&state->wake_write_fd);
   ssize_t result;
 
+  if (wake_write_fd == -1) {
+    return;
+  }
+
   do {
-    result = write(state->wake_write_fd, &byte, sizeof(byte));
+    result = write(wake_write_fd, &byte, sizeof(byte));
   } while (result == -1 && errno == EINTR);
 
   if (result == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
@@ -161,21 +166,26 @@ static void *cleanup_worker_main(void *argument) {
 
   while (1) {
     cleanup_job *jobs = atomic_exchange(&state->pending, NULL);
+    ssize_t read_result;
 
     if (jobs != NULL) {
       cleanup_jobs_run(jobs);
     }
 
-    while (read(state->wake_read_fd, bytes, sizeof(bytes)) == -1 &&
-           errno == EINTR) {
+    do {
+      read_result = read(state->wake_read_fd, bytes, sizeof(bytes));
+    } while (read_result == -1 && errno == EINTR);
+
+    if (read_result == 0 || (read_result == -1 && errno != EINTR)) {
+      cleanup_jobs_run(atomic_exchange(&state->pending, NULL));
+      return NULL;
     }
   }
-
-  return NULL;
 }
 
 static int set_descriptor_flag(int fd, int command, int flag) {
   int current;
+  int result;
 
   do {
     current = fcntl(fd, command);
@@ -186,11 +196,29 @@ static int set_descriptor_flag(int fd, int command, int flag) {
   }
 
   do {
-    current = fcntl(fd, command == F_GETFL ? F_SETFL : F_SETFD,
-                    current | flag);
-  } while (current == -1 && errno == EINTR);
+    result = fcntl(fd, command == F_GETFL ? F_SETFL : F_SETFD,
+                   current | flag);
+  } while (result == -1 && errno == EINTR);
 
-  return current;
+  return result;
+}
+
+static int duplicate_descriptor(int fd) {
+  int duplicate;
+
+  do {
+    duplicate = dup(fd);
+  } while (duplicate == -1 && errno == EINTR);
+
+  if (duplicate != -1 &&
+      set_descriptor_flag(duplicate, F_GETFD, FD_CLOEXEC) == -1) {
+    int error = errno;
+    close_owned_fd(duplicate);
+    errno = error;
+    return -1;
+  }
+
+  return duplicate;
 }
 
 static int cleanup_worker_start(cleanup_worker *state) {
@@ -198,30 +226,28 @@ static int cleanup_worker_start(cleanup_worker *state) {
 
   memset(state, 0, sizeof(*state));
   state->wake_read_fd = -1;
-  state->wake_write_fd = -1;
+  atomic_init(&state->wake_write_fd, -1);
   atomic_init(&state->pending, NULL);
 
   if (pipe(wake_fds) == -1) {
     return -1;
   }
   state->wake_read_fd = wake_fds[0];
-  state->wake_write_fd = wake_fds[1];
+  atomic_store(&state->wake_write_fd, wake_fds[1]);
 
   if (set_descriptor_flag(state->wake_read_fd, F_GETFD, FD_CLOEXEC) == -1 ||
-      set_descriptor_flag(state->wake_write_fd, F_GETFD, FD_CLOEXEC) == -1 ||
-      set_descriptor_flag(state->wake_write_fd, F_GETFL, O_NONBLOCK) == -1) {
+      set_descriptor_flag(wake_fds[1], F_GETFD, FD_CLOEXEC) == -1 ||
+      set_descriptor_flag(wake_fds[1], F_GETFL, O_NONBLOCK) == -1) {
     close_owned_fd(state->wake_read_fd);
-    close_owned_fd(state->wake_write_fd);
+    close_owned_fd(atomic_exchange(&state->wake_write_fd, -1));
     state->wake_read_fd = -1;
-    state->wake_write_fd = -1;
     return -1;
   }
 
   if (pthread_create(&state->thread, NULL, cleanup_worker_main, state) != 0) {
     close_owned_fd(state->wake_read_fd);
-    close_owned_fd(state->wake_write_fd);
+    close_owned_fd(atomic_exchange(&state->wake_write_fd, -1));
     state->wake_read_fd = -1;
-    state->wake_write_fd = -1;
     return -1;
   }
 
@@ -251,13 +277,11 @@ static void cleanup_worker_enqueue(cleanup_worker *state, cleanup_job *job,
 }
 
 static void cleanup_worker_stop(cleanup_worker *state) {
-  close_owned_fd(state->wake_write_fd);
-  state->wake_write_fd = -1;
+  close_owned_fd(atomic_exchange(&state->wake_write_fd, -1));
   pthread_join(state->thread, NULL);
   cleanup_jobs_run(atomic_exchange(&state->pending, NULL));
   close_owned_fd(state->wake_read_fd);
   state->wake_read_fd = -1;
-  state->wake_write_fd = -1;
 }
 
 static int valid_basename(const ErlNifBinary *basename) {
@@ -350,6 +374,7 @@ static ERL_NIF_TERM open_root_nif(ErlNifEnv *env, int argc,
   ErlNifUInt64 expected_special_device;
   ErlNifUInt64 expected_inode;
   nif_state *state = enif_priv_data(env);
+  cleanup_job *cleanup;
   root_resource *root;
   struct stat stat;
   char *path_string;
@@ -367,8 +392,14 @@ static ERL_NIF_TERM open_root_nif(ErlNifEnv *env, int argc,
     return enif_make_badarg(env);
   }
 
+  cleanup = enif_alloc(sizeof(*cleanup));
+  if (cleanup == NULL) {
+    return make_errno_error(env, ENOMEM);
+  }
+
   path_string = enif_alloc(path.size + 1);
   if (path_string == NULL) {
+    enif_free(cleanup);
     return make_errno_error(env, ENOMEM);
   }
   memcpy(path_string, path.data, path.size);
@@ -379,12 +410,14 @@ static ERL_NIF_TERM open_root_nif(ErlNifEnv *env, int argc,
   enif_free(path_string);
 
   if (fd == -1) {
+    enif_free(cleanup);
     return make_errno_error(env, error);
   }
 
   if (fstat(fd, &stat) == -1) {
     error = errno;
     close(fd);
+    enif_free(cleanup);
     return make_errno_error(env, error);
   }
 
@@ -392,23 +425,21 @@ static ERL_NIF_TERM open_root_nif(ErlNifEnv *env, int argc,
       (ErlNifUInt64)stat.st_rdev != expected_special_device ||
       (ErlNifUInt64)stat.st_ino != expected_inode) {
     close(fd);
+    enif_free(cleanup);
     return make_error(env, atom_stale_root);
   }
 
   root = enif_alloc_resource(state->root_resource_type, sizeof(*root));
   if (root == NULL) {
     close(fd);
+    enif_free(cleanup);
     return make_errno_error(env, ENOMEM);
   }
 
   memset(root, 0, sizeof(*root));
   root->fd = fd;
   root->cleanup_worker = &state->cleanup;
-  root->cleanup = enif_alloc(sizeof(*root->cleanup));
-  if (root->cleanup == NULL) {
-    enif_release_resource(root);
-    return make_errno_error(env, ENOMEM);
-  }
+  root->cleanup = cleanup;
 
   root->mutex = enif_mutex_create("outbox_segment_root");
   if (root->mutex == NULL) {
@@ -450,6 +481,7 @@ static ERL_NIF_TERM close_root_nif(ErlNifEnv *env, int argc,
 static ERL_NIF_TERM create_nif(ErlNifEnv *env, int argc,
                                const ERL_NIF_TERM argv[]) {
   nif_state *state = enif_priv_data(env);
+  cleanup_job *cleanup;
   root_resource *root;
   segment_resource *segment;
   ErlNifBinary basename;
@@ -473,8 +505,14 @@ static ERL_NIF_TERM create_nif(ErlNifEnv *env, int argc,
     return make_error(env, atom_invalid_basename);
   }
 
+  cleanup = enif_alloc(sizeof(*cleanup));
+  if (cleanup == NULL) {
+    return make_errno_error(env, ENOMEM);
+  }
+
   basename_string = enif_alloc(basename.size + 1);
   if (basename_string == NULL) {
+    enif_free(cleanup);
     return make_errno_error(env, ENOMEM);
   }
   memcpy(basename_string, basename.data, basename.size);
@@ -484,14 +522,16 @@ static ERL_NIF_TERM create_nif(ErlNifEnv *env, int argc,
   if (root->fd == -1) {
     enif_mutex_unlock(root->mutex);
     enif_free(basename_string);
+    enif_free(cleanup);
     return make_error(env, atom_closed);
   }
-  directory_fd = dup(root->fd);
+  directory_fd = duplicate_descriptor(root->fd);
   error = errno;
   enif_mutex_unlock(root->mutex);
 
   if (directory_fd == -1) {
     enif_free(basename_string);
+    enif_free(cleanup);
     return make_errno_error(env, error);
   }
 
@@ -504,6 +544,7 @@ static ERL_NIF_TERM create_nif(ErlNifEnv *env, int argc,
   if (file_fd == -1) {
     close(directory_fd);
     enif_free(basename_string);
+    enif_free(cleanup);
     return make_errno_error(env, error);
   }
 
@@ -512,6 +553,7 @@ static ERL_NIF_TERM create_nif(ErlNifEnv *env, int argc,
     close(file_fd);
     close(directory_fd);
     enif_free(basename_string);
+    enif_free(cleanup);
     return make_errno_error(env, error);
   }
 
@@ -519,6 +561,7 @@ static ERL_NIF_TERM create_nif(ErlNifEnv *env, int argc,
     close(file_fd);
     close(directory_fd);
     enif_free(basename_string);
+    enif_free(cleanup);
     return make_errno_error(env, EINVAL);
   }
 
@@ -527,6 +570,7 @@ static ERL_NIF_TERM create_nif(ErlNifEnv *env, int argc,
     close(file_fd);
     close(directory_fd);
     enif_free(basename_string);
+    enif_free(cleanup);
     return make_errno_error(env, ENOMEM);
   }
 
@@ -539,11 +583,7 @@ static ERL_NIF_TERM create_nif(ErlNifEnv *env, int argc,
   segment->cleanup_worker = &state->cleanup;
   segment->basename_size = basename.size;
   segment->basename = basename_string;
-  segment->cleanup = enif_alloc(sizeof(*segment->cleanup));
-  if (segment->cleanup == NULL) {
-    enif_release_resource(segment);
-    return make_errno_error(env, ENOMEM);
-  }
+  segment->cleanup = cleanup;
 
   segment->mutex = enif_mutex_create("outbox_segment_file");
   if (segment->mutex == NULL) {

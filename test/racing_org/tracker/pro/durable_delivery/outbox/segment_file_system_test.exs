@@ -57,11 +57,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystemTest do
   end
 
   test "native lifecycle keeps cleanup out of destructor scheduler contexts" do
-    source =
-      __DIR__
-      |> Path.join("../../../../../../c_src/outbox_segment.c")
-      |> Path.expand()
-      |> File.read!()
+    source = native_source()
 
     refute source =~ "ERL_NIF_RT_TAKEOVER"
     assert source =~ "O_NONBLOCK"
@@ -77,7 +73,44 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystemTest do
     refute enqueue_body =~ "enif_free"
   end
 
+  test "native cleanup worker exits on wake-pipe EOF and fatal reads" do
+    source = native_source()
+
+    assert [_, worker_body] =
+             Regex.run(~r/static void \*cleanup_worker_main\([^\{]+\) \{(.*?)\n\}/s, source)
+
+    assert worker_body =~ "read_result == 0"
+    assert worker_body =~ "errno != EINTR"
+    assert worker_body =~ "return NULL"
+  end
+
+  test "native constructors reserve cleanup jobs before acquiring descriptors" do
+    source = native_source()
+
+    assert [_, open_root] =
+             Regex.run(~r/static ERL_NIF_TERM open_root_nif\([^\{]+\) \{(.*?)\n\}/s, source)
+
+    assert cleanup_allocation_precedes?(
+             open_root,
+             ~r/=\s*open\(path_string/,
+             ~r/cleanup\s*=\s*enif_alloc\(sizeof\(\*cleanup\)\)/
+           ),
+           "open_root_nif opens the directory before reserving its cleanup job"
+
+    assert [_, create] =
+             Regex.run(~r/static ERL_NIF_TERM create_nif\([^\{]+\) \{(.*?)\n\}/s, source)
+
+    assert cleanup_allocation_precedes?(
+             create,
+             ~r/=\s*(?:dup|duplicate_descriptor)\(root->fd/,
+             ~r/cleanup\s*=\s*enif_alloc\(sizeof\(\*cleanup\)\)/
+           ),
+           "create_nif duplicates the root fd before reserving its cleanup job"
+  end
+
   test "process death closes abandoned native descriptors without unlinking", %{root: root} do
+    assert {:module, SegmentFileSystem} = Code.ensure_loaded(SegmentFileSystem)
+
     descriptor_count = descriptor_count!()
     stat = File.stat!(root)
     identity = {stat.major_device, stat.minor_device, stat.inode}
@@ -113,6 +146,19 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystemTest do
     for index <- 1..8 do
       assert File.read!(Path.join(root, "segment-#{index}.log")) == "payload-#{index}"
     end
+  end
+
+  defp native_source do
+    __DIR__
+    |> Path.join("../../../../../../c_src/outbox_segment.c")
+    |> Path.expand()
+    |> File.read!()
+  end
+
+  defp cleanup_allocation_precedes?(body, descriptor_pattern, cleanup_pattern) do
+    [{cleanup_at, _size}] = Regex.run(cleanup_pattern, body, return: :index)
+    [{descriptor_at, _size}] = Regex.run(descriptor_pattern, body, return: :index)
+    cleanup_at < descriptor_at
   end
 
   defp descriptor_count! do
