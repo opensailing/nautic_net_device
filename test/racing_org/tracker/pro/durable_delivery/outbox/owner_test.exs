@@ -663,6 +663,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
   end
 
   describe "configuration" do
+    test "root ownership setup uses the injected filesystem adapter", %{root: root} do
+      assert {:error, {:root_lock, :simulated_stat_failure}} =
+               start_owner(root, file_system: __MODULE__.StatFailureFileSystem)
+    end
+
     test "the root is independently configurable and never defaults implicitly", %{root: root} do
       assert {:error, :missing_root} =
                start_supervised_owner(owner_opts(root) |> Keyword.delete(:root))
@@ -736,6 +741,26 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
 
     @impl true
     def close(segment), do: SegmentFileSystem.close(segment)
+  end
+
+  defmodule StatFailureFileSystem do
+    @behaviour RacingOrg.Tracker.Pro.DurableDelivery.Outbox.FileSystem
+
+    alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.FileSystem
+
+    def read(path), do: FileSystem.read(path)
+    def stat(_path), do: {:error, :simulated_stat_failure}
+    def list_dir(path), do: FileSystem.list_dir(path)
+    def mkdir_p(path), do: FileSystem.mkdir_p(path)
+    def chmod(path, mode), do: FileSystem.chmod(path, mode)
+    def open(path, modes), do: FileSystem.open(path, modes)
+    def write(device, contents), do: FileSystem.write(device, contents)
+    def sync(device), do: FileSystem.sync(device)
+    def close(device), do: FileSystem.close(device)
+    def rename(source, destination), do: FileSystem.rename(source, destination)
+    def remove(path), do: FileSystem.remove(path)
+    def position(device, location), do: FileSystem.position(device, location)
+    def truncate(device), do: FileSystem.truncate(device)
   end
 
   defmodule FailingSyncFileSystem do

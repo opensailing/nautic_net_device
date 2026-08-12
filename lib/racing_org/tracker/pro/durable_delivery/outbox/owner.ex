@@ -338,13 +338,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   end
 
   defp claim_root_across_vms(root, opts) do
+    file_system = Keyword.get(opts, :file_system, FileSystem)
     segment_file_system = Keyword.get(opts, :segment_file_system, SegmentFileSystem)
 
-    with :ok <- ensure_lockable_root(root),
-         {:ok, %File.Stat{type: :directory} = stat} <- File.stat(root),
+    with :ok <- ensure_lockable_root(file_system, root),
+         {:ok, %File.Stat{type: :directory} = stat} <- file_system.stat(root),
          {:ok, handle} <-
            segment_file_system.open_root(
-             FileSystem,
+             file_system,
              root,
              {stat.major_device, stat.minor_device, stat.inode}
            ) do
@@ -366,9 +367,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
     end
   end
 
-  defp ensure_lockable_root(root) do
-    with :ok <- File.mkdir_p(root),
-         :ok <- File.chmod(root, 0o700) do
+  defp ensure_lockable_root(file_system, root) do
+    with :ok <- file_system.mkdir_p(root),
+         :ok <- file_system.chmod(root, 0o700) do
       :ok
     end
   end
