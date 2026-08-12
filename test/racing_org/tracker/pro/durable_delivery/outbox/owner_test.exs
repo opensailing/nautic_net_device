@@ -65,6 +65,20 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       assert File.read!(result) == "root_already_owned"
     end
 
+    test "releases the native root lock when Store startup fails", %{root: root} do
+      __MODULE__.RootCloseProbeSegmentFileSystem.watch(self())
+      on_exit(&__MODULE__.RootCloseProbeSegmentFileSystem.clear_watch/0)
+
+      assert {:error, {:invalid_option, :entry_id_generator}} =
+               start_owner(root,
+                 segment_file_system: __MODULE__.RootCloseProbeSegmentFileSystem,
+                 entry_id_generator: :invalid
+               )
+
+      assert_receive {:root_closed, closed_root}, 1_000
+      assert {:ok, ^closed_root} = RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store.canonical_root(root)
+    end
+
     test "a real supervisor can restart the owner immediately after a crash", %{root: root} do
       children = [
         Map.put(
@@ -740,6 +754,48 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
     def file_info(segment), do: SegmentFileSystem.file_info(segment)
 
     @impl true
+    def close(segment), do: SegmentFileSystem.close(segment)
+  end
+
+  defmodule RootCloseProbeSegmentFileSystem do
+    @behaviour RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem
+
+    alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem
+
+    def watch(test), do: :persistent_term.put({__MODULE__, :watcher}, test)
+    def clear_watch, do: :persistent_term.erase({__MODULE__, :watcher})
+
+    def open_root(file_system, path, identity) do
+      with {:ok, root} <- SegmentFileSystem.open_root(file_system, path, identity) do
+        :persistent_term.put({__MODULE__, root}, path)
+        {:ok, root}
+      end
+    end
+
+    def close_root(root) do
+      case {
+        :persistent_term.get({__MODULE__, :watcher}, nil),
+        :persistent_term.get({__MODULE__, root}, nil)
+      } do
+        {watcher, path} when is_pid(watcher) and is_binary(path) ->
+          send(watcher, {:root_closed, path})
+
+        _other ->
+          :ok
+      end
+
+      :persistent_term.erase({__MODULE__, root})
+      SegmentFileSystem.close_root(root)
+    end
+
+    def try_lock_root(root), do: SegmentFileSystem.try_lock_root(root)
+    def create(root, basename, mode), do: SegmentFileSystem.create(root, basename, mode)
+    def chmod(segment, mode), do: SegmentFileSystem.chmod(segment, mode)
+    def write(segment, contents), do: SegmentFileSystem.write(segment, contents)
+    def sync_file(segment), do: SegmentFileSystem.sync_file(segment)
+    def sync_directory(segment), do: SegmentFileSystem.sync_directory(segment)
+    def unlink_empty(segment), do: SegmentFileSystem.unlink_empty(segment)
+    def file_info(segment), do: SegmentFileSystem.file_info(segment)
     def close(segment), do: SegmentFileSystem.close(segment)
   end
 

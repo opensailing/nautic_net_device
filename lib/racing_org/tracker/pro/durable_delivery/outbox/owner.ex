@@ -45,6 +45,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   @default_max_entries 10_000
   @default_max_bytes 32 * 1_024 * 1_024
   @default_segment_max_bytes 1_024 * 1_024
+  @root_lock_retry_attempts 50
+  @root_lock_retry_ms 10
   @identity_keys [:device_id, :credential_epoch, :storage_epoch]
 
   @type receipt :: %{
@@ -178,18 +180,24 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
          {:ok, identity_source} <- option_identity_source(opts),
          {:ok, identity} <- read_identity(identity_source),
          :ok <- claim_root(root),
-         {:ok, root_lock} <- claim_root_across_vms(root, opts),
-         {:ok, store} <- open_store(root, identity, opts) do
-      Process.flag(:trap_exit, true)
+         {:ok, root_lock} <- claim_root_across_vms(root, opts) do
+      case open_store(root, identity, opts) do
+        {:ok, store} ->
+          Process.flag(:trap_exit, true)
 
-      {:ok,
-       %{
-         store: store,
-         root_lock: root_lock,
-         identity: identity,
-         identity_source: identity_source,
-         quarantined: false
-       }}
+          {:ok,
+           %{
+             store: store,
+             root_lock: root_lock,
+             identity: identity,
+             identity_source: identity_source,
+             quarantined: false
+           }}
+
+        {:error, reason} ->
+          _ = close_root_lock(root_lock)
+          {:stop, reason}
+      end
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -342,28 +350,50 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
     segment_file_system = Keyword.get(opts, :segment_file_system, SegmentFileSystem)
 
     with :ok <- ensure_lockable_root(file_system, root),
-         {:ok, %File.Stat{type: :directory} = stat} <- file_system.stat(root),
-         {:ok, handle} <-
-           segment_file_system.open_root(
-             file_system,
-             root,
-             {stat.major_device, stat.minor_device, stat.inode}
-           ) do
-      case segment_file_system.try_lock_root(handle) do
-        :ok ->
-          {:ok, handle}
-
-        {:error, reason} when reason in [:eacces, :eagain] ->
-          _ = segment_file_system.close_root(handle)
-          {:error, :root_already_owned}
-
-        {:error, reason} ->
-          _ = segment_file_system.close_root(handle)
-          {:error, {:root_lock, reason}}
-      end
+         {:ok, %File.Stat{type: :directory} = stat} <- file_system.stat(root) do
+      claim_native_root_lock(
+        file_system,
+        segment_file_system,
+        root,
+        {stat.major_device, stat.minor_device, stat.inode},
+        @root_lock_retry_attempts
+      )
     else
       {:ok, %File.Stat{}} -> {:error, :invalid_root}
       {:error, reason} -> {:error, {:root_lock, reason}}
+    end
+  end
+
+  defp claim_native_root_lock(file_system, segment_file_system, root, identity, attempts_left) do
+    case segment_file_system.open_root(file_system, root, identity) do
+      {:ok, handle} ->
+        case segment_file_system.try_lock_root(handle) do
+          :ok ->
+            {:ok, {segment_file_system, handle}}
+
+          {:error, reason} when reason in [:eacces, :eagain] and attempts_left > 0 ->
+            _ = segment_file_system.close_root(handle)
+            Process.sleep(@root_lock_retry_ms)
+
+            claim_native_root_lock(
+              file_system,
+              segment_file_system,
+              root,
+              identity,
+              attempts_left - 1
+            )
+
+          {:error, reason} when reason in [:eacces, :eagain] ->
+            _ = segment_file_system.close_root(handle)
+            {:error, :root_already_owned}
+
+          {:error, reason} ->
+            _ = segment_file_system.close_root(handle)
+            {:error, {:root_lock, reason}}
+        end
+
+      {:error, reason} ->
+        {:error, {:root_lock, reason}}
     end
   end
 
@@ -372,6 +402,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
          :ok <- file_system.chmod(root, 0o700) do
       :ok
     end
+  end
+
+  defp close_root_lock({segment_file_system, handle}) do
+    segment_file_system.close_root(handle)
+  rescue
+    _exception -> {:error, :root_close_failed}
+  catch
+    _kind, _reason -> {:error, :root_close_failed}
   end
 
   defp open_store(root, identity, opts) do
