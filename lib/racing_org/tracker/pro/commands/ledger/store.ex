@@ -949,23 +949,27 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   end
 
   defp with_path_lock(store, transition, opts \\ []) when is_function(transition, 0) do
-    caller = self()
-    result_ref = make_ref()
+    if Process.get(path_lock_marker(store.path)) do
+      {:error, :command_ledger_path_reentry}
+    else
+      caller = self()
+      result_ref = make_ref()
 
-    {holder, monitor_ref} =
-      spawn_monitor(fn ->
-        lock_id = {{__MODULE__, store.path}, self()}
-        result = run_path_transition(lock_id, transition)
-        send(caller, {result_ref, result})
-      end)
+      {holder, monitor_ref} =
+        spawn_monitor(fn ->
+          lock_id = {{__MODULE__, store.path}, self()}
+          result = run_path_transition(lock_id, store.path, transition)
+          send(caller, {result_ref, result})
+        end)
 
-    receive do
-      {^result_ref, result} ->
-        Process.demonitor(monitor_ref, [:flush])
-        result
+      receive do
+        {^result_ref, result} ->
+          Process.demonitor(monitor_ref, [:flush])
+          result
 
-      {:DOWN, ^monitor_ref, :process, ^holder, _reason} ->
-        holder_failure_result(store, opts)
+        {:DOWN, ^monitor_ref, :process, ^holder, _reason} ->
+          holder_failure_result(store, opts)
+      end
     end
   end
 
@@ -983,8 +987,8 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
     end
   end
 
-  defp run_path_transition(lock_id, transition) do
-    case :global.trans(lock_id, transition) do
+  defp run_path_transition(lock_id, path, transition) do
+    case :global.trans(lock_id, fn -> run_marked_path_transition(path, transition) end) do
       {:aborted, reason} -> {:error, {:command_ledger_lock_aborted, reason}}
       result -> result
     end
@@ -993,6 +997,19 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   catch
     _kind, _reason -> {:error, :command_ledger_lock_holder_failed}
   end
+
+  defp run_marked_path_transition(path, transition) do
+    marker = path_lock_marker(path)
+    Process.put(marker, true)
+
+    try do
+      transition.()
+    after
+      Process.delete(marker)
+    end
+  end
+
+  defp path_lock_marker(path), do: {__MODULE__, :path_lock, path}
 
   defp current_snapshot(store) do
     case read_snapshot(store) do
