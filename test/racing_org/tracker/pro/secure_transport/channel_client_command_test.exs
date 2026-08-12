@@ -395,6 +395,35 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
       refute_push(^topic, "control_v1", _response, 50)
       assert Process.alive?(client)
     end
+
+    test "refuses a receipt before control readiness without mutating the outbox", ctx do
+      {client, topic, server_control, _executor} =
+        start_command_client(ctx,
+          accept_control?: false,
+          outbox: self(),
+          outbox_module: FakeOutbox
+        )
+
+      receipt = %{
+        device_id: @logical_device_id,
+        credential_epoch: @control_epoch,
+        storage_epoch: @storage_epoch,
+        stream: :telemetry,
+        sequence: 1,
+        payload_hash: :binary.copy(<<0x22>>, 32),
+        cumulative_sequence: 1
+      }
+
+      assert {:ok, receipt_hash} = Receipt.hash(receipt)
+      wire_receipt = Map.put(receipt, :receipt_hash, receipt_hash)
+      assert {:ok, bytes} = Messages.encode(:delivery_receipt, wire_receipt)
+      assert {:ok, frame, _control} = Control.seal(server_control, :delivery_receipt, bytes)
+      push(client, topic, "control_v1", Control.encode_carrier(frame))
+
+      refute_receive {:acknowledge, _, _}, 100
+      refute_push(^topic, "control_v1", _response, 20)
+      assert Process.alive?(client)
+    end
   end
 
   # --- helpers ---

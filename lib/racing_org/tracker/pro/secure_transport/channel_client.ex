@@ -852,12 +852,22 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     {:ok, socket}
   end
 
-  defp handle_control_message(_topic, :delivery_receipt, attrs, socket) do
+  defp handle_control_message(
+         _topic,
+         :delivery_receipt,
+         attrs,
+         %{assigns: %{control_ready?: true}} = socket
+       ) do
     case acknowledge_delivery(socket, Map.delete(attrs, :receipt_hash)) do
       {:ok, _removed} -> :ok
       {:error, reason} -> Logger.warning("[ChannelClient] durable receipt refused: #{inspect(reason)}")
     end
 
+    {:ok, socket}
+  end
+
+  defp handle_control_message(_topic, :delivery_receipt, _attrs, socket) do
+    Logger.warning("[ChannelClient] durable receipt before control readiness; refusing")
     {:ok, socket}
   end
 
