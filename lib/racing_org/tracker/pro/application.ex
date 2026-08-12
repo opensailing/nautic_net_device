@@ -176,6 +176,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
       [RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner] ++
         desired_state_manager_children(product, controller_capability) ++
         operational_gate_children(product, controller_capability) ++
+        command_executor_children(product) ++
         [
           RacingOrg.Tracker.Pro.SecureTransport.ChannelClient,
           RacingOrg.Tracker.Pro.Race.BulkUploader
@@ -183,6 +184,30 @@ defmodule RacingOrg.Tracker.Pro.Application do
     else
       []
     end
+  end
+
+  # The durable command executor owns the on-device command ledger and every
+  # command effect. It starts AFTER the Manager and the gate (it reads both to
+  # judge the desired-generation, manifest, and operational-gate fences) and
+  # BEFORE the ChannelClient that routes authenticated deliveries into it, so a
+  # delivery can never arrive before the ledger is open and recovered.
+  #
+  # Its ledger path is derived from the PERSISTENT desired-state storage root
+  # (which holds the /data storage_epoch file), never from the transient boot_id,
+  # so a reboot reopens the same ledger and a pending intent is recovered rather
+  # than lost. Identity is resolved at init from the verified bootstrap authority.
+  defp command_executor_children(:logger) do
+    [
+      {RacingOrg.Tracker.Pro.Commands.Ledger.Executor,
+       path: command_ledger_path(), providers: RacingOrg.Tracker.Pro.Commands.Ledger.Registry.recovery_verifiers()}
+    ]
+  end
+
+  defp command_executor_children(:uplink), do: []
+
+  defp command_ledger_path do
+    Application.get_env(:racing_org_tracker_pro, :command_ledger_path) ||
+      RacingOrg.Tracker.Pro.Commands.Ledger.Executor.default_path()
   end
 
   defp desired_state_manager_children(:logger, controller_capability) do

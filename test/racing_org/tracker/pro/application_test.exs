@@ -27,6 +27,7 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
     RuntimeIdentity
   }
 
+  alias RacingOrg.Tracker.Pro.Commands.Ledger.Executor, as: CommandExecutor
   alias RacingOrg.Tracker.Pro.Race.BulkUploader
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
@@ -121,6 +122,7 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
     refute OperationalGate in ids
     refute Applier in ids
     refute Manager in ids
+    refute CommandExecutor in ids
   end
 
   describe "secure_transport_configured?/1 gate predicate" do
@@ -197,6 +199,7 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
         BootProvisioner,
         Manager,
         OperationalGate,
+        CommandExecutor,
         ChannelClient,
         BulkUploader
       ]
@@ -208,6 +211,41 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
 
       assert Enum.all?(indices, &is_integer/1)
       assert indices == Enum.sort(indices)
+    end
+
+    test "the command executor is bound to the persistent storage-epoch root, never boot_id" do
+      Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+
+      specs =
+        :logger
+        |> RacingOrg.Tracker.Pro.Application.child_specs(:racing_org_rpi3)
+        |> Enum.map(&Supervisor.child_spec(&1, []))
+
+      executor_spec = Enum.find(specs, &(&1.id == CommandExecutor))
+      assert {CommandExecutor, :start_link, [opts]} = executor_spec.start
+      assert executor_spec.restart == :permanent
+
+      # The ledger path is derived from configuration, not from a transient boot
+      # incarnation, so a reboot reopens the SAME durable ledger. Identity is
+      # resolved at init from the verified authority rather than baked into the
+      # child spec.
+      path = Keyword.fetch!(opts, :path)
+      assert is_binary(path)
+      refute String.contains?(path, "boot")
+      assert Keyword.fetch!(opts, :providers) == RacingOrg.Tracker.Pro.Commands.Ledger.Registry.recovery_verifiers()
+      refute Keyword.has_key?(opts, :boot_id)
+    end
+
+    test "the command executor starts before the channel that routes deliveries into it" do
+      Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+
+      ids =
+        :logger
+        |> RacingOrg.Tracker.Pro.Application.child_specs(:racing_org_rpi3)
+        |> spec_ids()
+
+      assert Enum.find_index(ids, &(&1 == CommandExecutor)) <
+               Enum.find_index(ids, &(&1 == ChannelClient))
     end
 
     test "uplink does not start the logger-only desired-state runtime" do
@@ -229,6 +267,7 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
       refute OperationalGate in ids
       refute Applier in ids
       refute Manager in ids
+      refute CommandExecutor in ids
     end
   end
 

@@ -32,10 +32,23 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   ## Commands
 
-  On a `"command"` push the client decodes the `ServerReply` protobuf and applies
-  it through `RacingOrg.Tracker.Pro.Commands` (the existing, idempotent command handler), then
-  pushes the `"ack"` event the server expects. Duplicate commands are de-duped by
-  `RacingOrg.Tracker.Pro.Commands` and still acked (idempotent).
+  There are two mutually exclusive command paths, selected by what the session
+  negotiated at connect.
+
+  AUTHENTICATED DURABLE (a control capability offer was made): commands arrive as
+  `control_v1` `:command_delivery` frames and are routed to
+  `RacingOrg.Tracker.Pro.Commands.Ledger.Executor`, which classifies them,
+  persists the intent, runs the effect, persists the terminal outcome, and
+  returns the exact `:command_ack` this client seals and sends. In this mode the
+  legacy `"command"` event is DISABLED: honoring it would apply an unfenced
+  effect and emit a legacy ACK for a command the ledger never admitted.
+
+  LEGACY (no capability offer): a `"command"` push decodes the `ServerReply`
+  protobuf and applies it through `RacingOrg.Tracker.Pro.Commands` (the existing,
+  idempotent handler), then pushes the `"ack"` event the server expects.
+  Duplicate commands are de-duped by `RacingOrg.Tracker.Pro.Commands` and still
+  acked. This path is preserved only for genuinely legacy sessions, where no
+  durable command delivery owns the command.
 
   ## Eviction / reconnect
 
@@ -57,6 +70,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   require Logger
 
+  alias RacingOrg.Tracker.Pro.Commands.Ledger.Executor, as: CommandExecutor
   alias RacingOrg.Tracker.Pro.DesiredState.{Manager, Runtime}
   alias RacingOrg.Tracker.Pro.SecureTransport.Backoff
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
@@ -90,6 +104,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       or a `{module, server}` tuple so tests can inject a fake module + pid.
     * `:url` — full `wss://host/device_socket` URL override (else derived from
       `SECURE_TRANSPORT_WS_URL`, then the configured `:api_endpoint` host).
+    * `:command_executor` — the durable command executor server that owns
+      authenticated `control_v1` command delivery (default
+      `RacingOrg.Tracker.Pro.Commands.Ledger.Executor`).
+    * `:command_executor_module` — the module used to call it, so tests can
+      inject a stand-in without a real on-disk ledger.
     * `:keystore_opts` — opts forwarded to `KeyStore.load/1` (tests use a temp dir).
     * `:auto_connect?` — force connect/idle for tests (defaults to `connectable?/0`).
     * `:backoff` — `RacingOrg.Tracker.Pro.SecureTransport.Backoff` opts.
@@ -318,6 +337,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       backoff_opts: Keyword.get(opts, :backoff, Backoff.defaults()),
       control_offer: control_offer,
       control_selection: control_selection,
+      # The durable command executor that owns classification, the ledger, and
+      # every command effect. `command_executor_module` exists so tests can inject
+      # a stand-in without a real ledger on disk.
+      command_executor: Keyword.get(opts, :command_executor, CommandExecutor),
+      command_executor_module: Keyword.get(opts, :command_executor_module, CommandExecutor),
       desired_state_identity: Keyword.get(opts, :desired_state_identity, &Runtime.identity/0),
       desired_state_compatibility: Keyword.get(opts, :desired_state_compatibility, &Runtime.compatibility/0),
       desired_state_status:
@@ -475,6 +499,22 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   end
 
   def handle_message(_other_topic, "control_v1", _carrier, socket), do: {:ok, socket}
+
+  # The legacy direct command path is DISABLED for any session that negotiated
+  # authenticated durable command mode. Applying it would run an unfenced effect
+  # and emit a legacy ACK for a command the ledger never admitted — exactly the
+  # bypass the durable ledger exists to prevent. Legacy sessions (no capability
+  # offer) keep the original behavior because no durable delivery owns their
+  # commands.
+  def handle_message(_topic, "command", payload, %{assigns: %{control_selection: selection}} = socket)
+      when not is_nil(selection) do
+    Logger.warning(
+      "[ChannelClient] ignoring legacy command #{inspect(command_id(payload))}; " <>
+        "this session negotiated authenticated durable command delivery"
+    )
+
+    {:ok, socket}
+  end
 
   # Server pushes a command -> decode + apply + ack (idempotent).
   def handle_message(topic, "command", payload, socket) do
@@ -753,9 +793,60 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     end
   end
 
-  # Delivery dispatch begins in a later stage. Authenticated, well-formed message
-  # types outside control_accept are deliberately consumed and dropped here.
-  defp handle_control_message(_topic, _type, _attrs, socket), do: {:ok, socket}
+  # An authenticated command delivery is routed to the durable executor, which
+  # owns classification, the ledger, and every effect. The executor returns the
+  # exact ACK to encode; a deferral (foreign device, unusable clock, capacity, or
+  # an ambiguous pending intent) owes nothing and MUST NOT be acked.
+  defp handle_control_message(_topic, :command_delivery, attrs, %{assigns: %{control_ready?: true}} = socket) do
+    case deliver_command(socket, attrs) do
+      {:ack, ack} ->
+        case push_ready_control(socket, :command_ack, ack) do
+          {:ok, socket} -> {:ok, socket}
+          {:reconnect, socket} -> {:ok, socket}
+          {:error, socket} -> {:ok, socket}
+        end
+
+      {:defer, reason} ->
+        Logger.debug("[ChannelClient] command delivery deferred: #{inspect(reason)}")
+        {:ok, socket}
+    end
+  end
+
+  # A delivery that arrives before this session answered control_accept has no
+  # negotiated control topic to answer on, so it is refused without an effect.
+  defp handle_control_message(_topic, :command_delivery, _attrs, socket) do
+    Logger.warning("[ChannelClient] command delivery before control readiness; refusing")
+    {:ok, socket}
+  end
+
+  # Durable receipts and checkpoint hydration are registered, authenticated types
+  # whose runtime dispatch is a separate seam. They are named explicitly rather
+  # than folded into a catch-all so an unimplemented type can never be mistaken
+  # for one that was handled.
+  defp handle_control_message(_topic, type, _attrs, socket)
+       when type in [:delivery_receipt, :checkpoint_hydration] do
+    Logger.debug("[ChannelClient] #{type} received; runtime dispatch not wired in this stage")
+    {:ok, socket}
+  end
+
+  defp handle_control_message(_topic, type, _attrs, socket) do
+    Logger.debug("[ChannelClient] ignoring unhandled control message #{inspect(type)}")
+    {:ok, socket}
+  end
+
+  defp deliver_command(socket, attrs) do
+    module = socket.assigns.command_executor_module
+
+    case module.deliver(socket.assigns.command_executor, attrs) do
+      {:ack, ack} when is_map(ack) -> {:ack, ack}
+      {:defer, reason} -> {:defer, reason}
+      _unexpected -> {:defer, :invalid_command_executor_result}
+    end
+  rescue
+    _exception -> {:defer, :command_executor_unavailable}
+  catch
+    :exit, _reason -> {:defer, :command_executor_unavailable}
+  end
 
   defp verify_control_accept(_attrs, _identity, nil), do: {:error, :legacy_negotiation}
 
