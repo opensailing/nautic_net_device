@@ -7,6 +7,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
   """
   use Slipstream.SocketTest
 
+  alias RacingOrg.Tracker.Pro.DesiredStateTestSupport, as: DS
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
   alias RacingOrg.Tracker.Pro.SecureTransport.Handshake
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore
@@ -60,6 +61,29 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
       send(server, {:acknowledge, receipt, opts})
       {:ok, []}
     end
+  end
+
+  defmodule FakeDesiredStateManager do
+    def deliver_manifest(server, generation, delivery) do
+      send(server, {:desired_state_delivery, :manifest_delivery, generation, delivery})
+      {:ok, :staged}
+    end
+
+    def deliver_chunk(server, generation, delivery) do
+      send(server, {:desired_state_delivery, :section_chunk, generation, delivery})
+      {:ok, :stored}
+    end
+
+    def deliver_secret(server, generation, delivery) do
+      send(server, {:desired_state_delivery, :secret_delivery, generation, delivery})
+      {:ok, :accepted}
+    end
+  end
+
+  defmodule FailingDesiredStateManager do
+    def deliver_manifest(_server, _generation, _delivery), do: raise("manager failed")
+    def deliver_chunk(_server, _generation, _delivery), do: exit(:manager_failed)
+    def deliver_secret(_server, _generation, _delivery), do: throw(:manager_failed)
   end
 
   # Stands in for the production executor: it records every delivery and, unless
@@ -225,6 +249,107 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
     end
   end
 
+  describe "authenticated desired-state deliveries" do
+    test "dispatches manifest, chunk, and secret deliveries with the owning session generation", ctx do
+      {client, topic, server_control, _executor} =
+        start_command_client(ctx,
+          desired_state_manager: self(),
+          desired_state_manager_module: FakeDesiredStateManager
+        )
+
+      fixture =
+        DS.generation_fixture(
+          device_id: @logical_device_id,
+          credential_epoch: @control_epoch,
+          boot_id: @boot_id,
+          storage_epoch: @storage_epoch,
+          generation: @generation,
+          wifi_secrets: [DS.secret_descriptor()]
+        )
+
+      deliveries = [
+        {:manifest_delivery, fixture.delivery},
+        {:section_chunk, fixture |> DS.chunks() |> hd()},
+        {:secret_delivery, DS.secret_delivery(fixture)}
+      ]
+
+      expected_generation = :sys.get_state(client).assigns.session.generation
+
+      server_control =
+        Enum.reduce(deliveries, server_control, fn {type, delivery}, control ->
+          {:ok, bytes} = Messages.encode(type, delivery)
+          {:ok, frame, next_control} = Control.seal(control, type, bytes)
+          push(client, topic, "control_v1", Control.encode_carrier(frame))
+
+          assert_receive {:desired_state_delivery, ^type, ^expected_generation, ^delivery}, 1_000
+          refute_push(^topic, "control_v1", _response, 20)
+          next_control
+        end)
+
+      assert %Control{} = server_control
+      assert Process.alive?(client)
+    end
+
+    test "refuses desired-state deliveries before control readiness", ctx do
+      {client, topic, server_control, _executor} =
+        start_command_client(ctx,
+          accept_control?: false,
+          desired_state_manager: self(),
+          desired_state_manager_module: FakeDesiredStateManager
+        )
+
+      fixture =
+        DS.generation_fixture(
+          device_id: @logical_device_id,
+          credential_epoch: @control_epoch,
+          boot_id: @boot_id,
+          storage_epoch: @storage_epoch,
+          generation: @generation
+        )
+
+      {:ok, bytes} = Messages.encode(:manifest_delivery, fixture.delivery)
+      {:ok, frame, _control} = Control.seal(server_control, :manifest_delivery, bytes)
+      push(client, topic, "control_v1", Control.encode_carrier(frame))
+
+      refute_receive {:desired_state_delivery, _, _, _}, 100
+      refute_push(^topic, "control_v1", _response, 20)
+      assert Process.alive?(client)
+    end
+
+    test "normalizes desired-state collaborator raises, exits, and throws", ctx do
+      {client, topic, server_control, _executor} =
+        start_command_client(ctx,
+          desired_state_manager: :unavailable,
+          desired_state_manager_module: FailingDesiredStateManager
+        )
+
+      fixture =
+        DS.generation_fixture(
+          device_id: @logical_device_id,
+          credential_epoch: @control_epoch,
+          boot_id: @boot_id,
+          storage_epoch: @storage_epoch,
+          generation: @generation,
+          wifi_secrets: [DS.secret_descriptor()]
+        )
+
+      deliveries = [
+        {:manifest_delivery, fixture.delivery},
+        {:section_chunk, fixture |> DS.chunks() |> hd()},
+        {:secret_delivery, DS.secret_delivery(fixture)}
+      ]
+
+      Enum.reduce(deliveries, server_control, fn {type, delivery}, control ->
+        {:ok, bytes} = Messages.encode(type, delivery)
+        {:ok, frame, next_control} = Control.seal(control, type, bytes)
+        push(client, topic, "control_v1", Control.encode_carrier(frame))
+        refute_push(^topic, "control_v1", _response, 20)
+        assert Process.alive?(client)
+        next_control
+      end)
+    end
+  end
+
   describe "legacy direct command fence" do
     test "a negotiated durable session never applies a legacy command or emits a legacy ack", ctx do
       {client, topic, _server_control, _executor} = start_command_client(ctx)
@@ -298,6 +423,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
          command_executor_module: FakeExecutor,
          outbox: Keyword.get(opts, :outbox, :unused_outbox),
          outbox_module: Keyword.get(opts, :outbox_module, FakeOutbox),
+         desired_state_manager: Keyword.get(opts, :desired_state_manager, :unused_desired_state_manager),
+         desired_state_manager_module: Keyword.get(opts, :desired_state_manager_module, FakeDesiredStateManager),
          desired_state_identity: fn -> {:ok, control_identity()} end,
          desired_state_compatibility: fn ->
            %{

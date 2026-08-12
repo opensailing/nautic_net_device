@@ -345,6 +345,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       command_executor_module: Keyword.get(opts, :command_executor_module, CommandExecutor),
       outbox: Keyword.get(opts, :outbox, OutboxOwner),
       outbox_module: Keyword.get(opts, :outbox_module, OutboxOwner),
+      desired_state_manager: Keyword.get(opts, :desired_state_manager, Manager),
+      desired_state_manager_module: Keyword.get(opts, :desired_state_manager_module, Manager),
       desired_state_identity: Keyword.get(opts, :desired_state_identity, &Runtime.identity/0),
       desired_state_compatibility: Keyword.get(opts, :desired_state_compatibility, &Runtime.compatibility/0),
       desired_state_status:
@@ -796,6 +798,34 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     end
   end
 
+  defp handle_control_message(
+         _topic,
+         type,
+         attrs,
+         %{assigns: %{control_ready?: true, session: %Session{generation: generation}}} = socket
+       )
+       when type in [:manifest_delivery, :section_chunk, :secret_delivery] do
+    case deliver_desired_state(socket, type, generation, attrs) do
+      {:ok, _status} ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "[ChannelClient] desired-state delivery refused: " <>
+            inspect(reason)
+        )
+    end
+
+    {:ok, socket}
+  end
+
+  defp handle_control_message(_topic, type, _attrs, socket)
+       when type in [:manifest_delivery, :section_chunk, :secret_delivery] do
+    Logger.warning("[ChannelClient] desired-state delivery before control readiness; refusing")
+
+    {:ok, socket}
+  end
+
   # An authenticated command delivery is routed to the durable executor, which
   # owns classification, the ledger, and every effect. The executor returns the
   # exact ACK to encode; a deferral (foreign device, unusable clock, capacity, or
@@ -849,6 +879,21 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     _exception -> {:error, :outbox_owner_unavailable}
   catch
     :exit, _reason -> {:error, :outbox_owner_unavailable}
+  end
+
+  defp deliver_desired_state(socket, type, generation, attrs) do
+    module = socket.assigns.desired_state_manager_module
+    manager = socket.assigns.desired_state_manager
+
+    case type do
+      :manifest_delivery -> module.deliver_manifest(manager, generation, attrs)
+      :section_chunk -> module.deliver_chunk(manager, generation, attrs)
+      :secret_delivery -> module.deliver_secret(manager, generation, attrs)
+    end
+  rescue
+    _exception -> {:error, :desired_state_manager_unavailable}
+  catch
+    _kind, _reason -> {:error, :desired_state_manager_unavailable}
   end
 
   defp deliver_command(socket, attrs) do
