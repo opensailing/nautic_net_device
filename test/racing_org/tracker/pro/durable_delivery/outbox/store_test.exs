@@ -21,6 +21,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
   @device_id Base.decode16!("0f1e2d3c4b5a69788796a5b4c3d2e1f0", case: :lower)
   @other_device_id Base.decode16!("aabbccddeeff00112233445566778899", case: :lower)
   @credential_epoch 7
+  @database_int_max 9_223_372_036_854_775_807
+  @next_sequence_max @database_int_max + 1
 
   defmodule TracingFileSystem do
     @behaviour FileSystem
@@ -1012,6 +1014,85 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     root = Path.join(System.tmp_dir!(), "durable_outbox_#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf(root) end)
     %{root: root}
+  end
+
+  test "allocates only wire-safe sequences and stops generic enqueue at the frozen bound", %{
+    root: root
+  } do
+    assert {:ok, store} = open_store(root)
+    assert {:ok, seed, store} = Store.enqueue(store, :telemetry, "seed", entry_id: entry_id(1))
+    assert {:ok, [^seed], _store} = Store.acknowledge(store, receipt_for(seed))
+    rewrite_next_sequence!(root, "telemetry", @database_int_max)
+
+    test_pid = self()
+
+    generator = fn ->
+      send(test_pid, :generic_entry_id_generated)
+      entry_id(2)
+    end
+
+    assert {:ok, store} = open_store(root, entry_id_generator: generator)
+    assert Store.next_sequence(store, :telemetry) == {:ok, @database_int_max}
+
+    assert {:ok, entry, exhausted} = Store.enqueue(store, :telemetry, "last-wire-safe")
+    assert_receive :generic_entry_id_generated
+    assert entry.sequence == @database_int_max
+    assert Store.next_sequence(exhausted, :telemetry) == {:ok, @next_sequence_max}
+
+    assert {:error, :sequence_exhausted} =
+             Store.enqueue(exhausted, :telemetry, "cannot-transmit")
+
+    refute_receive :generic_entry_id_generated
+    assert Enum.map(Store.pending(exhausted), & &1.sequence) == [@database_int_max]
+
+    assert {:ok, reopened} = open_store(root, entry_id_generator: generator)
+    assert Store.next_sequence(reopened, :telemetry) == {:ok, @next_sequence_max}
+    assert {:error, :sequence_exhausted} = Store.enqueue(reopened, :telemetry, "still-exhausted")
+    refute_receive :generic_entry_id_generated
+  end
+
+  test "stops checkpoint allocation before entry-id generation or builder execution", %{root: root} do
+    assert {:ok, store} = open_store(root, streams: [:checkpoint])
+
+    assert {:ok, seed, store} =
+             Store.enqueue_checkpoint(
+               store,
+               fn 1 -> checkpoint_delivery(1, <<0::256>>) end,
+               entry_id: entry_id(1)
+             )
+
+    assert {:ok, [^seed], _store} = Store.acknowledge(store, receipt_for(seed))
+    rewrite_next_sequence!(root, "checkpoint", @database_int_max)
+
+    test_pid = self()
+
+    generator = fn ->
+      send(test_pid, :checkpoint_entry_id_generated)
+      entry_id(2)
+    end
+
+    assert {:ok, store} =
+             open_store(root, streams: [:checkpoint], entry_id_generator: generator)
+
+    assert {:ok, entry, exhausted} =
+             Store.enqueue_checkpoint(store, fn sequence ->
+               send(test_pid, {:checkpoint_builder_ran, sequence})
+               checkpoint_delivery(sequence, <<0::256>>)
+             end)
+
+    assert_receive :checkpoint_entry_id_generated
+    assert_receive {:checkpoint_builder_ran, @database_int_max}
+    assert entry.sequence == @database_int_max
+    assert Store.next_sequence(exhausted, :checkpoint) == {:ok, @next_sequence_max}
+
+    assert {:error, :sequence_exhausted} =
+             Store.enqueue_checkpoint(exhausted, fn sequence ->
+               send(test_pid, {:exhausted_checkpoint_builder_ran, sequence})
+               {:error, :builder_ran_after_exhaustion}
+             end)
+
+    refute_receive :checkpoint_entry_id_generated
+    refute_receive {:exhausted_checkpoint_builder_ran, _sequence}
   end
 
   test "appends and fsyncs before enqueue succeeds, then recovers entries and sequences", %{root: root} do
@@ -3911,6 +3992,59 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     assert Enum.map(Store.pending(recovered), & &1.sequence) == [3]
   end
 
+  test "quarantines a replayed entry at the terminal next-sequence sentinel", %{root: root} do
+    File.mkdir_p!(root)
+
+    File.write!(
+      Path.join(root, "snapshot.bin"),
+      legacy_snapshot_v1(%{
+        "next_sequences" => [{"health", 1}, {"telemetry", @next_sequence_max}]
+      })
+    )
+
+    File.write!(
+      Path.join(root, "segment-00000000000000000001.log"),
+      encoded_entry(@next_sequence_max, entry_id(1), "cannot-transmit")
+    )
+
+    assert {:error, {:quarantined, :sequence_out_of_range, quarantine_path}} = open_store(root)
+    assert File.exists?(quarantine_path)
+  end
+
+  test "rejects hydrated sequence counters beyond the terminal wire-safe sentinel", %{root: root} do
+    File.mkdir_p!(root)
+
+    File.write!(
+      Path.join(root, "snapshot.bin"),
+      legacy_snapshot_v1(%{
+        "next_sequences" => [{"health", 1}, {"telemetry", @next_sequence_max + 1}]
+      })
+    )
+
+    assert {:error, {:quarantined, :invalid_snapshot, quarantine_path}} = open_store(root)
+    assert File.exists?(quarantine_path)
+
+    run_state_root = root <> "_run_state_sequence_bound"
+    on_exit(fn -> File.rm_rf(run_state_root) end)
+    assert {:ok, _store} = open_store(run_state_root)
+
+    run_state_path = Path.join(run_state_root, "run-state.bin")
+    assert {:ok, run_state} = run_state_path |> File.read!() |> RunState.decode()
+
+    assert {:ok, bytes} =
+             run_state
+             |> Map.put("sequence_floors", [
+               {"health", 1},
+               {"telemetry", @next_sequence_max + 1}
+             ])
+             |> RunState.encode()
+
+    File.write!(run_state_path, bytes)
+    assert {:error, :invalid_run_state} = open_store(run_state_root)
+    assert File.exists?(run_state_path)
+    refute File.exists?(Path.join(run_state_root, "quarantine"))
+  end
+
   test "schema-v4 snapshots require explicit entry-id history metadata", %{root: root} do
     assert {:ok, store} = open_store(root)
     assert {:ok, entry, store} = Store.enqueue(store, :telemetry, "payload", entry_id: entry_id(1))
@@ -5325,6 +5459,24 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
     {:ok, bytes} = Snapshot.encode(snapshot)
     bytes
+  end
+
+  defp rewrite_next_sequence!(root, stream_name, sequence) do
+    path = Path.join(root, "snapshot.bin")
+    {:ok, snapshot} = path |> File.read!() |> Snapshot.decode()
+
+    next_sequences =
+      Enum.map(snapshot["next_sequences"], fn
+        {^stream_name, _current} -> {stream_name, sequence}
+        stream -> stream
+      end)
+
+    assert {:ok, bytes} =
+             snapshot
+             |> Map.put("next_sequences", next_sequences)
+             |> Snapshot.encode()
+
+    File.write!(path, bytes)
   end
 
   defp downgrade_snapshot_to_v2!(root) do

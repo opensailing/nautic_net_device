@@ -48,6 +48,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   @entry_id_tombstone_domain "RacingOrg-DurableOutboxEntryIdTombstone-v1"
   @max_symlink_hops 40
   @u32_max 0xFFFF_FFFF
+  @database_int_max 9_223_372_036_854_775_807
+  @next_sequence_max @database_int_max + 1
   @zero_device_id <<0::128>>
 
   # A root recorded under a different origin identity is intact data belonging to
@@ -300,9 +302,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          :ok <- generic_enqueue_stream(stream),
          :ok <- validate_payload(payload),
          {:ok, priority} <- priority(opts),
+         {:ok, sequence} <- allocatable_sequence(store, stream),
          {:ok, entry_id} <- entry_id(store, opts),
-         :ok <- unique_entry_id(store, entry_id),
-         sequence <- Map.fetch!(store.next_sequences, stream) do
+         :ok <- unique_entry_id(store, entry_id) do
       append_entry(
         store,
         stream,
@@ -320,9 +322,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     with :ok <- complete_entry_id_history(store),
          {:ok, stream_name} <- configured_stream_name(store, :checkpoint),
          :ok <- verify_fresh(store),
+         {:ok, sequence} <- allocatable_sequence(store, :checkpoint),
          {:ok, entry_id} <- entry_id(store, opts),
          :ok <- unique_entry_id(store, entry_id),
-         sequence <- Map.fetch!(store.next_sequences, :checkpoint),
          {:ok, payload, payload_hash} <- checkpoint_payload(store, builder, sequence) do
       append_entry(
         store,
@@ -1227,7 +1229,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
       store,
       values,
       invalid_reason,
-      &(is_integer(&1) and &1 > 0)
+      &(is_integer(&1) and &1 > 0 and &1 <= @next_sequence_max)
     )
   end
 
@@ -2508,6 +2510,17 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   end
 
   defp unique_replayed_entry_id(store, entry_id), do: unique_entry_id(store, entry_id)
+
+  defp allocatable_sequence(store, stream) do
+    sequence = Map.fetch!(store.next_sequences, stream)
+
+    if sequence <= @database_int_max,
+      do: {:ok, sequence},
+      else: {:error, :sequence_exhausted}
+  end
+
+  defp expected_sequence(_store, _stream, sequence) when sequence > @database_int_max,
+    do: {:error, :sequence_out_of_range}
 
   defp expected_sequence(store, stream, sequence) do
     if Map.fetch!(store.next_sequences, stream) == sequence,
