@@ -17,6 +17,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem do
 
   @callback open_root(module(), Path.t(), identity()) :: {:ok, root()} | {:error, term()}
   @callback close_root(root()) :: :ok | {:error, term()}
+  @callback try_lock_root(root()) :: :ok | {:error, term()}
   @callback create(root(), binary(), non_neg_integer()) :: {:ok, segment()} | {:error, term()}
   @callback chmod(segment(), non_neg_integer()) :: :ok | {:error, term()}
   @callback write(segment(), iodata()) :: :ok | {:error, term()}
@@ -40,6 +41,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem do
 
   @doc false
   def close_root(_root), do: :erlang.nif_error(:not_loaded)
+
+  @doc false
+  def try_lock_root(_root), do: :erlang.nif_error(:not_loaded)
 
   @doc false
   def create(_root, _basename, _mode), do: :erlang.nif_error(:not_loaded)

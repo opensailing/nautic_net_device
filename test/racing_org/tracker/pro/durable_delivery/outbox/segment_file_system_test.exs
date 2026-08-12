@@ -23,6 +23,20 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystemTest do
              SegmentFileSystem.open_root(FileSystem, root, {stat.major_device, stat.minor_device, high_inode})
   end
 
+  test "holds an advisory root lock until its handle closes", %{root: root} do
+    stat = File.stat!(root)
+    identity = {stat.major_device, stat.minor_device, stat.inode}
+
+    assert {:ok, first} = SegmentFileSystem.open_root(FileSystem, root, identity)
+    assert :ok = SegmentFileSystem.try_lock_root(first)
+    assert {:ok, second} = SegmentFileSystem.open_root(FileSystem, root, identity)
+    assert {:error, reason} = SegmentFileSystem.try_lock_root(second)
+    assert reason in [:eacces, :eagain]
+    assert :ok = SegmentFileSystem.close_root(first)
+    assert :ok = SegmentFileSystem.try_lock_root(second)
+    assert :ok = SegmentFileSystem.close_root(second)
+  end
+
   test "creates and durably appends through root-bound handles", %{root: root} do
     stat = File.stat!(root)
     identity = {stat.major_device, stat.minor_device, stat.inode}

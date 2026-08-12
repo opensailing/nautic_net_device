@@ -216,6 +216,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
     end
 
     @impl true
+    def try_lock_root(root), do: SegmentFileSystem.try_lock_root(root)
+
+    @impl true
     def create(root, basename, mode) do
       path = Path.join(root_path(root), basename)
       report({:create, path, mode})
@@ -770,6 +773,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
     @impl true
     def close_root(root), do: SegmentFileSystem.close_root(root)
+
+    @impl true
+    def try_lock_root(root), do: SegmentFileSystem.try_lock_root(root)
 
     @impl true
     def create(root_resource, basename, mode) do

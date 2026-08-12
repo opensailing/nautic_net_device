@@ -29,7 +29,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
 
   use GenServer
 
-  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.{Entry, Store}
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.{Entry, FileSystem, SegmentFileSystem, Store}
 
   @u32_max 0xFFFF_FFFF
   @zero_device_id <<0::128>>
@@ -178,12 +178,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
          {:ok, identity_source} <- option_identity_source(opts),
          {:ok, identity} <- read_identity(identity_source),
          :ok <- claim_root(root),
+         {:ok, root_lock} <- claim_root_across_vms(root, opts),
          {:ok, store} <- open_store(root, identity, opts) do
       Process.flag(:trap_exit, true)
 
       {:ok,
        %{
          store: store,
+         root_lock: root_lock,
          identity: identity,
          identity_source: identity_source,
          quarantined: false
@@ -333,6 +335,42 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
       loss_authorizations: length(Store.loss_authorizations(state.store)),
       streams: map_size(state.store.stream_names)
     }
+  end
+
+  defp claim_root_across_vms(root, opts) do
+    segment_file_system = Keyword.get(opts, :segment_file_system, SegmentFileSystem)
+
+    with :ok <- ensure_lockable_root(root),
+         {:ok, %File.Stat{type: :directory} = stat} <- File.stat(root),
+         {:ok, handle} <-
+           segment_file_system.open_root(
+             FileSystem,
+             root,
+             {stat.major_device, stat.minor_device, stat.inode}
+           ) do
+      case segment_file_system.try_lock_root(handle) do
+        :ok ->
+          {:ok, handle}
+
+        {:error, reason} when reason in [:eacces, :eagain] ->
+          _ = segment_file_system.close_root(handle)
+          {:error, :root_already_owned}
+
+        {:error, reason} ->
+          _ = segment_file_system.close_root(handle)
+          {:error, {:root_lock, reason}}
+      end
+    else
+      {:ok, %File.Stat{}} -> {:error, :invalid_root}
+      {:error, reason} -> {:error, {:root_lock, reason}}
+    end
+  end
+
+  defp ensure_lockable_root(root) do
+    with :ok <- File.mkdir_p(root),
+         :ok <- File.chmod(root, 0o700) do
+      :ok
+    end
   end
 
   defp open_store(root, identity, opts) do

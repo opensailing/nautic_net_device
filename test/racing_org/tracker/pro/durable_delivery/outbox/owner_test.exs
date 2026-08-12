@@ -38,6 +38,33 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       assert {:ok, _reclaimed} = start_owner(root)
     end
 
+    @tag timeout: 180_000
+    test "independent BEAM processes cannot own the same root concurrently", %{root: root} do
+      File.mkdir_p!(root)
+      script = Path.join(root, "cross-vm-owner.exs")
+      ready = Path.join(root, "cross-vm-owner.ready")
+      release = Path.join(root, "cross-vm-owner.release")
+      result = Path.join(root, "cross-vm-owner.result")
+
+      File.write!(
+        script,
+        cross_vm_owner_script(root, ready, release, result)
+      )
+
+      {first, first_ref} = spawn_elixir(script)
+      ready? = eventually(fn -> File.exists?(ready) end, 500)
+      assert ready?, cross_vm_exit_message(first_ref)
+
+      {second, second_ref} = spawn_elixir(script)
+      rejected? = eventually(fn -> File.exists?(result) end, 500)
+
+      File.write!(release, "release")
+      assert_receive {:cross_vm_owner_exit, ^second_ref, ^second, 0, second_output}, 10_000
+      assert_receive {:cross_vm_owner_exit, ^first_ref, ^first, 0, _output}, 10_000
+      assert rejected?, "contender did not reject ownership: #{second_output}"
+      assert File.read!(result) == "root_already_owned"
+    end
+
     test "a real supervisor can restart the owner immediately after a crash", %{root: root} do
       children = [
         Map.put(
@@ -680,6 +707,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
     def close_root(root), do: SegmentFileSystem.close_root(root)
 
     @impl true
+    def try_lock_root(root), do: SegmentFileSystem.try_lock_root(root)
+
+    @impl true
     def create(root, basename, mode), do: SegmentFileSystem.create(root, basename, mode)
 
     @impl true
@@ -837,6 +867,104 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       storage_epoch: Keyword.get(overrides, :storage_epoch, @storage_epoch)
     }
   end
+
+  defp cross_vm_owner_script(root, ready, release, result) do
+    """
+    Application.ensure_all_started(:crypto)
+    Application.ensure_all_started(:logger)
+    {:module, RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem} =
+      Code.ensure_loaded(RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem)
+
+    alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner
+
+    identity = %{
+      device_id: Base.decode16!("#{Base.encode16(@device_id, case: :lower)}", case: :lower),
+      credential_epoch: #{@credential_epoch},
+      storage_epoch: Base.decode16!("#{Base.encode16(@storage_epoch, case: :lower)}", case: :lower)
+    }
+
+    opts = [
+      root: #{inspect(root)},
+      identity: fn -> {:ok, identity} end,
+      streams: [:telemetry, :health],
+      max_entries: 10,
+      max_bytes: 10_000,
+      segment_max_bytes: 4_096
+    ]
+
+    Process.flag(:trap_exit, true)
+
+    case Owner.start_link(opts) do
+      {:ok, owner} ->
+        File.write!(#{inspect(ready)}, "ready")
+        until = System.monotonic_time(:millisecond) + 60_000
+
+        wait = fn wait ->
+          cond do
+            File.exists?(#{inspect(release)}) -> :ok
+            System.monotonic_time(:millisecond) >= until -> :ok
+            true -> Process.sleep(10); wait.(wait)
+          end
+        end
+
+        wait.(wait)
+        GenServer.stop(owner)
+
+      {:error, reason} when reason in [:root_already_owned] ->
+        File.write!(#{inspect(result)}, "root_already_owned")
+
+      {:error, {:root_already_owned, _owner}} ->
+        File.write!(#{inspect(result)}, "root_already_owned")
+
+      {:error, reason} ->
+        File.write!(#{inspect(result)}, "unexpected:" <> inspect(reason))
+    end
+    """
+  end
+
+  defp spawn_elixir(script) do
+    parent = self()
+    reference = make_ref()
+
+    pid =
+      spawn(fn ->
+        {output, status} =
+          System.cmd("mix", ["run", "--no-compile", "--no-start", script],
+            cd: File.cwd!(),
+            env: [
+              {"API_ENDPOINT", Application.fetch_env!(:racing_org_tracker_pro, :api_endpoint)},
+              {"UDP_ENDPOINT", Application.fetch_env!(:racing_org_tracker_pro, :udp_endpoint)},
+              {"PRODUCT", to_string(Application.fetch_env!(:racing_org_tracker_pro, :product))},
+              {"MIX_ENV", "test"}
+            ],
+            stderr_to_stdout: true
+          )
+
+        send(parent, {:cross_vm_owner_exit, reference, self(), status, output})
+      end)
+
+    {pid, reference}
+  end
+
+  defp cross_vm_exit_message(reference) do
+    receive do
+      {:cross_vm_owner_exit, ^reference, _process, status, output} ->
+        "cross-VM owner exited with #{status}: #{output}"
+    after
+      0 -> "cross-VM owner did not become ready"
+    end
+  end
+
+  defp eventually(assertion, attempts) when attempts > 0 do
+    if assertion.() do
+      true
+    else
+      Process.sleep(10)
+      eventually(assertion, attempts - 1)
+    end
+  end
+
+  defp eventually(assertion, 0), do: assertion.()
 
   defp owner_opts(root, overrides \\ []) do
     defaults = [

@@ -7,6 +7,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -46,6 +47,7 @@ typedef struct {
 
 typedef struct {
   int fd;
+  int lock_fd;
   ErlNifMutex *mutex;
   cleanup_job *cleanup;
   cleanup_worker *cleanup_worker;
@@ -336,12 +338,14 @@ static void root_destructor(ErlNifEnv *env, void *object) {
   root_resource *root = object;
   ErlNifMutex *mutex;
   int fd;
+  int lock_fd;
   (void)env;
 
   fd = take_fd(&root->fd);
+  lock_fd = take_fd(&root->lock_fd);
   mutex = root->mutex;
   root->mutex = NULL;
-  cleanup_worker_enqueue(root->cleanup_worker, root->cleanup, fd, -1, NULL,
+  cleanup_worker_enqueue(root->cleanup_worker, root->cleanup, fd, lock_fd, NULL,
                          mutex);
   root->cleanup = NULL;
   root->cleanup_worker = NULL;
@@ -438,6 +442,7 @@ static ERL_NIF_TERM open_root_nif(ErlNifEnv *env, int argc,
 
   memset(root, 0, sizeof(*root));
   root->fd = fd;
+  root->lock_fd = -1;
   root->cleanup_worker = &state->cleanup;
   root->cleanup = cleanup;
 
@@ -452,10 +457,11 @@ static ERL_NIF_TERM open_root_nif(ErlNifEnv *env, int argc,
   return result;
 }
 
-static ERL_NIF_TERM close_root_nif(ErlNifEnv *env, int argc,
-                                   const ERL_NIF_TERM argv[]) {
+static ERL_NIF_TERM try_lock_root_nif(ErlNifEnv *env, int argc,
+                                      const ERL_NIF_TERM argv[]) {
   nif_state *state = enif_priv_data(env);
   root_resource *root;
+  int lock_fd;
   int result;
   int error;
 
@@ -466,14 +472,71 @@ static ERL_NIF_TERM close_root_nif(ErlNifEnv *env, int argc,
   }
 
   enif_mutex_lock(root->mutex);
-  result = take_fd(&root->fd);
-  enif_mutex_unlock(root->mutex);
+  if (root->fd == -1) {
+    enif_mutex_unlock(root->mutex);
+    return make_error(env, atom_closed);
+  }
 
-  if (result == -1) {
+  if (root->lock_fd != -1) {
+    enif_mutex_unlock(root->mutex);
     return atom_ok;
   }
 
-  result = close_owned_fd(result);
+  do {
+    lock_fd = openat(root->fd, ".outbox.lock",
+                     O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+  } while (lock_fd == -1 && errno == EINTR);
+
+  if (lock_fd == -1) {
+    error = errno;
+    enif_mutex_unlock(root->mutex);
+    return make_errno_error(env, error);
+  }
+
+  do {
+    result = flock(lock_fd, LOCK_EX | LOCK_NB);
+  } while (result == -1 && errno == EINTR);
+  error = errno;
+
+  if (result == -1) {
+    close_owned_fd(lock_fd);
+  } else {
+    root->lock_fd = lock_fd;
+  }
+  enif_mutex_unlock(root->mutex);
+
+  return result == -1 ? make_errno_error(env, error) : atom_ok;
+}
+
+static ERL_NIF_TERM close_root_nif(ErlNifEnv *env, int argc,
+                                   const ERL_NIF_TERM argv[]) {
+  nif_state *state = enif_priv_data(env);
+  root_resource *root;
+  int result;
+  int lock_result;
+  int result_fd;
+  int lock_fd;
+  int error;
+
+  if (argc != 1 ||
+      !enif_get_resource(env, argv[0], state->root_resource_type,
+                         (void **)&root)) {
+    return enif_make_badarg(env);
+  }
+
+  enif_mutex_lock(root->mutex);
+  result_fd = take_fd(&root->fd);
+  lock_fd = take_fd(&root->lock_fd);
+  enif_mutex_unlock(root->mutex);
+
+  lock_result = close_owned_fd(lock_fd);
+  error = errno;
+  result = close_owned_fd(result_fd);
+
+  if (lock_result == -1) {
+    return make_errno_error(env, error);
+  }
+
   error = errno;
   return result == -1 ? make_errno_error(env, error) : atom_ok;
 }
@@ -905,6 +968,7 @@ static void unload(ErlNifEnv *env, void *private_data) {
 static ErlNifFunc nif_functions[] = {
     {"nif_open_root", 2, open_root_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"close_root", 1, close_root_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"try_lock_root", 1, try_lock_root_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"create", 3, create_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"chmod", 2, chmod_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"write", 2, write_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
