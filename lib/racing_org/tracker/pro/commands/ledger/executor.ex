@@ -432,8 +432,13 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
     if is_map(providers) and providers != %{} and
          Enum.all?(providers, fn
-           {type, {module, _context}} when is_atom(type) and is_atom(module) -> Code.ensure_loaded?(module)
-           _other -> false
+           {type, {module, _context}} when is_atom(type) and is_atom(module) ->
+             Code.ensure_loaded?(module) and function_exported?(module, :execute, 2) and
+               function_exported?(module, :recover, 2) and
+               function_exported?(module, :with_non_application_lease, 5)
+
+           _other ->
+             false
          end) do
       {:ok, providers}
     else

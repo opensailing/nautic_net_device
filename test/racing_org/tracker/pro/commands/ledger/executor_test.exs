@@ -17,6 +17,9 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
   # A provider whose effect behavior is scripted per command hash, recording every
   # observation so the tests can prove ordering (intent before effect, outcome
   # before ACK) and lease discipline.
+  defmodule LoadedButIncompleteProvider do
+  end
+
   defmodule ScriptedProvider do
     def execute(intent, state) do
       Agent.get_and_update(state, fn script ->
@@ -55,6 +58,18 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
     on_exit(fn -> File.rm_rf(root) end)
     {:ok, script} = Agent.start_link(fn -> %{} end)
     %{root: root, path: Path.join(root, "commands.ledger"), script: script}
+  end
+
+  describe "provider configuration" do
+    test "rejects a loaded provider that omits durable effect callbacks", ctx do
+      assert {:error, :invalid_command_providers} =
+               GenServer.start(
+                 Executor,
+                 executor_opts(ctx,
+                   providers: %{noop: {LoadedButIncompleteProvider, nil}}
+                 )
+               )
+    end
   end
 
   describe "durable execution ordering" do
