@@ -53,6 +53,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   @database_int_max 9_223_372_036_854_775_807
   @genesis_parent <<0::256>>
   @max_encoded_size Contract.max_checkpoint_size() + 4_096
+  @decode_timeout_ms 5_000
+  @decode_max_heap_words 1_000_000
 
   @build_keys [
     :device_id,
@@ -196,9 +198,15 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   distinguish a tampering strategy.
   """
   @spec decode(binary()) :: {:ok, t()} | {:error, :corrupt_checkpoint_head}
-  def decode(bytes) when is_binary(bytes) and byte_size(bytes) <= @max_encoded_size do
-    with {@format_version, @record_tag, record} when is_map(record) <- safe_term(bytes),
-         :ok <- exact_keys(record, @record_keys),
+  def decode(bytes) when is_binary(bytes) and byte_size(bytes) <= @max_encoded_size,
+    do: bounded_decode(bytes)
+
+  def decode(_bytes), do: {:error, :corrupt_checkpoint_head}
+
+  @doc false
+  @spec decode_term(term()) :: {:ok, t()} | {:error, :corrupt_checkpoint_head}
+  def decode_term({@format_version, @record_tag, record}) when is_map(record) do
+    with :ok <- exact_keys(record, @record_keys),
          :ok <- verify(record) do
       {:ok, record}
     else
@@ -206,7 +214,70 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
     end
   end
 
-  def decode(_bytes), do: {:error, :corrupt_checkpoint_head}
+  def decode_term(_term), do: {:error, :corrupt_checkpoint_head}
+
+  defp bounded_decode(bytes) do
+    owner = self()
+    result_ref = make_ref()
+
+    {worker, monitor} =
+      :erlang.spawn_opt(
+        fn ->
+          current_worker = self()
+          _watcher = spawn(fn -> stop_decode_on_owner_exit(owner, current_worker) end)
+          send(owner, {result_ref, decode_term(safe_term(bytes))})
+        end,
+        [
+          :monitor,
+          {:max_heap_size, %{size: @decode_max_heap_words, kill: true, error_logger: false}}
+        ]
+      )
+
+    receive do
+      {^result_ref, result} ->
+        Process.demonitor(monitor, [:flush])
+        result
+
+      {:DOWN, ^monitor, :process, ^worker, _reason} ->
+        {:error, :corrupt_checkpoint_head}
+    after
+      @decode_timeout_ms ->
+        Process.exit(worker, :kill)
+        await_decode_down(worker, monitor)
+        drain_decode_result(result_ref)
+        {:error, :corrupt_checkpoint_head}
+    end
+  end
+
+  defp stop_decode_on_owner_exit(owner, worker) do
+    owner_monitor = Process.monitor(owner)
+    worker_monitor = Process.monitor(worker)
+
+    receive do
+      {:DOWN, ^owner_monitor, :process, ^owner, _reason} ->
+        Process.exit(worker, :kill)
+        await_decode_down(worker, worker_monitor)
+
+      {:DOWN, ^worker_monitor, :process, ^worker, _reason} ->
+        :ok
+    end
+  end
+
+  defp await_decode_down(worker, monitor) do
+    receive do
+      {:DOWN, ^monitor, :process, ^worker, _reason} -> :ok
+    after
+      @decode_timeout_ms -> Process.demonitor(monitor, [:flush])
+    end
+  end
+
+  defp drain_decode_result(result_ref) do
+    receive do
+      {^result_ref, _result} -> :ok
+    after
+      0 -> :ok
+    end
+  end
 
   @doc """
   Re-derive and compare every hash on one record.
@@ -243,6 +314,32 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
 
   def bound_to?(_record, _identity), do: false
 
+  @doc false
+  @spec accepted_binding?(map()) :: boolean()
+  def accepted_binding?(summary) when is_map(summary) do
+    with :ok <- fixed_binary(Map.get(summary, :device_id), @device_id_size, :invalid_device_id),
+         :ok <- u32(Map.get(summary, :local_credential_epoch), :invalid_credential_epoch),
+         :ok <- nonzero_binary(Map.get(summary, :local_storage_epoch), :invalid_storage_epoch),
+         :ok <-
+           fixed_binary(Map.get(summary, :checkpoint_hash), @hash_size, :invalid_checkpoint_hash),
+         :ok <- fixed_binary(Map.get(summary, :binding_hash), @hash_size, :invalid_binding_hash) do
+      expected =
+        binding_hash(%{
+          device_id: summary.device_id,
+          local_credential_epoch: summary.local_credential_epoch,
+          local_storage_epoch: summary.local_storage_epoch,
+          accepted: true,
+          checkpoint_hash: summary.checkpoint_hash
+        })
+
+      secure_equal(expected, summary.binding_hash)
+    else
+      _error -> false
+    end
+  end
+
+  def accepted_binding?(_summary), do: false
+
   defp record_hash(attrs, content_hash) do
     Checkpoint.hash(%{
       device_id: attrs.device_id,
@@ -264,7 +361,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
       :sha256,
       @binding_domain <>
         <<@binding_version, Contract.version(), record.device_id::binary-size(@device_id_size),
-          record.local_credential_epoch::32, record.local_storage_epoch::binary-size(@storage_epoch_size), accepted,
+          record.local_credential_epoch::32,
+          record.local_storage_epoch::binary-size(@storage_epoch_size), accepted,
           record.checkpoint_hash::binary-size(@hash_size)>>
     )
   end
@@ -274,9 +372,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   # rejected rather than re-encoded, so the caller's bytes and the stored bytes
   # are always identical.
   defp canonical_content(kind, schema_version, content) when is_binary(content) do
-    with {:ok, decoded} <- normalize_content_error(Checkpoint.decode_content(kind, schema_version, content)),
-         {:ok, canonical} <- normalize_content_error(Checkpoint.encode_content(kind, schema_version, decoded)) do
-      if canonical == content, do: {:ok, canonical}, else: {:error, :noncanonical_checkpoint_content}
+    with {:ok, decoded} <-
+           normalize_content_error(Checkpoint.decode_content(kind, schema_version, content)),
+         {:ok, canonical} <-
+           normalize_content_error(Checkpoint.encode_content(kind, schema_version, decoded)) do
+      if canonical == content,
+        do: {:ok, canonical},
+        else: {:error, :noncanonical_checkpoint_content}
     end
   end
 
@@ -309,7 +411,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   defp normalize_content_error({:error, reason}) when reason in @preserved_content_errors,
     do: {:error, reason}
 
-  defp normalize_content_error({:error, :trailing_bytes}), do: {:error, :noncanonical_checkpoint_content}
+  defp normalize_content_error({:error, :trailing_bytes}),
+    do: {:error, :noncanonical_checkpoint_content}
+
   defp normalize_content_error({:error, _reason}), do: {:error, :invalid_checkpoint_content}
 
   # `binary_to_term/2` ignores bytes after a complete term, so appended garbage
@@ -336,7 +440,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
 
   defp exact_keys(_value, _expected), do: {:error, :invalid_checkpoint_record}
 
-  defp fixed_binary(value, size, _error) when is_binary(value) and byte_size(value) == size, do: :ok
+  defp fixed_binary(value, size, _error) when is_binary(value) and byte_size(value) == size,
+    do: :ok
+
   defp fixed_binary(_value, _size, error), do: {:error, error}
 
   defp nonzero_binary(value, error) do
@@ -348,10 +454,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   defp u32(value, _error) when is_integer(value) and value >= 0 and value <= @u32_max, do: :ok
   defp u32(_value, error), do: {:error, error}
 
-  defp database_int(value, _error) when is_integer(value) and value >= 0 and value <= @database_int_max, do: :ok
+  defp database_int(value, _error)
+       when is_integer(value) and value >= 0 and value <= @database_int_max, do: :ok
+
   defp database_int(_value, error), do: {:error, error}
 
-  defp positive_database_int(value, _error) when is_integer(value) and value > 0 and value <= @database_int_max, do: :ok
+  defp positive_database_int(value, _error)
+       when is_integer(value) and value > 0 and value <= @database_int_max, do: :ok
+
   defp positive_database_int(_value, error), do: {:error, error}
 
   defp boolean(value, _error) when is_boolean(value), do: :ok

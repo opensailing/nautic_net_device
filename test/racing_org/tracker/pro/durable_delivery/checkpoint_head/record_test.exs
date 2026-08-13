@@ -55,8 +55,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.RecordTest do
         :crypto.hash(
           :sha256,
           @binding_domain <>
-            <<@binding_version, Contract.version(), device_id::binary-size(16), 7::32, storage_epoch::binary-size(16),
-              0, checkpoint_hash::binary-size(32)>>
+            <<@binding_version, Contract.version(), device_id::binary-size(16), 7::32,
+              storage_epoch::binary-size(16), 0, checkpoint_hash::binary-size(32)>>
         )
 
       assert record.binding_hash == expected_binding
@@ -104,7 +104,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.RecordTest do
     test "accepts every kind in the closed registry at its registered schema" do
       for {kind, _code, schema_version} <- Contract.checkpoint_kinds() do
         assert {:ok, record} =
-                 Record.build(attrs(%{kind: kind, schema_version: schema_version, content: content(kind)}))
+                 Record.build(
+                   attrs(%{kind: kind, schema_version: schema_version, content: content(kind)})
+                 )
 
         assert record.kind == kind
         assert record.schema_version == schema_version
@@ -203,6 +205,20 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.RecordTest do
       assert {:ok, ^record} = Record.decode(bytes)
     end
 
+    test "round-trips a maximum-size record through the bounded decoder" do
+      assert {:ok, record} =
+               Record.build(
+                 attrs(%{
+                   kind: :wind_shift,
+                   content: content(:wind_shift)
+                 })
+               )
+
+      assert byte_size(record.content) == 65_298
+      assert {:ok, bytes} = Record.encode(record)
+      assert {:ok, ^record} = Record.decode(bytes)
+    end
+
     test "reject truncation, garbage, and unknown framing" do
       assert {:ok, record} = Record.build(attrs())
       assert {:ok, bytes} = Record.encode(record)
@@ -231,6 +247,22 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.RecordTest do
       oversized = :binary.copy(<<0>>, Record.max_encoded_size() + 1)
       assert {:error, :corrupt_checkpoint_head} = Record.decode(oversized)
       assert Record.max_encoded_size() < 2 * Contract.max_checkpoint_size()
+    end
+
+    test "contains external-term heap expansion inside the decoder" do
+      entries = 60_000
+      expanding_term = <<131, 108, entries::32, :binary.copy(<<106>>, entries)::binary, 106>>
+      owner = self()
+      result_ref = make_ref()
+
+      {pid, monitor} =
+        :erlang.spawn_opt(
+          fn -> send(owner, {result_ref, Record.decode(expanding_term)}) end,
+          [:monitor, {:max_heap_size, %{size: 100_000, kill: true, error_logger: false}}]
+        )
+
+      assert_receive {^result_ref, {:error, :corrupt_checkpoint_head}}, 2_000
+      assert_receive {:DOWN, ^monitor, :process, ^pid, :normal}, 2_000
     end
 
     test "reject a wrong format version or record tag" do
@@ -336,12 +368,35 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.RecordTest do
   end
 
   defp content(:wind_shift) do
+    started_at_ms = 1_784_800_800_000
+
+    timeline =
+      List.duplicate(
+        %{
+          "amplitude_deg" => nil,
+          "mean_twd_deg" => nil,
+          "period_s" => nil,
+          "phase_deg" => nil,
+          "t_ms" => started_at_ms,
+          "trend_deg_per_hr" => nil,
+          "tws_mps" => nil
+        },
+        632
+      )
+
     %{
       "last_summary" => nil,
       "pending_events" => [],
-      "pending_timeline" => [],
-      "seq" => 0,
-      "session" => nil
+      "pending_timeline" => timeline,
+      "seq" => 632,
+      "session" => %{
+        "lat_sum" => 0.0,
+        "lon_sum" => 0.0,
+        "pos_n" => 0,
+        "started_at_ms" => started_at_ms,
+        "tws_n" => 0,
+        "tws_sum" => 0.0
+      }
     }
   end
 
