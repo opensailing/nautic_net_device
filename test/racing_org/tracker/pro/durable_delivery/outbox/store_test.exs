@@ -299,6 +299,25 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
         else: result
     end
 
+    @impl true
+    def bind_entry(root, path, kind, root_identity, entry_identity, identity),
+      do: SegmentFileSystem.bind_entry(root, path, kind, root_identity, entry_identity, identity)
+
+    @impl true
+    def bound_info(bound_entry), do: SegmentFileSystem.bound_info(bound_entry)
+
+    @impl true
+    def read_bound(bound_entry, count), do: SegmentFileSystem.read_bound(bound_entry, count)
+
+    @impl true
+    def sync_bound(bound_entry), do: SegmentFileSystem.sync_bound(bound_entry)
+
+    @impl true
+    def remove_bound(bound_entry), do: SegmentFileSystem.remove_bound(bound_entry)
+
+    @impl true
+    def close_bound(bound_entry), do: SegmentFileSystem.close_bound(bound_entry)
+
     defp fail?(operation) do
       failures = Process.get({__MODULE__, :failures}, MapSet.new())
 
@@ -821,6 +840,25 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.StoreTest do
 
     @impl true
     def close(segment), do: SegmentFileSystem.close(segment)
+
+    @impl true
+    def bind_entry(root, path, kind, root_identity, entry_identity, identity),
+      do: SegmentFileSystem.bind_entry(root, path, kind, root_identity, entry_identity, identity)
+
+    @impl true
+    def bound_info(bound_entry), do: SegmentFileSystem.bound_info(bound_entry)
+
+    @impl true
+    def read_bound(bound_entry, count), do: SegmentFileSystem.read_bound(bound_entry, count)
+
+    @impl true
+    def sync_bound(bound_entry), do: SegmentFileSystem.sync_bound(bound_entry)
+
+    @impl true
+    def remove_bound(bound_entry), do: SegmentFileSystem.remove_bound(bound_entry)
+
+    @impl true
+    def close_bound(bound_entry), do: SegmentFileSystem.close_bound(bound_entry)
   end
 
   defmodule SwapAfterDirectoryCloseFileSystem do

@@ -1032,21 +1032,35 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
     do: key |> Atom.to_string() |> secret_capable_key?()
 
   defp secret_capable_key?(key) when is_binary(key) do
-    if String.valid?(key) do
-      normalized = key |> String.normalize(:nfc) |> String.downcase()
+    cond do
+      # NFC normalization is the identity on ASCII, so pure-ASCII keys — the
+      # overwhelming majority in near-cap canonical content — skip the expensive
+      # normalization walk without weakening the sweep.
+      ascii_key?(key) ->
+        secret_capable_normalized_key?(String.downcase(key))
 
-      normalized not in ~w(credential_epoch origin_credential_epoch) and
-        (normalized in ~w(metadata payload raw_payload blob data bytes auth authorization) or
-           Enum.any?(
-             ~w(psk password passphrase secret credential private_key api_key token),
-             &String.contains?(normalized, &1)
-           ))
-    else
-      false
+      String.valid?(key) ->
+        secret_capable_normalized_key?(key |> String.normalize(:nfc) |> String.downcase())
+
+      true ->
+        false
     end
   end
 
   defp secret_capable_key?(_key), do: false
+
+  defp secret_capable_normalized_key?(normalized) do
+    normalized not in ~w(credential_epoch origin_credential_epoch) and
+      (normalized in ~w(metadata payload raw_payload blob data bytes auth authorization) or
+         Enum.any?(
+           ~w(psk password passphrase secret credential private_key api_key token),
+           &String.contains?(normalized, &1)
+         ))
+  end
+
+  defp ascii_key?(<<byte, rest::binary>>) when byte < 128, do: ascii_key?(rest)
+  defp ascii_key?(<<>>), do: true
+  defp ascii_key?(_key), do: false
 
   defp checkpoint_size(bytes) when is_binary(bytes) do
     if byte_size(bytes) in 1..Contract.max_checkpoint_size(),
