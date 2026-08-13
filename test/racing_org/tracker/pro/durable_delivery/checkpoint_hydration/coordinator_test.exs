@@ -392,7 +392,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
              :checkpoint_decode,
              :adapter_hydrate,
              :runtime_restore,
+             :store_head,
              :journal_remove,
+             :store_head,
              :manager_finish
            ]
 
@@ -444,6 +446,56 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     assert Backend.data(:restored) == [%{runtime: %{content: selected.content}}]
     assert Backend.data(:journal) == nil
     assert Backend.data(:manager_finished?)
+  end
+
+  test "head advancement before cleanup recreates evidence and remains blocked", ctx do
+    selected = selected_record(ctx.hydration, content: "selected-runtime", sequence: 10)
+
+    advanced =
+      selected_record(ctx.hydration,
+        content: "advanced-runtime",
+        sequence: 11,
+        parent_hash: selected.checkpoint_hash
+      )
+
+    Backend.respond(:store_hydrate, {:return, {:ok, selected}})
+    Backend.respond(:store_head, [{:return, {:ok, advanced}}])
+
+    pid = start_coordinator(ctx)
+
+    assert {:error, :checkpoint_hydration_head_changed} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert Backend.data(:restored) == [%{runtime: %{content: selected.content}}]
+    assert %{phase: :head_committed} = Backend.data(:journal)
+    assert %{blocked?: true, phase: :head_committed} = Coordinator.status(pid)
+    refute :journal_remove in core_operations()
+    refute :manager_finish in core_operations()
+  end
+
+  test "head advancement immediately before finish recreates evidence and remains blocked", ctx do
+    selected = selected_record(ctx.hydration, content: "selected-runtime", sequence: 10)
+
+    advanced =
+      selected_record(ctx.hydration,
+        content: "advanced-runtime",
+        sequence: 11,
+        parent_hash: selected.checkpoint_hash
+      )
+
+    Backend.respond(:store_hydrate, {:return, {:ok, selected}})
+    Backend.respond(:store_head, [{:return, {:ok, selected}}, {:return, {:ok, advanced}}])
+
+    pid = start_coordinator(ctx)
+
+    assert {:error, :checkpoint_hydration_head_changed} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert Backend.data(:restored) == [%{runtime: %{content: selected.content}}]
+    assert %{phase: :head_committed} = Backend.data(:journal)
+    assert %{blocked?: true, phase: :head_committed} = Coordinator.status(pid)
+    assert :journal_remove in core_operations()
+    refute :manager_finish in core_operations()
   end
 
   test "a selected Store head with the wrong local identity remains blocked", ctx do
@@ -824,7 +876,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
              :checkpoint_decode,
              :adapter_hydrate,
              :runtime_restore,
+             :store_head,
              :journal_remove,
+             :store_head,
              :manager_finish
            ]
   end
@@ -1016,8 +1070,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
   defp selected_record(hydration, overrides) do
     content = Keyword.fetch!(overrides, :content)
     sequence = Keyword.fetch!(overrides, :sequence)
+    parent_hash = Keyword.get(overrides, :parent_hash, hydration.checkpoint_hash)
+    accepted = Keyword.get(overrides, :accepted, false)
+    content_hash = :crypto.hash(:sha256, content)
 
-    %{
+    record = %{
       device_id: hydration.device_id,
       local_credential_epoch: hydration.credential_epoch,
       local_storage_epoch: hydration.storage_epoch,
@@ -1027,14 +1084,39 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
       kind: hydration.kind,
       schema_version: hydration.schema_version,
       source_generation: hydration.source_generation + 1,
-      parent_hash: hydration.checkpoint_hash,
+      parent_hash: parent_hash,
       content: content,
-      content_hash: :crypto.hash(:sha256, content),
-      checkpoint_hash: :crypto.hash(:sha256, "selected-checkpoint"),
-      binding_hash: :crypto.hash(:sha256, "selected-binding"),
-      accepted: false
+      content_hash: content_hash,
+      checkpoint_hash:
+        fake_hash(:checkpoint, [
+          hydration.device_id,
+          hydration.origin_credential_epoch,
+          hydration.origin_storage_epoch,
+          sequence,
+          hydration.kind,
+          hydration.schema_version,
+          hydration.source_generation + 1,
+          parent_hash,
+          content_hash
+        ]),
+      accepted: accepted
     }
+
+    Map.put(
+      record,
+      :binding_hash,
+      fake_hash(:binding, [
+        record.device_id,
+        record.local_credential_epoch,
+        record.local_storage_epoch,
+        record.checkpoint_hash,
+        record.accepted
+      ])
+    )
   end
+
+  defp fake_hash(domain, values),
+    do: :crypto.hash(:sha256, :erlang.term_to_binary({domain, values}, [:deterministic]))
 
   defp journal_record(hydration, phase) do
     %{

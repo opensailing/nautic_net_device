@@ -371,9 +371,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
          :ok <- boundary(state, :before_restore),
          :ok <- restore_runtime(state, runtime),
          :ok <- boundary(state, :after_restore),
+         :ok <- ensure_selected_head_current(state),
          :ok <- boundary(state, :before_remove),
          :ok <- journal_remove(state),
          :ok <- boundary(state, :after_remove),
+         :ok <- ensure_selected_head_current(state),
          :ok <- boundary(state, :before_finish),
          :ok <- manager_finish(state) do
       {:ok, %{state | blocker: nil, selected_head: nil, recovery_error: nil}}
@@ -578,6 +580,30 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     else
       {:error, reason} -> {:error, reason}
     end
+  end
+
+  defp ensure_selected_head_current(%{selected_head: selected_head} = state)
+       when not is_nil(selected_head) do
+    case state.store_module.head(state.head_store, selected_head.kind) do
+      {:ok, current_head} ->
+        if same_selected_head?(selected_head, current_head),
+          do: :ok,
+          else: {:error, :checkpoint_hydration_head_changed}
+
+      :empty ->
+        {:error, :checkpoint_hydration_head_changed}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp ensure_selected_head_current(_state), do: {:error, :checkpoint_hydration_head_missing}
+
+  defp same_selected_head?(left, right) do
+    left.checkpoint_hash == right.checkpoint_hash and
+      left.binding_hash == right.binding_hash and
+      left.accepted == right.accepted
   end
 
   defp match_selected_head(state, selected_head) do
