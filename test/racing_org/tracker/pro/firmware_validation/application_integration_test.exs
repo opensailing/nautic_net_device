@@ -124,6 +124,31 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.ApplicationIntegrationTest do
     assert_receive {:archive_pending, Owner}
   end
 
+  test "logger supervises the checkpoint submission scheduler with acknowledgement wiring" do
+    scheduler = RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Scheduler
+    owner = RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner
+    Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+
+    specs = child_specs(:logger, :racing_org_rpi3)
+    ids = Enum.map(specs, & &1.id)
+
+    assert Enum.count(ids, &(&1 == scheduler)) == 1
+    scheduler_index = Enum.find_index(ids, &(&1 == scheduler))
+    assert Enum.find_index(ids, &(&1 == owner)) < scheduler_index
+    assert Enum.find_index(ids, &(&1 == HydrationCoordinator)) < scheduler_index
+    assert scheduler_index < Enum.find_index(ids, &(&1 == ChannelClient))
+
+    scheduler_spec = Enum.find(specs, &(&1.id == scheduler))
+    assert {^scheduler, :start_link, [scheduler_opts]} = scheduler_spec.start
+    assert scheduler_opts[:identity] == (&RacingOrg.Tracker.Pro.DesiredState.Runtime.identity/0)
+    assert is_function(scheduler_opts[:head_store], 0)
+
+    owner_spec = Enum.find(specs, &(&1.id == owner))
+    assert {^owner, :start_link, [owner_opts]} = owner_spec.start
+    assert is_function(owner_opts[:on_acknowledge], 1)
+    assert owner_opts[:on_acknowledge].([]) == :ok
+  end
+
   test "logger starts checkpoint hydration after authority and observers but before ChannelClient" do
     Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
 

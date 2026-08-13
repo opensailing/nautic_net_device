@@ -197,6 +197,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
         identity_refresh_token: nil,
         binding_error: :identity_unbound,
         on_admit: Keyword.get(opts, :on_admit),
+        on_acknowledge: Keyword.get(opts, :on_acknowledge),
         quarantined: false
       }
 
@@ -285,6 +286,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   defp apply_acknowledgement(state, receipt, opts) do
     case Store.acknowledge(state.store, receipt) do
       {:ok, removed, store} ->
+        notify_acknowledge(state, removed)
         {:reply, {:ok, removed}, %{state | store: store}}
 
       {:error, :receipt_entry_not_found} ->
@@ -459,6 +461,22 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   end
 
   defp notify_admit(_state, _stream), do: :ok
+
+  # Fire-and-forget retirement notification so a consumer can react to entries
+  # the backend durably accepted (e.g. record backend-accepted checkpoint
+  # heads). Runs only after the durable acknowledgement succeeded with at least
+  # one retired entry; notifier faults never disturb the owner.
+  defp notify_acknowledge(%{on_acknowledge: on_acknowledge}, [_entry | _rest] = removed)
+       when is_function(on_acknowledge, 1) do
+    _ = on_acknowledge.(removed)
+    :ok
+  rescue
+    _exception -> :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp notify_acknowledge(_state, _removed), do: :ok
 
   defp receipt_for(%Entry{} = entry) do
     %{

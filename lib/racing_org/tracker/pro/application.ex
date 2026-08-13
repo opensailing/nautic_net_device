@@ -218,6 +218,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
         command_executor_children(product) ++
         outbox_owner_children(product) ++
         checkpoint_hydration_children(product) ++
+        checkpoint_scheduler_children(product) ++
         [
           RacingOrg.Tracker.Pro.SecureTransport.ChannelClient,
           RacingOrg.Tracker.Pro.Race.BulkUploader
@@ -254,6 +255,12 @@ defmodule RacingOrg.Tracker.Pro.Application do
        identity: &RacingOrg.Tracker.Pro.DesiredState.Runtime.identity/0,
        on_admit: fn _stream ->
          RacingOrg.Tracker.Pro.SecureTransport.ChannelClient.dispatch_durable_deliveries()
+       end,
+       on_acknowledge: fn entries ->
+         RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Scheduler.record_accepted(
+           RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Scheduler,
+           entries
+         )
        end}
     ]
   end
@@ -293,6 +300,39 @@ defmodule RacingOrg.Tracker.Pro.Application do
   end
 
   defp checkpoint_hydration_children(:uplink), do: []
+
+  # The submission scheduler produces exact-runtime checkpoints from the live
+  # observers. It starts after the hydration coordinator so boot recovery has
+  # already reconciled the durable heads it compares against, and before
+  # ChannelClient so acknowledgement notifications always find it running.
+  defp checkpoint_scheduler_children(:logger) do
+    [
+      {RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Scheduler,
+       name: RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Scheduler,
+       identity: &RacingOrg.Tracker.Pro.DesiredState.Runtime.identity/0,
+       head_store: &checkpoint_scheduler_head_store/0}
+    ]
+  end
+
+  defp checkpoint_scheduler_children(:uplink), do: []
+
+  @doc false
+  @spec checkpoint_scheduler_head_store() ::
+          {:ok, RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store.t()} | {:error, term()}
+  def checkpoint_scheduler_head_store do
+    alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store
+
+    with {:ok, identity} <- RacingOrg.Tracker.Pro.DesiredState.Runtime.identity() do
+      Store.new(
+        base_dir: checkpoint_head_root(),
+        device_id: identity.device_id,
+        credential_epoch: identity.credential_epoch,
+        storage_epoch: identity.storage_epoch,
+        identity: &checkpoint_head_identity_authority/1,
+        transition_timeout_ms: @checkpoint_head_transition_timeout_ms
+      )
+    end
+  end
 
   defp checkpoint_head_identity_authority(transition) when is_function(transition, 1) do
     case RacingOrg.Tracker.Pro.DesiredState.Runtime.identity() do

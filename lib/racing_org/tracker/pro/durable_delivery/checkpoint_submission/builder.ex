@@ -218,18 +218,27 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Builder do
     end
   end
 
-  defp source_generation(:calibration, 2, %{"learner" => %{"seq" => generation}}),
+  @doc """
+  Extract the semantic learner generation from one projected runtime.
+
+  The scheduler compares this against the accepted head's generation, so idle
+  re-projections (whose capture timestamps differ) never resubmit an unchanged
+  runtime.
+  """
+  @spec source_generation(atom(), pos_integer(), map()) ::
+          {:ok, non_neg_integer()} | {:error, :invalid_source_generation}
+  def source_generation(:calibration, 2, %{"learner" => %{"seq" => generation}}),
     do: generation(generation)
 
-  defp source_generation(:polar, 3, %{
-         "learner" => %{"source_generation" => generation}
-       }),
-       do: generation(generation)
+  def source_generation(:polar, 3, %{
+        "learner" => %{"source_generation" => generation}
+      }),
+      do: generation(generation)
 
-  defp source_generation(:wind_shift, 2, %{"source_generation" => generation}),
+  def source_generation(:wind_shift, 2, %{"source_generation" => generation}),
     do: generation(generation)
 
-  defp source_generation(_kind, _schema_version, _content),
+  def source_generation(_kind, _schema_version, _content),
     do: {:error, :invalid_source_generation}
 
   defp generation(value) when is_integer(value) and value >= 0 and value <= 9_223_372_036_854_775_807,

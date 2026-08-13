@@ -161,6 +161,42 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
     end
   end
 
+  describe "acknowledge notification" do
+    test "notifies the configured sink with the exact retired entries", %{root: root} do
+      owner_pid = self()
+
+      assert {:ok, owner} =
+               start_owner(root,
+                 on_acknowledge: fn entries -> send(owner_pid, {:acknowledged, entries}) end
+               )
+
+      assert {:ok, receipt} = Owner.enqueue(owner, :telemetry, "payload")
+      assert {:ok, [entry]} = Owner.acknowledge(owner, receipt)
+      assert_receive {:acknowledged, [^entry]}
+    end
+
+    test "does not notify on idempotent replays and survives a crashing sink", %{root: root} do
+      owner_pid = self()
+
+      assert {:ok, owner} =
+               start_owner(root,
+                 on_acknowledge: fn entries ->
+                   send(owner_pid, {:acknowledged, entries})
+                   raise "sink crashed"
+                 end
+               )
+
+      assert {:ok, receipt} = Owner.enqueue(owner, :telemetry, "payload")
+      assert {:ok, [_entry]} = Owner.acknowledge(owner, receipt)
+      assert_receive {:acknowledged, [_retired]}
+      assert Process.alive?(owner)
+
+      assert {:ok, []} = Owner.acknowledge(owner, receipt, idempotent: true)
+      refute_receive {:acknowledged, _entries}, 50
+      assert Process.alive?(owner)
+    end
+  end
+
   describe "storage epoch" do
     test "obtains the storage epoch from an injected identity source", %{root: root} do
       assert {:ok, owner} = start_owner(root)
