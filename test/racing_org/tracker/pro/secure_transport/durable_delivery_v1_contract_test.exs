@@ -17,6 +17,21 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
   @parent_hash :binary.copy(<<0xB2>>, 32)
   @database_int_max 9_223_372_036_854_775_807
   @polar_schema 2
+  @delivery_submission_keys [
+    :device_id,
+    :credential_epoch,
+    :storage_epoch,
+    :stream,
+    :sequence,
+    :payload_hash
+  ]
+  @generic_delivery_streams [
+    :telemetry,
+    :race_recording_chunk,
+    :race_recording_manifest,
+    :desired_state_ack,
+    :health
+  ]
 
   describe "closed durable-delivery registries" do
     test "freezes message codes, directions, streams, and checkpoint schemas" do
@@ -29,6 +44,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
       assert Contract.message_type(:checkpoint_hydration) ==
                {:ok, 0x32, :server_to_device}
 
+      assert Contract.message_type(:delivery_submission) ==
+               {:ok, 0x33, :device_to_server}
+
+      assert Contract.message_type(0x33) ==
+               {:ok, :delivery_submission, :device_to_server}
+
       assert Contract.payload_domain(:delivery_receipt) ==
                "RacingOrg-DurableDeliveryReceipt-v1"
 
@@ -37,6 +58,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
 
       assert Contract.payload_domain(:checkpoint_hydration) ==
                "RacingOrg-CheckpointHydration-v1"
+
+      assert Contract.payload_domain(:delivery_submission) ==
+               "RacingOrg-DurableDeliverySubmission-v1"
 
       assert Contract.delivery_receipt_hash_domain() ==
                "RacingOrg-DurableDeliveryReceiptHash-v1"
@@ -80,6 +104,156 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
 
       assert {:error, :unknown_delivery_stream} = Contract.delivery_stream(:arbitrary)
       assert {:error, :unknown_checkpoint_kind} = Contract.checkpoint_kind(:arbitrary)
+    end
+  end
+
+  describe "generic durable-delivery submissions" do
+    test "round-trips every registered generic stream with byte-for-byte golden vectors" do
+      for stream <- @generic_delivery_streams do
+        submission = delivery_submission_attrs(stream)
+        assert Map.keys(submission) |> Enum.sort() == Enum.sort(@delivery_submission_keys)
+        assert {:ok, stream_code} = Contract.delivery_stream(stream)
+        assert {:ok, bytes} = Messages.encode(:delivery_submission, submission)
+        assert {:ok, ^submission} = Messages.decode(:delivery_submission, bytes)
+
+        assert bytes ==
+                 "RacingOrg-DurableDeliverySubmission-v1" <>
+                   <<0x01, 0x33, @device_id::binary, 7::unsigned-32, @storage_epoch::binary, stream_code::unsigned-8,
+                     11::unsigned-64, @payload_hash::binary>>
+      end
+    end
+
+    test "requires exact closed atom keys and valid durable identity fields" do
+      submission = delivery_submission_attrs(:telemetry)
+
+      assert {:error, :invalid_delivery_submission} =
+               submission
+               |> Map.put(:metadata, %{})
+               |> then(&Messages.encode(:delivery_submission, &1))
+
+      assert {:error, :invalid_delivery_submission} =
+               submission
+               |> Map.delete(:payload_hash)
+               |> then(&Messages.encode(:delivery_submission, &1))
+
+      assert {:error, :invalid_delivery_submission} =
+               submission
+               |> Map.delete(:stream)
+               |> Map.put("stream", :telemetry)
+               |> then(&Messages.encode(:delivery_submission, &1))
+
+      assert {:error, :invalid_device_id} =
+               Messages.encode(:delivery_submission, %{submission | device_id: <<0::128>>})
+
+      assert {:error, :invalid_device_id} =
+               Messages.encode(:delivery_submission, %{submission | device_id: <<0>>})
+
+      for credential_epoch <- [0, 0xFFFF_FFFF] do
+        assert {:ok, _bytes} =
+                 Messages.encode(:delivery_submission, %{
+                   submission
+                   | credential_epoch: credential_epoch
+                 })
+      end
+
+      assert {:error, :invalid_credential_epoch} =
+               Messages.encode(:delivery_submission, %{submission | credential_epoch: -1})
+
+      assert {:error, :invalid_credential_epoch} =
+               Messages.encode(:delivery_submission, %{
+                 submission
+                 | credential_epoch: 0x1_0000_0000
+               })
+
+      assert {:error, :invalid_storage_epoch} =
+               Messages.encode(:delivery_submission, %{submission | storage_epoch: <<0::128>>})
+
+      assert {:error, :invalid_storage_epoch} =
+               Messages.encode(:delivery_submission, %{submission | storage_epoch: <<0>>})
+    end
+
+    test "rejects checkpoint specialization, open stream values, sequence bounds, and malformed hashes" do
+      submission = delivery_submission_attrs(:telemetry)
+
+      assert {:error, :checkpoint_requires_specialized_submission} =
+               Messages.encode(:delivery_submission, %{submission | stream: :checkpoint})
+
+      assert {:error, :unknown_delivery_stream} =
+               Messages.encode(:delivery_submission, %{submission | stream: :arbitrary})
+
+      assert {:error, :unknown_delivery_stream} =
+               Messages.encode(:delivery_submission, %{submission | stream: 0x01})
+
+      assert {:error, :invalid_delivery_sequence} =
+               Messages.encode(:delivery_submission, %{submission | sequence: 0})
+
+      assert {:error, :invalid_delivery_sequence} =
+               Messages.encode(:delivery_submission, %{submission | sequence: -1})
+
+      assert {:ok, _bytes} =
+               Messages.encode(:delivery_submission, %{
+                 submission
+                 | sequence: @database_int_max
+               })
+
+      assert {:error, :invalid_delivery_sequence} =
+               Messages.encode(:delivery_submission, %{
+                 submission
+                 | sequence: @database_int_max + 1
+               })
+
+      assert {:error, :invalid_payload_hash} =
+               Messages.encode(:delivery_submission, %{submission | payload_hash: <<0>>})
+    end
+
+    test "strictly rejects wrong domains, versions, types, truncation, trailing, unknown, and checkpoint streams" do
+      submission = delivery_submission_attrs(:health)
+      assert {:ok, bytes} = Messages.encode(:delivery_submission, submission)
+      assert {:ok, receipt_bytes} = Messages.encode(:delivery_receipt, receipt_attrs())
+
+      assert {:error, :payload_domain_mismatch} =
+               Messages.decode(:delivery_submission, receipt_bytes)
+
+      assert {:error, :unsupported_payload_version} =
+               Messages.decode(
+                 :delivery_submission,
+                 replace_version(bytes, :delivery_submission, 0x02)
+               )
+
+      assert {:error, :payload_type_mismatch} =
+               Messages.decode(
+                 :delivery_submission,
+                 replace_type(bytes, :delivery_submission, 0x31)
+               )
+
+      assert {:error, :truncated} =
+               Messages.decode(:delivery_submission, binary_part(bytes, 0, byte_size(bytes) - 1))
+
+      assert {:error, :trailing_bytes} =
+               Messages.decode(:delivery_submission, bytes <> <<0>>)
+
+      body_offset = byte_size("RacingOrg-DurableDeliverySubmission-v1") + 2
+      storage_epoch_offset = body_offset + 16 + 4
+      stream_offset = storage_epoch_offset + 16
+      sequence_offset = stream_offset + 1
+
+      assert {:error, :invalid_device_id} =
+               Messages.decode(:delivery_submission, replace_bytes(bytes, body_offset, <<0::128>>))
+
+      assert {:error, :invalid_storage_epoch} =
+               Messages.decode(
+                 :delivery_submission,
+                 replace_bytes(bytes, storage_epoch_offset, <<0::128>>)
+               )
+
+      assert {:error, :unknown_delivery_stream} =
+               Messages.decode(:delivery_submission, replace_byte(bytes, stream_offset, 0xFF))
+
+      assert {:error, :checkpoint_requires_specialized_submission} =
+               Messages.decode(:delivery_submission, replace_byte(bytes, stream_offset, 0x05))
+
+      assert {:error, :invalid_delivery_sequence} =
+               Messages.decode(:delivery_submission, replace_bytes(bytes, sequence_offset, <<0::64>>))
     end
   end
 
@@ -489,6 +663,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
     end
   end
 
+  defp delivery_submission_attrs(stream) do
+    durable_identity(%{
+      stream: stream,
+      sequence: 11,
+      payload_hash: @payload_hash
+    })
+  end
+
   defp receipt_attrs do
     attrs =
       durable_identity(%{
@@ -603,6 +785,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
           attrs.storage_epoch::binary-size(16), attrs.sequence::64, kind_code, attrs.schema_version::16,
           attrs.source_generation::64, attrs.parent_hash::binary-size(32), attrs.content_hash::binary-size(32)>>
     )
+  end
+
+  defp replace_byte(bytes, offset, replacement),
+    do: replace_bytes(bytes, offset, <<replacement>>)
+
+  defp replace_bytes(bytes, offset, replacement) do
+    <<prefix::binary-size(offset), _old::binary-size(byte_size(replacement)), suffix::binary>> =
+      bytes
+
+    prefix <> replacement <> suffix
   end
 
   defp replace_version(bytes, type, version) do

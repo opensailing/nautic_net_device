@@ -91,6 +91,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   defp encode_body(:delivery_receipt, attrs), do: encode_delivery_receipt(attrs)
   defp encode_body(:checkpoint_submission, attrs), do: encode_checkpoint_submission(attrs)
   defp encode_body(:checkpoint_hydration, attrs), do: encode_checkpoint_hydration(attrs)
+  defp encode_body(:delivery_submission, attrs), do: encode_delivery_submission(attrs)
   defp encode_body(_type, _attrs), do: {:error, :unsupported_message_type}
 
   defp decode_body(:control_accept, bytes), do: decode_control_accept(bytes)
@@ -105,6 +106,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   defp decode_body(:delivery_receipt, bytes), do: decode_delivery_receipt(bytes)
   defp decode_body(:checkpoint_submission, bytes), do: decode_checkpoint_submission(bytes)
   defp decode_body(:checkpoint_hydration, bytes), do: decode_checkpoint_hydration(bytes)
+  defp decode_body(:delivery_submission, bytes), do: decode_delivery_submission(bytes)
   defp decode_body(_type, _bytes), do: {:error, :unsupported_message_type}
 
   # control_accept
@@ -675,6 +677,51 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
 
   defp decode_command_ack(_), do: {:error, :truncated}
 
+  # delivery_submission
+
+  defp encode_delivery_submission(attrs) do
+    expected = @durable_identity_keys ++ [:stream, :sequence, :payload_hash]
+
+    with :ok <- exact_keys(attrs, expected, :invalid_delivery_submission),
+         :ok <- nonzero_binary(attrs.device_id, @device_id_size, :invalid_device_id),
+         :ok <- u32(attrs.credential_epoch, :invalid_credential_epoch),
+         :ok <-
+           nonzero_binary(
+             attrs.storage_epoch,
+             @incarnation_id_size,
+             :invalid_storage_epoch
+           ),
+         {:ok, stream_code} <- generic_delivery_stream_code(attrs.stream),
+         :ok <- positive_database_int(attrs.sequence, :invalid_delivery_sequence),
+         :ok <- fixed_binary(attrs.payload_hash, @hash_size, :invalid_payload_hash) do
+      {:ok,
+       <<attrs.device_id::binary-size(@device_id_size), attrs.credential_epoch::32,
+         attrs.storage_epoch::binary-size(@incarnation_id_size), stream_code, attrs.sequence::64,
+         attrs.payload_hash::binary-size(@hash_size)>>}
+    end
+  end
+
+  defp decode_delivery_submission(
+         <<device_id::binary-size(@device_id_size), credential_epoch::32,
+           storage_epoch::binary-size(@incarnation_id_size), stream_code, sequence::64,
+           payload_hash::binary-size(@hash_size), rest::binary>>
+       ) do
+    with {:ok, stream} <- generic_delivery_stream(stream_code),
+         attrs = %{
+           device_id: device_id,
+           credential_epoch: credential_epoch,
+           storage_epoch: storage_epoch,
+           stream: stream,
+           sequence: sequence,
+           payload_hash: payload_hash
+         },
+         {:ok, _encoded} <- encode_body(:delivery_submission, attrs) do
+      {:ok, attrs, rest}
+    end
+  end
+
+  defp decode_delivery_submission(_), do: {:error, :truncated}
+
   # delivery_receipt
 
   defp encode_delivery_receipt(attrs) do
@@ -938,6 +985,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   end
 
   defp delivery_stream_code(_stream), do: {:error, :unknown_delivery_stream}
+
+  defp generic_delivery_stream_code(:checkpoint),
+    do: {:error, :checkpoint_requires_specialized_submission}
+
+  defp generic_delivery_stream_code(stream), do: delivery_stream_code(stream)
+
+  defp generic_delivery_stream(code) do
+    case Contract.delivery_stream(code) do
+      {:ok, :checkpoint} -> {:error, :checkpoint_requires_specialized_submission}
+      {:ok, stream} -> {:ok, stream}
+      {:error, _reason} = error -> error
+    end
+  end
 
   defp checkpoint_identity(kind, schema_version) do
     case Contract.checkpoint_kind(kind) do

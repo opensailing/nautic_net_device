@@ -104,7 +104,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
     command_ack: {0x21, :device_to_server},
     delivery_receipt: {0x30, :server_to_device},
     checkpoint_submission: {0x31, :device_to_server},
-    checkpoint_hydration: {0x32, :server_to_device}
+    checkpoint_hydration: {0x32, :server_to_device},
+    delivery_submission: {0x33, :device_to_server}
   }
   @message_by_code Map.new(@message_types, fn {name, {code, direction}} ->
                      {code, {name, direction}}
@@ -122,7 +123,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
     command_ack: "RacingOrg-CommandAck-v1",
     delivery_receipt: "RacingOrg-DurableDeliveryReceipt-v1",
     checkpoint_submission: "RacingOrg-CheckpointSubmission-v1",
-    checkpoint_hydration: "RacingOrg-CheckpointHydration-v1"
+    checkpoint_hydration: "RacingOrg-CheckpointHydration-v1",
+    delivery_submission: "RacingOrg-DurableDeliverySubmission-v1"
   }
 
   @offer_domain "RacingOrg-ControlOffer-v1"
