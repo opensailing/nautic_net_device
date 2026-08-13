@@ -22,6 +22,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   @zero_identifier <<0::128>>
   @default_manager_retry_ms 100
+  @manager_retry_errors [
+    :checkpoint_hydration_manager_unavailable,
+    :checkpoint_hydration_coordinator_mismatch,
+    :checkpoint_hydration_token_mismatch,
+    :checkpoint_hydration_not_blocked
+  ]
   @hydrate_keys [
     :device_id,
     :credential_epoch,
@@ -137,7 +143,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       {:ok, state} ->
         {:ok, state}
 
-      {:error, :checkpoint_hydration_manager_unavailable = reason, %{blocker: nil} = state} ->
+      {:error, reason, %{blocker: nil} = state} when reason in @manager_retry_errors ->
         state = %{state | recovery_required?: true, recovery_error: reason}
         {:ok, schedule_manager_retry(state)}
 
@@ -522,7 +528,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     state = %{state | recovery_required?: false}
 
     case recover_state(state) do
-      {:error, :checkpoint_hydration_manager_unavailable = reason, %{blocker: nil}} ->
+      {:error, reason, %{blocker: nil}} when reason in @manager_retry_errors ->
         {:error, reason, %{state | recovery_required?: true}}
 
       result ->
@@ -867,14 +873,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     %{state | manager_monitor_ref: nil, manager_pid: nil}
   end
 
-  defp maybe_retry_manager(state, reason)
-       when reason in [
-              :checkpoint_hydration_manager_unavailable,
-              :checkpoint_hydration_coordinator_mismatch,
-              :checkpoint_hydration_token_mismatch,
-              :checkpoint_hydration_not_blocked
-            ],
-       do: schedule_manager_retry(state)
+  defp maybe_retry_manager(state, reason) when reason in @manager_retry_errors,
+    do: schedule_manager_retry(state)
 
   defp maybe_retry_manager(state, _reason), do: state
 

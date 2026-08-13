@@ -1210,6 +1210,38 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     end)
   end
 
+  test "boot recovery retries a stale Manager blocker until it becomes claimable", ctx do
+    record = journal_record(ctx.hydration, :head_committed)
+    Backend.put(:journal, record)
+    Backend.put(:head, selected_record(ctx.hydration, content: ctx.hydration.content, sequence: 9))
+
+    Backend.respond(:manager_begin, [
+      {:return, {:error, :checkpoint_hydration_coordinator_mismatch}},
+      {:block, :default}
+    ])
+
+    pid = start_coordinator(ctx, manager_retry_ms: 10)
+
+    assert %{
+             blocked?: true,
+             phase: nil,
+             recovery_error: :checkpoint_hydration_recovery_required
+           } = Coordinator.status(pid)
+
+    assert {:error, :checkpoint_hydration_recovery_required} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert_receive {:coordinator_blocked, :manager_begin, ^pid}, 1_000
+    send(pid, {:continue_coordinator_operation, :manager_begin})
+
+    eventually(fn ->
+      assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+      assert Backend.data(:manager_finished?)
+      assert Backend.data(:journal) == nil
+      assert Backend.data(:installed_binding) == @binding
+    end)
+  end
+
   test "idle Manager replacements are re-monitored and reconciled before fresh hydration", ctx do
     Backend.put(:head, nil)
     pid = start_coordinator(ctx, reconcile_empty_journal: true, manager_retry_ms: 10)
