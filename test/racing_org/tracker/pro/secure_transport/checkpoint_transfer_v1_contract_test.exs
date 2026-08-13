@@ -101,6 +101,23 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointTransferV1ContractTest
       assert {:error, _reason} = Checkpoint.chunk_hash(Map.put(attrs, :chunk_length, 3))
       assert {:error, _reason} = Checkpoint.chunk_hash(Map.delete(attrs, :chunk))
     end
+
+    test "rejects invalid chunk types and lengths with lockstep errors" do
+      attrs = %{
+        checkpoint_hash: :binary.copy(<<0xC3>>, 32),
+        total_content_length: 1,
+        chunk_index: 0,
+        chunk_count: 1,
+        chunk_offset: 0,
+        chunk: <<0x42>>
+      }
+
+      assert {:error, :invalid_chunk} = Checkpoint.chunk_hash(Map.put(attrs, :chunk, nil))
+      assert {:error, :invalid_chunk_length} = Checkpoint.chunk_hash(Map.put(attrs, :chunk, <<>>))
+
+      assert {:error, :invalid_chunk_length} =
+               Checkpoint.chunk_hash(Map.put(attrs, :chunk, :binary.copy(<<0>>, @chunk_size + 1)))
+    end
   end
 
   describe "checkpoint chunks" do

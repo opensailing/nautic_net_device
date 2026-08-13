@@ -161,7 +161,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
          :ok <- u32(attrs.chunk_index, :invalid_chunk_index),
          :ok <- positive_u32(attrs.chunk_count, :invalid_chunk_count),
          :ok <- u64(attrs.chunk_offset, :invalid_chunk_offset),
-         :ok <- chunk_bytes(attrs.chunk, :invalid_chunk_length) do
+         :ok <- chunk_bytes(attrs.chunk) do
       preimage =
         Contract.checkpoint_content_chunk_hash_domain() <>
           <<Contract.version(), attrs.checkpoint_hash::binary-size(@hash_size), attrs.total_content_length::64,
@@ -1233,11 +1233,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
 
   defp positive_u64(_value, error), do: {:error, error}
 
-  defp chunk_bytes(value, error) do
-    if is_binary(value) and byte_size(value) in 1..Contract.chunk_size(),
+  defp chunk_bytes(value) when is_binary(value) do
+    if byte_size(value) in 1..Contract.chunk_size(),
       do: :ok,
-      else: {:error, error}
+      else: {:error, :invalid_chunk_length}
   end
+
+  defp chunk_bytes(_value), do: {:error, :invalid_chunk}
 
   defp database_int(value, _error)
        when is_integer(value) and value >= 0 and value <= @database_int_max,
