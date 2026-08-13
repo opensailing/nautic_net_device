@@ -288,9 +288,13 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
             rebind_reply(state)
         end
 
+      {:error, {:command_ledger_durability_uncertain, _reason} = reason} ->
+        log_refusal(:intent, plan.delivery, reason)
+        reconcile_uncertain_delivery(plan.delivery, mark_store_reconciliation(state, reason))
+
       {:error, reason} ->
         log_refusal(:intent, plan.delivery, reason)
-        {:reply, {:defer, reason}, mark_store_reconciliation(state, reason)}
+        {:reply, {:defer, reason}, state}
     end
   end
 
@@ -302,11 +306,15 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
       {:ok, ack, store} ->
         ack_or_rebind(ack, %{state | store: store})
 
+      {:error, {:command_ledger_durability_uncertain, _reason} = reason} ->
+        log_refusal(:outcome, intent, reason)
+        reconcile_uncertain_delivery(intent, mark_store_reconciliation(state, reason))
+
       {:error, reason} ->
         # The effect already happened but its outcome is not durable, so the
         # intent stays pending for the recovery contract rather than being acked.
         log_refusal(:outcome, intent, reason)
-        {:reply, {:defer, reason}, mark_store_reconciliation(state, reason)}
+        {:reply, {:defer, reason}, state}
     end
   end
 
@@ -314,6 +322,15 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
   # is the only path allowed to reject it.
   defp complete(intent, {:error, reason}, state) do
     log_refusal(:effect, intent, reason)
+    resolve_failed_effect(intent, reason, state)
+  end
+
+  defp complete(intent, _invalid, state) do
+    log_refusal(:effect, intent, :invalid_command_provider_return)
+    resolve_failed_effect(intent, :invalid_command_provider_return, state)
+  end
+
+  defp resolve_failed_effect(_intent, reason, state) do
     {resolution, state} = resolve_pending(state)
 
     case resolution do
@@ -347,9 +364,13 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
           {:ok, ack, store} ->
             ack_or_rebind(ack, %{state | store: store})
 
+          {:error, {:command_ledger_durability_uncertain, _reason} = reason} ->
+            log_refusal(:terminal, plan.delivery, reason)
+            reconcile_uncertain_delivery(plan.delivery, mark_store_reconciliation(state, reason))
+
           {:error, reason} ->
             log_refusal(:terminal, plan.delivery, reason)
-            {:reply, {:defer, reason}, mark_store_reconciliation(state, reason)}
+            {:reply, {:defer, reason}, state}
         end
 
       {:rebind_required, state} ->
@@ -396,9 +417,35 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
       {:ok, ack, store} ->
         {{:resolved, ack}, %{state | store: store}}
 
+      {:error, {:command_ledger_durability_uncertain, _reason} = reason} ->
+        log_refusal(:recovery_completion, intent, reason)
+        reconcile_uncertain_recovery(intent, result_term, mark_store_reconciliation(state, reason))
+
       {:error, reason} ->
         log_refusal(:recovery_completion, intent, reason)
-        {{:pending, reason}, mark_store_reconciliation(state, reason)}
+        {{:pending, reason}, state}
+    end
+  end
+
+  defp reconcile_uncertain_recovery(intent, result_term, state) do
+    case reconcile_store_if_needed(state) do
+      {:ok, state} ->
+        case Ledger.recover_pending(Store.snapshot(state.store)) do
+          :none ->
+            {:none, state}
+
+          {:recover, current_intent} when current_intent.command_id == intent.command_id ->
+            complete_recovered(current_intent, result_term, state)
+
+          {:recover, _other_intent} ->
+            {{:pending, :ambiguous_command_recovery}, state}
+        end
+
+      {:rebind_required, state} ->
+        {{:pending, :command_executor_rebind_required}, state}
+
+      {:error, reason, state} ->
+        {{:pending, reason}, state}
     end
   end
 
@@ -422,13 +469,39 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
         state = latch_rebind_required(state, :identity_drift)
         {{:pending, :command_executor_rebind_required}, state}
 
+      {:error, {:command_ledger_durability_uncertain, _reason} = reason} ->
+        log_refusal(:recovery_rejection, intent, reason)
+        reconcile_uncertain_rejection(intent, mark_store_reconciliation(state, reason))
+
       {:error, reason} ->
         log_refusal(:recovery_rejection, intent, reason)
-        {{:pending, reason}, mark_store_reconciliation(state, reason)}
+        {{:pending, reason}, state}
     end
   end
 
   defp reject_recovered(_intent, _proof, state), do: {{:pending, :ambiguous_command_recovery}, state}
+
+  defp reconcile_uncertain_rejection(intent, state) do
+    case reconcile_store_if_needed(state) do
+      {:ok, state} ->
+        case Ledger.recover_pending(Store.snapshot(state.store)) do
+          :none ->
+            {:none, state}
+
+          {:recover, current_intent} when current_intent.command_id == intent.command_id ->
+            {{:pending, :ambiguous_command_recovery}, state}
+
+          {:recover, _other_intent} ->
+            {{:pending, :ambiguous_command_recovery}, state}
+        end
+
+      {:rebind_required, state} ->
+        {{:pending, :command_executor_rebind_required}, state}
+
+      {:error, reason, state} ->
+        {{:pending, reason}, state}
+    end
+  end
 
   # --- provider invocation ---
 
@@ -468,6 +541,23 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
   defp rebind_reply(state),
     do: {:reply, {:defer, :command_executor_rebind_required}, state}
+
+  defp reconcile_uncertain_delivery(delivery, state) do
+    case reconcile_store_if_needed(state) do
+      {:ok, state} ->
+        case resolve_pending(state) do
+          {:none, state} -> route(delivery, state)
+          {{:resolved, _ack}, state} -> route(delivery, state)
+          {{:pending, reason}, state} -> {:reply, {:defer, reason}, state}
+        end
+
+      {:rebind_required, state} ->
+        rebind_reply(state)
+
+      {:error, reason, state} ->
+        {:reply, {:defer, reason}, state}
+    end
+  end
 
   defp invoke_provider(intent, function, state) do
     case Map.fetch(state.providers, intent.command_type) do
@@ -552,18 +642,25 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
       storage_epoch: Keyword.get(opts, :storage_epoch)
     }
 
-    if Enum.all?(Map.values(identity), &(not is_nil(&1))) do
-      with {:ok, identity} <- validate_identity(identity) do
-        {:ok, {:static, identity}}
-      end
-    else
-      provider = Keyword.get_lazy(opts, :identity, fn -> &Runtime.identity/0 end)
+    configured_fields = Enum.count(Map.values(identity), &(not is_nil(&1)))
 
-      if is_function(provider, 0) do
-        {:ok, {:dynamic, provider}}
-      else
-        {:error, :no_verified_authority}
-      end
+    case configured_fields do
+      3 ->
+        with {:ok, identity} <- validate_identity(identity) do
+          {:ok, {:static, identity}}
+        end
+
+      0 ->
+        provider = Keyword.get_lazy(opts, :identity, fn -> &Runtime.identity/0 end)
+
+        if is_function(provider, 0) do
+          {:ok, {:dynamic, provider}}
+        else
+          {:error, :no_verified_authority}
+        end
+
+      _partial ->
+        {:error, :invalid_command_executor_identity}
     end
   end
 

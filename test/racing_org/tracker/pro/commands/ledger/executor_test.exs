@@ -65,6 +65,75 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
     def script(state, key, value), do: Agent.update(state, &Map.put(&1, key, value))
   end
 
+  defmodule MalformedReturnProvider do
+    def execute(_intent, owner) do
+      send(owner, :malformed_provider_execute_called)
+      :malformed
+    end
+
+    def recover(_intent, owner) do
+      send(owner, :malformed_provider_recover_called)
+      :malformed
+    end
+
+    def with_non_application_lease(_intent, _proof, _reason, _context, transition), do: transition.()
+  end
+
+  defmodule RaisingProvider do
+    def execute(_intent, owner) do
+      send(owner, :provider_execute_called)
+      raise "provider failed"
+    end
+
+    def recover(_intent, owner) do
+      send(owner, :provider_recover_called)
+      raise "provider failed"
+    end
+
+    def with_non_application_lease(_intent, _proof, _reason, _context, _transition), do: raise("provider failed")
+  end
+
+  defmodule SequencedFaultArmingRejectProvider do
+    def execute(_intent, _context), do: {:error, :not_used}
+
+    def recover(intent, %{owner: owner, script: script}) do
+      case Agent.get_and_update(script, fn [next | rest] -> {next, rest} end) do
+        :ambiguous ->
+          send(owner, {:rejection_recovery_observed, intent.command_id})
+          :ambiguous
+
+        :not_applied ->
+          send(owner, {:rejection_recovery_observed, intent.command_id})
+          {:not_applied, :effect_not_started}
+      end
+    end
+
+    def with_non_application_lease(intent, _proof, _reason, %{fault: fault, owner: owner}, transition) do
+      Agent.update(fault, fn _disarmed -> :armed end)
+      send(owner, {:rejection_lease_observed, intent.command_id})
+      transition.()
+    end
+  end
+
+  defmodule SequencedFaultArmingRecoverProvider do
+    def execute(_intent, _context), do: {:error, :not_used}
+
+    def recover(intent, %{fault: fault, owner: owner, script: script}) do
+      case Agent.get_and_update(script, fn [next | rest] -> {next, rest} end) do
+        :ambiguous ->
+          send(owner, {:recovery_observed, intent.command_id})
+          :ambiguous
+
+        :applied ->
+          Agent.update(fault, fn _disarmed -> :armed end)
+          send(owner, {:recovery_observed, intent.command_id})
+          {:applied, %{outcome: :applied}}
+      end
+    end
+
+    def with_non_application_lease(_intent, _proof, _reason, _context, transition), do: transition.()
+  end
+
   defmodule FaultArmingProvider do
     def execute(intent, %{arm_on: :execute} = context) do
       arm_fault(context.fault)
@@ -72,6 +141,11 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
     end
 
     def execute(intent, context), do: ScriptedProvider.execute(intent, context.script)
+
+    def recover(intent, %{arm_on: :recover} = context) do
+      arm_fault(context.fault)
+      ScriptedProvider.recover(intent, context.script)
+    end
 
     def recover(intent, context), do: ScriptedProvider.recover(intent, context.script)
 
@@ -151,10 +225,11 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
   end
 
   describe "identity lifecycle" do
-    test "ignores unrelated info messages without crashing the permanent executor", ctx do
+    test "ignores unrelated info messages and trapped exits without crashing the permanent executor", ctx do
       executor = start_executor(ctx)
 
       send(executor, {:unexpected_command_executor_message, make_ref()})
+      send(executor, {:EXIT, self(), :unrelated_trapped_exit})
 
       assert Executor.identity(executor) == durable_identity()
       assert Process.alive?(executor)
@@ -564,6 +639,34 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
   end
 
   describe "identity source validation" do
+    test "rejects every partial static identity configuration", ctx do
+      fields = [:device_id, :credential_epoch, :storage_epoch]
+
+      for {present_fields, index} <-
+            fields
+            |> Enum.flat_map(fn field -> [[field]] end)
+            |> Kernel.++([
+              [:device_id, :credential_epoch],
+              [:device_id, :storage_epoch],
+              [:credential_epoch, :storage_epoch]
+            ])
+            |> Enum.with_index(1) do
+        identity = durable_identity()
+
+        overrides =
+          Enum.map(fields, fn field ->
+            {field, if(field in present_fields, do: Map.fetch!(identity, field), else: nil)}
+          end)
+
+        opts =
+          ctx
+          |> Map.put(:path, Path.join(ctx.root, "partial-static-#{index}.ledger"))
+          |> executor_opts(Keyword.put(overrides, :name, nil))
+
+        assert {:error, :invalid_command_executor_identity} = GenServer.start(Executor, opts)
+      end
+    end
+
     test "non-transient startup identity failures are fatal", ctx do
       rows = [
         fn -> {:error, :bootstrap_failed} end,
@@ -632,6 +735,51 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
                    providers: %{noop: {LoadedButIncompleteProvider, nil}}
                  )
                )
+    end
+  end
+
+  describe "provider failures" do
+    test "a malformed execute return stays pending and never repeats the effect", ctx do
+      executor =
+        start_executor(ctx,
+          providers: %{noop: {MalformedReturnProvider, self()}}
+        )
+
+      command = delivery(command_id: command_id(1), payload: payload(:noop))
+
+      assert {:defer, :ambiguous_command_recovery} = Executor.deliver(executor, command)
+      assert_receive :malformed_provider_execute_called
+      assert_receive :malformed_provider_recover_called
+
+      assert {:defer, :ambiguous_command_recovery} = Executor.deliver(executor, command)
+      assert_receive :malformed_provider_recover_called
+      refute_receive :malformed_provider_execute_called
+      assert Process.alive?(executor)
+
+      assert {:ok, reopened} = open_store(ctx)
+      assert Store.pending_intent(reopened).command_id == command.command_id
+      refute Map.has_key?(Store.snapshot(reopened).outcomes, command.command_id)
+    end
+
+    test "provider exceptions fail closed and keep the executor alive", ctx do
+      executor =
+        start_executor(ctx,
+          providers: %{noop: {RaisingProvider, self()}}
+        )
+
+      command = delivery(command_id: command_id(1), payload: payload(:noop))
+
+      assert {:defer, :ambiguous_command_recovery} = Executor.deliver(executor, command)
+      assert_receive :provider_execute_called
+      assert_receive :provider_recover_called
+
+      assert {:defer, :ambiguous_command_recovery} = Executor.deliver(executor, command)
+      assert_receive :provider_recover_called
+      refute_receive :provider_execute_called
+      assert Process.alive?(executor)
+
+      assert {:ok, reopened} = open_store(ctx)
+      assert Store.pending_intent(reopened).command_id == command.command_id
     end
   end
 
@@ -881,6 +1029,61 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
   end
 
   describe "durability-uncertain write reconciliation" do
+    test "re-observes a visible uncertain intent before answering the initial delivery", ctx do
+      {fault, injector} = disarmed_one_shot_fault_at(:renamed)
+      ScriptedProvider.script(ctx.script, :recover, {:applied, %{outcome: :applied}})
+      executor = start_executor(ctx, fault_injector: injector)
+      command = delivery(command_id: command_id(1), payload: payload(:noop))
+      arm_fault(fault)
+
+      assert {:ack, ack} = Executor.deliver(executor, command)
+      assert ack.command_id == command.command_id
+      assert ack.status in [:applied, :duplicate]
+      assert ScriptedProvider.observed(ctx.script) == [{:recover, command.command_id}]
+
+      assert {:ok, reopened} = open_store(ctx)
+      assert Store.pending_intent(reopened) == nil
+      assert Map.fetch!(Store.snapshot(reopened).outcomes, command.command_id).status == :applied
+    end
+
+    test "re-observes a visible uncertain applied outcome before answering the initial delivery", ctx do
+      {fault, injector} = disarmed_one_shot_fault_at(:renamed)
+      provider_context = %{arm_on: :execute, fault: fault, script: ctx.script}
+
+      executor =
+        start_executor(ctx,
+          fault_injector: injector,
+          providers: %{noop: {FaultArmingProvider, provider_context}}
+        )
+
+      command = delivery(command_id: command_id(1), payload: payload(:noop))
+
+      assert {:ack, ack} = Executor.deliver(executor, command)
+      assert ack.command_id == command.command_id
+      assert ack.status == :duplicate
+      assert ScriptedProvider.observed(ctx.script) == [{:execute, command.command_id}]
+
+      assert {:ok, reopened} = open_store(ctx)
+      assert Store.pending_intent(reopened) == nil
+      assert Map.fetch!(Store.snapshot(reopened).outcomes, command.command_id).status == :applied
+    end
+
+    test "re-observes a visible uncertain terminal before answering the initial delivery", ctx do
+      {fault, injector} = disarmed_one_shot_fault_at(:renamed)
+      executor = start_executor(ctx, fault_injector: injector, trusted_now_ms: fn -> {:ok, 5_000} end)
+      command = delivery(command_id: command_id(1), expires_at_ms: 4_999, payload: payload(:noop))
+      arm_fault(fault)
+
+      assert {:ack, ack} = Executor.deliver(executor, command)
+      assert ack.command_id == command.command_id
+      assert ack.status in [:rejected, :duplicate]
+      assert ack.reason == :expired
+      assert ScriptedProvider.observed(ctx.script) == []
+
+      assert {:ok, reopened} = open_store(ctx)
+      assert Map.fetch!(Store.snapshot(reopened).outcomes, command.command_id).reason == :expired
+    end
+
     test "reopens a visible uncertain intent and recovers without restarting", ctx do
       {fault, injector} = disarmed_fault_at(:renamed)
       executor = start_executor(ctx, fault_injector: injector)
@@ -963,6 +1166,61 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
       assert ack.status in [:rejected, :duplicate]
       assert ack.reason == :expired
       assert ScriptedProvider.observed(ctx.script) == []
+    end
+
+    test "re-observes an uncertain recovered outcome before answering the delivery", ctx do
+      pending = seed_pending_intent(ctx)
+      {fault, injector} = disarmed_one_shot_fault_at(:renamed)
+      {:ok, recovery_script} = Agent.start_link(fn -> [:ambiguous, :applied] end)
+      provider_context = %{fault: fault, owner: self(), script: recovery_script}
+
+      executor =
+        start_executor(ctx,
+          fault_injector: injector,
+          providers: %{noop: {SequencedFaultArmingRecoverProvider, provider_context}}
+        )
+
+      assert_receive {:recovery_observed, command_id}
+      assert command_id == pending.command_id
+
+      assert {:ack, ack} = Executor.deliver(executor, pending)
+      assert_receive {:recovery_observed, ^command_id}
+      assert ack.command_id == pending.command_id
+      assert ack.status == :duplicate
+      refute_receive {:recovery_observed, ^command_id}
+
+      assert {:ok, reopened} = open_store(ctx)
+      assert Store.pending_intent(reopened) == nil
+      assert Map.fetch!(Store.snapshot(reopened).outcomes, pending.command_id).status == :applied
+    end
+
+    test "re-observes an uncertain recovery rejection before answering the delivery", ctx do
+      pending = seed_pending_intent(ctx)
+      {fault, injector} = disarmed_one_shot_fault_at(:renamed)
+      {:ok, recovery_script} = Agent.start_link(fn -> [:ambiguous, :not_applied] end)
+      provider_context = %{fault: fault, owner: self(), script: recovery_script}
+
+      executor =
+        start_executor(ctx,
+          fault_injector: injector,
+          providers: %{noop: {SequencedFaultArmingRejectProvider, provider_context}}
+        )
+
+      assert_receive {:rejection_recovery_observed, command_id}
+      assert command_id == pending.command_id
+
+      assert {:ack, ack} = Executor.deliver(executor, pending)
+      assert_receive {:rejection_recovery_observed, ^command_id}
+      assert_receive {:rejection_lease_observed, ^command_id}
+      assert ack.command_id == pending.command_id
+      assert ack.status in [:rejected, :duplicate]
+      assert ack.reason == :operational_gate_closed
+      refute_receive {:rejection_recovery_observed, ^command_id}
+      refute_receive {:rejection_lease_observed, ^command_id}
+
+      assert {:ok, reopened} = open_store(ctx)
+      assert Store.pending_intent(reopened) == nil
+      assert Map.fetch!(Store.snapshot(reopened).outcomes, pending.command_id).status == :rejected
     end
 
     test "reopens a visible uncertain rejection and replays it without another recovery", ctx do
@@ -1262,6 +1520,23 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
     injector = fn
       ^stage ->
         if Agent.get(fault, &(&1 == :armed)), do: {:error, :power_loss}, else: :ok
+
+      _other ->
+        :ok
+    end
+
+    {fault, injector}
+  end
+
+  defp disarmed_one_shot_fault_at(stage) do
+    {:ok, fault} = Agent.start_link(fn -> :disarmed end)
+
+    injector = fn
+      ^stage ->
+        Agent.get_and_update(fault, fn
+          :armed -> {{:error, :power_loss}, :disarmed}
+          :disarmed -> {:ok, :disarmed}
+        end)
 
       _other ->
         :ok
