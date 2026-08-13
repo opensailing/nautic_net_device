@@ -40,6 +40,9 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
   @default_max_outcomes 64
   @default_max_result_bytes 262_144
+  @default_identity_refresh_ms 250
+  @u32_max 0xFFFF_FFFF
+  @zero_identifier <<0::128>>
   @default_ledger_filename "commands.ledger"
 
   @type delivery :: map()
@@ -59,6 +62,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
     * `:desired_state` — 0-arity returning the active generation/manifest.
     * `:gate` — 0-arity returning `:closed | {:open, binding}`.
     * `:trusted_now_ms` — 0-arity returning `{:ok, ms}` or `:unavailable`.
+    * `:identity_refresh_ms` — dynamic identity-source polling interval.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -95,8 +99,8 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
   def deliver(_server, _delivery), do: {:defer, :invalid_command_delivery}
 
-  @doc "The exact durable identity this executor's ledger is scoped to."
-  @spec identity(GenServer.server()) :: map()
+  @doc "The exact durable identity this executor's ledger is scoped to, or nil while unbound."
+  @spec identity(GenServer.server()) :: map() | nil
   def identity(server), do: GenServer.call(server, :identity)
 
   @doc "The canonical durable ledger path."
@@ -143,19 +147,30 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
   def init(opts) do
     Process.flag(:trap_exit, true)
 
-    with {:ok, identity} <- resolve_identity(opts),
+    with {:ok, path} <- canonical_ledger_path(configured_path(opts)),
          {:ok, providers} <- resolve_providers(opts),
-         {:ok, store} <- open_store(opts, identity, providers) do
+         {:ok, identity_source} <- resolve_identity_source(opts) do
       state = %{
-        store: store,
-        identity: identity,
+        path: path,
+        store: nil,
+        identity: nil,
+        identity_source: identity_source,
+        identity_refresh_ms: identity_refresh_ms(opts),
+        identity_refresh_ref: nil,
+        identity_refresh_token: nil,
+        rebind_required?: false,
+        opts: opts,
         providers: providers,
         desired_state: Keyword.get_lazy(opts, :desired_state, &default_desired_state/0),
         gate: Keyword.get_lazy(opts, :gate, &default_gate/0),
         trusted_now_ms: Keyword.get_lazy(opts, :trusted_now_ms, &default_clock/0)
       }
 
-      {:ok, state, {:continue, :recover_pending}}
+      case bind_identity(state) do
+        {:ok, state} -> {:ok, state, {:continue, :recover_pending}}
+        {:unbound, state} -> {:ok, schedule_identity_refresh(state)}
+        {:error, reason} -> {:stop, reason}
+      end
     else
       {:error, reason} -> {:stop, reason}
     end
@@ -164,7 +179,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
   @impl true
   def handle_continue(:recover_pending, state) do
     {_resolution, state} = resolve_pending(state)
-    {:noreply, state}
+    {:noreply, schedule_identity_refresh(state)}
   end
 
   # Any pending intent is resolved before a new delivery is considered, because a
@@ -177,15 +192,58 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
   # command and the ledger replays its retained terminal bytes.
   @impl true
   def handle_call({:deliver, delivery}, _from, state) do
-    case resolve_pending(state) do
-      {:none, state} -> route(delivery, state)
-      {{:resolved, _ack}, state} -> route(delivery, state)
-      {{:pending, reason}, state} -> {:reply, {:defer, reason}, state}
+    case refresh_identity(state) do
+      {:bound, state} ->
+        case resolve_pending(state) do
+          {:none, state} -> route(delivery, state)
+          {{:resolved, _ack}, state} -> route(delivery, state)
+          {{:pending, reason}, state} -> {:reply, {:defer, reason}, state}
+        end
+
+      {:unbound, state} ->
+        {:reply, {:defer, :command_executor_unbound}, state}
+
+      {:rebind_required, state} ->
+        {:reply, {:defer, :command_executor_rebind_required}, state}
+
+      {:bind_error, reason, state} ->
+        {:stop, reason, {:defer, :command_executor_unbound}, state}
     end
   end
 
   def handle_call(:identity, _from, state), do: {:reply, state.identity, state}
+
+  def handle_call(:path, _from, %{store: nil} = state) do
+    {:reply, state.path, state}
+  end
+
   def handle_call(:path, _from, state), do: {:reply, state.store.path, state}
+
+  @impl true
+  def handle_info({:refresh_identity, token}, %{identity_refresh_token: token} = state) do
+    state = %{state | identity_refresh_ref: nil, identity_refresh_token: nil}
+    previously_unbound? = is_nil(state.identity)
+
+    case refresh_identity(state) do
+      {:bound, state} when previously_unbound? ->
+        {_resolution, state} = resolve_pending(state)
+        {:noreply, schedule_identity_refresh(state)}
+
+      {:bound, state} ->
+        {:noreply, schedule_identity_refresh(state)}
+
+      {:unbound, state} ->
+        {:noreply, schedule_identity_refresh(state)}
+
+      {:rebind_required, state} ->
+        {:noreply, state}
+
+      {:bind_error, reason, state} ->
+        {:stop, reason, state}
+    end
+  end
+
+  def handle_info({:refresh_identity, _stale_token}, state), do: {:noreply, state}
 
   @impl true
   def format_status(status), do: redact(status)
@@ -208,8 +266,11 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
     case Store.begin_intent(state.store, plan) do
       {:ok, intent, store} ->
         state = %{state | store: store}
-        {result, state} = run_effect(intent, state)
-        complete(intent, result, state)
+
+        case run_effect(intent, state) do
+          {:ok, result, state} -> complete(intent, result, state)
+          {:rebind_required, state} -> {:reply, {:defer, :command_executor_rebind_required}, state}
+        end
 
       {:error, reason} ->
         log_refusal(:intent, plan.delivery, reason)
@@ -282,11 +343,12 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
         {:none, state}
 
       {:recover, intent} ->
-        case invoke_provider(intent, :recover, state) do
-          {:applied, result_term} -> complete_recovered(intent, result_term, state)
-          {:not_applied, proof} -> reject_recovered(intent, proof, state)
-          :ambiguous -> {{:pending, :ambiguous_command_recovery}, state}
-          _invalid -> {{:pending, :ambiguous_command_recovery}, state}
+        case with_live_identity(state, fn state -> invoke_provider(intent, :recover, state) end) do
+          {:ok, {:applied, result_term}, state} -> complete_recovered(intent, result_term, state)
+          {:ok, {:not_applied, proof}, state} -> reject_recovered(intent, proof, state)
+          {:ok, :ambiguous, state} -> {{:pending, :ambiguous_command_recovery}, state}
+          {:ok, _invalid, state} -> {{:pending, :ambiguous_command_recovery}, state}
+          {:rebind_required, state} -> {{:pending, :command_executor_rebind_required}, state}
         end
     end
   end
@@ -329,7 +391,15 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
   # --- provider invocation ---
 
   defp run_effect(intent, state) do
-    {invoke_provider(intent, :execute, state), state}
+    with_live_identity(state, fn state -> invoke_provider(intent, :execute, state) end)
+  end
+
+  defp with_live_identity(state, fun) do
+    case read_identity(state.identity_source) do
+      {:ok, identity} when identity == state.identity -> {:ok, fun.(state), state}
+      {:ok, _identity} -> {:rebind_required, latch_rebind_required(state, :identity_drift)}
+      {:error, reason} -> {:rebind_required, latch_rebind_required(state, reason)}
+    end
   end
 
   defp invoke_provider(intent, function, state) do
@@ -401,7 +471,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
   # --- init helpers ---
 
-  defp resolve_identity(opts) do
+  defp resolve_identity_source(opts) do
     identity = %{
       device_id: Keyword.get(opts, :device_id),
       credential_epoch: Keyword.get(opts, :credential_epoch),
@@ -409,21 +479,134 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
     }
 
     if Enum.all?(Map.values(identity), &(not is_nil(&1))) do
-      {:ok, identity}
+      with {:ok, identity} <- validate_identity(identity) do
+        {:ok, {:static, identity}}
+      end
     else
-      resolve_runtime_identity(opts)
+      provider = Keyword.get_lazy(opts, :identity, fn -> &Runtime.identity/0 end)
+
+      if is_function(provider, 0) do
+        {:ok, {:dynamic, provider}}
+      else
+        {:error, :no_verified_authority}
+      end
     end
   end
 
-  defp resolve_runtime_identity(opts) do
-    provider = Keyword.get_lazy(opts, :identity, fn -> &Runtime.identity/0 end)
+  defp refresh_identity(%{rebind_required?: true} = state), do: {:rebind_required, state}
 
-    case invoke(provider) do
-      {:ok, %{device_id: device_id, credential_epoch: credential_epoch, storage_epoch: storage_epoch}} ->
-        {:ok, %{device_id: device_id, credential_epoch: credential_epoch, storage_epoch: storage_epoch}}
+  defp refresh_identity(%{identity: nil} = state) do
+    case bind_identity(state) do
+      {:ok, state} ->
+        {:bound, state}
 
-      _unavailable ->
+      {:unbound, state} ->
+        {:unbound, state}
+
+      {:error, :command_ledger_identity_mismatch} ->
+        {:rebind_required, latch_rebind_required(state, :command_ledger_identity_mismatch)}
+
+      {:error, reason} ->
+        {:bind_error, reason, state}
+    end
+  end
+
+  defp refresh_identity(state) do
+    case read_identity(state.identity_source) do
+      {:ok, identity} when identity == state.identity ->
+        {:bound, state}
+
+      {:ok, _identity} ->
+        {:rebind_required, latch_rebind_required(state, :identity_drift)}
+
+      {:error, _reason} ->
+        {:rebind_required, latch_rebind_required(state, :identity_unavailable)}
+    end
+  end
+
+  defp bind_identity(state) do
+    case read_identity(state.identity_source) do
+      {:ok, identity} ->
+        case open_store(Keyword.put(state.opts, :canonical_path, state.path), identity, state.providers) do
+          {:ok, store} -> {:ok, %{state | store: store, identity: identity}}
+          {:error, reason} -> {:error, reason}
+        end
+
+      {:error, :no_verified_authority} ->
+        {:unbound, state}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp read_identity({:static, identity}), do: validate_identity(identity)
+
+  defp read_identity({:dynamic, provider}) do
+    case provider.() do
+      {:ok, identity} when is_map(identity) ->
+        validate_identity(identity)
+
+      {:error, :no_verified_authority} ->
         {:error, :no_verified_authority}
+
+      _invalid ->
+        {:error, :invalid_command_executor_identity}
+    end
+  rescue
+    _exception -> {:error, :command_executor_identity_source_failed}
+  catch
+    _kind, _reason -> {:error, :command_executor_identity_source_failed}
+  end
+
+  defp validate_identity(%{
+         device_id: device_id,
+         credential_epoch: credential_epoch,
+         storage_epoch: storage_epoch
+       })
+       when is_binary(device_id) and byte_size(device_id) == 16 and device_id != @zero_identifier and
+              is_integer(credential_epoch) and credential_epoch >= 0 and credential_epoch <= @u32_max and
+              is_binary(storage_epoch) and byte_size(storage_epoch) == 16 and
+              storage_epoch != @zero_identifier do
+    {:ok,
+     %{
+       device_id: device_id,
+       credential_epoch: credential_epoch,
+       storage_epoch: storage_epoch
+     }}
+  end
+
+  defp validate_identity(_identity), do: {:error, :invalid_command_executor_identity}
+
+  defp latch_rebind_required(state, reason) do
+    Logger.warning("[CommandExecutor] stopped accepting commands: #{inspect(reason)}")
+
+    state
+    |> cancel_identity_refresh()
+    |> Map.put(:identity, nil)
+    |> Map.put(:rebind_required?, true)
+  end
+
+  defp schedule_identity_refresh(%{identity_source: {:dynamic, _provider}} = state) do
+    state = cancel_identity_refresh(state)
+    token = make_ref()
+    timer_ref = Process.send_after(self(), {:refresh_identity, token}, state.identity_refresh_ms)
+    %{state | identity_refresh_ref: timer_ref, identity_refresh_token: token}
+  end
+
+  defp schedule_identity_refresh(state), do: cancel_identity_refresh(state)
+
+  defp cancel_identity_refresh(%{identity_refresh_ref: nil} = state), do: state
+
+  defp cancel_identity_refresh(%{identity_refresh_ref: timer_ref} = state) do
+    _result = Process.cancel_timer(timer_ref)
+    %{state | identity_refresh_ref: nil, identity_refresh_token: nil}
+  end
+
+  defp identity_refresh_ms(opts) do
+    case Keyword.get(opts, :identity_refresh_ms, @default_identity_refresh_ms) do
+      milliseconds when is_integer(milliseconds) and milliseconds > 0 -> milliseconds
+      _invalid -> @default_identity_refresh_ms
     end
   end
 
@@ -448,7 +631,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
   defp open_store(opts, identity, providers) do
     Store.open(
-      Keyword.get_lazy(opts, :path, &default_path/0),
+      Keyword.get(opts, :canonical_path, configured_path(opts)),
       [
         device_id: identity.device_id,
         credential_epoch: identity.credential_epoch,
@@ -463,6 +646,60 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
   # The store re-authorizes with the SAME collaborators the hot path reads, so a
   # fence cannot differ between classification and persistence.
+  defp configured_path(opts), do: Keyword.get_lazy(opts, :path, &default_path/0)
+
+  defp canonical_ledger_path(path) when is_binary(path) and path != "" do
+    path
+    |> Path.expand()
+    |> resolve_path_symlinks(32)
+  end
+
+  defp canonical_ledger_path(_path), do: {:error, :invalid_command_ledger_path}
+
+  defp resolve_path_symlinks(_path, 0), do: {:error, :command_ledger_symlink_limit}
+
+  defp resolve_path_symlinks(path, remaining) do
+    case Path.split(path) do
+      [root | parts] -> resolve_path_parts(root, parts, remaining)
+      [] -> {:error, :invalid_command_ledger_path}
+    end
+  end
+
+  defp resolve_path_parts(current, [], _remaining), do: {:ok, current}
+
+  defp resolve_path_parts(current, [part | rest], remaining) do
+    candidate = Path.join(current, part)
+
+    case File.lstat(candidate) do
+      {:ok, %File.Stat{type: :symlink}} ->
+        with {:ok, target} <- File.read_link(candidate) do
+          target
+          |> symlink_target(current)
+          |> append_path_parts(rest)
+          |> resolve_path_symlinks(remaining - 1)
+        end
+
+      {:ok, _stat} ->
+        resolve_path_parts(candidate, rest, remaining)
+
+      {:error, :enoent} ->
+        {:ok, append_path_parts(candidate, rest)}
+
+      {:error, reason} ->
+        {:error, {:command_ledger_path, reason}}
+    end
+  end
+
+  defp symlink_target(target, parent) do
+    case Path.type(target) do
+      :absolute -> Path.expand(target)
+      :relative -> Path.expand(target, parent)
+      :volumerelative -> Path.expand(target, parent)
+    end
+  end
+
+  defp append_path_parts(path, parts), do: Enum.reduce(parts, path, &Path.join(&2, &1))
+
   defp admission_context(opts) do
     %{
       desired_state: Keyword.get_lazy(opts, :desired_state, &default_desired_state/0),
@@ -519,8 +756,14 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
   defp redact(status), do: status
 
-  defp redact_state(%{store: _store, identity: identity}) do
-    %{identity: identity, store: :redacted, providers: :redacted, collaborators: :redacted}
+  defp redact_state(%{store: _store, identity: identity} = state) do
+    %{
+      identity: identity,
+      rebind_required?: Map.get(state, :rebind_required?, false),
+      store: :redacted,
+      providers: :redacted,
+      collaborators: :redacted
+    }
   end
 
   defp redact_state(_state), do: :redacted

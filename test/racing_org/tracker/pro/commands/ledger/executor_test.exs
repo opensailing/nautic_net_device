@@ -20,6 +20,18 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
   defmodule LoadedButIncompleteProvider do
   end
 
+  defmodule SequencedIdentitySource do
+    def next(state) do
+      Agent.get_and_update(state, fn
+        %{current: current, remaining: [next | rest]} = script ->
+          {current, %{script | current: next, remaining: rest}}
+
+        %{current: current, remaining: []} = script ->
+          {current, script}
+      end)
+    end
+  end
+
   defmodule ScriptedProvider do
     def execute(intent, state) do
       Agent.get_and_update(state, fn script ->
@@ -58,6 +70,331 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
     on_exit(fn -> File.rm_rf(root) end)
     {:ok, script} = Agent.start_link(fn -> %{} end)
     %{root: root, path: Path.join(root, "commands.ledger"), script: script}
+  end
+
+  describe "identity lifecycle" do
+    test "starts unbound and fails delivery closed while verified authority is unavailable", ctx do
+      {:ok, authority} = Agent.start_link(fn -> {:error, :no_verified_authority} end)
+      executor = start_dynamic_executor(ctx, authority)
+
+      assert Process.alive?(executor)
+      assert Executor.identity(executor) == nil
+      assert Path.type(Executor.path(executor)) == :absolute
+      assert Path.basename(Executor.path(executor)) == Path.basename(ctx.path)
+
+      command = delivery(command_id: command_id(1), payload: payload(:noop))
+      assert {:defer, :command_executor_unbound} = Executor.deliver(executor, command)
+      assert {:defer, :command_executor_unbound} = Executor.deliver(executor, command)
+
+      assert Process.alive?(executor)
+      refute File.exists?(ctx.path)
+      assert ScriptedProvider.observed(ctx.script) == []
+    end
+
+    test "binds and opens the ledger when verified authority appears without restarting", ctx do
+      {:ok, authority} = Agent.start_link(fn -> {:error, :no_verified_authority} end)
+      executor = start_dynamic_executor(ctx, authority)
+
+      assert Executor.identity(executor) == nil
+      Agent.update(authority, fn _unavailable -> {:ok, durable_identity()} end)
+
+      assert_eventually(fn -> Executor.identity(executor) == durable_identity() end)
+      assert Process.alive?(executor)
+      assert File.exists?(ctx.path)
+
+      assert {:ack, ack} =
+               Executor.deliver(executor, delivery(command_id: command_id(1), payload: payload(:noop)))
+
+      assert ack.status == :applied
+      assert [{:execute, _id}] = ScriptedProvider.observed(ctx.script)
+    end
+
+    test "first late bind recovers a pending intent immediately under the live identity fence", ctx do
+      pending = seed_pending_intent(ctx)
+      ScriptedProvider.script(ctx.script, :recover, {:applied, %{outcome: :applied}})
+      {:ok, authority} = Agent.start_link(fn -> {:error, :no_verified_authority} end)
+      executor = start_dynamic_executor(ctx, authority)
+
+      Agent.update(authority, fn _unavailable -> {:ok, durable_identity()} end)
+
+      assert_eventually(fn ->
+        case open_store(ctx) do
+          {:ok, store} -> Store.pending_intent(store) == nil
+          {:error, _reason} -> false
+        end
+      end)
+
+      assert Executor.identity(executor) == durable_identity()
+      assert [{:recover, recovered_id}] = ScriptedProvider.observed(ctx.script)
+      assert recovered_id == pending.command_id
+    end
+
+    test "startup recovery latches rebind required when authority drifts immediately after open", ctx do
+      pending = seed_pending_intent(ctx)
+
+      rotated = %{
+        durable_identity()
+        | credential_epoch: @credential_epoch + 1,
+          storage_epoch: @other_storage_epoch
+      }
+
+      {:ok, authority} =
+        Agent.start_link(fn ->
+          %{current: {:ok, durable_identity()}, remaining: [{:ok, rotated}]}
+        end)
+
+      executor =
+        start_executor(ctx,
+          identity: fn -> SequencedIdentitySource.next(authority) end,
+          identity_refresh_ms: 10,
+          device_id: nil,
+          credential_epoch: nil,
+          storage_epoch: nil
+        )
+
+      assert_eventually(fn -> Executor.identity(executor) == nil end)
+      assert {:defer, :command_executor_rebind_required} = Executor.deliver(executor, pending)
+      assert ScriptedProvider.observed(ctx.script) == []
+
+      assert {:ok, old_store} = open_store(ctx)
+      assert Store.pending_intent(old_store).command_id == pending.command_id
+    end
+
+    test "pending recovery revalidates authority immediately before the external verifier", ctx do
+      pending = seed_pending_intent(ctx)
+
+      rotated = %{
+        durable_identity()
+        | credential_epoch: @credential_epoch + 1,
+          storage_epoch: @other_storage_epoch
+      }
+
+      {:ok, authority} =
+        Agent.start_link(fn ->
+          %{
+            current: {:ok, durable_identity()},
+            remaining: [{:ok, rotated}]
+          }
+        end)
+
+      executor =
+        start_executor(ctx,
+          identity: fn -> SequencedIdentitySource.next(authority) end,
+          identity_refresh_ms: 10,
+          device_id: nil,
+          credential_epoch: nil,
+          storage_epoch: nil
+        )
+
+      assert_eventually(fn -> Executor.identity(executor) == nil end)
+      assert {:defer, :command_executor_rebind_required} = Executor.deliver(executor, pending)
+      assert ScriptedProvider.observed(ctx.script) == []
+
+      assert {:ok, old_store} = open_store(ctx)
+      assert Store.pending_intent(old_store).command_id == pending.command_id
+    end
+
+    test "a normal delivery revalidates authority after intent durability and before its effect", ctx do
+      rotated = %{
+        durable_identity()
+        | credential_epoch: @credential_epoch + 1,
+          storage_epoch: @other_storage_epoch
+      }
+
+      {:ok, authority} =
+        Agent.start_link(fn ->
+          %{
+            current: {:ok, durable_identity()},
+            remaining: [{:ok, durable_identity()}, {:ok, rotated}]
+          }
+        end)
+
+      executor =
+        start_executor(ctx,
+          identity: fn -> SequencedIdentitySource.next(authority) end,
+          identity_refresh_ms: 10_000,
+          device_id: nil,
+          credential_epoch: nil,
+          storage_epoch: nil
+        )
+
+      command = delivery(command_id: command_id(1), payload: payload(:noop))
+      assert {:defer, :command_executor_rebind_required} = Executor.deliver(executor, command)
+      assert Executor.identity(executor) == nil
+      assert ScriptedProvider.observed(ctx.script) == []
+
+      assert {:ok, old_store} = open_store(ctx)
+      assert Store.pending_intent(old_store).command_id == command.command_id
+      assert Store.snapshot(old_store).next_expected_sequence == 1
+    end
+
+    test "post-bind authority loss latches rebind required and preserves the old ledger", ctx do
+      {:ok, authority} = Agent.start_link(fn -> {:ok, durable_identity()} end)
+      executor = start_dynamic_executor(ctx, authority, identity_refresh_ms: 10_000)
+      command = delivery(command_id: command_id(1), payload: payload(:noop))
+
+      assert {:ack, applied} = Executor.deliver(executor, command)
+      Agent.update(authority, fn _bound -> {:error, :no_verified_authority} end)
+
+      assert {:defer, :command_executor_rebind_required} = Executor.deliver(executor, command)
+      Agent.update(authority, fn _lost -> {:ok, durable_identity()} end)
+      assert {:defer, :command_executor_rebind_required} = Executor.deliver(executor, command)
+      assert ScriptedProvider.observed(ctx.script) == [{:execute, command.command_id}]
+
+      assert {:ok, old_store} = open_store(ctx)
+      outcome = Map.fetch!(Store.snapshot(old_store).outcomes, command.command_id)
+      assert outcome.result == applied.result
+      assert File.exists?(ctx.path)
+    end
+
+    test "credential storage and device drift independently latch before duplicate replay", ctx do
+      drifted_identities = [
+        %{durable_identity() | credential_epoch: @credential_epoch + 1},
+        %{durable_identity() | storage_epoch: @other_storage_epoch},
+        %{durable_identity() | device_id: :binary.copy(<<0x4B>>, 16)}
+      ]
+
+      for {rotated, index} <- Enum.with_index(drifted_identities, 1) do
+        isolated = %{
+          ctx
+          | path: Path.join(ctx.root, "commands-#{index}.ledger")
+        }
+
+        {:ok, authority} = Agent.start_link(fn -> {:ok, durable_identity()} end)
+
+        opts =
+          isolated
+          |> executor_opts(
+            identity: fn -> Agent.get(authority, & &1) end,
+            identity_refresh_ms: 10_000,
+            device_id: nil,
+            credential_epoch: nil,
+            storage_epoch: nil
+          )
+          |> Keyword.put(:name, nil)
+
+        {:ok, executor} = Executor.start_link(opts)
+
+        command = delivery(command_id: command_id(index), payload: payload(:noop))
+        assert {:ack, _applied} = Executor.deliver(executor, command)
+
+        Agent.update(authority, fn _bound -> {:ok, rotated} end)
+        assert {:defer, :command_executor_rebind_required} = Executor.deliver(executor, command)
+        assert Process.alive?(executor)
+        GenServer.stop(executor)
+      end
+    end
+
+    test "stale identity refresh messages cannot create another poll loop", ctx do
+      {:ok, authority} = Agent.start_link(fn -> {:error, :no_verified_authority} end)
+      executor = start_dynamic_executor(ctx, authority, identity_refresh_ms: 10_000)
+      before = Agent.get(authority, & &1)
+
+      send(executor, {:refresh_identity, make_ref()})
+      Process.sleep(20)
+
+      assert Process.alive?(executor)
+      assert Agent.get(authority, & &1) == before
+      assert Executor.identity(executor) == nil
+    end
+
+    test "credential and storage identity drift fails closed without deleting the old ledger", ctx do
+      {:ok, authority} = Agent.start_link(fn -> {:ok, durable_identity()} end)
+      executor = start_dynamic_executor(ctx, authority)
+      old_delivery = delivery(command_id: command_id(1), payload: payload(:noop))
+
+      assert {:ack, %{status: :applied}} = Executor.deliver(executor, old_delivery)
+      old_path = Executor.path(executor)
+      assert File.exists?(old_path)
+
+      rotated = %{
+        durable_identity()
+        | credential_epoch: @credential_epoch + 1,
+          storage_epoch: @other_storage_epoch
+      }
+
+      Agent.update(authority, fn _old -> {:ok, rotated} end)
+
+      next_old_delivery =
+        delivery(
+          command_id: command_id(2),
+          command_sequence: 2,
+          payload: payload(:noop)
+        )
+
+      assert {:defer, :command_executor_rebind_required} =
+               Executor.deliver(executor, next_old_delivery)
+
+      assert Executor.identity(executor) == nil
+      assert Executor.path(executor) == old_path
+      assert Process.alive?(executor)
+      assert File.exists?(old_path)
+      assert [{:execute, _old}] = ScriptedProvider.observed(ctx.script)
+
+      assert {:ok, old_store} = open_store(ctx)
+      assert Store.snapshot(old_store).next_expected_sequence == 2
+      assert Map.has_key?(Store.snapshot(old_store).outcomes, old_delivery.command_id)
+    end
+  end
+
+  describe "identity source validation" do
+    test "non-transient startup identity failures are fatal", ctx do
+      rows = [
+        fn -> {:error, :bootstrap_failed} end,
+        fn -> :invalid end,
+        fn -> raise "identity failed" end,
+        fn -> throw(:identity_failed) end,
+        fn -> exit(:identity_failed) end
+      ]
+
+      for source <- rows do
+        opts =
+          executor_opts(ctx,
+            identity: source,
+            device_id: nil,
+            credential_epoch: nil,
+            storage_epoch: nil,
+            name: nil
+          )
+
+        assert {:error, reason} = GenServer.start(Executor, opts)
+        refute reason == :no_verified_authority
+      end
+    end
+
+    test "static and dynamic identities reject the same malformed durable shapes", ctx do
+      invalid = [
+        %{durable_identity() | device_id: <<0::128>>},
+        %{durable_identity() | device_id: <<1>>},
+        %{durable_identity() | credential_epoch: -1},
+        %{durable_identity() | credential_epoch: 0x1_0000_0000},
+        %{durable_identity() | storage_epoch: <<0::128>>},
+        %{durable_identity() | storage_epoch: <<1>>}
+      ]
+
+      for {identity, index} <- Enum.with_index(invalid, 1) do
+        static_opts =
+          executor_opts(%{ctx | path: Path.join(ctx.root, "static-invalid-#{index}.ledger")},
+            device_id: identity.device_id,
+            credential_epoch: identity.credential_epoch,
+            storage_epoch: identity.storage_epoch,
+            name: nil
+          )
+
+        assert {:error, :invalid_command_executor_identity} = GenServer.start(Executor, static_opts)
+
+        dynamic_opts =
+          executor_opts(%{ctx | path: Path.join(ctx.root, "dynamic-invalid-#{index}.ledger")},
+            identity: fn -> {:ok, identity} end,
+            device_id: nil,
+            credential_epoch: nil,
+            storage_epoch: nil,
+            name: nil
+          )
+
+        assert {:error, :invalid_command_executor_identity} = GenServer.start(Executor, dynamic_opts)
+      end
+    end
   end
 
   describe "provider configuration" do
@@ -400,6 +737,42 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
   end
 
   # --- helpers ---
+
+  defp start_dynamic_executor(ctx, authority, overrides \\ []) do
+    start_executor(
+      ctx,
+      Keyword.merge(
+        [
+          identity: fn -> Agent.get(authority, & &1) end,
+          identity_refresh_ms: 10,
+          device_id: nil,
+          credential_epoch: nil,
+          storage_epoch: nil
+        ],
+        overrides
+      )
+    )
+  end
+
+  defp durable_identity do
+    %{
+      device_id: @device_id,
+      credential_epoch: @credential_epoch,
+      storage_epoch: @storage_epoch
+    }
+  end
+
+  defp assert_eventually(predicate, attempts \\ 100)
+  defp assert_eventually(predicate, 0), do: assert(predicate.())
+
+  defp assert_eventually(predicate, attempts) do
+    if predicate.() do
+      :ok
+    else
+      Process.sleep(10)
+      assert_eventually(predicate, attempts - 1)
+    end
+  end
 
   defp start_executor(ctx, overrides \\ []) do
     start_supervised!({Executor, Keyword.put(executor_opts(ctx, overrides), :name, nil)})
