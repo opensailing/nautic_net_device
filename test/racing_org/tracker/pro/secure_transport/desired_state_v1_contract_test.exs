@@ -64,7 +64,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1ContractTest do
                checkpoint_submission_chunk: {0x34, :device_to_server},
                checkpoint_submission_resume: {0x35, :server_to_device},
                checkpoint_hydration_chunk: {0x36, :server_to_device},
-               checkpoint_hydration_resume: {0x37, :device_to_server}
+               checkpoint_hydration_resume: {0x37, :device_to_server},
+               delivery_payload: {0x38, :device_to_server},
+               delivery_payload_chunk: {0x39, :device_to_server}
              }
 
       assert Contract.reserved_message_ranges() == [

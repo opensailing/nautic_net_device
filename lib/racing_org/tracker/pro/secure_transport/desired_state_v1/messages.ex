@@ -28,6 +28,24 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
 
   @identity_keys [:device_id, :credential_epoch, :boot_id, :storage_epoch]
   @durable_identity_keys [:device_id, :credential_epoch, :storage_epoch]
+  @delivery_payload_common_keys @durable_identity_keys ++ [:stream, :sequence, :payload_hash]
+  @delivery_payload_chunk_hash_keys [
+    :payload_hash,
+    :total_payload_length,
+    :chunk_index,
+    :chunk_count,
+    :chunk_offset,
+    :chunk
+  ]
+  @delivery_payload_chunk_keys @delivery_payload_common_keys ++
+                                 [
+                                   :total_payload_length,
+                                   :chunk_index,
+                                   :chunk_count,
+                                   :chunk_offset,
+                                   :chunk_hash,
+                                   :chunk
+                                 ]
   @checkpoint_submission_common_keys @durable_identity_keys ++
                                        [
                                          :sequence,
@@ -87,6 +105,32 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
 
   def encode(_type, _attrs), do: {:error, :unsupported_message_type}
 
+  @doc "Hash one exact delivery payload chunk under its dedicated domain."
+  def delivery_payload_chunk_hash(attrs) when is_map(attrs) do
+    with :ok <-
+           exact_keys(
+             attrs,
+             @delivery_payload_chunk_hash_keys,
+             :invalid_delivery_payload_chunk
+           ),
+         :ok <- fixed_binary(attrs.payload_hash, @hash_size, :invalid_payload_hash),
+         :ok <- positive_u64(attrs.total_payload_length, :invalid_total_payload_length),
+         :ok <- u32(attrs.chunk_index, :invalid_chunk_index),
+         :ok <- positive_u32(attrs.chunk_count, :invalid_chunk_count),
+         :ok <- u64(attrs.chunk_offset, :invalid_chunk_offset),
+         :ok <- payload_chunk_bytes(attrs.chunk) do
+      preimage =
+        Contract.delivery_payload_chunk_hash_domain() <>
+          <<Contract.version(), attrs.payload_hash::binary-size(@hash_size), attrs.total_payload_length::64,
+            attrs.chunk_index::32, attrs.chunk_count::32, attrs.chunk_offset::64, byte_size(attrs.chunk)::32,
+            attrs.chunk::binary>>
+
+      {:ok, :crypto.hash(:sha256, preimage)}
+    end
+  end
+
+  def delivery_payload_chunk_hash(_attrs), do: {:error, :invalid_delivery_payload_chunk}
+
   @doc "Decode exactly the expected registered authenticated payload."
   def decode(type, bytes) when is_atom(type) and is_binary(bytes) do
     with {:ok, rest} <- strip_header(type, bytes),
@@ -136,6 +180,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
     do: encode_checkpoint_hydration_resume(attrs)
 
   defp encode_body(:delivery_submission, attrs), do: encode_delivery_submission(attrs)
+  defp encode_body(:delivery_payload, attrs), do: encode_delivery_payload(attrs)
+  defp encode_body(:delivery_payload_chunk, attrs), do: encode_delivery_payload_chunk(attrs)
   defp encode_body(_type, _attrs), do: {:error, :unsupported_message_type}
 
   defp decode_body(:control_accept, bytes), do: decode_control_accept(bytes)
@@ -164,6 +210,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
     do: decode_checkpoint_hydration_resume(bytes)
 
   defp decode_body(:delivery_submission, bytes), do: decode_delivery_submission(bytes)
+  defp decode_body(:delivery_payload, bytes), do: decode_delivery_payload(bytes)
+  defp decode_body(:delivery_payload_chunk, bytes), do: decode_delivery_payload_chunk(bytes)
   defp decode_body(_type, _bytes), do: {:error, :unsupported_message_type}
 
   # control_accept
@@ -778,6 +826,159 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   end
 
   defp decode_delivery_submission(_), do: {:error, :truncated}
+
+  # delivery_payload
+
+  defp encode_delivery_payload(attrs) do
+    expected = @delivery_payload_common_keys ++ [:payload]
+
+    with :ok <- exact_keys(attrs, expected, :invalid_delivery_payload),
+         {:ok, common} <- encode_delivery_payload_common(attrs),
+         :ok <- delivery_payload_bytes(attrs.payload),
+         expected_hash = :crypto.hash(:sha256, attrs.payload),
+         :ok <- ensure(secure_equal(expected_hash, attrs.payload_hash), :payload_hash_mismatch) do
+      {:ok, common <> <<byte_size(attrs.payload)::32, attrs.payload::binary>>}
+    end
+  end
+
+  defp decode_delivery_payload(bytes) do
+    with {:ok, common, rest} <- take_delivery_payload_common(bytes),
+         <<payload_length::32, rest::binary>> <- rest,
+         true <- byte_size(rest) >= payload_length || {:error, :truncated},
+         <<payload::binary-size(payload_length), trailing::binary>> <- rest,
+         attrs = Map.put(common, :payload, payload),
+         {:ok, _encoded} <- encode_body(:delivery_payload, attrs) do
+      {:ok, attrs, trailing}
+    else
+      false -> {:error, :truncated}
+      {:error, _reason} = error -> error
+      _ -> {:error, :truncated}
+    end
+  end
+
+  # delivery_payload_chunk
+
+  defp encode_delivery_payload_chunk(attrs) do
+    with :ok <- exact_keys(attrs, @delivery_payload_chunk_keys, :invalid_delivery_payload_chunk),
+         {:ok, common} <- encode_delivery_payload_common(attrs),
+         :ok <- validate_delivery_payload_chunk_geometry(attrs),
+         :ok <- fixed_binary(attrs.chunk_hash, @hash_size, :invalid_payload_chunk_hash),
+         {:ok, expected_chunk_hash} <-
+           attrs
+           |> Map.take(@delivery_payload_chunk_hash_keys)
+           |> delivery_payload_chunk_hash(),
+         :ok <-
+           ensure(
+             secure_equal(expected_chunk_hash, attrs.chunk_hash),
+             :payload_chunk_hash_mismatch
+           ) do
+      {:ok,
+       common <>
+         <<attrs.total_payload_length::64, attrs.chunk_index::32, attrs.chunk_count::32, attrs.chunk_offset::64,
+           attrs.chunk_hash::binary-size(@hash_size), byte_size(attrs.chunk)::32, attrs.chunk::binary>>}
+    end
+  end
+
+  defp decode_delivery_payload_chunk(bytes) do
+    with {:ok, common, rest} <- take_delivery_payload_common(bytes),
+         <<total_payload_length::64, chunk_index::32, chunk_count::32, chunk_offset::64,
+           chunk_hash::binary-size(@hash_size), chunk_length::32, rest::binary>> <- rest,
+         true <- byte_size(rest) >= chunk_length || {:error, :truncated},
+         <<chunk::binary-size(chunk_length), trailing::binary>> <- rest,
+         attrs =
+           Map.merge(common, %{
+             total_payload_length: total_payload_length,
+             chunk_index: chunk_index,
+             chunk_count: chunk_count,
+             chunk_offset: chunk_offset,
+             chunk_hash: chunk_hash,
+             chunk: chunk
+           }),
+         {:ok, _encoded} <- encode_body(:delivery_payload_chunk, attrs) do
+      {:ok, attrs, trailing}
+    else
+      false -> {:error, :truncated}
+      {:error, _reason} = error -> error
+      _ -> {:error, :truncated}
+    end
+  end
+
+  defp encode_delivery_payload_common(attrs) do
+    with :ok <- nonzero_binary(attrs.device_id, @device_id_size, :invalid_device_id),
+         :ok <- u32(attrs.credential_epoch, :invalid_credential_epoch),
+         :ok <-
+           nonzero_binary(
+             attrs.storage_epoch,
+             @incarnation_id_size,
+             :invalid_storage_epoch
+           ),
+         {:ok, stream_code} <- generic_delivery_stream_code(attrs.stream),
+         :ok <- positive_database_int(attrs.sequence, :invalid_delivery_sequence),
+         :ok <- fixed_binary(attrs.payload_hash, @hash_size, :invalid_payload_hash) do
+      {:ok,
+       <<attrs.device_id::binary-size(@device_id_size), attrs.credential_epoch::32,
+         attrs.storage_epoch::binary-size(@incarnation_id_size), stream_code, attrs.sequence::64,
+         attrs.payload_hash::binary-size(@hash_size)>>}
+    end
+  end
+
+  defp take_delivery_payload_common(
+         <<device_id::binary-size(@device_id_size), credential_epoch::32,
+           storage_epoch::binary-size(@incarnation_id_size), stream_code, sequence::64,
+           payload_hash::binary-size(@hash_size), rest::binary>>
+       ) do
+    with {:ok, stream} <- generic_delivery_stream(stream_code) do
+      {:ok,
+       %{
+         device_id: device_id,
+         credential_epoch: credential_epoch,
+         storage_epoch: storage_epoch,
+         stream: stream,
+         sequence: sequence,
+         payload_hash: payload_hash
+       }, rest}
+    end
+  end
+
+  defp take_delivery_payload_common(_), do: {:error, :truncated}
+
+  defp validate_delivery_payload_chunk_geometry(attrs) do
+    with :ok <- positive_u64(attrs.total_payload_length, :invalid_total_payload_length),
+         :ok <-
+           ensure(
+             attrs.total_payload_length <= Contract.max_delivery_payload_content_size(),
+             :payload_too_large
+           ),
+         :ok <- positive_u32(attrs.chunk_count, :invalid_chunk_count),
+         :ok <-
+           ensure(
+             attrs.chunk_count <= Contract.max_delivery_payload_chunks(),
+             :invalid_chunk_count
+           ),
+         expected_count = delivery_payload_chunk_count(attrs.total_payload_length),
+         :ok <- ensure(attrs.chunk_count == expected_count, :invalid_chunk_count),
+         :ok <- u32(attrs.chunk_index, :invalid_chunk_index),
+         :ok <- ensure(attrs.chunk_index < attrs.chunk_count, :invalid_chunk_index),
+         :ok <- u64(attrs.chunk_offset, :invalid_chunk_offset),
+         expected_offset = attrs.chunk_index * Contract.chunk_size(),
+         :ok <- ensure(attrs.chunk_offset == expected_offset, :invalid_chunk_offset),
+         :ok <- payload_chunk_bytes(attrs.chunk),
+         expected_length = min(Contract.chunk_size(), attrs.total_payload_length - expected_offset),
+         :ok <- ensure(byte_size(attrs.chunk) == expected_length, :invalid_chunk_length) do
+      :ok
+    end
+  end
+
+  defp delivery_payload_chunk_count(total_payload_length),
+    do: div(total_payload_length + Contract.chunk_size() - 1, Contract.chunk_size())
+
+  defp delivery_payload_bytes(payload) when is_binary(payload) do
+    if byte_size(payload) <= Contract.max_delivery_payload_size(),
+      do: :ok,
+      else: {:error, :payload_too_large}
+  end
+
+  defp delivery_payload_bytes(_payload), do: {:error, :invalid_payload}
 
   # delivery_receipt
 
@@ -1446,6 +1647,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
       {:error, _reason} = error -> error
     end
   end
+
+  defp payload_chunk_bytes(value) when is_binary(value) do
+    if byte_size(value) in 1..Contract.chunk_size(),
+      do: :ok,
+      else: {:error, :invalid_chunk_length}
+  end
+
+  defp payload_chunk_bytes(_value), do: {:error, :invalid_chunk}
 
   defp checkpoint_identity(kind, schema_version)
        when is_atom(kind) and is_integer(schema_version),

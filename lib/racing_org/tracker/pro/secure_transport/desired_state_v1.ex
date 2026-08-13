@@ -11,10 +11,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   @section_set_version 0x0001
   @purpose_control_v1 0x81
 
+  @delivery_payload_domain "RacingOrg-DurableDeliveryPayload-v1"
+  @delivery_payload_chunk_domain "RacingOrg-DurableDeliveryPayloadChunk-v1"
+  @delivery_payload_chunk_hash_domain "RacingOrg-DurableDeliveryPayloadChunkHash-v1"
+
   @chunk_size 61_440
   @max_plaintext_size 65_536
   @max_manifest_size 16_384
   @max_section_size 16_777_216
+  @max_delivery_payload_content_size 16_777_216
+  @max_delivery_payload_chunks div(@max_delivery_payload_content_size + @chunk_size - 1, @chunk_size)
+  @delivery_payload_fixed_body_size 16 + 4 + 16 + 1 + 8 + 32 + 4
+  @max_delivery_payload_size @max_plaintext_size - byte_size(@delivery_payload_domain) - 2 -
+                               @delivery_payload_fixed_body_size
   @max_generation_size 33_554_432
   @max_secret_size 1_024
   @max_command_payload_size 65_326
@@ -128,7 +137,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
     checkpoint_submission_chunk: {0x34, :device_to_server},
     checkpoint_submission_resume: {0x35, :server_to_device},
     checkpoint_hydration_chunk: {0x36, :server_to_device},
-    checkpoint_hydration_resume: {0x37, :device_to_server}
+    checkpoint_hydration_resume: {0x37, :device_to_server},
+    delivery_payload: {0x38, :device_to_server},
+    delivery_payload_chunk: {0x39, :device_to_server}
   }
   @message_by_code Map.new(@message_types, fn {name, {code, direction}} ->
                      {code, {name, direction}}
@@ -151,7 +162,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
     checkpoint_submission_chunk: "RacingOrg-CheckpointSubmissionChunk-v1",
     checkpoint_submission_resume: "RacingOrg-CheckpointSubmissionResume-v1",
     checkpoint_hydration_chunk: "RacingOrg-CheckpointHydrationChunk-v1",
-    checkpoint_hydration_resume: "RacingOrg-CheckpointHydrationResume-v1"
+    checkpoint_hydration_resume: "RacingOrg-CheckpointHydrationResume-v1",
+    delivery_payload: @delivery_payload_domain,
+    delivery_payload_chunk: @delivery_payload_chunk_domain
   }
 
   @offer_domain "RacingOrg-ControlOffer-v1"
@@ -250,6 +263,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   def max_plaintext_size, do: @max_plaintext_size
   def max_manifest_size, do: @max_manifest_size
   def max_section_size, do: @max_section_size
+  def max_delivery_payload_size, do: @max_delivery_payload_size
+  def max_delivery_payload_content_size, do: @max_delivery_payload_content_size
+  def max_delivery_payload_chunks, do: @max_delivery_payload_chunks
   def max_generation_size, do: @max_generation_size
   def max_secret_size, do: @max_secret_size
   def max_command_payload_size, do: @max_command_payload_size
@@ -413,6 +429,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   def checkpoint_content_hash_domain, do: @checkpoint_content_hash_domain
   def checkpoint_hash_domain, do: @checkpoint_hash_domain
   def checkpoint_content_chunk_hash_domain, do: @checkpoint_content_chunk_hash_domain
+  def delivery_payload_chunk_hash_domain, do: @delivery_payload_chunk_hash_domain
 
   def secret_kind(kind) when is_atom(kind) do
     case Map.fetch(@secret_kinds, kind) do
