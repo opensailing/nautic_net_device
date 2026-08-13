@@ -134,8 +134,15 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     state = monitor_manager(state)
 
     case recover_state(state) do
-      {:ok, state} -> {:ok, state}
-      {:error, reason, state} -> {:ok, state |> Map.put(:recovery_error, reason) |> maybe_retry_manager(reason)}
+      {:ok, state} ->
+        {:ok, state}
+
+      {:error, :checkpoint_hydration_manager_unavailable = reason, %{blocker: nil} = state} ->
+        state = %{state | recovery_required?: true, recovery_error: reason}
+        {:ok, schedule_manager_retry(state)}
+
+      {:error, reason, state} ->
+        {:ok, state |> Map.put(:recovery_error, reason) |> maybe_retry_manager(reason)}
     end
   end
 
@@ -221,6 +228,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       state
       |> Map.put(:manager_monitor_ref, nil)
       |> Map.put(:manager_pid, nil)
+      |> Map.put(:recovery_required?, true)
+      |> Map.put(:recovery_error, :checkpoint_hydration_manager_unavailable)
       |> schedule_manager_retry()
 
     {:noreply, state}
@@ -509,6 +518,18 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     end
   end
 
+  defp recover_for_retry(%{recovery_required?: true, blocker: nil} = state) do
+    state = %{state | recovery_required?: false}
+
+    case recover_state(state) do
+      {:error, :checkpoint_hydration_manager_unavailable = reason, %{blocker: nil}} ->
+        {:error, reason, %{state | recovery_required?: true}}
+
+      result ->
+        result
+    end
+  end
+
   defp recover_for_retry(%{blocker: nil} = state), do: recover_state(state)
 
   defp recover_for_retry(%{blocker: %{record: nil}, reconcile_empty_journal?: true} = state),
@@ -685,7 +706,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
        }}
     else
       {:error, reason} ->
-        state = retain_recovery_evidence(state, evidence)
+        state =
+          state
+          |> retain_recovery_evidence(evidence)
+          |> maybe_retry_manager(reason)
+
         {:error, reason, state}
     end
   end
@@ -853,7 +878,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   defp maybe_retry_manager(state, _reason), do: state
 
-  defp schedule_manager_retry(%{blocker: nil} = state), do: state
+  defp schedule_manager_retry(%{blocker: nil, recovery_required?: false} = state), do: state
 
   defp schedule_manager_retry(%{manager_retry_ref: nil} = state) do
     token = make_ref()
@@ -1089,8 +1114,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     }
   end
 
-  defp manager_begin(state, token, binding),
-    do: state.manager_module.begin_checkpoint_hydration(state.manager, token, binding)
+  defp manager_begin(state, token, binding) do
+    state.manager_module.begin_checkpoint_hydration(state.manager, token, binding)
+  rescue
+    _exception -> {:error, :checkpoint_hydration_manager_unavailable}
+  catch
+    :exit, _reason -> {:error, :checkpoint_hydration_manager_unavailable}
+    _kind, _reason -> {:error, :checkpoint_hydration_manager_unavailable}
+  end
 
   defp manager_finish(state) do
     state.manager_module.finish_checkpoint_hydration(
@@ -1098,6 +1129,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       state.blocker.token,
       state.blocker.binding
     )
+  rescue
+    _exception -> {:error, :checkpoint_hydration_manager_unavailable}
+  catch
+    :exit, _reason -> {:error, :checkpoint_hydration_manager_unavailable}
+    _kind, _reason -> {:error, :checkpoint_hydration_manager_unavailable}
   end
 
   defp journal_read(state),

@@ -1176,6 +1176,117 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     refute :manager_finish in core_operations()
   end
 
+  test "boot recovery waits for an unavailable Manager and converges automatically", ctx do
+    record = journal_record(ctx.hydration, :head_committed)
+    Backend.put(:journal, record)
+    Backend.put(:head, selected_record(ctx.hydration, content: ctx.hydration.content, sequence: 9))
+
+    old_manager = Backend.data(:manager_pid)
+    Process.exit(old_manager, :kill)
+    Process.sleep(10)
+
+    pid = start_coordinator(ctx, manager_retry_ms: 10)
+
+    assert %{
+             blocked?: true,
+             phase: nil,
+             recovery_error: :checkpoint_hydration_recovery_required
+           } = Coordinator.status(pid)
+
+    assert {:error, :checkpoint_hydration_recovery_required} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    replacement = spawn(fn -> Process.sleep(:infinity) end)
+    Backend.put(:manager_pid, replacement)
+    Backend.put(:manager_blocked?, false)
+    Backend.put(:installed_binding, nil)
+    Backend.put(:installed_token, nil)
+
+    eventually(fn ->
+      assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+      assert Backend.data(:manager_finished?)
+      assert Backend.data(:journal) == nil
+      assert Backend.data(:installed_binding) == @binding
+    end)
+  end
+
+  test "idle Manager replacements are re-monitored and reconciled before fresh hydration", ctx do
+    Backend.put(:head, nil)
+    pid = start_coordinator(ctx, reconcile_empty_journal: true, manager_retry_ms: 10)
+    assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+
+    first_manager = Backend.data(:manager_pid)
+    Process.exit(first_manager, :kill)
+
+    eventually(fn ->
+      assert %{
+               blocked?: true,
+               phase: nil,
+               recovery_error: :checkpoint_hydration_recovery_required
+             } = Coordinator.status(pid)
+    end)
+
+    replacement = spawn(fn -> Process.sleep(:infinity) end)
+    Backend.put(:manager_pid, replacement)
+    Backend.put(:manager_blocked?, false)
+    Backend.put(:installed_binding, nil)
+    Backend.put(:installed_token, nil)
+
+    eventually(fn ->
+      assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+      assert Backend.data(:manager_finished?)
+    end)
+
+    Process.exit(replacement, :kill)
+
+    eventually(fn ->
+      assert %{
+               blocked?: true,
+               phase: nil,
+               recovery_error: :checkpoint_hydration_recovery_required
+             } = Coordinator.status(pid)
+    end)
+
+    second_replacement = spawn(fn -> Process.sleep(:infinity) end)
+    Backend.put(:manager_pid, second_replacement)
+    Backend.put(:manager_blocked?, false)
+    Backend.put(:installed_binding, nil)
+    Backend.put(:installed_token, nil)
+
+    eventually(fn ->
+      assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+      assert Backend.data(:manager_finished?)
+    end)
+  end
+
+  test "Manager exits at begin fail safely without killing the Coordinator", ctx do
+    Backend.respond(:manager_begin, {:crash, :noproc})
+    pid = start_coordinator(ctx, manager_retry_ms: 10)
+
+    assert {:error, :checkpoint_hydration_manager_unavailable} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert Process.alive?(pid)
+    assert Backend.data(:journal) == nil
+    refute Backend.data(:manager_finished?)
+  end
+
+  test "Manager exits at finish retain durable recovery and retry without killing the Coordinator", ctx do
+    Backend.respond(:manager_finish, {:crash, :noproc})
+    pid = start_coordinator(ctx, manager_retry_ms: 10)
+
+    assert {:error, :checkpoint_hydration_manager_unavailable} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert Process.alive?(pid)
+
+    eventually(fn ->
+      assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+      assert Backend.data(:manager_finished?)
+      assert Backend.data(:journal) == nil
+    end)
+  end
+
   test "manager replacement reclaims committed recovery and retries automatically", ctx do
     record = journal_record(ctx.hydration, :head_committed)
     Backend.put(:journal, record)
