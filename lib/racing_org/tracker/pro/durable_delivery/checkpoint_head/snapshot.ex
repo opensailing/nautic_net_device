@@ -14,9 +14,59 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Snapshot do
   @binding_version 3
   @legacy_binding_version 1
   @max_ancestry_entries 4_096
-  @max_encoded_size 4 * 1_024 * 1_024
-  @decode_timeout_ms 5_000
-  @decode_max_heap_words 4_000_000
+
+  # Derive the ETF capacity from one maximal-width metadata term and one summary.
+  # Replacing the empty ancestry with a full list then costs one list header plus
+  # the independently encoded summary size per bounded entry; no maximal list is
+  # constructed at compile time or runtime.
+  @max_u32 0xFFFF_FFFF
+  @max_database_int 9_223_372_036_854_775_807
+
+  @maximal_summary %{
+    device_id: <<0::128>>,
+    origin_credential_epoch: @max_u32,
+    origin_storage_epoch: <<1::128>>,
+    sequence: @max_database_int,
+    kind: :calibration,
+    schema_version: 2,
+    source_generation: @max_database_int,
+    parent_hash: <<1::256>>,
+    content_hash: <<2::256>>,
+    checkpoint_hash: <<3::256>>
+  }
+
+  @maximal_accepted_summary Map.merge(@maximal_summary, %{
+                              local_credential_epoch: @max_u32,
+                              local_storage_epoch: <<1::128>>,
+                              binding_hash: <<4::256>>
+                            })
+
+  @maximal_current_record Map.merge(@maximal_accepted_summary, %{
+                            content: <<>>,
+                            accepted: false
+                          })
+
+  @maximal_snapshot_metadata {
+    @format_version,
+    @snapshot_tag,
+    %{
+      current: @maximal_current_record,
+      last_accepted: @maximal_accepted_summary,
+      ancestry: [],
+      ancestry_truncated: false,
+      snapshot_hash: <<0::256>>
+    }
+  }
+
+  @max_summary_encoded_size :erlang.external_size(@maximal_summary) - 1
+  @max_snapshot_metadata_encoded_size :erlang.external_size(@maximal_snapshot_metadata)
+  @ancestry_list_header_delta 5
+  @max_encoded_size Contract.max_checkpoint_content_size() +
+                      @max_snapshot_metadata_encoded_size +
+                      @ancestry_list_header_delta +
+                      @max_ancestry_entries * @max_summary_encoded_size
+  @decode_timeout_ms 30_000
+  @decode_max_heap_words 64_000_000
 
   @summary_keys [
     :device_id,
@@ -633,9 +683,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Snapshot do
 
   defp verify_chain_links(current, ancestry) do
     result =
-      Enum.reduce_while(ancestry, {:ok, current.parent_hash, MapSet.new()}, fn summary,
-                                                                               {:ok, expected,
-                                                                                seen} ->
+      Enum.reduce_while(ancestry, {:ok, current.parent_hash, MapSet.new()}, fn summary, {:ok, expected, seen} ->
         cond do
           not secure_equal(expected, summary.checkpoint_hash) ->
             {:halt, {:error, :invalid_checkpoint_snapshot}}
@@ -822,9 +870,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Snapshot do
     :crypto.hash(
       :sha256,
       @binding_domain <>
-        <<@binding_version, byte_size(current_bytes)::32, current_bytes::binary,
-          byte_size(accepted_bytes)::16, accepted_bytes::binary, truncated,
-          byte_size(ancestry_bytes)::32, ancestry_bytes::binary>>
+        <<@binding_version, byte_size(current_bytes)::32, current_bytes::binary, byte_size(accepted_bytes)::16,
+          accepted_bytes::binary, truncated, byte_size(ancestry_bytes)::32, ancestry_bytes::binary>>
     )
   end
 
@@ -835,8 +882,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Snapshot do
     :crypto.hash(
       :sha256,
       @legacy_binding_domain <>
-        <<@legacy_binding_version, byte_size(current_bytes)::32, current_bytes::binary,
-          byte_size(accepted_bytes)::16, accepted_bytes::binary>>
+        <<@legacy_binding_version, byte_size(current_bytes)::32, current_bytes::binary, byte_size(accepted_bytes)::16,
+          accepted_bytes::binary>>
     )
   end
 
@@ -860,12 +907,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Snapshot do
   defp encode_record_summary(:unknown), do: <<0xFF>>
 
   defp encode_record_summary(summary) do
-    {:ok, kind_code, _schema_version} = Contract.checkpoint_kind(summary.kind)
+    {:ok, kind_code} = Contract.checkpoint_schema(summary.kind, summary.schema_version)
 
     <<summary.device_id::binary-size(16), summary.origin_credential_epoch::32,
-      summary.origin_storage_epoch::binary-size(16), summary.sequence::64, kind_code,
-      summary.schema_version::16, summary.source_generation::64,
-      summary.parent_hash::binary-size(32), summary.content_hash::binary-size(32),
+      summary.origin_storage_epoch::binary-size(16), summary.sequence::64, kind_code, summary.schema_version::16,
+      summary.source_generation::64, summary.parent_hash::binary-size(32), summary.content_hash::binary-size(32),
       summary.checkpoint_hash::binary-size(32)>>
   end
 

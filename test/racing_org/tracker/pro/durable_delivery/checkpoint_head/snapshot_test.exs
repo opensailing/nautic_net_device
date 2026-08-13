@@ -2,7 +2,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.SnapshotTest do
   use ExUnit.Case, async: true
 
   alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.{Record, Snapshot}
+  alias RacingOrg.Tracker.Pro.Polar.Observer.{Bins, Gate}
+  alias RacingOrg.Tracker.Pro.Polar.Observer.Snapshot, as: PolarSnapshot
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime.Polar,
+    as: PolarRuntime
 
   @device_id Base.decode16!("0f1e2d3c4b5a69788796a5b4c3d2e1f0", case: :lower)
   @storage_epoch Base.decode16!("00112233445566778899aabbccddeeff", case: :lower)
@@ -312,8 +318,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.SnapshotTest do
     assert {:ok, local} =
              record(
                local_credential_epoch: 8,
-               local_storage_epoch:
-                 Base.decode16!("ffeeddccbbaa99887766554433221100", case: :lower),
+               local_storage_epoch: Base.decode16!("ffeeddccbbaa99887766554433221100", case: :lower),
                sequence: 2,
                source_generation: 43,
                parent_hash: accepted.checkpoint_hash
@@ -565,6 +570,113 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.SnapshotTest do
              Snapshot.build(current, forged_watermark, [forged_watermark])
   end
 
+  test "persists and exactly reopens a schema-valid record near the semantic cap" do
+    semantic_cap = Contract.max_checkpoint_content_size()
+    content = near_semantic_cap_polar_content()
+
+    assert {:ok, canonical} = Checkpoint.canonical_content(:polar, 2, content)
+    assert byte_size(canonical) == 8_285_599
+    assert byte_size(canonical) > semantic_cap - 262_144
+    assert byte_size(canonical) <= semantic_cap
+
+    assert {:ok, record} =
+             record(kind: :polar, schema_version: 2, content: canonical)
+
+    assert {:ok, snapshot} = Snapshot.build(record, nil)
+    assert {:ok, encoded} = Snapshot.encode(snapshot)
+    assert byte_size(encoded) == 8_286_230
+    assert byte_size(encoded) > semantic_cap - 262_144
+    assert byte_size(encoded) <= Snapshot.max_encoded_size()
+    assert Snapshot.max_encoded_size() == 9_843_832
+    assert {:ok, reopened} = Snapshot.decode(encoded)
+    assert reopened.current.content === canonical
+    assert reopened === snapshot
+  end
+
+  test "persists and exactly reopens near-cap content with maximum legal ancestry" do
+    max_entries = Snapshot.max_ancestry_entries()
+    assert {:ok, ancestor_content} = Checkpoint.canonical_content(:polar, 2, polar_content(1))
+    assert {:ok, ancestor_content_hash} = Checkpoint.content_hash(:polar, 2, ancestor_content)
+
+    {ancestors, parent_hash} =
+      Enum.map_reduce(1..max_entries, Record.genesis_parent(), fn sequence, parent_hash ->
+        assert {:ok, checkpoint_hash} =
+                 Checkpoint.hash(%{
+                   device_id: @device_id,
+                   credential_epoch: 7,
+                   storage_epoch: @storage_epoch,
+                   sequence: sequence,
+                   kind: :polar,
+                   schema_version: 2,
+                   source_generation: sequence,
+                   parent_hash: parent_hash,
+                   content_hash: ancestor_content_hash
+                 })
+
+        summary = %{
+          device_id: @device_id,
+          origin_credential_epoch: 7,
+          origin_storage_epoch: @storage_epoch,
+          sequence: sequence,
+          kind: :polar,
+          schema_version: 2,
+          source_generation: sequence,
+          parent_hash: parent_hash,
+          content_hash: ancestor_content_hash,
+          checkpoint_hash: checkpoint_hash
+        }
+
+        {summary, checkpoint_hash}
+      end)
+
+    assert {:ok, canonical} =
+             Checkpoint.canonical_content(:polar, 2, near_semantic_cap_polar_content())
+
+    assert byte_size(canonical) == 8_285_599
+
+    assert {:ok, current} =
+             record(
+               kind: :polar,
+               schema_version: 2,
+               content: canonical,
+               sequence: max_entries + 1,
+               source_generation: max_entries + 1,
+               parent_hash: parent_hash
+             )
+
+    ancestry = Enum.reverse(ancestors)
+
+    assert length(ancestry) == max_entries
+    assert {:ok, snapshot} = Snapshot.build(current, nil, ancestry)
+    assert {:ok, encoded} = Snapshot.encode(snapshot)
+    assert byte_size(encoded) > Contract.max_checkpoint_content_size() + 4_096
+    assert byte_size(encoded) <= Snapshot.max_encoded_size()
+    assert {:ok, reopened} = Snapshot.decode(encoded)
+    assert reopened.current.content === canonical
+    assert reopened.ancestry === ancestry
+    assert reopened === snapshot
+  end
+
+  test "binds record summaries to their explicit runtime schema" do
+    content = runtime_polar_content()
+    assert {:ok, parent} = record(kind: :polar, schema_version: 3, content: content)
+    assert {:ok, summary} = Snapshot.record_summary(parent)
+
+    assert {:ok, current} =
+             record(
+               kind: :polar,
+               schema_version: 3,
+               content: content,
+               sequence: 2,
+               source_generation: 43,
+               parent_hash: parent.checkpoint_hash
+             )
+
+    assert {:ok, snapshot} = Snapshot.build(current, nil, [summary])
+    assert {:ok, encoded} = Snapshot.encode(snapshot)
+    assert {:ok, ^snapshot} = Snapshot.decode(encoded)
+  end
+
   test "decodes maximum-size legacy records concurrently within the deadline" do
     assert {:ok, legacy} =
              record(
@@ -642,9 +754,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.SnapshotTest do
             accepted_bytes::binary>>
       )
 
-    :erlang.term_to_binary(
-      {2, :checkpoint_head_snapshot, Map.put(snapshot, :snapshot_hash, hash)}
-    )
+    :erlang.term_to_binary({2, :checkpoint_head_snapshot, Map.put(snapshot, :snapshot_hash, hash)})
   end
 
   defp encode_summary(nil), do: <<>>
@@ -654,10 +764,68 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.SnapshotTest do
     {:ok, kind_code, _schema_version} = Contract.checkpoint_kind(summary.kind)
 
     <<summary.device_id::binary-size(16), summary.origin_credential_epoch::32,
-      summary.origin_storage_epoch::binary-size(16), summary.sequence::64, kind_code,
-      summary.schema_version::16, summary.source_generation::64,
-      summary.parent_hash::binary-size(32), summary.content_hash::binary-size(32),
+      summary.origin_storage_epoch::binary-size(16), summary.sequence::64, kind_code, summary.schema_version::16,
+      summary.source_generation::64, summary.parent_hash::binary-size(32), summary.content_hash::binary-size(32),
       summary.checkpoint_hash::binary-size(32)>>
+  end
+
+  defp near_semantic_cap_polar_content, do: polar_content(36_500)
+
+  defp polar_content(cell_count) do
+    %{
+      "cells" =>
+        for tws_bin <- 0..(cell_count - 1) do
+          %{
+            "count" => 5,
+            "quantile" => %{
+              "buffer" => [],
+              "n" => [2, 3, 4],
+              "np" => [1.0, 2.8, 4.6, 4.8, 5.0],
+              "q" => [1.0, 2.0, 3.0, 4.0, 5.0]
+            },
+            "twa_bin" => rem(tws_bin, 72),
+            "tws_bin" => tws_bin
+          }
+        end,
+      "max_tws_mps" => 65_535.0,
+      "p" => 0.9,
+      "twa_width_deg" => 2.5,
+      "tws_width_mps" => 1.0
+    }
+  end
+
+  defp runtime_polar_content do
+    bins = Bins.new()
+    gate = Gate.new(min_dwell: 1)
+    assert {:ok, admission_hash} = PolarSnapshot.policy_hash(gate, 0.3, 1, 0.9)
+    assert {:ok, learner} = PolarSnapshot.capture("boat-runtime", admission_hash, bins, 0.9, 10, %{})
+
+    internal = %{
+      version: 1,
+      captured_at_utc_ms: 1_786_536_000_000,
+      authority: %{boat_identifier: "boat-runtime"},
+      policy: %{
+        admission_hash: admission_hash,
+        gate: Map.from_struct(gate),
+        min_stw_mps: 0.3,
+        window_size: 1,
+        p: 0.9,
+        sample_ms: 60_000,
+        sync_ms: 60_000,
+        persist_ms: 60_000,
+        persistence_enabled: true,
+        bins: Map.from_struct(bins)
+      },
+      learner: %{source_generation: 10, content: learner},
+      upstream_seq: 41,
+      window: [],
+      sync: %{dirty_keys: [], last_sync_age_ms: 45_000},
+      persistence_phase: %{dirty_keys: [], force: true, last_persist_age_ms: 30_000},
+      tick: %{remaining_ms: 45_000}
+    }
+
+    assert {:ok, content} = PolarRuntime.project(internal)
+    content
   end
 
   defp maximum_wind_shift_content do

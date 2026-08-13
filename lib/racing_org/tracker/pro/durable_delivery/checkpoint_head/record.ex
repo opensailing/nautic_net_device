@@ -52,9 +52,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   @u32_max 0xFFFF_FFFF
   @database_int_max 9_223_372_036_854_775_807
   @genesis_parent <<0::256>>
-  @max_encoded_size Contract.max_checkpoint_size() + 4_096
-  @decode_timeout_ms 5_000
-  @decode_max_heap_words 1_000_000
+  @max_encoded_size Contract.max_checkpoint_content_size() + 4_096
+  @decode_timeout_ms 30_000
+  @decode_max_heap_words 64_000_000
 
   @build_keys [
     :device_id,
@@ -145,8 +145,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
          :ok <- database_int(attrs.source_generation, :invalid_source_generation),
          :ok <- fixed_binary(attrs.parent_hash, @hash_size, :invalid_parent_hash),
          :ok <- boolean(attrs.accepted, :invalid_acceptance),
-         {:ok, content} <- canonical_content(attrs.kind, attrs.schema_version, attrs.content),
-         {:ok, content_hash} <- Checkpoint.content_hash(attrs.kind, attrs.schema_version, content),
+         {:ok, content, content_hash} <-
+           canonical_content(attrs.kind, attrs.schema_version, attrs.content),
+         :ok <-
+           Checkpoint.validate_authority(attrs.kind, attrs.schema_version, content, %{
+             device_id: attrs.device_id,
+             credential_epoch: attrs.origin_credential_epoch,
+             storage_epoch: attrs.origin_storage_epoch
+           }),
          {:ok, checkpoint_hash} <- record_hash(attrs, content_hash) do
       record =
         %{
@@ -361,8 +367,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
       :sha256,
       @binding_domain <>
         <<@binding_version, Contract.version(), record.device_id::binary-size(@device_id_size),
-          record.local_credential_epoch::32,
-          record.local_storage_epoch::binary-size(@storage_epoch_size), accepted,
+          record.local_credential_epoch::32, record.local_storage_epoch::binary-size(@storage_epoch_size), accepted,
           record.checkpoint_hash::binary-size(@hash_size)>>
     )
   end
@@ -373,23 +378,36 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record do
   # are always identical.
   defp canonical_content(kind, schema_version, content) when is_binary(content) do
     with {:ok, decoded} <-
-           normalize_content_error(Checkpoint.decode_content(kind, schema_version, content)),
+           normalize_content_error(Checkpoint.decode_canonical_content(kind, schema_version, content)),
          {:ok, canonical} <-
-           normalize_content_error(Checkpoint.encode_content(kind, schema_version, decoded)) do
+           normalize_content_error(Checkpoint.canonical_content(kind, schema_version, decoded)) do
       if canonical == content,
-        do: {:ok, canonical},
+        do: content_with_hash(kind, schema_version, canonical),
         else: {:error, :noncanonical_checkpoint_content}
     end
   end
 
-  defp canonical_content(kind, schema_version, content) when is_map(content),
-    do: normalize_content_error(Checkpoint.encode_content(kind, schema_version, content))
+  defp canonical_content(kind, schema_version, content) when is_map(content) do
+    with {:ok, canonical} <-
+           normalize_content_error(Checkpoint.canonical_content(kind, schema_version, content)) do
+      content_with_hash(kind, schema_version, canonical)
+    end
+  end
 
   defp canonical_content(kind, schema_version, _content) do
-    case Contract.checkpoint_kind(kind) do
-      {:ok, _code, ^schema_version} -> {:error, :invalid_checkpoint_content}
-      {:ok, _code, _expected} -> {:error, :unsupported_checkpoint_schema}
+    case Contract.checkpoint_schema(kind, schema_version) do
+      {:ok, _code} -> {:error, :invalid_checkpoint_content}
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp content_with_hash(kind, schema_version, canonical) do
+    with {:ok, kind_code} <- Contract.checkpoint_schema(kind, schema_version) do
+      preimage =
+        Contract.checkpoint_content_hash_domain() <>
+          <<Contract.version(), kind_code, schema_version::16, byte_size(canonical)::64, canonical::binary>>
+
+      {:ok, canonical, :crypto.hash(:sha256, preimage)}
     end
   end
 
