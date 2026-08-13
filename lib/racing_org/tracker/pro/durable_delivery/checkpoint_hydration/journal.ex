@@ -30,9 +30,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Journal do
   @u32_max 0xFFFF_FFFF
   @u64_max 0xFFFF_FFFF_FFFF_FFFF
   @database_int_max 9_223_372_036_854_775_807
-  @max_encoded_size Contract.max_checkpoint_size() + 4_096
-  @decode_timeout_ms 1_000
-  @decode_max_heap_words 1_000_000
+  @max_encoded_size Contract.max_checkpoint_content_size() + 4_096
+  @read_chunk_size 16_384
+  @read_retry_count 2
+  @decode_timeout_ms 30_000
+  @decode_max_heap_words 64_000_000
   @lock_wait_ms 1_000
   @lock_retry_ms 2
 
@@ -103,15 +105,186 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Journal do
   def read(path, opts \\ [])
 
   def read(path, opts) when is_binary(path) and path != "" and is_list(opts) do
-    case safe_fs_call(file_system(opts), :read, [path]) do
-      {:ok, bytes} when is_binary(bytes) -> decode(bytes)
-      {:error, :enoent} -> :empty
-      {:error, reason} -> {:error, {:checkpoint_hydration_journal_io, reason}}
-      _other -> {:error, {:checkpoint_hydration_journal_io, :invalid_read_response}}
+    fs = file_system(opts)
+
+    if bounded_file_system?(fs) do
+      read_bounded(fs, path, @read_retry_count)
+    else
+      {:error, :checkpoint_hydration_journal_bounded_read_unsupported}
     end
   end
 
   def read(_path, _opts), do: {:error, :invalid_checkpoint_hydration_journal_path}
+
+  defp read_bounded(fs, path, retries_remaining) do
+    result = read_bounded_now(fs, path)
+
+    if retries_remaining > 0 and
+         result == {:error, {:checkpoint_hydration_journal_io, :file_changed_during_read}} do
+      case read_bounded(fs, path, retries_remaining - 1) do
+        :empty -> result
+        later_result -> later_result
+      end
+    else
+      result
+    end
+  end
+
+  defp read_bounded_now(fs, path) do
+    case safe_fs_call(fs, :lstat, [path]) do
+      {:ok, %File.Stat{type: :regular} = stat} ->
+        with :ok <- validate_regular_stat(stat, :invalid_lstat_response),
+             {:ok, bytes} <- read_regular_file(fs, path, stat) do
+          decode(bytes)
+        end
+
+      {:ok, %File.Stat{}} ->
+        {:error, :corrupt_checkpoint_hydration_journal}
+
+      {:error, :enoent} ->
+        :empty
+
+      {:error, reason} ->
+        {:error, {:checkpoint_hydration_journal_io, reason}}
+
+      _other ->
+        {:error, {:checkpoint_hydration_journal_io, :invalid_lstat_response}}
+    end
+  end
+
+  defp read_regular_file(fs, path, path_stat) do
+    case safe_fs_call(fs, :open, [path, [:read, :binary, :raw]]) do
+      {:ok, device} ->
+        result = read_open_device(fs, path, device, path_stat)
+        close_result = safe_fs_call(fs, :close, [device])
+
+        case {result, close_result} do
+          {{:ok, _bytes} = ok, :ok} -> ok
+          {{:error, _reason} = error, _close_result} -> error
+          {_result, {:error, reason}} -> {:error, {:checkpoint_hydration_journal_io, reason}}
+          {_result, _other} -> {:error, {:checkpoint_hydration_journal_io, :invalid_close_response}}
+        end
+
+      {:error, reason} ->
+        {:error, {:checkpoint_hydration_journal_io, reason}}
+
+      _other ->
+        {:error, {:checkpoint_hydration_journal_io, :invalid_open_response}}
+    end
+  end
+
+  defp read_open_device(fs, path, device, path_stat) do
+    with {:ok, descriptor_stat} <- regular_descriptor_info(fs, device),
+         :ok <- verify_same_file(path_stat, descriptor_stat),
+         true <- descriptor_stat.size <= @max_encoded_size,
+         :ok <- revalidate_open_path(fs, path, descriptor_stat),
+         {:ok, chunks, total} <- read_chunks(fs, device, @max_encoded_size + 1, [], 0),
+         true <- total <= @max_encoded_size,
+         :ok <- verify_read_total(total, descriptor_stat.size),
+         {:ok, final_stat} <- regular_descriptor_info(fs, device),
+         :ok <- verify_same_file(descriptor_stat, final_stat),
+         :ok <- revalidate_open_path(fs, path, final_stat) do
+      {:ok, chunks |> Enum.reverse() |> IO.iodata_to_binary()}
+    else
+      false -> {:error, :corrupt_checkpoint_hydration_journal}
+      {:error, :corrupt_checkpoint_hydration_journal} = error -> error
+      {:error, {:checkpoint_hydration_journal_io, _reason}} = error -> error
+      {:error, reason} -> {:error, {:checkpoint_hydration_journal_io, reason}}
+    end
+  end
+
+  defp regular_descriptor_info(fs, device) do
+    case safe_fs_call(fs, :file_info, [device]) do
+      {:ok, %File.Stat{type: :regular} = stat} ->
+        with :ok <- validate_regular_stat(stat, :invalid_file_info_response), do: {:ok, stat}
+
+      {:ok, %File.Stat{}} ->
+        {:error, :corrupt_checkpoint_hydration_journal}
+
+      {:error, reason} ->
+        {:error, {:checkpoint_hydration_journal_io, reason}}
+
+      _other ->
+        {:error, {:checkpoint_hydration_journal_io, :invalid_file_info_response}}
+    end
+  end
+
+  defp revalidate_open_path(fs, path, descriptor_stat) do
+    case safe_fs_call(fs, :lstat, [path]) do
+      {:ok, %File.Stat{type: :regular} = path_stat} ->
+        with :ok <- validate_regular_stat(path_stat, :invalid_lstat_response) do
+          verify_same_file(path_stat, descriptor_stat)
+        end
+
+      {:ok, %File.Stat{}} ->
+        {:error, {:checkpoint_hydration_journal_io, :file_changed_during_read}}
+
+      {:error, reason} ->
+        {:error, {:checkpoint_hydration_journal_io, reason}}
+
+      _other ->
+        {:error, {:checkpoint_hydration_journal_io, :invalid_lstat_response}}
+    end
+  end
+
+  defp validate_regular_stat(%File.Stat{} = stat, error) do
+    if non_negative_integer?(stat.size) and non_negative_integer?(stat.inode) and
+         non_negative_integer?(stat.major_device) and non_negative_integer?(stat.minor_device) do
+      :ok
+    else
+      {:error, {:checkpoint_hydration_journal_io, error}}
+    end
+  end
+
+  defp non_negative_integer?(value), do: is_integer(value) and value >= 0
+
+  defp verify_read_total(total, expected) when total == expected, do: :ok
+
+  defp verify_read_total(total, expected) when total < expected,
+    do: {:error, {:checkpoint_hydration_journal_io, :premature_eof}}
+
+  defp verify_read_total(_total, _expected),
+    do: {:error, {:checkpoint_hydration_journal_io, :file_changed_during_read}}
+
+  defp verify_same_file(left, right) do
+    if same_file_identity?(left, right) and left.size == right.size,
+      do: :ok,
+      else: {:error, {:checkpoint_hydration_journal_io, :file_changed_during_read}}
+  end
+
+  defp same_file_identity?(left, right) do
+    left.inode == right.inode and
+      left.major_device == right.major_device and
+      left.minor_device == right.minor_device
+  end
+
+  defp read_chunks(_fs, _device, 0, chunks, total), do: {:ok, chunks, total}
+
+  defp read_chunks(fs, device, remaining, chunks, total) when remaining > 0 do
+    count = min(remaining, @read_chunk_size)
+
+    case safe_fs_call(fs, :read, [device, count]) do
+      {:ok, bytes} when is_binary(bytes) and byte_size(bytes) > 0 and byte_size(bytes) <= count ->
+        size = byte_size(bytes)
+        read_chunks(fs, device, remaining - size, [bytes | chunks], total + size)
+
+      :eof ->
+        {:ok, chunks, total}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _other ->
+        {:error, :invalid_read_response}
+    end
+  end
+
+  defp bounded_file_system?(fs) do
+    Code.ensure_loaded?(fs) and
+      Enum.all?([{:lstat, 1}, {:open, 2}, {:file_info, 1}, {:read, 2}, {:close, 1}], fn {callback, arity} ->
+        function_exported?(fs, callback, arity)
+      end)
+  end
 
   @doc """
   Create or durably rewrite one journal transition.
@@ -276,8 +449,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Journal do
 
   defp validate_hydration(hydration, target) when is_map(hydration) do
     with :ok <- exact_keys(hydration, @hydration_keys),
-         {:ok, _kind_code, schema_version} <- Contract.checkpoint_kind(Map.get(hydration, :kind)),
-         true <- schema_version == Map.get(hydration, :schema_version),
+         schema_version <- Map.get(hydration, :schema_version),
+         {:ok, _kind_code} <-
+           Contract.checkpoint_schema(Map.get(hydration, :kind), schema_version),
          :ok <- u32(Map.get(hydration, :origin_credential_epoch)),
          :ok <- nonzero_identifier(Map.get(hydration, :origin_storage_epoch)),
          :ok <- positive_database_int(Map.get(hydration, :revision)),
@@ -286,6 +460,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Journal do
          :ok <- fixed_binary(Map.get(hydration, :content_hash), @hash_size),
          :ok <- fixed_binary(Map.get(hydration, :checkpoint_hash), @hash_size),
          {:ok, content} <- canonical_content(hydration),
+         :ok <-
+           Checkpoint.validate_authority(hydration.kind, schema_version, content, %{
+             device_id: target.device_id,
+             credential_epoch: hydration.origin_credential_epoch,
+             storage_epoch: hydration.origin_storage_epoch
+           }),
          {:ok, content_hash} <- Checkpoint.content_hash(hydration.kind, schema_version, content),
          true <- secure_equal(content_hash, hydration.content_hash),
          {:ok, checkpoint_hash} <- hydration_hash(target, hydration, content_hash),
@@ -313,9 +493,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Journal do
 
   defp canonical_content(%{content: content} = hydration) when is_binary(content) do
     with {:ok, decoded} <-
-           Checkpoint.decode_content(hydration.kind, hydration.schema_version, content),
+           Checkpoint.decode_canonical_content(hydration.kind, hydration.schema_version, content),
          {:ok, canonical} <-
-           Checkpoint.encode_content(hydration.kind, hydration.schema_version, decoded),
+           Checkpoint.canonical_content(hydration.kind, hydration.schema_version, decoded),
          true <- secure_equal(canonical, content) do
       {:ok, canonical}
     else

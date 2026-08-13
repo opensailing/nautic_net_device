@@ -1,36 +1,52 @@
 defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest do
   use ExUnit.Case, async: false
 
+  alias RacingOrg.Tracker.Pro.Calibration.Observer, as: CalibrationObserver
   alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record
   alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Journal
+  alias RacingOrg.Tracker.Pro.Polar.Observer.{Bins, Gate}
+  alias RacingOrg.Tracker.Pro.Polar.Observer.Snapshot, as: PolarSnapshot
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime.Calibration,
+    as: CalibrationRuntime
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime.Polar,
+    as: PolarRuntime
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime.WindShift,
+    as: WindShiftRuntime
+
+  alias RacingOrg.Tracker.Pro.WindShift.Observer, as: WindShiftObserver
 
   @device_id Base.decode16!("0f1e2d3c4b5a69788796a5b4c3d2e1f0", case: :lower)
   @storage_epoch Base.decode16!("00112233445566778899aabbccddeeff", case: :lower)
   @origin_storage_epoch Base.decode16!("ffeeddccbbaa99887766554433221100", case: :lower)
+  @replacement_storage_epoch Base.decode16!("102132435465768798a9bacbdcedfe0f", case: :lower)
   @session_incarnation Base.decode16!("102132435465768798a9bacbdcedfe0f", case: :lower)
   @transaction_id Base.decode16!("98badcfe1032547698badcfe10325476", case: :lower)
 
   defmodule BlockingReadFileSystem do
     alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
 
-    def read(path) do
+    def lstat(path) do
       case :persistent_term.get(__MODULE__, nil) do
         pid when is_pid(pid) ->
+          :persistent_term.erase(__MODULE__)
           send(pid, {:journal_read_started, self()})
 
           receive do
-            :continue_journal_read -> FileSystem.read(path)
+            :continue_journal_read -> FileSystem.lstat(path)
           end
 
         _other ->
-          FileSystem.read(path)
+          FileSystem.lstat(path)
       end
     end
 
     defdelegate read(device, count), to: FileSystem
     defdelegate file_info(device), to: FileSystem
-    defdelegate lstat(path), to: FileSystem
     defdelegate mkdir_p(path), to: FileSystem
     defdelegate mkdir(path), to: FileSystem
     defdelegate chmod(path, mode), to: FileSystem
@@ -41,6 +57,161 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
     defdelegate rename(source, destination), to: FileSystem
     defdelegate remove(path), to: FileSystem
     defdelegate rmdir(path), to: FileSystem
+  end
+
+  defmodule IncompleteBoundedReadFileSystem do
+    alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
+
+    def read(path) do
+      if owner = :persistent_term.get(__MODULE__, nil), do: send(owner, :journal_path_read_invoked)
+      FileSystem.read(path)
+    end
+  end
+
+  defmodule BoundedReadFileSystem do
+    alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
+
+    defdelegate read(device, count), to: FileSystem
+    defdelegate file_info(device), to: FileSystem
+    defdelegate lstat(path), to: FileSystem
+    defdelegate open(path, modes), to: FileSystem
+    defdelegate close(device), to: FileSystem
+  end
+
+  defmodule ProbedBoundedReadFileSystem do
+    alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Journal
+    alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
+
+    def lstat(path) do
+      with {:ok, stat} <- FileSystem.lstat(path) do
+        {:ok, %{stat | size: Journal.max_encoded_size()}}
+      end
+    end
+
+    def file_info(device) do
+      with {:ok, stat} <- FileSystem.file_info(device) do
+        {:ok, %{stat | size: Journal.max_encoded_size()}}
+      end
+    end
+
+    def read(device, count) do
+      case :persistent_term.get(__MODULE__, nil) do
+        {owner, counter} ->
+          :atomics.add(counter, 1, 1)
+          :atomics.add(counter, 2, count)
+          send(owner, {:journal_descriptor_read, count})
+
+        _other ->
+          :ok
+      end
+
+      FileSystem.read(device, count)
+    end
+
+    defdelegate open(path, modes), to: FileSystem
+    defdelegate close(device), to: FileSystem
+  end
+
+  defmodule FaultyBoundedReadFileSystem do
+    alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
+
+    def read(device, count) do
+      case :persistent_term.get(__MODULE__) do
+        {owner, :oversized_chunk} ->
+          send(owner, {:journal_read_fault, :oversized_chunk, count})
+          {:ok, :binary.copy(<<0xAA>>, count + 1)}
+
+        {owner, :premature_eof} ->
+          send(owner, {:journal_read_fault, :premature_eof, count})
+          :eof
+
+        {_owner, _mode} ->
+          FileSystem.read(device, count)
+      end
+    end
+
+    def file_info(device) do
+      case :persistent_term.get(__MODULE__) do
+        {_owner, :malformed_file_info} -> {:ok, %File.Stat{size: -1, type: :regular}}
+        {_owner, _mode} -> FileSystem.file_info(device)
+      end
+    end
+
+    def lstat(path) do
+      case :persistent_term.get(__MODULE__) do
+        {_owner, :malformed_lstat} -> {:ok, %File.Stat{size: -1, type: :regular}}
+        {_owner, _mode} -> FileSystem.lstat(path)
+      end
+    end
+
+    defdelegate open(path, modes), to: FileSystem
+
+    def close(device) do
+      {owner, mode} = :persistent_term.get(__MODULE__)
+      result = FileSystem.close(device)
+      send(owner, {:journal_descriptor_closed, mode, result})
+      result
+    end
+  end
+
+  defmodule ReplacingBoundedReadFileSystem do
+    alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
+
+    def read(device, count) do
+      result = FileSystem.read(device, count)
+
+      case {:persistent_term.get(__MODULE__), result} do
+        {{owner, path, replacements} = state, {:ok, bytes}} when replacements == :always or replacements > 0 ->
+          remaining = if replacements == :always, do: :always, else: replacements - 1
+          :persistent_term.put(__MODULE__, put_elem(state, 2, remaining))
+          replacement = path <> ".replacement.#{System.unique_integer([:positive])}"
+          File.write!(replacement, File.read!(path))
+          File.rename!(replacement, path)
+          send(owner, {:journal_path_replaced, byte_size(bytes)})
+
+        _other ->
+          :ok
+      end
+
+      result
+    end
+
+    defdelegate file_info(device), to: FileSystem
+    defdelegate lstat(path), to: FileSystem
+    defdelegate open(path, modes), to: FileSystem
+    defdelegate close(device), to: FileSystem
+  end
+
+  defmodule SymlinkSwapFileSystem do
+    alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
+
+    defdelegate read(device, count), to: FileSystem
+    defdelegate file_info(device), to: FileSystem
+
+    def lstat(path) do
+      case :persistent_term.get(__MODULE__, nil) do
+        nil ->
+          FileSystem.lstat(path)
+
+        {owner, target} ->
+          result = FileSystem.lstat(path)
+          :persistent_term.erase(__MODULE__)
+          :persistent_term.put({__MODULE__, :owner}, owner)
+          File.rename!(path, path <> ".before-swap")
+          File.ln_s!(target, path)
+          send(owner, :journal_path_replaced_by_symlink)
+          result
+      end
+    end
+
+    defdelegate open(path, modes), to: FileSystem
+
+    def close(device) do
+      owner = :persistent_term.get({__MODULE__, :owner})
+      result = FileSystem.close(device)
+      send(owner, {:journal_symlink_descriptor_closed, result})
+      result
+    end
   end
 
   setup do
@@ -58,6 +229,85 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
     assert {:ok, ^record} = Journal.read(path)
     assert File.stat!(path).mode |> Bitwise.band(0o777) == 0o600
     assert File.stat!(Path.dirname(path)).mode |> Bitwise.band(0o777) == 0o700
+  end
+
+  test "fails closed when an adapter cannot provide bounded descriptor reads", %{path: path} do
+    assert :ok = Journal.write(path, transition())
+    :persistent_term.put(IncompleteBoundedReadFileSystem, self())
+    on_exit(fn -> :persistent_term.erase(IncompleteBoundedReadFileSystem) end)
+
+    assert {:error, :checkpoint_hydration_journal_bounded_read_unsupported} =
+             Journal.read(path, file_system: IncompleteBoundedReadFileSystem)
+
+    refute_receive :journal_path_read_invoked
+  end
+
+  test "reads through an adapter exposing only the bounded descriptor callbacks", %{path: path} do
+    record = transition()
+    assert :ok = Journal.write(path, record)
+
+    assert {:ok, ^record} = Journal.read(path, file_system: BoundedReadFileSystem)
+  end
+
+  test "reads no more than max encoded size plus one through bounded chunks", %{path: path} do
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, :binary.copy(<<0>>, Journal.max_encoded_size() + 1))
+    counter = :atomics.new(2, signed: false)
+    :persistent_term.put(ProbedBoundedReadFileSystem, {self(), counter})
+    on_exit(fn -> :persistent_term.erase(ProbedBoundedReadFileSystem) end)
+
+    assert {:error, :corrupt_checkpoint_hydration_journal} =
+             Journal.read(path, file_system: ProbedBoundedReadFileSystem)
+
+    assert :atomics.get(counter, 1) > 200
+    assert :atomics.get(counter, 2) == Journal.max_encoded_size() + 1
+    assert_receive {:journal_descriptor_read, count}
+    assert count > 0
+    assert count <= 16_384
+  end
+
+  test "binds Wind runtime authority to hydration origin while permitting target rotation", %{
+    path: path
+  } do
+    content = runtime_wind_shift_content()
+    assert {:ok, content} = Checkpoint.encode_content(:wind_shift, 2, content)
+
+    valid =
+      transition()
+      |> put_in([:target, :credential_epoch], 8)
+      |> put_in([:target, :storage_epoch], @replacement_storage_epoch)
+      |> Map.put(
+        :hydration,
+        hydration(
+          kind: :wind_shift,
+          schema_version: 2,
+          origin_credential_epoch: 7,
+          origin_storage_epoch: @storage_epoch,
+          content: content,
+          content_hash: checkpoint_content_hash(:wind_shift, 2, content)
+        )
+      )
+      |> rebuild_hydration_hash()
+
+    assert :ok = Journal.write(path, valid)
+    assert {:ok, ^valid} = Journal.read(path)
+
+    assert :ok = Journal.remove(path)
+
+    for invalid <- [
+          valid
+          |> put_in([:target, :device_id], <<0xAA::128>>)
+          |> rebuild_hydration_hash(),
+          valid
+          |> put_in([:hydration, :origin_credential_epoch], 8)
+          |> rebuild_hydration_hash(),
+          valid
+          |> put_in([:hydration, :origin_storage_epoch], @origin_storage_epoch)
+          |> rebuild_hydration_hash()
+        ] do
+      assert {:error, :invalid_checkpoint_hydration_journal} = Journal.write(path, invalid)
+      refute File.exists?(path)
+    end
   end
 
   test "advances prepared to head-committed and permits exact idempotent rewrites", %{path: path} do
@@ -252,6 +502,40 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
     assert restored.hydration.parent_hash == Record.genesis_parent()
   end
 
+  test "writes and explicitly reopens every exact runtime schema", %{path: path} do
+    for {{kind, schema_version, content}, index} <- Enum.with_index(runtime_schema_fixtures(), 1) do
+      current_path = path <> ".runtime.#{kind}"
+      assert {:ok, canonical} = Checkpoint.canonical_content(kind, schema_version, content)
+      content_hash = checkpoint_content_hash(kind, schema_version, canonical)
+
+      origin =
+        if kind == :wind_shift,
+          do: [origin_credential_epoch: 7, origin_storage_epoch: @storage_epoch],
+          else: []
+
+      record =
+        transition()
+        |> Map.put(:transaction_id, transaction_id({kind, schema_version}))
+        |> put_in(
+          [:hydration],
+          hydration(
+            origin ++
+              [
+                kind: kind,
+                schema_version: schema_version,
+                revision: index,
+                source_generation: 88 + index,
+                content: canonical,
+                content_hash: content_hash
+              ]
+          )
+        )
+
+      assert :ok = Journal.write(current_path, record)
+      assert {:ok, ^record} = Journal.read(current_path)
+    end
+  end
+
   test "rejects unknown kinds, schema versions, malformed hashes, and excessive content", %{path: path} do
     invalid_records = [
       put_in(transition(), [:hydration, :kind], :telemetry),
@@ -266,6 +550,63 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
       assert {:error, :invalid_checkpoint_hydration_journal} = Journal.write(path, invalid)
       refute File.exists?(path)
     end
+  end
+
+  test "persists a schema-valid hydration beyond the single-frame carriage cap", %{path: path} do
+    content = large_polar_content()
+    assert {:ok, canonical} = Checkpoint.canonical_content(:polar, 2, content)
+    assert byte_size(canonical) > Contract.max_checkpoint_size()
+    assert byte_size(canonical) <= Contract.max_checkpoint_content_size()
+
+    content_hash = checkpoint_content_hash(:polar, 2, canonical)
+
+    hydration =
+      hydration(
+        kind: :polar,
+        schema_version: 2,
+        content: canonical,
+        content_hash: content_hash
+      )
+
+    record = put_in(transition(), [:hydration], hydration)
+
+    assert :ok = Journal.write(path, record)
+    assert {:ok, ^record} = Journal.read(path)
+  end
+
+  test "persists and exactly reopens canonical hydration near the semantic cap", %{path: path} do
+    semantic_cap = Contract.max_checkpoint_content_size()
+    content = near_semantic_cap_polar_content()
+
+    assert {:ok, canonical} = Checkpoint.canonical_content(:polar, 2, content)
+    assert byte_size(canonical) > semantic_cap - 262_144
+    assert byte_size(canonical) <= semantic_cap
+
+    content_hash = checkpoint_content_hash(:polar, 2, canonical)
+
+    hydration =
+      hydration(
+        kind: :polar,
+        schema_version: 2,
+        content: canonical,
+        content_hash: content_hash
+      )
+
+    record = put_in(transition(), [:hydration], hydration)
+
+    assert :ok = Journal.write(path, record)
+
+    persisted = File.read!(path)
+    assert byte_size(canonical) == 8_285_599
+    assert byte_size(persisted) == 8_286_277
+    assert byte_size(persisted) > semantic_cap - 262_144
+    assert byte_size(persisted) <= Journal.max_encoded_size()
+
+    assert {:ok, reopened} = Journal.read(path)
+    assert reopened.hydration.content === canonical
+    assert reopened.hydration.content_hash === record.hydration.content_hash
+    assert reopened.hydration.checkpoint_hash === record.hydration.checkpoint_hash
+    assert reopened === record
   end
 
   test "rejects noncanonical content and hashes that do not bind the envelope", %{path: path} do
@@ -331,11 +672,83 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
     assert {:error, :corrupt_checkpoint_hydration_journal} = Task.await(task, 2_000)
   end
 
-  test "classifies read and atomic persistence failures deterministically", %{path: path} do
-    directory_path = Path.join(path, "not-a-file")
+  test "rejects non-regular paths and a symlink substituted after lstat", %{path: path} do
+    directory_path = path <> ".directory"
     File.mkdir_p!(directory_path)
-    assert {:error, {:checkpoint_hydration_journal_io, :eisdir}} = Journal.read(directory_path)
+    assert {:error, :corrupt_checkpoint_hydration_journal} = Journal.read(directory_path)
 
+    assert :ok = Journal.write(path, transition())
+    target_path = path <> ".target"
+    File.cp!(path, target_path)
+    File.rm!(path)
+    File.ln_s!(target_path, path)
+    assert {:error, :corrupt_checkpoint_hydration_journal} = Journal.read(path)
+
+    File.rm!(path)
+    File.cp!(target_path, path)
+    :persistent_term.put(SymlinkSwapFileSystem, {self(), target_path})
+
+    on_exit(fn ->
+      :persistent_term.erase(SymlinkSwapFileSystem)
+      :persistent_term.erase({SymlinkSwapFileSystem, :owner})
+    end)
+
+    assert {:error, :corrupt_checkpoint_hydration_journal} =
+             Journal.read(path, file_system: SymlinkSwapFileSystem)
+
+    assert_receive :journal_path_replaced_by_symlink
+    assert_receive {:journal_symlink_descriptor_closed, :ok}
+  end
+
+  test "closes descriptors for malformed metadata, premature eof, and oversized chunks", %{path: path} do
+    assert :ok = Journal.write(path, transition())
+
+    for mode <- [:malformed_file_info, :premature_eof, :oversized_chunk] do
+      :persistent_term.put(FaultyBoundedReadFileSystem, {self(), mode})
+
+      assert {:error, expected} = Journal.read(path, file_system: FaultyBoundedReadFileSystem)
+
+      assert expected in [
+               :corrupt_checkpoint_hydration_journal,
+               {:checkpoint_hydration_journal_io, :invalid_file_info_response},
+               {:checkpoint_hydration_journal_io, :premature_eof},
+               {:checkpoint_hydration_journal_io, :invalid_read_response}
+             ]
+
+      assert_receive {:journal_descriptor_closed, ^mode, :ok}
+    end
+
+    :persistent_term.erase(FaultyBoundedReadFileSystem)
+  end
+
+  test "retries benign path replacement and fails closed when the path never stabilizes", %{path: path} do
+    record = transition()
+    assert :ok = Journal.write(path, record)
+    :persistent_term.put(ReplacingBoundedReadFileSystem, {self(), path, 1})
+    on_exit(fn -> :persistent_term.erase(ReplacingBoundedReadFileSystem) end)
+
+    assert {:ok, ^record} = Journal.read(path, file_system: ReplacingBoundedReadFileSystem)
+    assert_receive {:journal_path_replaced, _bytes}
+
+    :persistent_term.put(ReplacingBoundedReadFileSystem, {self(), path, :always})
+
+    assert {:error, {:checkpoint_hydration_journal_io, :file_changed_during_read}} =
+             Journal.read(path, file_system: ReplacingBoundedReadFileSystem)
+  end
+
+  test "does not convert a changed-read retry ending in absence into empty", %{path: path} do
+    assert :ok = Journal.write(path, transition())
+    :persistent_term.put(ReplacingBoundedReadFileSystem, {self(), path, 1})
+    on_exit(fn -> :persistent_term.erase(ReplacingBoundedReadFileSystem) end)
+
+    task = Task.async(fn -> Journal.read(path, file_system: ReplacingBoundedReadFileSystem) end)
+    assert_receive {:journal_path_replaced, _bytes}
+    File.rm!(path)
+
+    assert {:error, {:checkpoint_hydration_journal_io, :enoent}} = Task.await(task, 2_000)
+  end
+
+  test "classifies read and atomic persistence failures deterministically", %{path: path} do
     write_path = path <> ".write"
 
     assert {:error, {:pre_rename, _reason}} =
@@ -401,12 +814,157 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
     hash
   end
 
-  defp checkpoint_hash, do: checkpoint_hash(hydration_attributes())
+  defp checkpoint_content_hash(kind, schema_version, content) when is_binary(content) do
+    assert {:ok, hash} = Checkpoint.content_hash(kind, schema_version, content),
+           "expected #{kind} v#{schema_version} runtime fixture to be canonical"
 
-  defp checkpoint_hash(attrs) do
+    hash
+  end
+
+  defp checkpoint_content_hash(kind, schema_version, content) do
+    assert {:ok, canonical} = Checkpoint.canonical_content(kind, schema_version, content),
+           "expected #{kind} v#{schema_version} runtime fixture to be schema-valid"
+
+    checkpoint_content_hash(kind, schema_version, canonical)
+  end
+
+  defp runtime_schema_fixtures do
+    [
+      {:calibration, 2, runtime_calibration_content()},
+      {:polar, 3, runtime_polar_content()},
+      {:wind_shift, 2, runtime_wind_shift_content()}
+    ]
+  end
+
+  defp runtime_calibration_content do
+    {:ok, observer} =
+      CalibrationObserver.start_link(
+        name: nil,
+        sample_ms: 0,
+        dir: nil,
+        calibration: nil,
+        boat_identifier: "boat-runtime",
+        sender: fn _channel, _update -> :ok end,
+        now_fn: fn -> 10_000 end,
+        utc_now_fn: fn -> ~U[2026-08-10 12:00:00Z] end,
+        sync_ms: 60_000,
+        persist_ms: 60_000,
+        legs: [min_duration_s: 30.0]
+      )
+
+    assert {:ok, snapshot} = CalibrationObserver.snapshot(observer)
+    assert {:ok, content} = CalibrationRuntime.project(snapshot)
+    content
+  end
+
+  defp runtime_polar_content do
+    bins = Bins.new()
+    gate = Gate.new(min_dwell: 1)
+    assert {:ok, admission_hash} = PolarSnapshot.policy_hash(gate, 0.3, 1, 0.9)
+    assert {:ok, learner} = PolarSnapshot.capture("boat-runtime", admission_hash, bins, 0.9, 10, %{})
+
+    snapshot = %{
+      version: 1,
+      captured_at_utc_ms: 1_786_536_000_000,
+      authority: %{boat_identifier: "boat-runtime"},
+      policy: %{
+        admission_hash: admission_hash,
+        gate: Map.from_struct(gate),
+        min_stw_mps: 0.3,
+        window_size: 1,
+        p: 0.9,
+        sample_ms: 60_000,
+        sync_ms: 60_000,
+        persist_ms: 60_000,
+        persistence_enabled: true,
+        bins: Map.from_struct(bins)
+      },
+      learner: %{source_generation: 10, content: learner},
+      upstream_seq: 41,
+      window: [],
+      sync: %{dirty_keys: [], last_sync_age_ms: 45_000},
+      persistence_phase: %{dirty_keys: [], force: true, last_persist_age_ms: 30_000},
+      tick: %{remaining_ms: 45_000}
+    }
+
+    assert {:ok, content} = PolarRuntime.project(snapshot)
+    content
+  end
+
+  defp runtime_wind_shift_content do
+    {:ok, clock} =
+      Agent.start_link(fn ->
+        %{monotonic_ms: 10_000, utc: ~U[2026-08-12 12:00:00Z]}
+      end)
+
+    {:ok, observer} =
+      WindShiftObserver.start_link(
+        name: nil,
+        sample_ms: 0,
+        dir: nil,
+        config: nil,
+        commands: nil,
+        boat_identifier: "boat-runtime",
+        broadcast_enabled: false,
+        authority_fn: fn ->
+          {:ok, %{device_id: @device_id, credential_epoch: 7, storage_epoch: @storage_epoch}}
+        end,
+        signals_fn: fn -> %{"true_wind_direction" => {200.0, 10_000}} end,
+        now_fn: fn -> Agent.get(clock, & &1.monotonic_ms) end,
+        utc_now_fn: fn -> Agent.get(clock, & &1.utc) end,
+        put_signals_fn: fn _updates, _monotonic_ms -> :ok end,
+        sender: fn _channel, _update -> :ok end,
+        transmit_fn: fn _priority, _pgn, _payload -> :ok end
+      )
+
+    :ok = WindShiftObserver.tick(observer)
+    assert {:ok, snapshot} = WindShiftObserver.snapshot(observer)
+    assert {:ok, content} = WindShiftRuntime.project(snapshot)
+    content
+  end
+
+  defp large_polar_content, do: polar_content(600, 51.4444, 0.05)
+
+  defp near_semantic_cap_polar_content, do: polar_content(36_500, 65_535.0, 1.0)
+
+  defp polar_content(cell_count, max_tws_mps, tws_width_mps) do
+    %{
+      "cells" =>
+        for tws_bin <- 0..(cell_count - 1) do
+          %{
+            "count" => 5,
+            "quantile" => %{
+              "buffer" => [],
+              "n" => [2, 3, 4],
+              "np" => [1.0, 2.8, 4.6, 4.8, 5.0],
+              "q" => [1.0, 2.0, 3.0, 4.0, 5.0]
+            },
+            "twa_bin" => rem(tws_bin, 72),
+            "tws_bin" => tws_bin
+          }
+        end,
+      "max_tws_mps" => max_tws_mps,
+      "p" => 0.9,
+      "twa_width_deg" => 2.5,
+      "tws_width_mps" => tws_width_mps
+    }
+  end
+
+  defp rebuild_hydration_hash(record) do
+    put_in(
+      record,
+      [:hydration, :checkpoint_hash],
+      checkpoint_hash(record.hydration, record.target.device_id)
+    )
+  end
+
+  defp checkpoint_hash, do: checkpoint_hash(hydration_attributes())
+  defp checkpoint_hash(attrs), do: checkpoint_hash(attrs, @device_id)
+
+  defp checkpoint_hash(attrs, device_id) do
     {:ok, hash} =
       Checkpoint.hash(%{
-        device_id: @device_id,
+        device_id: device_id,
         credential_epoch: attrs.origin_credential_epoch,
         storage_epoch: attrs.origin_storage_epoch,
         sequence: attrs.revision,
@@ -434,7 +992,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
   end
 
   defp transaction_id(state) do
-    :crypto.hash(:sha256, Atom.to_string(state)) |> binary_part(0, 16)
+    :crypto.hash(:sha256, :erlang.term_to_binary(state, [:deterministic])) |> binary_part(0, 16)
   end
 
   defp fail_at(stage) do
