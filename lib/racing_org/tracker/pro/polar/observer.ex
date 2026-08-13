@@ -99,6 +99,7 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
   alias RacingOrg.Tracker.Pro.Polar.Observer.Bins
   alias RacingOrg.Tracker.Pro.Polar.Observer.Gate
   alias RacingOrg.Tracker.Pro.Polar.Observer.PSquare
+  alias RacingOrg.Tracker.Pro.Polar.Observer.RuntimeSnapshot
   alias RacingOrg.Tracker.Pro.Polar.Observer.Snapshot
   alias RacingOrg.Tracker.Pro.Polar.Observer.Store
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
@@ -203,6 +204,23 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
              | :checkpoint_conflict}
   def restore(server \\ __MODULE__, snapshot), do: GenServer.call(server, {:restore, snapshot})
 
+  @doc "Capture the complete causal Observer runtime in one closed versioned envelope."
+  @spec runtime_snapshot(GenServer.server()) ::
+          {:ok, RuntimeSnapshot.t()} | {:error, :invalid_runtime_snapshot}
+  def runtime_snapshot(server \\ __MODULE__), do: GenServer.call(server, :runtime_snapshot)
+
+  @doc "Atomically restore one validated full-runtime snapshot through the sole writer."
+  @spec restore_runtime(GenServer.server(), RuntimeSnapshot.t()) ::
+          :ok
+          | {:error,
+             :invalid_runtime_snapshot
+             | :authority_mismatch
+             | :policy_mismatch
+             | :stale_snapshot
+             | :restore_conflict}
+  def restore_runtime(server \\ __MODULE__, snapshot),
+    do: GenServer.call(server, {:restore_runtime, snapshot})
+
   @doc """
   The populated sailed cells as `[{key, {tws_mps, twa_deg}, %{boat_speed_mps, count}}]`
   (bin center + percentile boat speed + count). For inspection / the future web UI.
@@ -235,6 +253,7 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
     boat_identifier = Keyword.get_lazy(opts, :boat_identifier, &RacingOrg.Tracker.Pro.boat_identifier/0)
     gate = build_gate(Keyword.get(opts, :gate, []))
     bins = build_bins(Keyword.get(opts, :bins, []))
+    utc_now_fn = Keyword.get(opts, :utc_now_fn, &DateTime.utc_now/0)
 
     with true <- valid_admission_config?(gate, min_stw_mps, window_size),
          {:ok, policy_hash} <- Snapshot.policy_hash(gate, min_stw_mps, window_size, p),
@@ -261,6 +280,7 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
         signals_fn: Keyword.get(opts, :signals_fn, fn -> safe_signals() end),
         sender: Keyword.get(opts, :sender, &ChannelClient.send_sailed_polar_update/2),
         now_fn: now_fn,
+        utc_now_fn: utc_now_fn,
         store_opts: Keyword.get(opts, :store_opts, []),
         # Accumulated cells: %{key => {count, PSquare.t()}}.
         cells: restored.cells,
@@ -272,9 +292,12 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
         dirty_persist: MapSet.new(),
         dirty_sync: MapSet.new(),
         force_persist: restored.force_persist,
-        # Persisted fixed canonical fingerprint of the last accepted restore, so a
-        # retry remains idempotent across reboot and subsequent live progress.
+        # Persisted fixed canonical fingerprint of the last accepted learner-only
+        # restore, plus incarnation-local full-runtime restore identity/fences.
         last_restore_fingerprint: restored.last_restore_fingerprint,
+        last_runtime_restore_digest: nil,
+        last_runtime_restore_captured_at_utc_ms: nil,
+        runtime_restore_installed: false,
         # A post-rename error means the path already names the restored bytes even
         # though parent-directory durability is uncertain. Keep memory on the same
         # canonical identity and require a successful retry before idempotent ACK.
@@ -284,11 +307,13 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
         last_sync_ms: boot_ms,
         # Monotonic sync sequence the server orders/merges by.
         seq: restored.seq,
-        stats: %{admitted: 0, rejected: 0, samples: 0, reject_reasons: %{}}
+        stats: %{admitted: 0, rejected: 0, samples: 0, reject_reasons: %{}},
+        next_tick_ms: nil,
+        tick_timer_ref: nil,
+        tick_token: make_ref()
       }
 
-      schedule_tick(state)
-      {:ok, state}
+      {:ok, schedule_tick(state)}
     else
       _invalid -> {:stop, :invalid_checkpoint_config}
     end
@@ -310,6 +335,18 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
     {:reply, capture_snapshot(state), state}
   end
 
+  def handle_call(:runtime_snapshot, _from, state) do
+    reply = RuntimeSnapshot.project(state, state.now_fn.(), state.utc_now_fn.())
+    {:reply, reply, state}
+  end
+
+  def handle_call({:restore_runtime, snapshot}, _from, state) do
+    case restore_runtime_snapshot(state, snapshot) do
+      {:ok, restored} -> {:reply, :ok, restored}
+      {:error, reason} -> {:reply, {:error, reason}, state}
+    end
+  end
+
   def handle_call({:restore, snapshot}, _from, state) do
     case restore_snapshot(state, snapshot) do
       {:ok, restored} -> {:reply, :ok, restored}
@@ -329,11 +366,11 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
   end
 
   @impl true
-  def handle_info(:tick, state) do
-    state = do_tick(state)
-    schedule_tick(state)
-    {:noreply, state}
+  def handle_info({:tick, token}, %{tick_token: token} = state) do
+    {:noreply, state |> do_tick() |> schedule_tick()}
   end
+
+  def handle_info({:tick, _stale_token}, state), do: {:noreply, state}
 
   def handle_info(_msg, state), do: {:noreply, state}
 
@@ -456,6 +493,114 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
         last_restore_fingerprint: incoming.fingerprint,
         restore_durability_pending: false
     }
+  end
+
+  # --- Complete runtime snapshot reconciliation ---
+
+  defp restore_runtime_snapshot(state, snapshot) do
+    with :ok <- RuntimeSnapshot.preflight(snapshot),
+         {:ok, digest} <- RuntimeSnapshot.digest(snapshot),
+         :ok <- runtime_authority_fence(state, snapshot),
+         :ok <- runtime_policy_fence(state, snapshot) do
+      if same_fingerprint?(digest, state.last_runtime_restore_digest) and state.runtime_restore_installed do
+        {:ok, state}
+      else
+        with :ok <- runtime_restore_fence(state, snapshot, digest),
+             {:ok, restored} <- RuntimeSnapshot.restore(snapshot, state.now_fn.(), state.utc_now_fn.()) do
+          {:ok, install_runtime_snapshot(state, restored, digest, snapshot.captured_at_utc_ms)}
+        end
+      end
+    else
+      {:error, reason} when reason in [:authority_mismatch, :policy_mismatch, :stale_snapshot, :restore_conflict] ->
+        {:error, reason}
+
+      _ ->
+        {:error, :invalid_runtime_snapshot}
+    end
+  end
+
+  defp runtime_authority_fence(state, snapshot) do
+    if snapshot.authority.boat_identifier == state.boat_identifier,
+      do: :ok,
+      else: {:error, :authority_mismatch}
+  end
+
+  defp runtime_policy_fence(state, snapshot) do
+    with {:ok, current_policy} <- RuntimeSnapshot.policy(state),
+         true <- current_policy == snapshot.policy do
+      :ok
+    else
+      _ -> {:error, :policy_mismatch}
+    end
+  end
+
+  defp runtime_restore_fence(state, snapshot, _digest) do
+    cond do
+      not is_nil(state.last_runtime_restore_captured_at_utc_ms) and
+          snapshot.captured_at_utc_ms < state.last_runtime_restore_captured_at_utc_ms ->
+        {:error, :stale_snapshot}
+
+      snapshot.learner.source_generation < state.source_generation ->
+        {:error, :stale_snapshot}
+
+      snapshot.learner.source_generation > state.source_generation ->
+        :ok
+
+      not runtime_checkpoint_matches_state?(state, snapshot.learner.content) ->
+        {:error, :restore_conflict}
+
+      is_nil(state.last_runtime_restore_captured_at_utc_ms) ->
+        :ok
+
+      snapshot.captured_at_utc_ms > state.last_runtime_restore_captured_at_utc_ms ->
+        :ok
+
+      true ->
+        {:error, :restore_conflict}
+    end
+  end
+
+  defp runtime_checkpoint_matches_state?(state, checkpoint) do
+    with {:ok, current} <- capture_snapshot(state) do
+      same_fingerprint?(Snapshot.fingerprint(current), Snapshot.fingerprint(checkpoint))
+    else
+      _ -> false
+    end
+  end
+
+  defp install_runtime_snapshot(state, restored, digest, captured_at_utc_ms) do
+    previous_timer_ref = state.tick_timer_ref
+    if is_reference(previous_timer_ref), do: Process.cancel_timer(previous_timer_ref)
+
+    candidate = %{
+      state
+      | cells: restored.cells,
+        source_generation: restored.source_generation,
+        window: restored.window,
+        dirty_sync: restored.dirty_sync,
+        dirty_persist: restored.dirty_persist,
+        force_persist: restored.force_persist,
+        last_sync_ms: restored.last_sync_ms,
+        last_persist_ms: restored.last_persist_ms,
+        seq: restored.seq,
+        last_runtime_restore_digest: digest,
+        last_runtime_restore_captured_at_utc_ms: captured_at_utc_ms,
+        runtime_restore_installed: true,
+        tick_timer_ref: nil,
+        next_tick_ms: nil,
+        tick_token: make_ref()
+    }
+
+    install_runtime_tick(candidate, restored.tick_delay_ms)
+  end
+
+  defp install_runtime_tick(%{sample_ms: 0} = state, nil), do: state
+
+  defp install_runtime_tick(state, delay_ms)
+       when is_integer(delay_ms) and delay_ms >= 0 and state.sample_ms > 0 do
+    token = state.tick_token
+    ref = Process.send_after(self(), {:tick, token}, delay_ms)
+    %{state | tick_timer_ref: ref, next_tick_ms: state.now_fn.() + delay_ms}
   end
 
   # --- The tick: sample -> window -> admit -> accumulate -> throttled persist/sync ---
@@ -835,7 +980,9 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
   end
 
   defp encode_cells(state, keys) do
-    Enum.map(keys, fn key ->
+    keys
+    |> Enum.sort()
+    |> Enum.map(fn key ->
       {count, ps} = Map.fetch!(state.cells, key)
       {tws_c, twa_c} = Bins.center(state.bins, key)
       %{tws_mps: tws_c, twa_deg: twa_c, boat_speed_mps: PSquare.value(ps), count: count}
@@ -863,8 +1010,14 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer do
   # clocks are anchored at boot, so even the first fire waits a full interval).
   defp due?(last_ms, interval, state), do: state.now_fn.() - last_ms >= interval
 
-  defp schedule_tick(%{sample_ms: ms}) when ms > 0, do: Process.send_after(self(), :tick, ms)
-  defp schedule_tick(_state), do: :ok
+  defp schedule_tick(%{sample_ms: ms} = state) when ms > 0 do
+    token = make_ref()
+    ref = Process.send_after(self(), {:tick, token}, ms)
+    %{state | tick_token: token, tick_timer_ref: ref, next_tick_ms: state.now_fn.() + ms}
+  end
+
+  defp schedule_tick(state),
+    do: %{state | tick_token: make_ref(), tick_timer_ref: nil, next_tick_ms: nil}
 
   defp validate_checkpoint_config(opts) do
     p = Keyword.get(opts, :p, @default_p)
