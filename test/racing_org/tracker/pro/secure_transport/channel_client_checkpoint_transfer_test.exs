@@ -502,7 +502,6 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCheckpointTransferT
         }
       end,
       desired_state_status: fn -> %{active: active_authority()} end,
-      desired_state_replay: fn _generation -> :ok end,
       checkpoint_pending: fn _outbox, _opts -> [] end,
       checkpoint_planner: fn _entry -> {:error, :unexpected_checkpoint_entry} end,
       checkpoint_hydration_coordinator: {self(), {:ok, :hydrated}},

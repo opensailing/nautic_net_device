@@ -452,6 +452,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
          command_executor_module: FakeExecutor,
          outbox: Keyword.get(opts, :outbox, :unused_outbox),
          outbox_module: Keyword.get(opts, :outbox_module, FakeOutbox),
+         checkpoint_pending: fn _outbox, _opts -> [] end,
+         delivery_pending: fn _outbox, _opts -> [] end,
          desired_state_manager: Keyword.get(opts, :desired_state_manager, :unused_desired_state_manager),
          desired_state_manager_module: Keyword.get(opts, :desired_state_manager_module, FakeDesiredStateManager),
          desired_state_identity: fn -> {:ok, control_identity()} end,
@@ -463,7 +465,6 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
            }
          end,
          desired_state_status: fn -> %{active: nil} end,
-         desired_state_replay: fn _generation -> :ok end,
          keystore_opts: [base_path: ctx.base]}
       )
 

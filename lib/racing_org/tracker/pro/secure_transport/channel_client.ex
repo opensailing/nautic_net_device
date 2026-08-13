@@ -135,13 +135,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     }
   end
 
-  @doc "Enqueue a durable desired-state ACK for authenticated control delivery."
-  @spec send_desired_state_ack(GenServer.server(), map()) ::
+  @doc """
+  Kick the durable delivery dispatcher for still-pending generic outbox entries.
+
+  Best-effort: dispatch runs only while the control plane is ready on a live
+  session, and entries are retired exclusively by authenticated immutable
+  delivery receipts — never because bytes were sent.
+  """
+  @spec dispatch_durable_deliveries(GenServer.server()) ::
           :ok | {:error, :control_plane_unavailable}
-  def send_desired_state_ack(server \\ __MODULE__, ack) when is_map(ack) do
+  def dispatch_durable_deliveries(server \\ __MODULE__) do
     case GenServer.whereis(server) do
       pid when is_pid(pid) ->
-        send(pid, {:send_desired_state_ack, ack})
+        send(pid, {:dispatch_durable_deliveries, :current})
         :ok
 
       _unavailable ->
@@ -351,6 +357,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
           OutboxOwner.pending(outbox, pending_opts)
         end),
       checkpoint_planner: Keyword.get(opts, :checkpoint_planner, &Planner.plan/1),
+      delivery_pending:
+        Keyword.get(opts, :delivery_pending, fn outbox, pending_opts ->
+          OutboxOwner.pending(outbox, pending_opts)
+        end),
+      delivery_planner: Keyword.get(opts, :delivery_planner, &Planner.plan/1),
       checkpoint_hydration_coordinator: Keyword.get(opts, :checkpoint_hydration_coordinator, Coordinator),
       checkpoint_hydration_coordinator_module: Keyword.get(opts, :checkpoint_hydration_coordinator_module, Coordinator),
       checkpoint_hydration_staging_module: Keyword.get(opts, :checkpoint_hydration_staging_module, Staging),
@@ -364,10 +375,6 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       desired_state_status:
         Keyword.get(opts, :desired_state_status, fn ->
           Manager.status(Keyword.get(opts, :desired_state_manager, Manager))
-        end),
-      desired_state_replay:
-        Keyword.get(opts, :desired_state_replay, fn generation ->
-          Manager.replay(Keyword.get(opts, :desired_state_manager, Manager), generation)
         end),
       control_topic: nil,
       control_ready?: false,
@@ -724,26 +731,22 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     {:noreply, push_request_route_recalc(socket, position)}
   end
 
-  def handle_info({:send_desired_state_ack, ack}, socket) do
-    case push_ready_control(socket, :ack, ack) do
-      {:ok, socket} -> {:noreply, socket}
-      {:reconnect, socket} -> {:noreply, socket}
-      {:error, socket} -> {:noreply, socket}
-    end
-  end
-
-  def handle_info({:replay_desired_state_acks, generation}, socket) do
-    session = socket.assigns.session
-
-    if socket.assigns.control_ready? and match?(%Session{generation: ^generation}, session) do
-      _ = invoke_desired_state_replay(socket.assigns.desired_state_replay, generation)
-    end
-
-    {:noreply, socket}
-  end
-
   def handle_info({:dispatch_checkpoint_submissions, generation}, socket) do
     {:noreply, dispatch_checkpoint_submissions(socket, generation)}
+  end
+
+  def handle_info({:dispatch_durable_deliveries, :current}, socket) do
+    case socket.assigns.session do
+      %Session{generation: generation} when is_integer(generation) ->
+        {:noreply, dispatch_generic_deliveries(socket, generation)}
+
+      _no_session ->
+        {:noreply, socket}
+    end
+  end
+
+  def handle_info({:dispatch_durable_deliveries, generation}, socket) do
+    {:noreply, dispatch_generic_deliveries(socket, generation)}
   end
 
   def handle_info(_msg, socket), do: {:noreply, socket}
@@ -781,8 +784,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
         |> assign(:control_topic, topic)
         |> assign(:control_ready?, true)
 
-      send(self(), {:replay_desired_state_acks, generation})
       send(self(), {:dispatch_checkpoint_submissions, generation})
+      send(self(), {:dispatch_durable_deliveries, generation})
       {:ok, socket}
     else
       {:reconnect, socket} ->
@@ -945,7 +948,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       Enum.reduce_while(entries, socket, fn entry, current_socket ->
         case plan_checkpoint(current_socket, entry) do
           {:ok, %{frames: frames}} ->
-            case push_checkpoint_frames(current_socket, frames) do
+            case push_durable_frames(current_socket, frames) do
               {:ok, next_socket} -> {:cont, next_socket}
               {:stop, next_socket} -> {:halt, next_socket}
             end
@@ -965,13 +968,97 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   defp dispatch_checkpoint_submissions(socket, _generation), do: socket
 
+  # Serially transmit every pending generic (non-checkpoint) outbox entry in
+  # priority/FIFO order: the frozen delivery identity first, then its payload
+  # frames. Nothing is retired here — retirement happens only when the server's
+  # authenticated immutable delivery receipt arrives.
+  defp dispatch_generic_deliveries(
+         %{assigns: %{control_ready?: true, session: %Session{generation: generation}}} = socket,
+         generation
+       ) do
+    with {:ok, entries} <- pending_generic_entries(socket) do
+      Enum.reduce_while(entries, socket, fn entry, current_socket ->
+        case plan_generic_delivery(current_socket, entry) do
+          {:ok, %{frames: frames}} ->
+            case push_durable_frames(current_socket, frames) do
+              {:ok, next_socket} -> {:cont, next_socket}
+              {:stop, next_socket} -> {:halt, next_socket}
+            end
+
+          {:error, reason} ->
+            Logger.warning("[ChannelClient] durable delivery remains pending: #{inspect(reason)}")
+
+            {:halt, current_socket}
+        end
+      end)
+    else
+      {:error, reason} ->
+        Logger.warning("[ChannelClient] durable delivery dispatch unavailable: #{inspect(reason)}")
+        socket
+    end
+  end
+
+  defp dispatch_generic_deliveries(socket, _generation), do: socket
+
+  defp pending_generic_entries(socket) do
+    case socket.assigns.delivery_pending.(socket.assigns.outbox, []) do
+      entries when is_list(entries) ->
+        if Enum.all?(entries, &match?(%Entry{}, &1)) do
+          {:ok,
+           entries
+           |> Enum.reject(&(&1.stream == :checkpoint))
+           |> Enum.sort_by(&{-&1.priority, &1.ordinal})}
+        else
+          {:error, :invalid_pending_delivery_entries}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _other ->
+        {:error, :invalid_pending_delivery_entries}
+    end
+  rescue
+    _exception -> {:error, :outbox_owner_unavailable}
+  catch
+    _kind, _reason -> {:error, :outbox_owner_unavailable}
+  end
+
+  defp plan_generic_delivery(socket, %Entry{} = entry) do
+    case socket.assigns.delivery_planner.(entry) do
+      {:ok, %{entry: ^entry, payload: nil, frames: frames} = plan}
+      when is_list(frames) and frames != [] ->
+        if Enum.all?(frames, &valid_delivery_frame?/1),
+          do: {:ok, plan},
+          else: {:error, :invalid_delivery_plan}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _other ->
+        {:error, :invalid_delivery_plan}
+    end
+  rescue
+    _exception -> {:error, :delivery_planner_unavailable}
+  catch
+    _kind, _reason -> {:error, :delivery_planner_unavailable}
+  end
+
+  defp valid_delivery_frame?(%{type: type, attrs: attrs})
+       when type in [:delivery_submission, :delivery_payload, :delivery_payload_chunk] and
+              is_map(attrs) do
+    match?({:ok, _bytes}, Messages.encode(type, attrs))
+  end
+
+  defp valid_delivery_frame?(_frame), do: false
+
   defp resume_checkpoint_submission(socket, generation, attrs) do
     with true <- checkpoint_control_generation?(socket, generation),
          {:ok, _canonical_resume} <- Messages.encode(:checkpoint_submission_resume, attrs),
          {:ok, entries} <- pending_checkpoint_entries(socket),
          {:ok, plan} <- find_resumed_checkpoint(socket, entries, attrs),
          {:ok, frames} <- requested_checkpoint_frames(plan.frames, attrs) do
-      case push_checkpoint_frames(socket, frames) do
+      case push_durable_frames(socket, frames) do
         {:ok, socket} -> socket
         {:stop, socket} -> socket
       end
@@ -1033,7 +1120,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
 
   defp valid_checkpoint_frame?(_frame), do: false
 
-  defp push_checkpoint_frames(socket, frames) do
+  defp push_durable_frames(socket, frames) do
     Enum.reduce_while(frames, {:ok, socket}, fn %{type: type, attrs: attrs}, {:ok, current_socket} ->
       case push_ready_control(current_socket, type, attrs) do
         {:ok, next_socket} -> {:cont, {:ok, next_socket}}
@@ -1485,14 +1572,6 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     _exception -> {:error, :desired_state_runtime_unavailable}
   catch
     :exit, _reason -> {:error, :desired_state_runtime_unavailable}
-  end
-
-  defp invoke_desired_state_replay(fun, generation) when is_function(fun, 1) do
-    fun.(generation)
-  rescue
-    _exception -> {:error, :desired_state_manager_unavailable}
-  catch
-    :exit, _reason -> {:error, :desired_state_manager_unavailable}
   end
 
   # Push the current WiFi status (no applied_version known) only while this

@@ -252,7 +252,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
   # --- authenticated control_v1 carrier ---
 
   describe "control_v1 carrier (SocketTest)" do
-    test "verifies control_accept, sends readiness on its originating topic, and replays ACKs", ctx do
+    test "verifies control_accept, sends readiness on its originating topic, and dispatches durable deliveries", ctx do
       {client, holder, topic} = start_control_client(ctx)
       server_session = complete_handshake(client, topic, ctx, @control_epoch)
       assert_push(^topic, "wifi_status", _wifi_status)
@@ -264,7 +264,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       {server_control, accept_frame} = push_control_accept(client, wrong_topic, server_control)
 
       refute_push(^wrong_topic, "control_v1", _readiness, 50)
-      refute_receive {:replay_desired_state_acks, _generation}
+      refute_receive {:delivery_pending, _opts}
 
       push(client, origin_topic, "control_v1", Control.encode_carrier(accept_frame))
       assert_push(^origin_topic, "control_v1", readiness_carrier)
@@ -282,25 +282,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       assert readiness.firmware_git_sha == "0123abc"
       assert readiness.effective == nil
       assert :sys.get_state(client).assigns.control_topic == origin_topic
-      assert_receive {:replay_desired_state_acks, generation}
-      assert generation == SessionHolder.generation(holder)
+      assert_receive {:delivery_pending, _opts}
 
       push(client, origin_topic, "control_v1", Control.encode_carrier(accept_frame))
       refute_push(^origin_topic, "control_v1", _duplicate_readiness, 50)
-
-      ack =
-        control_identity(@control_epoch)
-        |> Map.merge(%{
-          generation: 11,
-          manifest_hash: :binary.copy(<<0xA5>>, 32),
-          status: :effective
-        })
-
-      assert :ok = ChannelClient.send_desired_state_ack(client, ack)
-      assert_push(^origin_topic, "control_v1", ack_carrier)
-      assert {:ok, ack_frame} = Control.decode_carrier(ack_carrier)
-      assert {:ok, :ack, ack_bytes, _server_control} = Control.open(server_control, ack_frame)
-      assert {:ok, ^ack} = Messages.decode(:ack, ack_bytes)
     end
 
     test "does not accept control or send readiness before session publication", ctx do
@@ -322,7 +307,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       {server_control, accept_frame} = push_control_accept(client, topic, server_control)
 
       refute_push(^topic, "control_v1", _readiness, 50)
-      refute_receive {:replay_desired_state_acks, _generation}
+      refute_receive {:delivery_pending, _opts}
 
       push(client, topic, "handshake_ok", %{
         "session_id" => Base.encode64(server_session.session_id)
@@ -379,7 +364,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       push(client, topic, "control_v1", Control.encode_carrier(secret_frame))
 
       refute_push(^topic, "control_v1", _response, 50)
-      refute_receive {:replay_desired_state_acks, _generation}
+      refute_receive {:delivery_pending, _opts}
       assert Process.alive?(client)
     end
 
@@ -396,7 +381,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
 
       {_server_control, _accept_frame} = push_control_accept(client, topic, server_control)
       refute_push(^topic, "control_v1", _readiness, 50)
-      refute_receive {:replay_desired_state_acks, _generation}
+      refute_receive {:delivery_pending, _opts}
       assert Process.alive?(client)
     end
 
@@ -435,7 +420,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
 
       # No readiness could be produced for this accept.
       refute_push(^topic, "control_v1", _readiness, 50)
-      refute_receive {:replay_desired_state_acks, _generation}
+      refute_receive {:delivery_pending, _opts}
 
       # The client must NOT sit wedged with a dead control plane. It has to drop the
       # unusable session and reconnect so negotiation can run again.
@@ -449,32 +434,51 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
     end
 
     test "reconnects when outbound control requires rekey", ctx do
-      {client, holder, topic} = start_control_client(ctx)
+      payload = "durable-rekey-payload"
+
+      entry = %RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Entry{
+        stream: :health,
+        device_id: @logical_device_id,
+        credential_epoch: @control_epoch,
+        storage_epoch: @storage_epoch,
+        sequence: 11,
+        entry_id: <<11::128>>,
+        payload_hash: :crypto.hash(:sha256, payload),
+        payload_checksum: :crypto.hash(:sha256, payload),
+        payload: payload,
+        priority: 1,
+        encoded_size: byte_size(payload) + 128,
+        ordinal: 1
+      }
+
+      {client, holder, topic} =
+        start_control_client(ctx, delivery_pending: fn _outbox, _opts -> [entry] end)
+
       server_session = complete_handshake(client, topic, ctx, @control_epoch)
       assert_push(^topic, "wifi_status", _wifi_status)
       assert eventually(fn -> SessionHolder.live?(holder) end)
       assert {:ok, server_control} = Control.new(:server, server_session)
+
+      :sys.replace_state(holder, fn state ->
+        %{state | control: %{state.control | send_counter: SecureTransport.rekey_after() - 2}}
+      end)
+
       {server_control, _accept_frame} = push_control_accept(client, topic, server_control)
 
       assert_push(^topic, "control_v1", readiness_carrier)
       assert {:ok, readiness_frame} = Control.decode_carrier(readiness_carrier)
 
-      assert {:ok, :readiness, _readiness_bytes, _server_control} =
+      assert {:ok, :readiness, _readiness_bytes, server_control} =
                Control.open(server_control, readiness_frame)
 
-      :sys.replace_state(holder, fn state ->
-        %{state | control: %{state.control | send_counter: SecureTransport.rekey_after()}}
-      end)
+      # The delivery_submission frame consumes the last pre-rekey counter; the
+      # payload frame then requires rekey, which must reconnect rather than wedge.
+      assert_push(^topic, "control_v1", submission_carrier)
+      assert {:ok, submission_frame} = Control.decode_carrier(submission_carrier)
 
-      ack =
-        control_identity(@control_epoch)
-        |> Map.merge(%{
-          generation: 11,
-          manifest_hash: :binary.copy(<<0xA5>>, 32),
-          status: :effective
-        })
+      assert {:ok, :delivery_submission, _submission_bytes, _server_control} =
+               Control.open(server_control, submission_frame)
 
-      assert :ok = ChannelClient.send_desired_state_ack(client, ack)
       assert_disconnect()
       assert eventually(fn -> not SessionHolder.live?(holder) end)
     end
@@ -2955,9 +2959,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
             }
           end,
           desired_state_status: fn -> %{active: nil} end,
-          desired_state_replay: fn generation ->
-            send(test_pid, {:replay_desired_state_acks, generation})
-            :ok
+          checkpoint_pending: fn _outbox, _opts -> [] end,
+          delivery_pending: fn _outbox, opts ->
+            send(test_pid, {:delivery_pending, opts})
+            []
           end,
           keystore_opts: [base_path: ctx.base]
         ],
