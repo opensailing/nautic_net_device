@@ -90,6 +90,7 @@ defmodule RacingOrg.Tracker.Pro.Race.Recording do
     device_status = opts[:device_status] || "complete"
 
     recording = seal_current_chunk(recording)
+    persist_meta(recording)
     manifest = build_manifest(recording, finished_at, device_status)
     File.write!(Path.join(recording.dir, @manifest_file), RaceManifest.encode(manifest))
     {recording, manifest}

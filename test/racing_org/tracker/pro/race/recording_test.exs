@@ -113,6 +113,15 @@ defmodule RacingOrg.Tracker.Pro.Race.RecordingTest do
     assert manifest.total_sample_count == 3
   end
 
+  test "load preserves finalized sealed descriptors for durable retry", %{base: base} do
+    {rec, _manifest} = base |> open() |> append_all(1..3) |> Recording.finalize()
+    assert {:ok, original_artifacts} = Recording.sealed_chunk_artifacts(rec)
+
+    assert {:ok, reloaded} = Recording.load(base, "2026-06-03-1")
+    assert Recording.finalized?(reloaded)
+    assert {:ok, ^original_artifacts} = Recording.sealed_chunk_artifacts(reloaded)
+  end
+
   test "delete removes the recording", %{base: base} do
     open(base)
     assert "2026-06-03-1" in Recording.list(base)
