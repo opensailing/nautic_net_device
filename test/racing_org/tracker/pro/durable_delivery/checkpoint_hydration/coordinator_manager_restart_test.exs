@@ -115,7 +115,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorM
       head_store_base_dir: head_store_base_dir,
       head_store_transition_timeout_ms: 30_000,
       reconcile_empty_journal: true,
-      identity: fn -> {:ok, head_identity} end,
+      identity: fn ->
+        case next_identity(identity_source) do
+          {:ok, identity} -> {:ok, Map.take(identity, [:device_id, :credential_epoch, :storage_epoch])}
+          {:error, _reason} = error -> error
+        end
+      end,
       identity_authority: fn transition -> transition.(head_identity) end,
       coordinator_starter: fn opts ->
         Coordinator.start_link(
@@ -148,7 +153,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorM
       }
     ]
 
-    {:ok, supervisor} = Supervisor.start_link(children, strategy: :one_for_one)
+    # Production tolerance for a Coordinator whose child start requires the
+    # shared durable identity: repeated start failures during a transient
+    # authority outage must not exhaust restart intensity before recovery.
+    {:ok, supervisor} =
+      Supervisor.start_link(children, strategy: :one_for_one, max_restarts: 100, max_seconds: 5)
+
     Process.unlink(supervisor)
 
     {:ok, head_store} =
@@ -181,6 +191,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorM
     on_exit(fn ->
       :persistent_term.erase({ProbeRestorer, boat_identifier})
       if Process.alive?(supervisor), do: Supervisor.stop(supervisor)
+      if Process.alive?(gate_pid), do: GenServer.stop(gate_pid)
       if Process.alive?(probe), do: Agent.stop(probe)
       if Process.alive?(identity_source), do: Agent.stop(identity_source)
       File.rm_rf(base)

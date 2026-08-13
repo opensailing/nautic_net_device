@@ -1053,6 +1053,45 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     refute :manager_finish in core_operations()
   end
 
+  test "boot reconciliation retries while the Manager binding is temporarily unavailable", ctx do
+    Backend.put(:head, nil)
+
+    Backend.respond(:manager_status, [
+      {:return, %{active: nil, identity: nil}},
+      :default
+    ])
+
+    pid = start_coordinator(ctx, reconcile_empty_journal: true, manager_retry_ms: 10)
+
+    assert Coordinator.status(pid) == %{
+             blocked?: true,
+             phase: nil,
+             recovery_error: :checkpoint_hydration_recovery_required
+           }
+
+    eventually(fn ->
+      assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+      assert Backend.data(:manager_finished?)
+    end)
+  end
+
+  test "an empty-journal binding race retries until Manager can claim the startup barrier", ctx do
+    Backend.put(:head, nil)
+
+    Backend.respond(:manager_begin, [
+      {:return_and_block, {:error, :checkpoint_hydration_binding_mismatch}},
+      :default
+    ])
+
+    pid = start_coordinator(ctx, reconcile_empty_journal: true, manager_retry_ms: 10)
+
+    eventually(fn ->
+      assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+      assert Backend.data(:manager_finished?)
+      assert Enum.count(core_operations(), &(&1 == :manager_begin)) >= 2
+    end)
+  end
+
   test "invalid transaction IDs never reach the Manager and a generated zero is retried", ctx do
     generator = Agent.start_link(fn -> [<<0::128>>, @transaction_id] end) |> elem(1)
 

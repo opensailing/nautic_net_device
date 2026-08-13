@@ -144,17 +144,18 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       {:ok, state} ->
         {:ok, state}
 
-      {:error, reason, %{blocker: nil} = state} when reason in @manager_retry_errors ->
-        state = %{state | recovery_required?: true, recovery_error: reason}
-        {:ok, schedule_manager_retry(state)}
+      {:error, reason, %{blocker: nil} = state} ->
+        cond do
+          retryable_manager_error?(state, reason) ->
+            state = %{state | recovery_required?: true, recovery_error: reason}
+            {:ok, schedule_manager_retry(state)}
 
-      {:error, :checkpoint_hydration_binding_failed, %{blocker: nil} = state} ->
-        {:ok,
-         %{
-           state
-           | recovery_required?: true,
-             recovery_error: :checkpoint_hydration_binding_failed
-         }}
+          reason == :checkpoint_hydration_binding_failed ->
+            {:ok, %{state | recovery_required?: true, recovery_error: reason}}
+
+          true ->
+            {:ok, %{state | recovery_error: reason}}
+        end
 
       {:error, reason, state} ->
         {:ok, state |> Map.put(:recovery_error, reason) |> maybe_retry_manager(reason)}
@@ -538,8 +539,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     state = %{state | recovery_required?: false}
 
     case recover_state(state) do
-      {:error, reason, %{blocker: nil}} when reason in @manager_retry_errors ->
-        {:error, reason, %{state | recovery_required?: true}}
+      {:error, reason, %{blocker: nil} = errored} ->
+        if retryable_manager_error?(errored, reason) or
+             reason == :checkpoint_hydration_binding_failed do
+          {:error, reason, %{state | recovery_required?: true}}
+        else
+          {:error, reason, errored}
+        end
 
       result ->
         result
@@ -883,10 +889,26 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     %{state | manager_monitor_ref: nil, manager_pid: nil}
   end
 
-  defp maybe_retry_manager(state, reason) when reason in @manager_retry_errors,
-    do: schedule_manager_retry(state)
+  defp maybe_retry_manager(state, reason) do
+    if retryable_manager_error?(state, reason),
+      do: schedule_manager_retry(state),
+      else: state
+  end
 
-  defp maybe_retry_manager(state, _reason), do: state
+  # A Manager-side binding mismatch before any blocker exists is a startup race:
+  # activation advanced between the Coordinator's binding read and the Manager's
+  # authoritative re-read. Reconciliation re-reads the current binding on retry,
+  # so only the pre-blocker empty-journal path treats it as transient. Mismatches
+  # against retained durable records stay terminal.
+  defp retryable_manager_error?(_state, reason) when reason in @manager_retry_errors, do: true
+
+  defp retryable_manager_error?(
+         %{blocker: nil, reconcile_empty_journal?: true},
+         :checkpoint_hydration_binding_mismatch
+       ),
+       do: true
+
+  defp retryable_manager_error?(_state, _reason), do: false
 
   defp schedule_manager_retry(%{blocker: nil, recovery_required?: false} = state), do: state
 
