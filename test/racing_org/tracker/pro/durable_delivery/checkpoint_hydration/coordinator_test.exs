@@ -444,6 +444,70 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     assert Backend.data(:manager_finished?)
   end
 
+  test "an unreadable journal claims the startup barrier and refuses fresh hydration", ctx do
+    selected = selected_record(ctx.hydration, content: "startup-current-runtime", sequence: 10)
+    Backend.put(:head, selected)
+
+    Backend.respond(
+      :journal_read,
+      {:return, {:error, :corrupt_checkpoint_hydration_journal}}
+    )
+
+    pid = start_coordinator(ctx, reconcile_empty_journal: true)
+
+    assert %{
+             blocked?: true,
+             phase: nil,
+             recovery_error: :checkpoint_hydration_recovery_required
+           } = Coordinator.status(pid)
+
+    assert Backend.data(:manager_blocked?)
+    refute Backend.data(:manager_finished?)
+    assert Backend.data(:restored) == []
+
+    assert {:error, :checkpoint_hydration_recovery_required} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    refute Backend.data(:manager_finished?)
+    assert Backend.data(:journal) == nil
+
+    assert :ok = Coordinator.recover(pid)
+    assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+    assert Backend.data(:restored) == [%{runtime: %{content: selected.content}}]
+    assert Backend.data(:manager_finished?)
+  end
+
+  test "journal read failures expose one bounded recovery category", ctx do
+    Backend.respond(
+      :journal_read,
+      [
+        {:return, {:error, {:checkpoint_hydration_journal_io, :eacces}}},
+        {:return, {:error, :corrupt_checkpoint_hydration_journal}}
+      ]
+    )
+
+    pid = start_coordinator(ctx, reconcile_empty_journal: true)
+
+    assert %{
+             blocked?: true,
+             phase: nil,
+             recovery_error: :checkpoint_hydration_recovery_required
+           } = Coordinator.status(pid)
+
+    assert Backend.data(:manager_blocked?)
+    refute Backend.data(:manager_finished?)
+
+    assert {:error, :checkpoint_hydration_recovery_required} = Coordinator.recover(pid)
+
+    assert %{
+             blocked?: true,
+             phase: nil,
+             recovery_error: :checkpoint_hydration_recovery_required
+           } = Coordinator.status(pid)
+
+    refute Backend.data(:manager_finished?)
+  end
+
   test "fresh hydration follows the crash-safe order and binds the session and transaction", ctx do
     pid = start_coordinator(ctx)
     Backend.clear_operations()

@@ -127,6 +127,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       selected_head: nil,
       reconciliation_heads: %{},
       fresh_request?: false,
+      recovery_required?: false,
       recovery_error: nil
     }
 
@@ -164,6 +165,16 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     {:reply, safe_status(state), state}
   end
 
+  def handle_call(:recover, _from, %{recovery_required?: true} = state) do
+    case recover_unreadable_journal(state) do
+      {:ok, state} ->
+        {:reply, :ok, state}
+
+      {:error, reason, state} ->
+        {:reply, {:error, public_recovery_error(state, reason)}, %{state | recovery_error: reason}}
+    end
+  end
+
   def handle_call(:recover, _from, %{blocker: nil} = state) do
     case recover_state(state) do
       {:ok, state} -> {:reply, :ok, state}
@@ -176,6 +187,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       {:ok, state} -> {:reply, :ok, state}
       {:error, reason, state} -> {:reply, {:error, reason}, %{state | recovery_error: reason}}
     end
+  end
+
+  def handle_call(
+        {:hydrate, _session_generation, _hydration},
+        _from,
+        %{recovery_required?: true} = state
+      ) do
+    {:reply, {:error, :checkpoint_hydration_recovery_required}, state}
   end
 
   def handle_call({:hydrate, _session_generation, _hydration}, _from, %{blocker: blocker} = state)
@@ -310,10 +329,65 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
         reconcile_empty_journal(state)
 
       :empty ->
-        {:ok, %{state | blocker: nil, selected_head: nil, recovery_error: nil}}
+        {:ok,
+         %{
+           state
+           | blocker: nil,
+             selected_head: nil,
+             recovery_required?: false,
+             recovery_error: nil
+         }}
 
       {:ok, record} ->
         recover_record(state, record)
+
+      {:error, reason} ->
+        retain_unreadable_journal_barrier(state, reason)
+    end
+  end
+
+  defp retain_unreadable_journal_barrier(state, reason) do
+    state = %{state | recovery_required?: true}
+
+    with {:ok, manager_state} <- manager_state(state),
+         {:ok, binding} <- active_binding(manager_state),
+         :ok <- match_target(binding, manager_state.identity),
+         token = make_ref(),
+         :ok <- manager_begin(state, token, binding) do
+      {:error, reason,
+       %{
+         state
+         | blocker: %{token: token, binding: binding, record: nil},
+           selected_head: nil,
+           reconciliation_heads: %{}
+       }}
+    else
+      {:error, _barrier_reason} -> {:error, reason, state}
+    end
+  end
+
+  defp recover_unreadable_journal(state) do
+    case journal_read(state) do
+      :empty ->
+        reconcile_empty_journal(%{
+          state
+          | blocker: nil,
+            selected_head: nil,
+            reconciliation_heads: %{},
+            recovery_required?: false
+        })
+
+      {:ok, record} ->
+        recover_record(
+          %{
+            state
+            | blocker: nil,
+              selected_head: nil,
+              reconciliation_heads: %{},
+              recovery_required?: false
+          },
+          record
+        )
 
       {:error, reason} ->
         {:error, reason, state}
@@ -344,6 +418,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
            | blocker: nil,
              selected_head: nil,
              reconciliation_heads: %{},
+             recovery_required?: false,
              recovery_error: nil
          }}
       else
@@ -605,6 +680,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
          | blocker: nil,
            selected_head: nil,
            fresh_request?: false,
+           recovery_required?: false,
            recovery_error: nil
        }}
     else
@@ -1078,13 +1154,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   defp put_record(state, record), do: put_in(state.blocker.record, record)
 
-  defp safe_status(%{blocker: blocker, recovery_error: recovery_error}) do
+  defp safe_status(%{blocker: blocker, recovery_error: recovery_error} = state) do
     phase = if is_map(blocker) and is_map(blocker.record), do: blocker.record.phase, else: nil
+    recovery_required? = Map.get(state, :recovery_required?, false) == true
 
     %{
-      blocked?: not is_nil(blocker),
+      blocked?: recovery_required? or not is_nil(blocker),
       phase: phase,
-      recovery_error: safe_recovery_error(recovery_error)
+      recovery_error: public_recovery_error(recovery_required?, recovery_error)
     }
   end
 
@@ -1095,6 +1172,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       recovery_error: :checkpoint_hydration_failed
     }
   end
+
+  defp public_recovery_error(%{recovery_required?: recovery_required?}, reason),
+    do: public_recovery_error(recovery_required?, reason)
+
+  defp public_recovery_error(true, _reason), do: :checkpoint_hydration_recovery_required
+  defp public_recovery_error(false, reason), do: safe_recovery_error(reason)
 
   defp safe_recovery_error(nil), do: nil
   defp safe_recovery_error(reason) when is_atom(reason), do: reason
