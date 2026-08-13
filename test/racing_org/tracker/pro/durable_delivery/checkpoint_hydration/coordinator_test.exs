@@ -117,10 +117,16 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
   defmodule FakeManager do
     alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorTest.Backend
 
+    def whereis(_server), do: Backend.data(:manager_pid)
+
     def status(_server) do
       Backend.operation(:manager_status)
       |> Backend.resolve(:manager_status, fn ->
-        %{active: Backend.data(:active), identity: Backend.data(:identity)}
+        if Process.alive?(Backend.data(:manager_pid)) do
+          %{active: Backend.data(:active), identity: Backend.data(:identity)}
+        else
+          exit(:noproc)
+        end
       end)
     end
 
@@ -377,8 +383,19 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
       credential_epoch: 7
     }
 
-    Backend.start(self(), %{active: @binding, identity: identity, session: session})
-    on_exit(&Backend.stop/0)
+    manager_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    Backend.start(self(), %{
+      active: @binding,
+      identity: identity,
+      session: session,
+      manager_pid: manager_pid
+    })
+
+    on_exit(fn ->
+      if Process.alive?(manager_pid), do: Process.exit(manager_pid, :kill)
+      Backend.stop()
+    end)
 
     {:ok, registry} = RuntimeRegistry.new([{:calibration, 2, FakeAdapter}])
 
@@ -599,13 +616,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
       end
 
       stop_coordinator(pid)
-      Backend.stop()
-
-      Backend.start(self(), %{
-        active: @binding,
-        identity: ctx.identity,
-        session: ctx.session
-      })
+      restart_backend(ctx)
     end
   end
 
@@ -804,14 +815,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     ]
 
     for {operation, result, expected_phase} <- cases do
-      Backend.stop()
-
-      Backend.start(self(), %{
-        active: @binding,
-        identity: ctx.identity,
-        session: ctx.session,
-        responses: %{operation => {:return, result}}
-      })
+      restart_backend(ctx, %{responses: %{operation => {:return, result}}})
 
       pid = start_coordinator(ctx)
       Backend.clear_operations()
@@ -974,8 +978,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
 
   test "boot replays prepared and head-committed journals idempotently after installing the blocker", ctx do
     for phase <- [:prepared, :head_committed] do
-      Backend.stop()
-      Backend.start(self(), %{active: @binding, identity: ctx.identity, session: ctx.session})
+      restart_backend(ctx)
       Backend.put(:journal, journal_record(ctx.hydration, phase))
 
       if phase == :head_committed do
@@ -1040,14 +1043,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
              operation_index(core_operations(), :checkpoint_decode, :not_found)
 
     stop_coordinator(pid)
-    Backend.stop()
-
     drifted_binding = %{@binding | storage_epoch: <<77::128>>}
 
-    Backend.start(self(), %{
+    restart_backend(ctx, %{
       active: drifted_binding,
       identity: %{ctx.identity | storage_epoch: <<77::128>>},
-      session: ctx.session,
       journal: journal_record(ctx.hydration, :prepared)
     })
 
@@ -1068,6 +1068,36 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     refute :checkpoint_decode in core_operations()
     refute :runtime_restore in core_operations()
     refute :manager_finish in core_operations()
+  end
+
+  test "manager replacement reclaims committed recovery and retries automatically", ctx do
+    record = journal_record(ctx.hydration, :head_committed)
+    Backend.put(:journal, record)
+    Backend.put(:head, selected_record(ctx.hydration, content: ctx.hydration.content, sequence: 9))
+    Backend.respond(:runtime_restore, {:return, {:error, :restore_conflict}})
+
+    pid = start_coordinator(ctx, manager_retry_ms: 10)
+
+    assert %{blocked?: true, recovery_error: :restore_conflict} = Coordinator.status(pid)
+    old_manager = Backend.data(:manager_pid)
+    Process.exit(old_manager, :kill)
+    Process.sleep(30)
+
+    assert Process.alive?(pid)
+    assert %{blocked?: true, phase: :head_committed} = Coordinator.status(pid)
+
+    replacement = spawn(fn -> Process.sleep(:infinity) end)
+    Backend.put(:manager_pid, replacement)
+    Backend.put(:manager_blocked?, false)
+    Backend.put(:installed_binding, nil)
+    Backend.put(:installed_token, nil)
+
+    eventually(fn ->
+      assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+      assert Backend.data(:manager_finished?)
+      assert Backend.data(:journal) == nil
+      assert Backend.data(:installed_binding) == @binding
+    end)
   end
 
   test "failed restore can be replayed in place without releasing the gate", ctx do
@@ -1124,8 +1154,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     ]
 
     for {stage, expected_phase} <- stages do
-      Backend.stop()
-      Backend.start(self(), %{active: @binding, identity: ctx.identity, session: ctx.session})
+      restart_backend(ctx)
       Backend.respond({:boundary, stage}, {:crash, :kill})
 
       pid = start_coordinator(ctx)
@@ -1252,6 +1281,27 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
              RuntimeRegistry.fetch(registry, :wind_shift, 1)
   end
 
+  defp restart_backend(ctx, overrides \\ %{}) do
+    Backend.stop()
+
+    manager_pid = spawn(fn -> Process.sleep(:infinity) end)
+
+    Backend.start(
+      self(),
+      Map.merge(
+        %{
+          active: @binding,
+          identity: ctx.identity,
+          session: ctx.session,
+          manager_pid: manager_pid
+        },
+        overrides
+      )
+    )
+
+    manager_pid
+  end
+
   defp start_coordinator(ctx, overrides \\ []) do
     {:ok, pid} = Coordinator.start_link(Keyword.merge(coordinator_opts(ctx), overrides))
     Process.unlink(pid)
@@ -1279,6 +1329,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
       store_module: FakeStore,
       manager_module: FakeManager,
       session_holder_module: FakeSessionHolder,
+      manager_retry_ms: 10,
       checkpoint_module: FakeCheckpoint,
       record_module: FakeRecord,
       journal_opts: [],
@@ -1370,6 +1421,18 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     Backend.operations()
     |> Enum.map(&elem(&1, 0))
     |> Enum.reject(&match?({:boundary, _stage}, &1))
+  end
+
+  defp eventually(fun, attempts \\ 50)
+
+  defp eventually(fun, 0), do: fun.()
+
+  defp eventually(fun, attempts) do
+    fun.()
+  rescue
+    ExUnit.AssertionError ->
+      Process.sleep(10)
+      eventually(fun, attempts - 1)
   end
 
   defp operation_index(operations, operation, default \\ 1_000_000) do

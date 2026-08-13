@@ -21,6 +21,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   alias RacingOrg.Tracker.Pro.WindShift.Observer, as: WindShiftObserver
 
   @zero_identifier <<0::128>>
+  @default_manager_retry_ms 100
   @hydrate_keys [
     :device_id,
     :credential_epoch,
@@ -111,6 +112,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       journal_module: Keyword.get(opts, :journal_module, Journal),
       store_module: Keyword.get(opts, :store_module, Store),
       manager_module: Keyword.get(opts, :manager_module, Manager),
+      manager_retry_ms: Keyword.get(opts, :manager_retry_ms, @default_manager_retry_ms),
+      manager_monitor_ref: nil,
+      manager_pid: nil,
+      manager_retry_ref: nil,
+      manager_retry_token: nil,
       session_holder_module: Keyword.get(opts, :session_holder_module, SessionHolder),
       checkpoint_module: Keyword.get(opts, :checkpoint_module, Checkpoint),
       record_module: Keyword.get(opts, :record_module, Record),
@@ -122,9 +128,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       recovery_error: nil
     }
 
+    state = monitor_manager(state)
+
     case recover_state(state) do
       {:ok, state} -> {:ok, state}
-      {:error, reason, state} -> {:ok, %{state | recovery_error: reason}}
+      {:error, reason, state} -> {:ok, state |> Map.put(:recovery_error, reason) |> maybe_retry_manager(reason)}
     end
   end
 
@@ -182,6 +190,41 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
         {:reply, {:error, reason}, %{state | fresh_request?: false, recovery_error: reason}}
     end
   end
+
+  @impl true
+  def handle_info(
+        {:DOWN, monitor_ref, :process, manager_pid, _reason},
+        %{manager_monitor_ref: monitor_ref, manager_pid: manager_pid} = state
+      ) do
+    state =
+      state
+      |> Map.put(:manager_monitor_ref, nil)
+      |> Map.put(:manager_pid, nil)
+      |> schedule_manager_retry()
+
+    {:noreply, state}
+  end
+
+  def handle_info(
+        {:retry_manager_recovery, token},
+        %{manager_retry_token: token} = state
+      ) do
+    state =
+      state
+      |> Map.put(:manager_retry_ref, nil)
+      |> Map.put(:manager_retry_token, nil)
+      |> monitor_manager()
+
+    state =
+      case recover_for_retry(state) do
+        {:ok, state} -> state
+        {:error, reason, state} -> state |> Map.put(:recovery_error, reason) |> maybe_retry_manager(reason)
+      end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:retry_manager_recovery, _stale_token}, state), do: {:noreply, state}
 
   defp start_hydration(state, session_generation, hydration) do
     with {:ok, hydration} <- validate_hydration_shape(hydration),
@@ -276,6 +319,24 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     case journal_read(state) do
       {:ok, record} ->
         recover_record(state, record)
+
+      :empty ->
+        {:error, :checkpoint_hydration_recovery_evidence_missing, state}
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp recover_for_retry(%{blocker: nil} = state), do: recover_state(state)
+
+  defp recover_for_retry(state) do
+    case journal_read(state) do
+      {:ok, record} ->
+        case recover_record(%{state | blocker: nil, selected_head: nil}, record) do
+          {:error, reason, %{blocker: nil}} -> {:error, reason, state}
+          result -> result
+        end
 
       :empty ->
         {:error, :checkpoint_hydration_recovery_evidence_missing, state}
@@ -549,6 +610,67 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     end
   end
 
+  defp monitor_manager(state) do
+    case manager_pid(state) do
+      pid when is_pid(pid) and pid == state.manager_pid and is_reference(state.manager_monitor_ref) ->
+        state
+
+      pid when is_pid(pid) ->
+        state = clear_manager_monitor(state)
+        %{state | manager_pid: pid, manager_monitor_ref: Process.monitor(pid)}
+
+      _other ->
+        state
+    end
+  end
+
+  defp manager_pid(state) do
+    manager_pid =
+      if function_exported?(state.manager_module, :whereis, 1) do
+        state.manager_module.whereis(state.manager)
+      else
+        GenServer.whereis(state.manager)
+      end
+
+    case manager_pid do
+      pid when is_pid(pid) -> pid
+      {_name, _node} = remote -> remote
+      _other -> nil
+    end
+  rescue
+    _exception -> nil
+  catch
+    _kind, _reason -> nil
+  end
+
+  defp clear_manager_monitor(%{manager_monitor_ref: nil} = state), do: state
+
+  defp clear_manager_monitor(%{manager_monitor_ref: monitor_ref} = state) do
+    Process.demonitor(monitor_ref, [:flush])
+    %{state | manager_monitor_ref: nil, manager_pid: nil}
+  end
+
+  defp maybe_retry_manager(state, reason)
+       when reason in [
+              :checkpoint_hydration_manager_unavailable,
+              :checkpoint_hydration_coordinator_mismatch,
+              :checkpoint_hydration_token_mismatch,
+              :checkpoint_hydration_not_blocked
+            ],
+       do: schedule_manager_retry(state)
+
+  defp maybe_retry_manager(state, _reason), do: state
+
+  defp schedule_manager_retry(%{blocker: nil} = state), do: state
+
+  defp schedule_manager_retry(%{manager_retry_ref: nil} = state) do
+    token = make_ref()
+    timer_ref = Process.send_after(self(), {:retry_manager_recovery, token}, state.manager_retry_ms)
+    %{state | manager_retry_ref: timer_ref, manager_retry_token: token}
+  end
+
+  defp schedule_manager_retry(state), do: state
+
   defp current_binding(state) do
     with {:ok, manager_state} <- manager_state(state),
          {:ok, binding} <- active_binding(manager_state),
@@ -577,6 +699,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       _other ->
         {:error, :checkpoint_hydration_binding_unavailable}
     end
+  rescue
+    _exception -> {:error, :checkpoint_hydration_manager_unavailable}
+  catch
+    :exit, _reason -> {:error, :checkpoint_hydration_manager_unavailable}
+    _kind, _reason -> {:error, :checkpoint_hydration_manager_unavailable}
   end
 
   defp active_binding(%{active: active}) when is_map(active) do
