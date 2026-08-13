@@ -47,6 +47,31 @@ defmodule RacingOrg.Tracker.Pro.Calibration.CheckpointTest do
       assert estimator["bands"]["clamp_max"] === 10.0
     end
 
+    test "projects semantically valid learner content beyond one control frame" do
+      estimator = AwaOffset.new()
+
+      estimators =
+        Map.new(1..48, fn sequence ->
+          hardware_identifier = sequence |> Integer.to_string(16) |> String.upcase() |> String.pad_leading(4, "0")
+          {hardware_identifier, estimator}
+        end)
+
+      snapshot = %{
+        awa_estimators: estimators,
+        aws_estimators: %{},
+        prev_applied: %{},
+        seq: 48,
+        stw_estimators: %{}
+      }
+
+      assert {:ok, content} = CalibrationCheckpoint.project(snapshot)
+      assert {:ok, canonical} = ContractCheckpoint.canonical_content(:calibration, 1, content)
+      assert byte_size(canonical) > RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.max_checkpoint_size()
+
+      assert {:error, :checkpoint_too_large} =
+               ContractCheckpoint.encode_content(:calibration, 1, content)
+    end
+
     test "rejects noncanonical sensor identities and open snapshot metadata" do
       snapshot = observer_snapshot()
       awa = snapshot.awa_estimators["1A2B"]

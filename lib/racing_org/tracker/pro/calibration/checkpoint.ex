@@ -6,7 +6,8 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
   structs and tuple-keyed `prev_applied`) into the closed, canonical calibration
   content shape owned by `DesiredStateV1.Checkpoint`. `hydrate/1` performs the
   inverse conversion into a snapshot suitable for the existing observer restore
-  path. Both directions validate the closed wire contract and fail closed.
+  path. Both directions validate the closed semantic contract without imposing a
+  single-frame carriage limit and fail closed.
   """
 
   alias RacingOrg.Tracker.Pro.Calibration.Estimate
@@ -45,7 +46,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
   @spec project(map()) :: {:ok, map()} | {:error, :invalid_calibration_checkpoint}
   def project(snapshot) do
     with {:ok, content} <- project_snapshot(snapshot),
-         {:ok, _bytes} <- ContractCheckpoint.encode_content(:calibration, @schema_version, content) do
+         {:ok, _bytes} <- ContractCheckpoint.canonical_content(:calibration, @schema_version, content) do
       {:ok, content}
     else
       _ -> @error
@@ -59,7 +60,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Checkpoint do
   @doc "Hydrate validated calibration checkpoint content into an observer-store snapshot."
   @spec hydrate(map()) :: {:ok, map()} | {:error, :invalid_calibration_checkpoint}
   def hydrate(content) do
-    with {:ok, _bytes} <- ContractCheckpoint.encode_content(:calibration, @schema_version, content),
+    with {:ok, _bytes} <- ContractCheckpoint.canonical_content(:calibration, @schema_version, content),
          {:ok, snapshot} <- hydrate_content(content) do
       {:ok, snapshot}
     else
