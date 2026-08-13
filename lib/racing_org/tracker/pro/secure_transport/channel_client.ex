@@ -71,8 +71,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   require Logger
 
   alias RacingOrg.Tracker.Pro.Commands.Ledger.Executor, as: CommandExecutor
-  alias RacingOrg.Tracker.Pro.DesiredState.{Manager, Runtime}
+  alias RacingOrg.Tracker.Pro.DesiredState.{Manager, Runtime, RuntimeIdentity}
+  alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.{Coordinator, Staging}
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Entry
   alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner, as: OutboxOwner
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Submission.Planner
   alias RacingOrg.Tracker.Pro.SecureTransport.Backoff
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapState
@@ -343,6 +346,17 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       command_executor_module: Keyword.get(opts, :command_executor_module, CommandExecutor),
       outbox: Keyword.get(opts, :outbox, OutboxOwner),
       outbox_module: Keyword.get(opts, :outbox_module, OutboxOwner),
+      checkpoint_pending:
+        Keyword.get(opts, :checkpoint_pending, fn outbox, pending_opts ->
+          OutboxOwner.pending(outbox, pending_opts)
+        end),
+      checkpoint_planner: Keyword.get(opts, :checkpoint_planner, &Planner.plan/1),
+      checkpoint_hydration_coordinator: Keyword.get(opts, :checkpoint_hydration_coordinator, Coordinator),
+      checkpoint_hydration_coordinator_module: Keyword.get(opts, :checkpoint_hydration_coordinator_module, Coordinator),
+      checkpoint_hydration_staging_module: Keyword.get(opts, :checkpoint_hydration_staging_module, Staging),
+      checkpoint_hydration_staging_root:
+        Keyword.get_lazy(opts, :checkpoint_hydration_staging_root, &checkpoint_hydration_staging_root/0),
+      checkpoint_hydration_staging_opts: Keyword.get(opts, :checkpoint_hydration_staging_opts, []),
       desired_state_manager: Keyword.get(opts, :desired_state_manager, Manager),
       desired_state_manager_module: Keyword.get(opts, :desired_state_manager_module, Manager),
       desired_state_identity: Keyword.get(opts, :desired_state_identity, &Runtime.identity/0),
@@ -728,6 +742,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     {:noreply, socket}
   end
 
+  def handle_info({:dispatch_checkpoint_submissions, generation}, socket) do
+    {:noreply, dispatch_checkpoint_submissions(socket, generation)}
+  end
+
   def handle_info(_msg, socket), do: {:noreply, socket}
 
   # --- internal ---
@@ -764,6 +782,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
         |> assign(:control_ready?, true)
 
       send(self(), {:replay_desired_state_acks, generation})
+      send(self(), {:dispatch_checkpoint_submissions, generation})
       {:ok, socket}
     else
       {:reconnect, socket} ->
@@ -865,16 +884,476 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     {:ok, socket}
   end
 
-  # Checkpoint hydration is a registered, authenticated type whose runtime
-  # dispatch remains an explicit seam rather than being folded into the catch-all.
+  defp handle_control_message(
+         _topic,
+         :checkpoint_submission_resume,
+         attrs,
+         %{assigns: %{control_ready?: true, session: %Session{generation: generation}}} = socket
+       ) do
+    {:ok, resume_checkpoint_submission(socket, generation, attrs)}
+  end
+
+  defp handle_control_message(_topic, :checkpoint_submission_resume, _attrs, socket) do
+    Logger.warning("[ChannelClient] checkpoint submission resume before control readiness; refusing")
+    {:ok, socket}
+  end
+
+  defp handle_control_message(
+         _topic,
+         :checkpoint_hydration,
+         attrs,
+         %{assigns: %{control_ready?: true, session: %Session{generation: generation}}} = socket
+       ) do
+    _ = hydrate_checkpoint(socket, generation, attrs)
+    {:ok, socket}
+  end
+
   defp handle_control_message(_topic, :checkpoint_hydration, _attrs, socket) do
-    Logger.debug("[ChannelClient] checkpoint hydration received; runtime dispatch not wired in this stage")
+    Logger.warning("[ChannelClient] checkpoint hydration before control readiness; refusing")
+    {:ok, socket}
+  end
+
+  defp handle_control_message(
+         _topic,
+         :checkpoint_hydration_chunk,
+         attrs,
+         %{assigns: %{control_ready?: true, session: %Session{generation: generation}}} = socket
+       ) do
+    {:ok, stage_checkpoint_hydration(socket, generation, attrs)}
+  end
+
+  defp handle_control_message(_topic, :checkpoint_hydration_chunk, _attrs, socket) do
+    Logger.warning("[ChannelClient] checkpoint hydration chunk before control readiness; refusing")
+    {:ok, socket}
+  end
+
+  defp handle_control_message(_topic, :checkpoint_hydration_resume, _attrs, socket) do
+    Logger.warning("[ChannelClient] refusing server-originated checkpoint hydration resume")
     {:ok, socket}
   end
 
   defp handle_control_message(_topic, type, _attrs, socket) do
     Logger.debug("[ChannelClient] ignoring unhandled control message #{inspect(type)}")
     {:ok, socket}
+  end
+
+  defp dispatch_checkpoint_submissions(
+         %{assigns: %{control_ready?: true, session: %Session{generation: generation}}} = socket,
+         generation
+       ) do
+    with {:ok, entries} <- pending_checkpoint_entries(socket) do
+      Enum.reduce_while(entries, socket, fn entry, current_socket ->
+        case plan_checkpoint(current_socket, entry) do
+          {:ok, %{frames: frames}} ->
+            case push_checkpoint_frames(current_socket, frames) do
+              {:ok, next_socket} -> {:cont, next_socket}
+              {:stop, next_socket} -> {:halt, next_socket}
+            end
+
+          {:error, reason} ->
+            Logger.warning("[ChannelClient] checkpoint submission remains pending: #{inspect(reason)}")
+
+            {:halt, current_socket}
+        end
+      end)
+    else
+      {:error, reason} ->
+        Logger.warning("[ChannelClient] checkpoint dispatch unavailable: #{inspect(reason)}")
+        socket
+    end
+  end
+
+  defp dispatch_checkpoint_submissions(socket, _generation), do: socket
+
+  defp resume_checkpoint_submission(socket, generation, attrs) do
+    with true <- checkpoint_control_generation?(socket, generation),
+         {:ok, _canonical_resume} <- Messages.encode(:checkpoint_submission_resume, attrs),
+         {:ok, entries} <- pending_checkpoint_entries(socket),
+         {:ok, plan} <- find_resumed_checkpoint(socket, entries, attrs),
+         {:ok, frames} <- requested_checkpoint_frames(plan.frames, attrs) do
+      case push_checkpoint_frames(socket, frames) do
+        {:ok, socket} -> socket
+        {:stop, socket} -> socket
+      end
+    else
+      false ->
+        socket
+
+      {:error, reason} ->
+        Logger.warning("[ChannelClient] checkpoint submission resume refused: #{inspect(reason)}")
+        socket
+    end
+  end
+
+  defp pending_checkpoint_entries(socket) do
+    case socket.assigns.checkpoint_pending.(socket.assigns.outbox, stream: :checkpoint) do
+      entries when is_list(entries) ->
+        if Enum.all?(entries, &match?(%Entry{stream: :checkpoint}, &1)) do
+          {:ok, Enum.sort_by(entries, &{-&1.priority, &1.ordinal})}
+        else
+          {:error, :invalid_pending_checkpoint_entries}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _other ->
+        {:error, :invalid_pending_checkpoint_entries}
+    end
+  rescue
+    _exception -> {:error, :outbox_owner_unavailable}
+  catch
+    _kind, _reason -> {:error, :outbox_owner_unavailable}
+  end
+
+  defp plan_checkpoint(socket, %Entry{} = entry) do
+    case socket.assigns.checkpoint_planner.(entry) do
+      {:ok, %{entry: ^entry, payload: nil, frames: frames} = plan}
+      when is_list(frames) and frames != [] ->
+        if Enum.all?(frames, &valid_checkpoint_frame?/1),
+          do: {:ok, plan},
+          else: {:error, :invalid_checkpoint_plan}
+
+      {:error, reason} ->
+        {:error, reason}
+
+      _other ->
+        {:error, :invalid_checkpoint_plan}
+    end
+  rescue
+    _exception -> {:error, :checkpoint_planner_unavailable}
+  catch
+    _kind, _reason -> {:error, :checkpoint_planner_unavailable}
+  end
+
+  defp valid_checkpoint_frame?(%{type: type, attrs: attrs})
+       when type in [:checkpoint_submission, :checkpoint_submission_chunk] and is_map(attrs) do
+    match?({:ok, _bytes}, Messages.encode(type, attrs))
+  end
+
+  defp valid_checkpoint_frame?(_frame), do: false
+
+  defp push_checkpoint_frames(socket, frames) do
+    Enum.reduce_while(frames, {:ok, socket}, fn %{type: type, attrs: attrs}, {:ok, current_socket} ->
+      case push_ready_control(current_socket, type, attrs) do
+        {:ok, next_socket} -> {:cont, {:ok, next_socket}}
+        {:reconnect, next_socket} -> {:halt, {:stop, next_socket}}
+        {:error, next_socket} -> {:halt, {:stop, next_socket}}
+      end
+    end)
+  end
+
+  defp find_resumed_checkpoint(socket, entries, attrs) do
+    entries
+    |> Enum.filter(&checkpoint_entry_matches_resume?(&1, attrs))
+    |> Enum.reduce_while({:error, :checkpoint_submission_not_pending}, fn entry, _not_found ->
+      case plan_checkpoint(socket, entry) do
+        {:ok, %{frames: frames} = plan} ->
+          if checkpoint_plan_matches_resume?(frames, attrs),
+            do: {:halt, {:ok, plan}},
+            else: {:cont, {:error, :checkpoint_submission_not_pending}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  defp checkpoint_entry_matches_resume?(entry, attrs) do
+    entry.device_id == attrs.device_id and
+      entry.credential_epoch == attrs.credential_epoch and
+      entry.storage_epoch == attrs.storage_epoch and
+      entry.sequence == attrs.sequence and
+      entry.payload_hash == attrs.checkpoint_hash
+  end
+
+  defp checkpoint_plan_matches_resume?(frames, attrs) do
+    common = Map.drop(attrs, [:missing_ranges])
+    expected_indices = Enum.to_list(0..(attrs.chunk_count - 1))
+
+    Enum.map(frames, fn
+      %{type: :checkpoint_submission_chunk, attrs: frame_attrs} -> frame_attrs.chunk_index
+      _frame -> :invalid
+    end) == expected_indices and
+      Enum.all?(frames, fn
+        %{type: :checkpoint_submission_chunk, attrs: frame_attrs} ->
+          Map.take(frame_attrs, checkpoint_submission_resume_keys()) == common
+
+        _frame ->
+          false
+      end)
+  rescue
+    _exception -> false
+  end
+
+  defp requested_checkpoint_frames(frames, attrs) do
+    requested =
+      attrs.missing_ranges
+      |> Enum.flat_map(fn range ->
+        range.first_chunk_index..(range.first_chunk_index + range.chunk_count - 1)
+      end)
+
+    by_index = Map.new(frames, fn %{attrs: frame_attrs} = frame -> {frame_attrs.chunk_index, frame} end)
+
+    results = Enum.map(requested, &Map.fetch(by_index, &1))
+
+    if Enum.all?(results, &match?({:ok, _frame}, &1)) do
+      {:ok, Enum.map(results, fn {:ok, frame} -> frame end)}
+    else
+      {:error, :checkpoint_submission_resume_mismatch}
+    end
+  end
+
+  defp checkpoint_submission_resume_keys do
+    [
+      :device_id,
+      :credential_epoch,
+      :storage_epoch,
+      :sequence,
+      :kind,
+      :schema_version,
+      :source_generation,
+      :parent_hash,
+      :content_hash,
+      :checkpoint_hash,
+      :total_content_length,
+      :chunk_count
+    ]
+  end
+
+  defp hydrate_checkpoint(socket, generation, attrs) do
+    with true <- checkpoint_control_generation?(socket, generation),
+         :ok <- checkpoint_hydration_authorized(socket, attrs),
+         {:ok, :hydrated} <- checkpoint_coordinator_hydrate(socket, generation, attrs) do
+      :ok
+    else
+      false ->
+        {:error, :stale_session}
+
+      {:error, reason} ->
+        Logger.warning("[ChannelClient] checkpoint hydration refused: #{inspect(reason)}")
+        {:error, reason}
+
+      _unexpected ->
+        Logger.warning("[ChannelClient] checkpoint hydration returned invalid result")
+        {:error, :invalid_checkpoint_hydration_result}
+    end
+  end
+
+  defp checkpoint_coordinator_hydrate(socket, generation, attrs) do
+    socket.assigns.checkpoint_hydration_coordinator_module.hydrate(
+      socket.assigns.checkpoint_hydration_coordinator,
+      generation,
+      attrs
+    )
+  rescue
+    _exception -> {:error, :checkpoint_hydration_coordinator_unavailable}
+  catch
+    _kind, _reason -> {:error, :checkpoint_hydration_coordinator_unavailable}
+  end
+
+  defp stage_checkpoint_hydration(socket, generation, attrs) do
+    with true <- checkpoint_control_generation?(socket, generation),
+         :ok <- checkpoint_hydration_authorized(socket, attrs),
+         {:ok, result} <-
+           with_current_checkpoint_session(socket, generation, fn ->
+             stage_checkpoint_hydration_fenced(socket, attrs)
+           end) do
+      continue_staged_checkpoint_hydration(socket, generation, result)
+    else
+      false ->
+        socket
+
+      {:error, reason} ->
+        Logger.warning("[ChannelClient] checkpoint hydration chunk refused: #{inspect(reason)}")
+        socket
+    end
+  end
+
+  defp stage_checkpoint_hydration_fenced(socket, attrs) do
+    module = socket.assigns.checkpoint_hydration_staging_module
+    root = socket.assigns.checkpoint_hydration_staging_root
+    opts = socket.assigns.checkpoint_hydration_staging_opts
+    transfer = checkpoint_hydration_transfer(attrs)
+
+    with {:ok, _put_status} <- module.put(root, attrs, opts),
+         {:ok, status} <- module.status(root, transfer, opts),
+         :ok <- checkpoint_staging_status_matches(status, transfer) do
+      case status.missing_ranges do
+        [] ->
+          with {:ok, content} <- module.assemble(root, transfer, opts) do
+            {:ok, {:complete, transfer, content}}
+          end
+
+        missing_ranges when is_list(missing_ranges) ->
+          resume = Map.put(transfer, :missing_ranges, missing_ranges)
+
+          case Messages.encode(:checkpoint_hydration_resume, resume) do
+            {:ok, _canonical_resume} -> {:ok, {:resume, resume}}
+            {:error, reason} -> {:error, reason}
+          end
+      end
+    end
+  rescue
+    _exception -> {:error, :checkpoint_hydration_staging_unavailable}
+  catch
+    _kind, _reason -> {:error, :checkpoint_hydration_staging_unavailable}
+  end
+
+  defp continue_staged_checkpoint_hydration(socket, _generation, {:resume, resume}) do
+    case push_ready_control(socket, :checkpoint_hydration_resume, resume) do
+      {:ok, socket} -> socket
+      {:reconnect, socket} -> socket
+      {:error, socket} -> socket
+    end
+  end
+
+  defp continue_staged_checkpoint_hydration(socket, generation, {:complete, transfer, content}) do
+    hydration =
+      transfer
+      |> Map.drop([:total_content_length, :chunk_count])
+      |> Map.put(:content, content)
+
+    case hydrate_checkpoint(socket, generation, hydration) do
+      :ok ->
+        remove_staged_checkpoint(socket, transfer.checkpoint_hash)
+        socket
+
+      {:error, _reason} ->
+        socket
+    end
+  end
+
+  defp remove_staged_checkpoint(socket, checkpoint_hash) do
+    module = socket.assigns.checkpoint_hydration_staging_module
+
+    case module.remove(
+           socket.assigns.checkpoint_hydration_staging_root,
+           checkpoint_hash,
+           socket.assigns.checkpoint_hydration_staging_opts
+         ) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("[ChannelClient] hydrated checkpoint staging cleanup retained: #{inspect(reason)}")
+
+        {:error, reason}
+
+      _unexpected ->
+        Logger.warning("[ChannelClient] hydrated checkpoint staging cleanup returned invalid result")
+
+        {:error, :invalid_checkpoint_hydration_cleanup_result}
+    end
+  rescue
+    _exception -> {:error, :checkpoint_hydration_staging_unavailable}
+  catch
+    _kind, _reason -> {:error, :checkpoint_hydration_staging_unavailable}
+  end
+
+  defp checkpoint_hydration_transfer(attrs) do
+    Map.take(attrs, [
+      :device_id,
+      :credential_epoch,
+      :storage_epoch,
+      :origin_credential_epoch,
+      :origin_storage_epoch,
+      :sequence,
+      :kind,
+      :schema_version,
+      :source_generation,
+      :parent_hash,
+      :content_hash,
+      :checkpoint_hash,
+      :total_content_length,
+      :chunk_count
+    ])
+  end
+
+  defp checkpoint_staging_status_matches(status, transfer) when is_map(status) do
+    if status.total_content_length == transfer.total_content_length and
+         status.chunk_count == transfer.chunk_count and is_list(status.missing_ranges) do
+      :ok
+    else
+      {:error, :invalid_checkpoint_hydration_staging_status}
+    end
+  rescue
+    _exception -> {:error, :invalid_checkpoint_hydration_staging_status}
+  end
+
+  defp checkpoint_staging_status_matches(_status, _transfer),
+    do: {:error, :invalid_checkpoint_hydration_staging_status}
+
+  defp checkpoint_hydration_authorized(socket, attrs) do
+    with {:ok, identity} <- invoke_zero_arity(socket.assigns.desired_state_identity),
+         {:ok, status} <- invoke_zero_arity(socket.assigns.desired_state_status),
+         {:ok, active} <- checkpoint_active_authority(status),
+         :ok <- checkpoint_target_matches(attrs, identity),
+         :ok <- checkpoint_target_matches(attrs, active),
+         :ok <- checkpoint_target_matches(identity, active) do
+      :ok
+    end
+  end
+
+  defp checkpoint_active_authority(%{active: active}) when is_map(active) do
+    if is_integer(active.generation) and active.generation > 0 and
+         is_binary(active.manifest_hash) and byte_size(active.manifest_hash) == 32 do
+      {:ok, active}
+    else
+      {:error, :checkpoint_hydration_binding_unavailable}
+    end
+  rescue
+    _exception -> {:error, :checkpoint_hydration_binding_unavailable}
+  end
+
+  defp checkpoint_active_authority(_status),
+    do: {:error, :checkpoint_hydration_binding_unavailable}
+
+  defp checkpoint_target_matches(left, right) do
+    if Map.take(left, [:device_id, :credential_epoch, :storage_epoch]) ==
+         Map.take(right, [:device_id, :credential_epoch, :storage_epoch]) do
+      :ok
+    else
+      {:error, :checkpoint_hydration_target_mismatch}
+    end
+  end
+
+  defp with_current_checkpoint_session(socket, generation, transition) do
+    expected_session = socket.assigns.session
+
+    callback = fn session ->
+      if session.session_id == expected_session.session_id and
+           session.credential_epoch == expected_session.credential_epoch do
+        {:checkpoint_stage_result, transition.()}
+      else
+        {:checkpoint_stage_result, {:error, :stale_session}}
+      end
+    end
+
+    case SessionHolder.with_session(socket.assigns.session_holder, generation, callback) do
+      {:ok, {:checkpoint_stage_result, result}} -> result
+      {:error, reason} -> {:error, reason}
+      _other -> {:error, :stale_session}
+    end
+  rescue
+    _exception -> {:error, :session_holder_unavailable}
+  catch
+    _kind, _reason -> {:error, :session_holder_unavailable}
+  end
+
+  defp checkpoint_control_generation?(
+         %{assigns: %{control_ready?: true, session: %Session{generation: generation}}},
+         generation
+       ),
+       do: true
+
+  defp checkpoint_control_generation?(_socket, _generation), do: false
+
+  defp checkpoint_hydration_staging_root do
+    Application.get_env(:racing_org_tracker_pro, :checkpoint_hydration_staging_root) ||
+      RuntimeIdentity.storage_epoch_path()
+      |> Path.dirname()
+      |> Path.join("checkpoint_hydration_staging")
   end
 
   defp acknowledge_delivery(socket, receipt) do
