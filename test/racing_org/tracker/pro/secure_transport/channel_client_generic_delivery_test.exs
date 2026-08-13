@@ -399,7 +399,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientGenericDeliveryTest
   end
 
   defp receive_control(topic, server_control) do
-    assert_push(^topic, "control_v1", carrier)
+    assert_push(^topic, "control_v1", carrier, 2_000)
     assert {:ok, frame} = Control.decode_carrier(carrier)
     assert {:ok, type, bytes, server_control} = Control.open(server_control, frame)
     assert {:ok, attrs} = Messages.decode(type, bytes)
