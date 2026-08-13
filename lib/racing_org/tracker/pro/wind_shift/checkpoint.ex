@@ -10,6 +10,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Checkpoint do
   """
 
   alias RacingOrg.Tracker.Pro.RuntimeSnapshot
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Canonical
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint, as: ContractCheckpoint
 
   alias RacingOrg.Tracker.Pro.WindShift.{Cycle, Envelope, Means, StepDetect}
@@ -105,7 +106,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Checkpoint do
   @spec project(snapshot()) :: {:ok, content()} | {:error, :invalid_wind_shift_snapshot}
   def project(snapshot) do
     with {:ok, content} <- project_snapshot(snapshot),
-         {:ok, _bytes} <- ContractCheckpoint.encode_content(@kind, @schema_version, content) do
+         {:ok, _bytes} <- ContractCheckpoint.canonical_content(@kind, @schema_version, content) do
       {:ok, content}
     else
       _ -> {:error, :invalid_wind_shift_snapshot}
@@ -115,8 +116,10 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Checkpoint do
   @doc "Hydrate validated checkpoint-v1 content into the exact Observer.Store snapshot shape."
   @spec hydrate(content()) :: {:ok, snapshot()} | {:error, term()}
   def hydrate(content) do
-    with {:ok, bytes} <- ContractCheckpoint.encode_content(@kind, @schema_version, content),
-         {:ok, canonical_content} <- ContractCheckpoint.decode_content(@kind, @schema_version, bytes),
+    with {:ok, bytes} <- ContractCheckpoint.canonical_content(@kind, @schema_version, content),
+         {:ok, canonical_content} <- Canonical.decode(bytes),
+         {:ok, canonical_bytes} <- ContractCheckpoint.canonical_content(@kind, @schema_version, canonical_content),
+         true <- canonical_bytes == bytes,
          {:ok, snapshot} <- hydrate_content(canonical_content) do
       {:ok, snapshot}
     end

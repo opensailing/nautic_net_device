@@ -130,15 +130,16 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   alias RacingOrg.Tracker.Pro.Calibration.Detect.Circular
   alias RacingOrg.Tracker.Pro.Compute.Engine
+  alias RacingOrg.Tracker.Pro.DesiredState.Runtime, as: DesiredStateRuntime
   alias RacingOrg.Tracker.Pro.Compute.PgnEncode
   alias RacingOrg.Tracker.Pro.RuntimeSnapshot
   alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
-  alias RacingOrg.Tracker.Pro.WindShift.Checkpoint
   alias RacingOrg.Tracker.Pro.WindShift.Classifier
   alias RacingOrg.Tracker.Pro.WindShift.Config
   alias RacingOrg.Tracker.Pro.WindShift.Cycle
   alias RacingOrg.Tracker.Pro.WindShift.Envelope
   alias RacingOrg.Tracker.Pro.WindShift.Means
+  alias RacingOrg.Tracker.Pro.WindShift.Observer.Snapshot
   alias RacingOrg.Tracker.Pro.WindShift.Observer.Store
   alias RacingOrg.Tracker.Pro.WindShift.Period
   alias RacingOrg.Tracker.Pro.WindShift.StepDetect
@@ -218,6 +219,9 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     * `:utc_now_fn` — 0-arity wall clock (default `&DateTime.utc_now/0`); stamps
       the session identity, timeline rows, events, and durable runtime age anchor.
     * `:store_opts` — options forwarded to atomic persistence (fault injection in tests).
+    * `:authority_fn` — 0-arity verified durable identity provider. It returns
+      `{:ok, %{device_id, credential_epoch, storage_epoch}}`; production defaults
+      to `DesiredState.Runtime.identity/2` and tests may inject a deterministic authority.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
@@ -273,7 +277,12 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   snapshot is a non-regressive no-op even after local learner progress.
   """
   @type restore_error ::
-          :invalid_wind_shift_runtime_snapshot | {:persistence_failed, term()}
+          :invalid_wind_shift_runtime_snapshot
+          | :authority_mismatch
+          | :policy_mismatch
+          | :snapshot_conflict
+          | :stale_snapshot
+          | {:persistence_failed, term()}
 
   @spec restore(map()) :: :ok | {:error, restore_error()}
   def restore(snapshot) when is_map(snapshot), do: restore(__MODULE__, snapshot)
@@ -323,11 +332,19 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
         sender: Keyword.get(opts, :sender, &ChannelClient.send_wind_shift_update/2),
         now_fn: now_fn,
         utc_now_fn: utc_now_fn,
+        authority_fn: Keyword.get(opts, :authority_fn, &DesiredStateRuntime.identity/0),
         store_opts: Keyword.get(opts, :store_opts, []),
         # Policy (from WindShift.Config; safe defaults until readable).
+        policy_version: nil,
         windows: @default_windows,
         alarms: @default_alarms,
+        wally_mode: "off",
         wally_mode_code: 0,
+        residual_window: @resid_window,
+        period_every_ms: @period_every_ms,
+        xing_hysteresis_deg: @xing_hysteresis_deg,
+        absorb_dwell_ticks: @absorb_dwell_ticks,
+        broadcast_rate_ms: @rate_ms,
         # Session identity + upstream sync bookkeeping (restored across reboots).
         session: Map.get(persisted, :session),
         seq: Map.get(persisted, :seq, 0),
@@ -341,7 +358,12 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
         last_tx_ms: nil,
         dirty_persist: Map.get(persisted, :dirty_persist, false),
         last_authoritative_fingerprint: nil,
+        last_authoritative_generation: nil,
         restore_durability_pending: false,
+        source_generation: 0,
+        next_tick_ms: nil,
+        tick_timer_ref: nil,
+        tick_token: nil,
         stats: %{samples: 0, accepted: 0, rejected: 0, reject_reasons: %{}}
       }
       |> put_policy(fetch_policy(config))
@@ -349,12 +371,11 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
       |> restore_persisted_authoritative_runtime(persisted, boot_ms, boot_utc)
 
     subscribe_config(config)
-    schedule_tick(state)
-    {:ok, state}
+    {:ok, schedule_tick(state)}
   end
 
   @impl true
-  def handle_call(:tick, _from, state), do: {:reply, :ok, do_tick(state)}
+  def handle_call(:tick, _from, state), do: {:reply, :ok, mark_runtime_progress(state, do_tick(state))}
 
   def handle_call(:persist_now, _from, state), do: {:reply, :ok, persist(state)}
 
@@ -367,32 +388,30 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   def handle_call(:stats, _from, state), do: {:reply, state.stats, state}
 
   def handle_call(:snapshot, _from, state) do
-    {:reply, Checkpoint.snapshot_runtime(state, state.now_fn.()), state}
+    {:reply, Snapshot.project(state, state.now_fn.(), state.utc_now_fn.()), state}
   end
 
   def handle_call({:restore, snapshot}, _from, state) do
-    case authoritative_fingerprint(snapshot) do
-      {:ok, fingerprint}
-      when fingerprint == state.last_authoritative_fingerprint and state.restore_durability_pending ->
-        retry_uncertain_authoritative_restore(state)
-
-      {:ok, fingerprint} when fingerprint == state.last_authoritative_fingerprint ->
-        {:reply, :ok, state}
-
-      {:ok, fingerprint} ->
-        restore_authoritative_runtime(snapshot, fingerprint, state)
-
-      {:error, :invalid_wind_shift_runtime_snapshot} = error ->
-        {:reply, error, state}
+    with {:ok, fingerprint} <- Snapshot.digest(snapshot),
+         {:ok, duplicate} <- duplicate_authoritative_snapshot?(fingerprint, state),
+         {:ok, current_authority} <- Snapshot.authority(state),
+         :ok <- ensure_restore_authority(snapshot.authority, current_authority),
+         {:ok, current_policy} <- Snapshot.policy(state),
+         :ok <- ensure_restore_policy_unless_duplicate(snapshot.policy, current_policy, duplicate) do
+      reconcile_authoritative_snapshot(snapshot, fingerprint, state)
+    else
+      {:error, reason} -> {:reply, {:error, reason}, state}
+      _ -> {:reply, {:error, :invalid_wind_shift_runtime_snapshot}, state}
     end
   end
 
   @impl true
-  def handle_info(:tick, state) do
-    state = do_tick(state)
-    schedule_tick(state)
+  def handle_info({:tick, token}, %{tick_token: token} = state) do
+    state = state |> then(&mark_runtime_progress(&1, do_tick(&1))) |> schedule_tick()
     {:noreply, state}
   end
+
+  def handle_info({:tick, _stale_token}, state), do: {:noreply, state}
 
   # The wind-shift policy changed -> refetch it, and REBUILD the cores ONLY when
   # the core-shaping half (windows / alarm margin) actually changed. The warmup
@@ -1063,12 +1082,14 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
       fingerprint ->
         with true <- fixed_fingerprint?(fingerprint),
-             {:ok, snapshot} <- Checkpoint.snapshot_runtime(state, now_ms),
+             {:ok, snapshot} <- Snapshot.project(state, now_ms, captured_at_utc),
+             true <- is_integer(state.last_authoritative_generation),
              {:ok, captured_at_utc_ms} <- RuntimeSnapshot.utc_ms(captured_at_utc) do
           {:ok,
            Map.put(record, :authoritative_runtime, %{
              captured_at_utc_ms: captured_at_utc_ms,
              fingerprint: fingerprint,
+             source_generation: state.last_authoritative_generation,
              snapshot: snapshot
            })}
         else
@@ -1077,22 +1098,44 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     end
   end
 
+  defp reconcile_authoritative_snapshot(snapshot, fingerprint, state) do
+    cond do
+      fingerprint == state.last_authoritative_fingerprint and state.restore_durability_pending ->
+        retry_uncertain_authoritative_restore(state)
+
+      fingerprint == state.last_authoritative_fingerprint ->
+        {:reply, :ok, state}
+
+      state.last_authoritative_generation == snapshot.source_generation ->
+        {:reply, {:error, :snapshot_conflict}, state}
+
+      snapshot.source_generation < state.source_generation ->
+        {:reply, {:error, :stale_snapshot}, state}
+
+      true ->
+        restore_authoritative_runtime(snapshot, fingerprint, state)
+    end
+  end
+
   defp restore_authoritative_runtime(snapshot, fingerprint, state) do
     now_ms = state.now_fn.()
     current_utc = state.utc_now_fn.()
-    current_utc_ms = DateTime.to_unix(current_utc, :millisecond)
 
-    with {:ok, learner_state} <- Checkpoint.restore_runtime(snapshot, now_ms, current_utc_ms),
-         :ok <- runtime_compatible_with_policy(learner_state, state) do
+    with {:ok, restored} <- Snapshot.restore(snapshot, now_ms, current_utc),
+         :ok <- runtime_compatible_with_policy(restored.runtime, state) do
       candidate =
-        if stale_runtime_session?(learner_state.session, current_utc) do
-          %{state | seq: max(state.seq, learner_state.seq)}
+        if stale_runtime_session?(restored.runtime.session, current_utc) do
+          %{state | seq: max(state.seq, restored.runtime.seq)}
         else
-          Map.merge(state, learner_state)
+          Map.merge(state, restored.runtime)
         end
+        |> Map.put(:stats, restored.stats)
+        |> Map.put(:source_generation, restored.source_generation)
         |> Map.put(:dirty_persist, true)
         |> Map.put(:last_authoritative_fingerprint, fingerprint)
+        |> Map.put(:last_authoritative_generation, restored.source_generation)
         |> Map.put(:restore_durability_pending, false)
+        |> reschedule_restored_tick(restored.tick_delay_ms)
 
       finish_authoritative_restore(state, candidate)
     else
@@ -1115,6 +1158,8 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   end
 
   defp retry_uncertain_authoritative_restore(state) do
+    state = %{state | last_authoritative_generation: state.source_generation}
+
     case persist_authoritative_candidate(state) do
       {:ok, persisted} ->
         {:reply, :ok, persisted}
@@ -1139,16 +1184,6 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
       {:error, reason} -> {:error, reason, candidate}
     end
   end
-
-  defp authoritative_fingerprint(snapshot) when is_map(snapshot) do
-    {:ok, :crypto.hash(:sha256, :erlang.term_to_binary(snapshot, [:deterministic]))}
-  rescue
-    _ -> {:error, :invalid_wind_shift_runtime_snapshot}
-  catch
-    _, _ -> {:error, :invalid_wind_shift_runtime_snapshot}
-  end
-
-  defp authoritative_fingerprint(_snapshot), do: {:error, :invalid_wind_shift_runtime_snapshot}
 
   defp fixed_fingerprint?(value), do: is_binary(value) and byte_size(value) == 32
 
@@ -1181,7 +1216,13 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   defp restore_persisted_authoritative_runtime(state, persisted, boot_ms, boot_utc) do
     case Map.get(persisted, :authoritative_runtime) do
       %{fingerprint: fingerprint} = envelope ->
-        with :ok <- RuntimeSnapshot.exact_keys(envelope, [:captured_at_utc_ms, :fingerprint, :snapshot]),
+        with :ok <-
+               RuntimeSnapshot.exact_keys(envelope, [
+                 :captured_at_utc_ms,
+                 :fingerprint,
+                 :snapshot,
+                 :source_generation
+               ]),
              true <- fixed_fingerprint?(fingerprint) do
           reconcile_persisted_authoritative_runtime(state, envelope, fingerprint, boot_ms, boot_utc)
         else
@@ -1195,25 +1236,31 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   defp reconcile_persisted_authoritative_runtime(
          state,
-         %{captured_at_utc_ms: captured_at_utc_ms, snapshot: snapshot},
+         %{source_generation: accepted_generation, snapshot: snapshot},
          fingerprint,
          boot_ms,
          boot_utc
        ) do
-    with {:ok, captured_at_utc_ms} <- RuntimeSnapshot.utc_ms(captured_at_utc_ms),
-         {:ok, boot_utc_ms} <- RuntimeSnapshot.utc_ms(boot_utc),
-         {:ok, elapsed_ms} <- RuntimeSnapshot.elapsed_wall_ms(captured_at_utc_ms, boot_utc_ms),
-         {:ok, advanced_snapshot} <- Checkpoint.advance_runtime(snapshot, elapsed_ms),
-         {:ok, learner_state} <- Checkpoint.restore_runtime(advanced_snapshot, boot_ms, boot_utc_ms),
-         :ok <- runtime_compatible_with_policy(learner_state, state) do
-      if stale_runtime_session?(learner_state.session, boot_utc) do
+    with {:ok, current_authority} <- Snapshot.authority(state),
+         :ok <- ensure_restore_authority(snapshot.authority, current_authority),
+         {:ok, current_policy} <- Snapshot.policy(state),
+         :ok <- ensure_restore_policy_unless_duplicate(snapshot.policy, current_policy, false),
+         true <- is_integer(accepted_generation) and accepted_generation >= 0,
+         {:ok, restored} <- Snapshot.restore(snapshot, boot_ms, boot_utc),
+         :ok <- runtime_compatible_with_policy(restored.runtime, state) do
+      if stale_runtime_session?(restored.runtime.session, boot_utc) do
         state
-        |> Map.put(:seq, max(state.seq, learner_state.seq))
+        |> Map.put(:seq, max(state.seq, restored.runtime.seq))
+        |> Map.put(:last_authoritative_generation, accepted_generation)
         |> authoritative_tombstone(fingerprint)
       else
         state
-        |> Map.merge(learner_state)
+        |> Map.merge(restored.runtime)
+        |> Map.put(:stats, restored.stats)
+        |> Map.put(:source_generation, restored.source_generation)
         |> Map.put(:last_authoritative_fingerprint, fingerprint)
+        |> Map.put(:last_authoritative_generation, accepted_generation)
+        |> reschedule_restored_tick(restored.tick_delay_ms)
       end
     else
       _ -> authoritative_tombstone(state, fingerprint)
@@ -1375,18 +1422,43 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
     if compatible?, do: :ok, else: {:error, :invalid_wind_shift_runtime_snapshot}
   end
 
-  defp put_policy(state, %{windows: windows, alarms: alarms, wally_mode_code: code}),
-    do: %{state | windows: windows, alarms: alarms, wally_mode_code: code}
+  defp put_policy(state, %{
+         version: version,
+         windows: windows,
+         alarms: alarms,
+         wally_mode: wally_mode,
+         wally_mode_code: code
+       }),
+       do: %{
+         state
+         | policy_version: version,
+           windows: windows,
+           alarms: alarms,
+           wally_mode: wally_mode,
+           wally_mode_code: code
+       }
 
   # Wally.mode_code(nil) == 0 (off) — the fail-safe default policy.
-  @default_policy %{windows: @default_windows, alarms: @default_alarms, wally_mode_code: 0}
+  @default_policy %{
+    version: nil,
+    windows: @default_windows,
+    alarms: @default_alarms,
+    wally_mode: "off",
+    wally_mode_code: 0
+  }
 
   defp fetch_policy(nil), do: @default_policy
 
   defp fetch_policy({module, server}) do
     case module.current(server) do
-      %{windows: %{} = windows, alarms: %{} = alarms} = policy ->
-        %{windows: windows, alarms: alarms, wally_mode_code: Wally.mode_code(Map.get(policy, :wally_mode))}
+      %{version: version, windows: %{} = windows, alarms: %{} = alarms, wally_mode: wally_mode} ->
+        %{
+          version: version,
+          windows: windows,
+          alarms: alarms,
+          wally_mode: wally_mode,
+          wally_mode_code: Wally.mode_code(wally_mode)
+        }
 
       _ ->
         @default_policy
@@ -1530,8 +1602,92 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
   # clocks are anchored at boot, so even the first fire waits a full interval).
   defp due?(last_ms, interval, state), do: state.now_fn.() - last_ms >= interval
 
-  defp schedule_tick(%{sample_ms: ms}) when ms > 0, do: Process.send_after(self(), :tick, ms)
-  defp schedule_tick(_state), do: :ok
+  defp schedule_tick(%{sample_ms: ms} = state) when ms > 0 do
+    schedule_tick_after(state, ms)
+  end
+
+  defp schedule_tick(state), do: %{state | next_tick_ms: nil, tick_timer_ref: nil, tick_token: nil}
+
+  defp schedule_tick_after(state, delay_ms) when is_integer(delay_ms) and delay_ms >= 0 do
+    token = make_ref()
+    ref = Process.send_after(self(), {:tick, token}, delay_ms)
+
+    %{
+      state
+      | tick_token: token,
+        tick_timer_ref: ref,
+        next_tick_ms: state.now_fn.() + delay_ms
+    }
+  end
+
+  defp reschedule_restored_tick(state, nil), do: cancel_tick(state) |> schedule_tick()
+
+  defp reschedule_restored_tick(state, delay_ms) do
+    state
+    |> cancel_tick()
+    |> schedule_tick_after(delay_ms)
+  end
+
+  defp cancel_tick(%{tick_timer_ref: ref} = state) when is_reference(ref) do
+    _ = Process.cancel_timer(ref)
+    %{state | next_tick_ms: nil, tick_timer_ref: nil, tick_token: nil}
+  end
+
+  defp cancel_tick(state), do: %{state | next_tick_ms: nil, tick_timer_ref: nil, tick_token: nil}
+
+  defp mark_runtime_progress(previous, current) do
+    if runtime_changed?(previous, current) do
+      %{current | source_generation: previous.source_generation + 1}
+    else
+      current
+    end
+  end
+
+  defp runtime_changed?(previous, current) do
+    runtime_identity(previous) != runtime_identity(current)
+  end
+
+  defp runtime_identity(state) do
+    Map.take(state, [
+      :absorb_count,
+      :cycle,
+      :envelope,
+      :last_lift,
+      :last_period_ms,
+      :last_summary,
+      :last_sync_ms,
+      :last_t_ms,
+      :last_tack,
+      :last_timeline_ms,
+      :last_tx_ms,
+      :last_verdict,
+      :means,
+      :pending_events,
+      :pending_timeline,
+      :period,
+      :prev_regime,
+      :prev_step_status,
+      :resid,
+      :seq,
+      :session,
+      :stats,
+      :step,
+      :step_clock,
+      :t0_ms,
+      :unwrap,
+      :xing
+    ])
+  end
+
+  defp duplicate_authoritative_snapshot?(fingerprint, state) when is_binary(fingerprint),
+    do: {:ok, fingerprint == state.last_authoritative_fingerprint}
+
+  defp ensure_restore_authority(authority, authority), do: :ok
+  defp ensure_restore_authority(_snapshot_authority, _current_authority), do: {:error, :authority_mismatch}
+
+  defp ensure_restore_policy_unless_duplicate(_snapshot_policy, _current_policy, true), do: :ok
+  defp ensure_restore_policy_unless_duplicate(policy, policy, false), do: :ok
+  defp ensure_restore_policy_unless_duplicate(_snapshot_policy, _current_policy, false), do: {:error, :policy_mismatch}
 
   defp normalize_collaborator(nil), do: nil
   defp normalize_collaborator({module, server}) when is_atom(module), do: {module, server}

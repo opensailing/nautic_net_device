@@ -19,6 +19,32 @@ defmodule RacingOrg.Tracker.Pro.WindShift.CheckpointTest do
     assert hydrated == snapshot
   end
 
+  test "semantic projection remains valid above the current single-frame transport limit" do
+    base = snapshot()
+
+    pending_timeline =
+      for i <- 0..2_999 do
+        %{
+          t_ms: @started_at_ms + i,
+          mean_twd_deg: rem(i, 360) / 1,
+          phase_deg: 0.0,
+          amplitude_deg: nil,
+          period_s: nil,
+          trend_deg_per_hr: nil,
+          tws_mps: 6.0
+        }
+      end
+
+    oversized = %{base | pending_timeline: pending_timeline}
+
+    assert {:ok, content} = Checkpoint.project(oversized)
+    assert {:ok, canonical} = ContractCheckpoint.canonical_content(:wind_shift, 1, content)
+    assert byte_size(canonical) > 65_327
+    assert {:error, :checkpoint_too_large} = ContractCheckpoint.encode_content(:wind_shift, 1, content)
+    assert {:ok, hydrated} = Checkpoint.hydrate(content)
+    assert hydrated == oversized
+  end
+
   test "preserves a newer current event followed by a delayed older extreme exactly" do
     newer_current =
       snapshot().pending_events

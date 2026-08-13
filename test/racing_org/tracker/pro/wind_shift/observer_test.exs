@@ -5,6 +5,9 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
 
   alias RacingOrg.Tracker.Pro.WindShift.Checkpoint, as: WindCheckpoint
   alias RacingOrg.Tracker.Pro.WindShift.Config
+  alias RacingOrg.Tracker.Pro.WindShift.Cycle
+  alias RacingOrg.Tracker.Pro.WindShift.Envelope
+  alias RacingOrg.Tracker.Pro.WindShift.Means
   alias RacingOrg.Tracker.Pro.WindShift.Observer
   alias RacingOrg.Tracker.Pro.WindShift.Observer.Store
   alias RacingOrg.Tracker.Pro.WindShift.StepDetect
@@ -12,6 +15,9 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
 
   @utc_base ~U[2026-07-17 10:00:00.000Z]
   @wall_base DateTime.to_unix(@utc_base, :millisecond)
+  @device_id <<1::128>>
+  @storage_epoch <<2::128>>
+  @authority %{device_id: @device_id, credential_epoch: 7, storage_epoch: @storage_epoch}
 
   # --- scripted-signal harness -------------------------------------------------
   #
@@ -69,6 +75,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
       commands: nil,
       boat_identifier: "boat-test",
       broadcast_enabled: false,
+      authority_fn: fn -> {:ok, @authority} end,
       signals_fn: signals_fn,
       now_fn: fn -> Agent.get(script, & &1.t_ms) end,
       utc_now_fn: fn ->
@@ -724,10 +731,22 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
 
       assert state.last_summary == %{legacy.last_summary | mean_twd_deg: 0.0}
 
+      :sys.replace_state(observer, fn state ->
+        state
+        |> build_fresh_runtime_state()
+        |> Map.merge(%{
+          source_generation: 1,
+          session: nil,
+          pending_timeline: [],
+          pending_events: [],
+          last_summary: nil
+        })
+      end)
+
       assert {:ok, runtime} = Observer.snapshot(observer)
-      assert Enum.map(runtime.pending_timeline, & &1.mean_twd_deg) == [359.0, 0.0]
-      assert Enum.map(runtime.pending_events, & &1.twd_deg) == [359.0, 0.0, 1.0]
-      assert runtime.last_summary.mean_twd_deg == 0.0
+      assert runtime.runtime.pending_timeline == []
+      assert runtime.runtime.pending_events == []
+      assert runtime.runtime.last_summary == nil
 
       :ok = Observer.persist_now(observer)
       assert {:ok, migrated} = Store.load(dir)
@@ -1121,8 +1140,21 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
       end)
 
       assert {:ok, snapshot} = Observer.snapshot(source)
+      runtime = snapshot.runtime
 
       assert Map.keys(snapshot) |> Enum.sort() ==
+               [
+                 :authority,
+                 :captured_at_utc_ms,
+                 :policy,
+                 :runtime,
+                 :source_generation,
+                 :stats,
+                 :tick,
+                 :version
+               ]
+
+      assert Map.keys(runtime) |> Enum.sort() ==
                [
                  :absorb_count,
                  :cycle,
@@ -1153,14 +1185,14 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
                ]
 
       store_snapshot =
-        Map.take(snapshot, [:session, :seq, :pending_timeline, :pending_events, :last_summary])
+        Map.take(runtime, [:session, :seq, :pending_timeline, :pending_events, :last_summary])
 
       assert {:ok, _canonical_content} = WindCheckpoint.project(store_snapshot)
 
-      assert Map.keys(snapshot.means) |> Enum.sort() ==
+      assert Map.keys(runtime.means) |> Enum.sort() ==
                [:cos, :fast, :mid, :sin, :slow, :tau_fast_s, :tau_mid_s, :tau_slow_s]
 
-      assert Map.keys(snapshot.envelope) |> Enum.sort() ==
+      assert Map.keys(runtime.envelope) |> Enum.sort() ==
                [
                  :debounce_ms,
                  :first_age_ms,
@@ -1175,7 +1207,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
                  :window_ms
                ]
 
-      assert Map.keys(snapshot.cycle) |> Enum.sort() ==
+      assert Map.keys(runtime.cycle) |> Enum.sort() ==
                [
                  :cycle_var,
                  :innovation_tau_s,
@@ -1189,7 +1221,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
                  :x
                ]
 
-      assert Map.keys(snapshot.step) |> Enum.sort() ==
+      assert Map.keys(runtime.step) |> Enum.sort() ==
                [
                  :band_deg,
                  :cand_n,
@@ -1399,43 +1431,43 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
 
       invalid_learner =
         snapshot
-        |> put_in([:seq], 999)
-        |> put_in([:cycle, :p, Access.at(0), Access.at(0)], "not-a-number")
+        |> put_in([:runtime, :seq], 999)
+        |> put_in([:runtime, :cycle, :p, Access.at(0), Access.at(0)], "not-a-number")
 
       invalid_crossing_date =
         put_in(
           snapshot,
-          [:xing],
+          [:runtime, :xing],
           %{side: :pos, extreme: %{phase_deg: 5.0, twd_deg: 203.0, t_ms: @wall_base + 24 * 60 * 60 * 1_000}}
         )
 
       future_crossing =
         put_in(
           snapshot,
-          [:xing],
+          [:runtime, :xing],
           %{side: :pos, extreme: %{phase_deg: 5.0, twd_deg: 203.0, t_ms: @wall_base + 60_000}}
         )
 
       invalid_crossing_sign =
         put_in(
           snapshot,
-          [:xing],
+          [:runtime, :xing],
           %{side: :pos, extreme: %{phase_deg: -5.0, twd_deg: 203.0, t_ms: @wall_base + 2_000}}
         )
 
       invalid_crossing_domain =
         put_in(
           snapshot,
-          [:xing],
+          [:runtime, :xing],
           %{side: :pos, extreme: %{phase_deg: 500.0, twd_deg: 203.0, t_ms: @wall_base + 2_000}}
         )
 
       invalid_step_transition =
         put_in(
           snapshot,
-          [:step],
+          [:runtime, :step],
           %{
-            snapshot.step
+            snapshot.runtime.step
             | status: :confirmed,
               dir: :up,
               onset_age_ms: 1_000,
@@ -1448,10 +1480,10 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
 
       invalid_covariance =
         snapshot
-        |> put_in([:cycle, :p, Access.at(0), Access.at(0)], 1.0)
-        |> put_in([:cycle, :p, Access.at(1), Access.at(1)], 1.0)
-        |> put_in([:cycle, :p, Access.at(0), Access.at(1)], 2.0)
-        |> put_in([:cycle, :p, Access.at(1), Access.at(0)], 2.0)
+        |> put_in([:runtime, :cycle, :p, Access.at(0), Access.at(0)], 1.0)
+        |> put_in([:runtime, :cycle, :p, Access.at(1), Access.at(1)], 1.0)
+        |> put_in([:runtime, :cycle, :p, Access.at(0), Access.at(1)], 2.0)
+        |> put_in([:runtime, :cycle, :p, Access.at(1), Access.at(0)], 2.0)
 
       for invalid <- [
             nil,
@@ -1484,23 +1516,23 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
       )
 
       assert {:ok, authoritative} = Observer.snapshot(source)
-      authoritative = %{authoritative | seq: 7}
-      assert authoritative.session != nil
-      assert authoritative.pending_timeline != []
+      authoritative = put_in(authoritative, [:runtime, :seq], 7)
+      assert authoritative.runtime.session != nil
+      assert authoritative.runtime.pending_timeline != []
 
       target_ctx = new_script()
       Agent.update(target_ctx.script, &%{&1 | t_ms: 1_000})
-      target = start_observer(target_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+      target = start_observer(target_ctx, sync_ms: 3_600_000_000, timeline_ms: 1)
 
       assert :ok = Observer.restore(target, authoritative)
       assert {:ok, restored} = Observer.snapshot(target)
-      assert restored.seq == 7
-      assert restored.session == nil
-      assert restored.pending_timeline == []
-      assert restored.pending_events == []
-      assert restored.last_summary == nil
-      assert restored.means.fast == nil
-      assert restored.last_verdict == nil
+      assert restored.runtime.seq == 7
+      assert restored.runtime.session == nil
+      assert restored.runtime.pending_timeline == []
+      assert restored.runtime.pending_events == []
+      assert restored.runtime.last_summary == nil
+      assert restored.runtime.means.fast == nil
+      assert restored.runtime.last_verdict == nil
     end
 
     test "rejects runtime tunables that do not match the current wind policy" do
@@ -1515,7 +1547,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
       target = start_observer(target_ctx, config: {Config, config})
       assert {:ok, before} = Observer.snapshot(target)
 
-      assert {:error, :invalid_wind_shift_runtime_snapshot} = Observer.restore(target, authoritative)
+      assert {:error, :policy_mismatch} = Observer.restore(target, authoritative)
       assert Observer.snapshot(target) == {:ok, before}
     end
 
@@ -1564,9 +1596,14 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
                 authoritative_runtime: %{
                   captured_at_utc_ms: ^captured_at_utc_ms,
                   fingerprint: ^fingerprint,
-                  snapshot: ^authoritative
+                  source_generation: 4,
+                  snapshot: persisted_authoritative
                 }
               }} = Store.load(dir)
+
+      assert persisted_authoritative.runtime == authoritative.runtime
+      assert persisted_authoritative.authority == authoritative.authority
+      assert persisted_authoritative.policy == authoritative.policy
 
       Process.unlink(target)
       ref = Process.monitor(target)
@@ -1664,7 +1701,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
         )
 
       assert {:ok, before_corrected_redelivery} = Observer.snapshot(corrected)
-      assert before_corrected_redelivery.means.fast == nil
+      assert before_corrected_redelivery.runtime.means.fast == nil
       assert :ok = Observer.restore(corrected, authoritative)
       assert Observer.snapshot(corrected) == {:ok, before_corrected_redelivery}
       GenServer.stop(corrected)
@@ -1681,7 +1718,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
       on_exit(fn -> File.rm(blocked_dir) end)
 
       target_ctx = new_script()
-      target = start_observer(target_ctx, dir: blocked_dir)
+      target = start_observer(target_ctx, dir: blocked_dir, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
       assert {:ok, before} = Observer.snapshot(target)
 
       assert {:error, {:persistence_failed, {:pre_rename, _reason}}} =
@@ -1717,6 +1754,8 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
       target =
         start_observer(target_ctx,
           dir: dir,
+          sync_ms: 3_600_000_000,
+          timeline_ms: 3_600_000_000,
           store_opts: [fault_injector: fault_injector]
         )
 
@@ -1733,12 +1772,20 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     test "duplicate authoritative restore remains non-regressive across progress, core rebuild, and restart" do
       dir = Path.join(System.tmp_dir!(), "wind_shift_runtime_head_#{System.unique_integer([:positive])}")
       on_exit(fn -> File.rm_rf(dir) end)
+      config = start_supervised!({Config, name: nil, store_dir: nil}, id: make_ref())
+      {:ok, _} = Config.apply_config(config, %{"version" => 0})
       source_ctx = new_script()
-      source = start_observer(source_ctx, sync_ms: 3_600_000_000, timeline_ms: 3_600_000_000)
+
+      source =
+        start_observer(source_ctx,
+          config: {Config, config},
+          sync_ms: 3_600_000_000,
+          timeline_ms: 3_600_000_000
+        )
+
       drive(source, source_ctx, for(i <- 0..3, do: %{t_ms: i * 1_000, twd_deg: 200.0 + i, tws_mps: 6.0}))
       assert {:ok, authoritative} = Observer.snapshot(source)
 
-      config = start_supervised!({Config, name: nil, store_dir: nil}, id: make_ref())
       target_ctx = new_script()
       Agent.update(target_ctx.script, &%{&1 | t_ms: 3_000})
 
@@ -1764,7 +1811,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
 
       {:ok, _} = Config.apply_config(config, %{"version" => 1, "windows" => %{"fast_s" => 10}})
       assert {:ok, rebuilt} = Observer.snapshot(target)
-      assert rebuilt.means.fast == nil
+      assert rebuilt.runtime.means.fast == nil
       assert :ok = Observer.restore(target, authoritative)
       assert Observer.snapshot(target) == {:ok, rebuilt}
 
@@ -2029,6 +2076,31 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverTest do
     assert_receive {:tx, 2, 130_824, <<0x7D, 0x99, 0x50, 0x21, _, _>>}
     assert_receive {:tx, 2, 130_824, <<0x7D, 0x99, 0x51, 0x21, _, _>>}
     refute_receive {:tx, _, _, <<0x7D, 0x99, 0x52, _, _, _>>}, 20
+  end
+
+  defp build_fresh_runtime_state(state) do
+    windows = state.windows
+
+    Map.merge(state, %{
+      means: Means.new(tau_fast_s: windows.fast_s, tau_mid_s: windows.mid_s, tau_slow_s: windows.slow_s),
+      envelope: Envelope.new(window_s: windows.envelope_s, margin_deg: state.alarms.new_extreme_margin_deg),
+      cycle: Cycle.new(),
+      step: StepDetect.new(),
+      step_clock: %{u_min_t_ms: nil, d_max_t_ms: nil, onset_t_ms: nil},
+      unwrap: nil,
+      resid: {:queue.new(), 0},
+      period: :none,
+      last_period_ms: nil,
+      t0_ms: nil,
+      last_t_ms: nil,
+      prev_step_status: :none,
+      prev_regime: nil,
+      absorb_count: 0,
+      last_tack: nil,
+      xing: %{side: nil, extreme: nil},
+      last_verdict: nil,
+      last_lift: nil
+    })
   end
 
   defp oscillating_verdict do
