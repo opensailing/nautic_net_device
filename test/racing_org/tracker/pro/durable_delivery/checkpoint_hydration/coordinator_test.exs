@@ -1242,6 +1242,55 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     end)
   end
 
+  test "manual recovery cancels a queued Manager retry after convergence", ctx do
+    record = journal_record(ctx.hydration, :head_committed)
+    Backend.put(:journal, record)
+    Backend.put(:head, selected_record(ctx.hydration, content: ctx.hydration.content, sequence: 9))
+
+    Backend.respond(:manager_begin, [
+      {:return, {:error, :checkpoint_hydration_coordinator_mismatch}},
+      :default
+    ])
+
+    pid = start_coordinator(ctx, reconcile_empty_journal: true, manager_retry_ms: 100)
+
+    assert %{
+             blocked?: true,
+             phase: nil,
+             recovery_error: :checkpoint_hydration_recovery_required
+           } = Coordinator.status(pid)
+
+    assert :ok = Coordinator.recover(pid)
+    assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+
+    Backend.clear_operations()
+    Process.sleep(150)
+
+    refute :manager_begin in core_operations()
+    refute :runtime_restore in core_operations()
+    refute :manager_finish in core_operations()
+  end
+
+  test "unexpected messages cannot discard Coordinator recovery state", ctx do
+    record = journal_record(ctx.hydration, :head_committed)
+    Backend.put(:journal, record)
+    Backend.put(:head, selected_record(ctx.hydration, content: ctx.hydration.content, sequence: 9))
+    Backend.respond(:runtime_restore, {:return, {:error, :restore_conflict}})
+
+    pid = start_coordinator(ctx)
+
+    assert %{blocked?: true, phase: :head_committed, recovery_error: :restore_conflict} =
+             Coordinator.status(pid)
+
+    send(pid, {:unexpected_checkpoint_hydration_message, "private"})
+    Process.sleep(10)
+
+    assert Process.alive?(pid)
+
+    assert %{blocked?: true, phase: :head_committed, recovery_error: :restore_conflict} =
+             Coordinator.status(pid)
+  end
+
   test "idle Manager replacements are re-monitored and reconciled before fresh hydration", ctx do
     Backend.put(:head, nil)
     pid = start_coordinator(ctx, reconcile_empty_journal: true, manager_retry_ms: 10)

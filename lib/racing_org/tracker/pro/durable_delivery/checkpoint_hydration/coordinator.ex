@@ -181,7 +181,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   def handle_call(:recover, _from, %{recovery_required?: true} = state) do
     case recover_unreadable_journal(state) do
       {:ok, state} ->
-        {:reply, :ok, state}
+        {:reply, :ok, cancel_manager_retry(state)}
 
       {:error, reason, state} ->
         {:reply, {:error, public_recovery_error(state, reason)}, %{state | recovery_error: reason}}
@@ -190,14 +190,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   def handle_call(:recover, _from, %{blocker: nil} = state) do
     case recover_state(state) do
-      {:ok, state} -> {:reply, :ok, state}
+      {:ok, state} -> {:reply, :ok, cancel_manager_retry(state)}
       {:error, reason, state} -> {:reply, {:error, reason}, %{state | recovery_error: reason}}
     end
   end
 
   def handle_call(:recover, _from, state) do
     case recover_blocked_state(state) do
-      {:ok, state} -> {:reply, :ok, state}
+      {:ok, state} -> {:reply, :ok, cancel_manager_retry(state)}
       {:error, reason, state} -> {:reply, {:error, reason}, %{state | recovery_error: reason}}
     end
   end
@@ -261,6 +261,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   end
 
   def handle_info({:retry_manager_recovery, _stale_token}, state), do: {:noreply, state}
+  def handle_info(_message, state), do: {:noreply, state}
 
   defp start_hydration(state, session_generation, hydration) do
     with {:ok, hydration} <- validate_hydration_shape(hydration),
@@ -887,6 +888,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   end
 
   defp schedule_manager_retry(state), do: state
+
+  defp cancel_manager_retry(%{manager_retry_ref: nil} = state), do: state
+
+  defp cancel_manager_retry(state) do
+    Process.cancel_timer(state.manager_retry_ref)
+    %{state | manager_retry_ref: nil, manager_retry_token: nil}
+  end
 
   defp current_binding(state) do
     with {:ok, manager_state} <- manager_state(state),
