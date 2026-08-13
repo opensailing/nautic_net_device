@@ -39,6 +39,58 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime
     assert Map.keys(wire["runtime"]) |> Enum.sort() == runtime_wire_keys()
   end
 
+  test "rebinds only in-memory authority while canonical bytes remain origin-bound" do
+    wire = wire_fixture()
+    assert {:ok, canonical_before} = Checkpoint.canonical_content(:wind_shift, 2, wire)
+    assert {:ok, snapshot} = RuntimeAdapter.hydrate(wire)
+
+    target = %{
+      device_id: @device_id,
+      credential_epoch: 9,
+      storage_epoch: <<3::128>>
+    }
+
+    assert {:ok, rebound} = RuntimeAdapter.rebind_authority(snapshot, target)
+    assert rebound == %{snapshot | authority: target}
+    assert snapshot.authority != target
+
+    assert {:ok, canonical_after} = Checkpoint.canonical_content(:wind_shift, 2, wire)
+    assert canonical_after == canonical_before
+
+    assert {:ok, content_hash} = Checkpoint.content_hash(:wind_shift, 2, canonical_after)
+    assert Base.encode16(content_hash, case: :lower) == @content_hash_sha256
+  end
+
+  test "refuses target rebinding across device identity" do
+    assert {:ok, snapshot} = wire_fixture() |> RuntimeAdapter.hydrate()
+
+    target = %{
+      device_id: <<9::128>>,
+      credential_epoch: 9,
+      storage_epoch: <<3::128>>
+    }
+
+    assert {:error, :checkpoint_authority_rebind_mismatch} =
+             RuntimeAdapter.rebind_authority(snapshot, target)
+  end
+
+  test "rejects malformed target authority and non-exact hydrated snapshots" do
+    assert {:ok, snapshot} = wire_fixture() |> RuntimeAdapter.hydrate()
+
+    for invalid_target <- [
+          Map.put(snapshot.authority, :storage_epoch, <<0::128>>),
+          Map.put(snapshot.authority, :device_id, <<1::120>>),
+          Map.put(snapshot.authority, :credential_epoch, -1),
+          Map.put(snapshot.authority, :credential_epoch, 0x1_0000_0000),
+          Map.put(snapshot.authority, :unknown, true),
+          Map.delete(snapshot.authority, :storage_epoch)
+        ] do
+      assert @invalid = RuntimeAdapter.rebind_authority(snapshot, invalid_target)
+    end
+
+    assert @invalid = RuntimeAdapter.rebind_authority(Map.delete(snapshot, :tick), snapshot.authority)
+  end
+
   test "rejects crossing hysteresis that the live observer cannot restore" do
     snapshot =
       snapshot_fixture()

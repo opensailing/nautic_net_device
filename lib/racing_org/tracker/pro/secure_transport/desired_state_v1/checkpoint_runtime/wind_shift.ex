@@ -118,6 +118,23 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime
     _, _ -> @invalid
   end
 
+  @doc "Rebind one hydrated runtime snapshot to the current durable target authority."
+  @spec rebind_authority(term(), term()) ::
+          {:ok, map()}
+          | {:error, :invalid_checkpoint_content}
+          | {:error, :checkpoint_authority_rebind_mismatch}
+  def rebind_authority(snapshot, target_authority) do
+    case Snapshot.rebind_authority(snapshot, target_authority) do
+      {:ok, rebound} -> {:ok, rebound}
+      {:error, :authority_device_mismatch} -> {:error, :checkpoint_authority_rebind_mismatch}
+      _ -> @invalid
+    end
+  rescue
+    _ -> @invalid
+  catch
+    _, _ -> @invalid
+  end
+
   defp validated_snapshot(wire_content) do
     with {:ok, snapshot} <- decode_snapshot(wire_content),
          :ok <- validate_snapshot(snapshot),

@@ -278,7 +278,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
          :ok <- match_session(authorization, binding),
          {:ok, adapter} <- RuntimeRegistry.fetch(state.registry, hydration.kind, hydration.schema_version),
          :ok <- validate_hydration_integrity(state, hydration),
-         {:ok, runtime} <- decode_runtime(state, adapter, hydration),
+         {:ok, runtime} <- decode_runtime(state, adapter, hydration, binding),
          {:ok, transaction_id} <- transaction_id(state) do
       begin_transition(state, authorization, transaction_id, binding, hydration, runtime)
     else
@@ -456,7 +456,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
           with true <- selected_head.schema_version == schema_version,
                :ok <- state.record_module.verify(selected_head),
                :ok <- match_reconciliation_head(state, selected_head),
-               {:ok, runtime} <- decode_runtime(state, adapter, selected_head),
+               {:ok, runtime} <- decode_runtime(state, adapter, selected_head, state.blocker.binding),
                {:ok, {module, function}} <- Map.fetch(state.restorers, kind),
                :ok <- restore_with(module, function, runtime) do
             state = put_in(state.reconciliation_heads[kind], selected_head)
@@ -612,7 +612,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
              record.hydration.schema_version
            ),
          :ok <- validate_hydration_integrity(state, record.hydration, record.target),
-         {:ok, runtime} <- decode_runtime(state, adapter, record.hydration),
+         {:ok, runtime} <- decode_runtime(state, adapter, record.hydration, record.target),
          {:ok, state} <- replay_phase(state) do
       complete_transition(state, runtime)
     else
@@ -1005,14 +1005,22 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     end
   end
 
-  defp decode_runtime(state, adapter, hydration) do
+  defp decode_runtime(state, adapter, hydration, target) do
     with {:ok, wire} <-
            state.checkpoint_module.decode_canonical_content(
              hydration.kind,
              hydration.schema_version,
              hydration.content
            ),
-         {:ok, runtime} <- invoke_adapter(adapter, wire) do
+         {:ok, runtime} <- invoke_adapter(adapter, wire),
+         {:ok, runtime} <-
+           rebind_runtime_authority(
+             adapter,
+             hydration.kind,
+             hydration.schema_version,
+             runtime,
+             target
+           ) do
       {:ok, runtime}
     end
   end
@@ -1025,6 +1033,24 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     _kind, _reason -> {:error, :invalid_checkpoint_runtime}
   end
 
+  defp rebind_runtime_authority(adapter, :wind_shift, 2, runtime, target) do
+    case adapter.rebind_authority(runtime, target_authority(target)) do
+      {:ok, rebound} -> {:ok, rebound}
+      {:error, reason} -> {:error, reason}
+      _other -> {:error, :checkpoint_runtime_authority_rebind_failed}
+    end
+  rescue
+    _exception -> {:error, :checkpoint_runtime_authority_rebind_failed}
+  catch
+    _kind, _reason -> {:error, :checkpoint_runtime_authority_rebind_failed}
+  end
+
+  defp rebind_runtime_authority(_adapter, _kind, _schema_version, runtime, _target),
+    do: {:ok, runtime}
+
+  defp target_authority(target),
+    do: Map.take(target, [:device_id, :credential_epoch, :storage_epoch])
+
   defp selected_runtime(%{selected_head: nil}, delivered_runtime), do: {:ok, delivered_runtime}
 
   defp selected_runtime(%{selected_head: selected_head} = state, _delivered_runtime) do
@@ -1032,7 +1058,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
          :ok <- match_selected_head(state, selected_head),
          {:ok, adapter} <-
            RuntimeRegistry.fetch(state.registry, selected_head.kind, selected_head.schema_version) do
-      decode_runtime(state, adapter, selected_head)
+      decode_runtime(state, adapter, selected_head, state.blocker.record.target)
     else
       {:error, reason} -> {:error, reason}
     end

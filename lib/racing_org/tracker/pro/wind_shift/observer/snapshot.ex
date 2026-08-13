@@ -197,6 +197,33 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Snapshot do
 
   def authority(_state), do: @error
 
+  @doc """
+  Rebind a validated in-memory runtime envelope to the current target authority.
+
+  Historical checkpoint bytes remain bound to their origin authority; this
+  operation replaces only the operational authority used by the live Observer.
+  Device identity is never rebindable.
+  """
+  @spec rebind_authority(term(), term()) ::
+          {:ok, t()}
+          | {:error, :invalid_wind_shift_runtime_snapshot}
+          | {:error, :authority_device_mismatch}
+  def rebind_authority(snapshot, target_authority) do
+    with :ok <- RuntimeSnapshot.exact_keys(snapshot, @top_fields),
+         :ok <- validate_authority(snapshot.authority),
+         :ok <- validate_authority(target_authority),
+         true <- snapshot.authority.device_id == target_authority.device_id do
+      {:ok, %{snapshot | authority: Map.take(target_authority, @authority_fields)}}
+    else
+      false -> {:error, :authority_device_mismatch}
+      _ -> @error
+    end
+  rescue
+    _ -> @error
+  catch
+    _, _ -> @error
+  end
+
   @doc false
   def policy(state) when is_map(state) do
     policy = %{

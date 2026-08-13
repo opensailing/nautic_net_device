@@ -156,6 +156,28 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverSnapshotTest do
     assert Observer.snapshot(target) == {:ok, progressed}
   end
 
+  test "a rebound snapshot restores across rotated authority while the normal fence stays strict" do
+    source_clock = start_clock(10_000)
+    source = start_observer(source_clock)
+    accept_sample(source, source_clock, 10_000, @capture_utc)
+    assert {:ok, snapshot} = Observer.snapshot(source)
+
+    target_authority = %{@authority | credential_epoch: 9, storage_epoch: <<3::128>>}
+    target_clock = start_clock(50_000)
+
+    target =
+      start_observer(target_clock,
+        authority_fn: fn -> {:ok, target_authority} end
+      )
+
+    assert {:error, :authority_mismatch} = Observer.restore(target, snapshot)
+    assert {:ok, rebound} = Snapshot.rebind_authority(snapshot, target_authority)
+    assert :ok = Observer.restore(target, rebound)
+    assert {:ok, restored} = Observer.snapshot(target)
+    assert restored.authority == target_authority
+    assert %{restored | authority: snapshot.authority} == snapshot
+  end
+
   test "complete config policy version, alarms, windows, and wally mode are bound exactly" do
     config = start_supervised!({Config, name: nil, store_dir: nil}, id: make_ref())
 

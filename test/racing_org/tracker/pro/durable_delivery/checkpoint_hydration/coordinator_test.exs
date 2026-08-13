@@ -323,6 +323,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
       Backend.operation(:adapter_hydrate, wire)
       |> Backend.resolve(:adapter_hydrate, fn -> {:ok, %{runtime: wire}} end)
     end
+
+    def rebind_authority(runtime, authority) do
+      Backend.operation(:adapter_rebind, %{runtime: runtime, authority: authority})
+      |> Backend.resolve(:adapter_rebind, fn -> {:ok, Map.put(runtime, :authority, authority)} end)
+    end
   end
 
   defmodule FakeRestorer do
@@ -400,6 +405,99 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     {:ok, registry} = RuntimeRegistry.new([{:calibration, 2, FakeAdapter}])
 
     %{hydration: hydration, registry: registry, identity: identity, session: session}
+  end
+
+  test "Wind Shift hydration rebinds origin authority to the current target before restore", ctx do
+    hydration = ctx.hydration |> Map.merge(%{kind: :wind_shift, schema_version: 2}) |> with_checkpoint_hash()
+    {:ok, registry} = RuntimeRegistry.new([{:wind_shift, 2, FakeAdapter}])
+    pid = start_coordinator(ctx, registry: registry, restorers: %{wind_shift: {FakeRestorer, :restore}})
+
+    assert {:ok, :hydrated} = Coordinator.hydrate(pid, ctx.session.generation, hydration)
+
+    target_authority =
+      Map.take(@binding, [
+        :device_id,
+        :credential_epoch,
+        :storage_epoch
+      ])
+
+    assert Backend.data(:restored) == [
+             %{runtime: %{content: hydration.content}, authority: target_authority}
+           ]
+
+    assert Enum.any?(Backend.operations(), fn
+             {:adapter_rebind, %{authority: ^target_authority}} -> true
+             _other -> false
+           end)
+  end
+
+  test "non-Wind Shift hydrations never rebind runtime authority", ctx do
+    pid = start_coordinator(ctx)
+    assert {:ok, :hydrated} = Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+    refute :adapter_rebind in core_operations()
+  end
+
+  test "Wind Shift rebind refusal blocks before runtime restore", ctx do
+    hydration = ctx.hydration |> Map.merge(%{kind: :wind_shift, schema_version: 2}) |> with_checkpoint_hash()
+    {:ok, registry} = RuntimeRegistry.new([{:wind_shift, 2, FakeAdapter}])
+    Backend.respond(:adapter_rebind, {:return, {:error, :checkpoint_authority_rebind_mismatch}})
+
+    pid = start_coordinator(ctx, registry: registry, restorers: %{wind_shift: {FakeRestorer, :restore}})
+
+    assert {:error, :checkpoint_authority_rebind_mismatch} =
+             Coordinator.hydrate(pid, ctx.session.generation, hydration)
+
+    refute :runtime_restore in core_operations()
+    refute Backend.data(:manager_blocked?)
+    assert Backend.data(:journal) == nil
+  end
+
+  test "empty-journal Wind Shift reconciliation rebinds the Store-selected current head", ctx do
+    hydration = ctx.hydration |> Map.merge(%{kind: :wind_shift, schema_version: 2}) |> with_checkpoint_hash()
+    selected = selected_record(hydration, content: "startup-current-runtime", sequence: 10)
+    Backend.put(:head, selected)
+    {:ok, registry} = RuntimeRegistry.new([{:wind_shift, 2, FakeAdapter}])
+
+    pid =
+      start_coordinator(ctx,
+        registry: registry,
+        restorers: %{wind_shift: {FakeRestorer, :restore}},
+        reconcile_empty_journal: true
+      )
+
+    assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+
+    target_authority = Map.take(@binding, [:device_id, :credential_epoch, :storage_epoch])
+
+    assert Backend.data(:restored) == [
+             %{runtime: %{content: selected.content}, authority: target_authority}
+           ]
+
+    assert Backend.data(:manager_finished?)
+  end
+
+  test "head-committed Wind Shift recovery rebinds historical origin authority", ctx do
+    hydration = ctx.hydration |> Map.merge(%{kind: :wind_shift, schema_version: 2}) |> with_checkpoint_hash()
+    Backend.put(:journal, journal_record(hydration, :head_committed))
+    Backend.put(:head, selected_record(hydration, content: hydration.content, sequence: 9))
+    {:ok, registry} = RuntimeRegistry.new([{:wind_shift, 2, FakeAdapter}])
+
+    pid =
+      start_coordinator(ctx,
+        registry: registry,
+        restorers: %{wind_shift: {FakeRestorer, :restore}}
+      )
+
+    assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+
+    target_authority = Map.take(@binding, [:device_id, :credential_epoch, :storage_epoch])
+
+    assert Backend.data(:restored) == [
+             %{runtime: %{content: hydration.content}, authority: target_authority}
+           ]
+
+    assert Backend.data(:journal) == nil
+    assert Backend.data(:manager_finished?)
   end
 
   test "production empty-journal startup restores current exact heads before releasing the barrier", ctx do
@@ -578,6 +676,42 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
            |> Enum.filter(&match?({:checkpoint_decode, _payload}, &1))
            |> Enum.map(fn {_operation, payload} -> payload.content end) == [
              ctx.hydration.content,
+             selected.content
+           ]
+  end
+
+  test "Wind Shift restores and rebinds the Store-selected descendant", ctx do
+    hydration = ctx.hydration |> Map.merge(%{kind: :wind_shift, schema_version: 2}) |> with_checkpoint_hash()
+    selected = selected_record(hydration, content: "newer-wind-runtime", sequence: 10)
+    Backend.respond(:store_hydrate, {:return, {:ok, selected}})
+    {:ok, registry} = RuntimeRegistry.new([{:wind_shift, 2, FakeAdapter}])
+
+    pid =
+      start_coordinator(ctx,
+        registry: registry,
+        restorers: %{wind_shift: {FakeRestorer, :restore}}
+      )
+
+    Backend.clear_operations()
+    assert {:ok, :hydrated} = Coordinator.hydrate(pid, ctx.session.generation, hydration)
+
+    target_authority = Map.take(@binding, [:device_id, :credential_epoch, :storage_epoch])
+
+    assert Backend.data(:restored) == [
+             %{runtime: %{content: selected.content}, authority: target_authority}
+           ]
+
+    assert Backend.operations()
+           |> Enum.filter(&match?({:checkpoint_decode, _payload}, &1))
+           |> Enum.map(fn {_operation, payload} -> payload.content end) == [
+             hydration.content,
+             selected.content
+           ]
+
+    assert Backend.operations()
+           |> Enum.filter(&match?({:adapter_rebind, _payload}, &1))
+           |> Enum.map(fn {_operation, payload} -> payload.runtime.runtime.content end) == [
+             hydration.content,
              selected.content
            ]
   end
@@ -1740,6 +1874,23 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
 
   defp fake_hash(domain, values),
     do: :crypto.hash(:sha256, :erlang.term_to_binary({domain, values}, [:deterministic]))
+
+  defp with_checkpoint_hash(hydration) do
+    attrs = %{
+      device_id: hydration.device_id,
+      credential_epoch: hydration.origin_credential_epoch,
+      storage_epoch: hydration.origin_storage_epoch,
+      sequence: hydration.sequence,
+      kind: hydration.kind,
+      schema_version: hydration.schema_version,
+      source_generation: hydration.source_generation,
+      parent_hash: hydration.parent_hash,
+      content_hash: hydration.content_hash
+    }
+
+    {:ok, checkpoint_hash} = FakeCheckpoint.hash(attrs)
+    %{hydration | checkpoint_hash: checkpoint_hash}
+  end
 
   defp journal_record(hydration, phase) do
     %{
