@@ -24,6 +24,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   @default_manager_retry_ms 100
   @manager_retry_errors [
     :checkpoint_hydration_manager_unavailable,
+    :checkpoint_hydration_binding_unavailable,
     :checkpoint_hydration_coordinator_mismatch,
     :checkpoint_hydration_token_mismatch,
     :checkpoint_hydration_not_blocked
@@ -146,6 +147,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       {:error, reason, %{blocker: nil} = state} when reason in @manager_retry_errors ->
         state = %{state | recovery_required?: true, recovery_error: reason}
         {:ok, schedule_manager_retry(state)}
+
+      {:error, :checkpoint_hydration_binding_failed, %{blocker: nil} = state} ->
+        {:ok,
+         %{
+           state
+           | recovery_required?: true,
+             recovery_error: :checkpoint_hydration_binding_failed
+         }}
 
       {:error, reason, state} ->
         {:ok, state |> Map.put(:recovery_error, reason) |> maybe_retry_manager(reason)}
@@ -920,6 +929,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     case state.manager_module.status(state.manager) do
       %{active: active, identity: identity} when is_map(active) and is_map(identity) ->
         {:ok, %{active: active, identity: identity}}
+
+      %{active: {:error, _reason}} ->
+        {:error, :checkpoint_hydration_binding_failed}
 
       _other ->
         {:error, :checkpoint_hydration_binding_unavailable}

@@ -123,7 +123,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
       Backend.operation(:manager_status)
       |> Backend.resolve(:manager_status, fn ->
         if Process.alive?(Backend.data(:manager_pid)) do
-          %{active: Backend.data(:active), identity: Backend.data(:identity)}
+          case Backend.data(:active) do
+            {:error, reason} ->
+              %{active: {:error, reason}, identity: Backend.data(:identity)}
+
+            active ->
+              %{active: active, identity: Backend.data(:identity)}
+          end
         else
           exit(:noproc)
         end
@@ -498,6 +504,24 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
 
     assert Backend.data(:journal) == nil
     assert Backend.data(:manager_finished?)
+  end
+
+  test "permanent Manager active-pointer errors do not schedule binding retries", ctx do
+    Backend.put(:active, {:error, :corrupt_active_pointer})
+
+    pid = start_coordinator(ctx, reconcile_empty_journal: true, manager_retry_ms: 10)
+
+    assert Coordinator.status(pid) == %{
+             blocked?: true,
+             phase: nil,
+             recovery_error: :checkpoint_hydration_recovery_required
+           }
+
+    Backend.clear_operations()
+    Process.sleep(30)
+
+    refute :manager_status in core_operations()
+    refute :manager_begin in core_operations()
   end
 
   test "production empty-journal startup restores current exact heads before releasing the barrier", ctx do
