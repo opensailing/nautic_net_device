@@ -65,6 +65,24 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
     def script(state, key, value), do: Agent.update(state, &Map.put(&1, key, value))
   end
 
+  defmodule FaultArmingProvider do
+    def execute(intent, %{arm_on: :execute} = context) do
+      arm_fault(context.fault)
+      ScriptedProvider.execute(intent, context.script)
+    end
+
+    def execute(intent, context), do: ScriptedProvider.execute(intent, context.script)
+
+    def recover(intent, context), do: ScriptedProvider.recover(intent, context.script)
+
+    def with_non_application_lease(intent, proof, reason, context, transition) do
+      if context.arm_on == :lease, do: arm_fault(context.fault)
+      ScriptedProvider.with_non_application_lease(intent, proof, reason, context.script, transition)
+    end
+
+    defp arm_fault(fault), do: Agent.update(fault, fn _disarmed -> :armed end)
+  end
+
   defmodule BlockingExecuteProvider do
     def execute(_intent, {owner, token}) do
       send(owner, {:execute_entered, token, self()})
@@ -862,6 +880,129 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
     end
   end
 
+  describe "durability-uncertain write reconciliation" do
+    test "reopens a visible uncertain intent and recovers without restarting", ctx do
+      {fault, injector} = disarmed_fault_at(:renamed)
+      executor = start_executor(ctx, fault_injector: injector)
+      command = delivery(command_id: command_id(1), payload: payload(:noop))
+      arm_fault(fault)
+
+      assert {:defer, {:command_ledger_durability_uncertain, {:fault_injected, :renamed, :power_loss}}} =
+               Executor.deliver(executor, command)
+
+      assert ScriptedProvider.observed(ctx.script) == []
+      assert {:ok, reopened} = open_store(ctx)
+      assert Store.pending_intent(reopened).command_id == command.command_id
+
+      disarm_fault(fault)
+      ScriptedProvider.script(ctx.script, :recover, {:applied, %{outcome: :applied}})
+
+      assert {:ack, ack} = Executor.deliver(executor, command)
+      assert ack.command_id == command.command_id
+      assert ack.status in [:applied, :duplicate]
+      assert ScriptedProvider.observed(ctx.script) == [{:recover, command.command_id}]
+
+      assert {:ok, reconciled} = open_store(ctx)
+      assert Store.pending_intent(reconciled) == nil
+      assert Map.fetch!(Store.snapshot(reconciled).outcomes, command.command_id).status == :applied
+    end
+
+    test "reopens a visible uncertain applied outcome and replays it without recovery", ctx do
+      {fault, injector} = disarmed_fault_at(:renamed)
+      provider_context = %{arm_on: :execute, fault: fault, script: ctx.script}
+
+      executor =
+        start_executor(ctx,
+          fault_injector: injector,
+          providers: %{noop: {FaultArmingProvider, provider_context}}
+        )
+
+      command = delivery(command_id: command_id(1), payload: payload(:noop))
+
+      assert {:defer, {:command_ledger_durability_uncertain, {:fault_injected, :renamed, :power_loss}}} =
+               Executor.deliver(executor, command)
+
+      assert ScriptedProvider.observed(ctx.script) == [{:execute, command.command_id}]
+      assert {:ok, reopened} = open_store(ctx)
+      assert Store.pending_intent(reopened) == nil
+      assert Map.fetch!(Store.snapshot(reopened).outcomes, command.command_id).status == :applied
+
+      assert {:defer, {:command_ledger_durability_uncertain, {:fault_injected, :renamed, :power_loss}}} =
+               Executor.deliver(executor, command)
+
+      assert ScriptedProvider.observed(ctx.script) == [{:execute, command.command_id}]
+
+      disarm_fault(fault)
+      ScriptedProvider.script(ctx.script, :recover, {:applied, %{outcome: :applied}})
+
+      assert {:ack, ack} = Executor.deliver(executor, command)
+      assert ack.command_id == command.command_id
+      assert ack.status == :duplicate
+
+      assert ScriptedProvider.observed(ctx.script) == [{:execute, command.command_id}]
+    end
+
+    test "reopens a visible uncertain classified terminal outcome and replays it", ctx do
+      {fault, injector} = disarmed_fault_at(:renamed)
+      executor = start_executor(ctx, fault_injector: injector, trusted_now_ms: fn -> {:ok, 5_000} end)
+      command = delivery(command_id: command_id(1), expires_at_ms: 4_999, payload: payload(:noop))
+      arm_fault(fault)
+
+      assert {:defer, {:command_ledger_durability_uncertain, {:fault_injected, :renamed, :power_loss}}} =
+               Executor.deliver(executor, command)
+
+      assert ScriptedProvider.observed(ctx.script) == []
+      assert {:ok, reopened} = open_store(ctx)
+      assert Store.pending_intent(reopened) == nil
+      assert Map.fetch!(Store.snapshot(reopened).outcomes, command.command_id).reason == :expired
+
+      disarm_fault(fault)
+
+      assert {:ack, ack} = Executor.deliver(executor, command)
+      assert ack.command_id == command.command_id
+      assert ack.status in [:rejected, :duplicate]
+      assert ack.reason == :expired
+      assert ScriptedProvider.observed(ctx.script) == []
+    end
+
+    test "reopens a visible uncertain rejection and replays it without another recovery", ctx do
+      pending = seed_pending_intent(ctx)
+      {fault, injector} = disarmed_fault_at(:renamed)
+      ScriptedProvider.script(ctx.script, :recover, {:not_applied, :effect_not_started})
+      provider_context = %{arm_on: :lease, fault: fault, script: ctx.script}
+
+      executor =
+        start_executor(ctx,
+          fault_injector: injector,
+          providers: %{noop: {FaultArmingProvider, provider_context}}
+        )
+
+      assert_eventually(fn ->
+        case open_store(ctx) do
+          {:ok, store} ->
+            Store.pending_intent(store) == nil and
+              Map.fetch!(Store.snapshot(store).outcomes, pending.command_id).status == :rejected
+
+          {:error, _reason} ->
+            false
+        end
+      end)
+
+      observed = ScriptedProvider.observed(ctx.script)
+      assert Enum.count(observed, &match?({:recover, _}, &1)) == 1
+      assert Enum.count(observed, &match?({:lease, _, _, _}, &1)) == 1
+
+      disarm_fault(fault)
+
+      assert {:ack, ack} = Executor.deliver(executor, pending)
+      assert ack.command_id == pending.command_id
+      assert ack.status in [:rejected, :duplicate]
+      assert ack.reason == :operational_gate_closed
+
+      assert ScriptedProvider.observed(ctx.script) == observed
+    end
+  end
+
   describe "recovery of a pending intent" do
     test "proven application completes the intent and answers the exact ACK", ctx do
       pending = seed_pending_intent(ctx)
@@ -1114,6 +1255,23 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
       assert_eventually(predicate, attempts - 1)
     end
   end
+
+  defp disarmed_fault_at(stage) do
+    {:ok, fault} = Agent.start_link(fn -> :disarmed end)
+
+    injector = fn
+      ^stage ->
+        if Agent.get(fault, &(&1 == :armed)), do: {:error, :power_loss}, else: :ok
+
+      _other ->
+        :ok
+    end
+
+    {fault, injector}
+  end
+
+  defp arm_fault(fault), do: Agent.update(fault, fn _state -> :armed end)
+  defp disarm_fault(fault), do: Agent.update(fault, fn _state -> :disarmed end)
 
   defp start_executor(ctx, overrides \\ []) do
     start_supervised!({Executor, Keyword.put(executor_opts(ctx, overrides), :name, nil)})

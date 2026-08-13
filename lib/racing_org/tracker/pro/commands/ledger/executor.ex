@@ -157,6 +157,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
         identity_refresh_ref: nil,
         identity_refresh_token: nil,
         rebind_required?: false,
+        reconcile_store?: false,
         opts: opts,
         providers: providers,
         desired_state: Keyword.get_lazy(opts, :desired_state, &default_desired_state/0),
@@ -193,10 +194,19 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
   def handle_call({:deliver, delivery}, _from, state) do
     case refresh_identity(state) do
       {:bound, state} ->
-        case resolve_pending(state) do
-          {:none, state} -> route(delivery, state)
-          {{:resolved, _ack}, state} -> route(delivery, state)
-          {{:pending, reason}, state} -> {:reply, {:defer, reason}, state}
+        case reconcile_store_if_needed(state) do
+          {:ok, state} ->
+            case resolve_pending(state) do
+              {:none, state} -> route(delivery, state)
+              {{:resolved, _ack}, state} -> route(delivery, state)
+              {{:pending, reason}, state} -> {:reply, {:defer, reason}, state}
+            end
+
+          {:rebind_required, state} ->
+            rebind_reply(state)
+
+          {:error, reason, state} ->
+            {:reply, {:defer, reason}, state}
         end
 
       {:unbound, state} ->
@@ -280,7 +290,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
       {:error, reason} ->
         log_refusal(:intent, plan.delivery, reason)
-        {:reply, {:defer, reason}, state}
+        {:reply, {:defer, reason}, mark_store_reconciliation(state, reason)}
     end
   end
 
@@ -296,7 +306,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
         # The effect already happened but its outcome is not durable, so the
         # intent stays pending for the recovery contract rather than being acked.
         log_refusal(:outcome, intent, reason)
-        {:reply, {:defer, reason}, state}
+        {:reply, {:defer, reason}, mark_store_reconciliation(state, reason)}
     end
   end
 
@@ -339,7 +349,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
           {:error, reason} ->
             log_refusal(:terminal, plan.delivery, reason)
-            {:reply, {:defer, reason}, state}
+            {:reply, {:defer, reason}, mark_store_reconciliation(state, reason)}
         end
 
       {:rebind_required, state} ->
@@ -388,7 +398,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
       {:error, reason} ->
         log_refusal(:recovery_completion, intent, reason)
-        {{:pending, reason}, state}
+        {{:pending, reason}, mark_store_reconciliation(state, reason)}
     end
   end
 
@@ -414,7 +424,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
       {:error, reason} ->
         log_refusal(:recovery_rejection, intent, reason)
-        {{:pending, reason}, state}
+        {{:pending, reason}, mark_store_reconciliation(state, reason)}
     end
   end
 
@@ -590,6 +600,30 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
         {:rebind_required, latch_rebind_required(state, :identity_unavailable)}
     end
   end
+
+  defp reconcile_store_if_needed(%{reconcile_store?: false} = state), do: {:ok, state}
+
+  defp reconcile_store_if_needed(state) do
+    with {:ok, state} <- verify_live_identity(state) do
+      case open_store(Keyword.put(state.opts, :canonical_path, state.path), state.identity, state.providers) do
+        {:ok, store} ->
+          case verify_live_identity(state) do
+            {:ok, state} -> {:ok, %{state | store: store, reconcile_store?: false}}
+            {:rebind_required, state} -> {:rebind_required, state}
+          end
+
+        {:error, reason} ->
+          {:error, reason, state}
+      end
+    else
+      {:rebind_required, state} -> {:rebind_required, state}
+    end
+  end
+
+  defp mark_store_reconciliation(state, {:command_ledger_durability_uncertain, _reason}),
+    do: %{state | reconcile_store?: true}
+
+  defp mark_store_reconciliation(state, _reason), do: state
 
   defp bind_identity(state) do
     case read_identity(state.identity_source) do
