@@ -20,7 +20,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Journal do
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
 
-  @format_version 1
+  @format_version 2
   @record_tag :checkpoint_hydration_journal
   @phases [:prepared, :head_committed]
   @expected_head_states [:absent, :accepted, :local_unaccepted, :fenced, :corrupt]
@@ -48,7 +48,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Journal do
     :expected_head,
     :hydration
   ]
-  @target_keys [:device_id, :credential_epoch, :storage_epoch]
+  @target_keys [:device_id, :credential_epoch, :storage_epoch, :generation, :manifest_hash]
   @expected_head_keys [:state, :checkpoint_hash]
   @hydration_keys [
     :kind,
@@ -67,7 +67,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Journal do
   @type target :: %{
           device_id: <<_::128>>,
           credential_epoch: non_neg_integer(),
-          storage_epoch: <<_::128>>
+          storage_epoch: <<_::128>>,
+          generation: non_neg_integer(),
+          manifest_hash: <<_::256>>
         }
   @type expected_head :: %{
           state: :absent | :accepted | :local_unaccepted | :fenced | :corrupt,
@@ -411,12 +413,16 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Journal do
     with :ok <- exact_keys(target, @target_keys),
          :ok <- nonzero_identifier(Map.get(target, :device_id)),
          :ok <- u32(Map.get(target, :credential_epoch)),
-         :ok <- nonzero_identifier(Map.get(target, :storage_epoch)) do
+         :ok <- nonzero_identifier(Map.get(target, :storage_epoch)),
+         :ok <- database_int(Map.get(target, :generation)),
+         :ok <- fixed_binary(Map.get(target, :manifest_hash), @hash_size) do
       {:ok,
        %{
          device_id: target.device_id,
          credential_epoch: target.credential_epoch,
-         storage_epoch: target.storage_epoch
+         storage_epoch: target.storage_epoch,
+         generation: target.generation,
+         manifest_hash: target.manifest_hash
        }}
     end
   end

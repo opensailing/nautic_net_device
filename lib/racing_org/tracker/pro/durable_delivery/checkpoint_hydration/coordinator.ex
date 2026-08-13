@@ -566,12 +566,19 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       token: token,
       binding: binding,
       record: %{
-        version: 1,
+        version: 2,
         phase: :prepared,
         transaction_id: transaction_id,
         session_incarnation: authorization.session_id,
         session_generation: authorization.session_generation,
-        target: Map.take(binding, [:device_id, :credential_epoch, :storage_epoch]),
+        target:
+          Map.take(binding, [
+            :device_id,
+            :credential_epoch,
+            :storage_epoch,
+            :generation,
+            :manifest_hash
+          ]),
         expected_head: nil,
         hydration: %{
           kind: hydration.kind,

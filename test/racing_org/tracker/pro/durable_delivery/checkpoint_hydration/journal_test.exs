@@ -26,6 +26,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
   @replacement_storage_epoch Base.decode16!("102132435465768798a9bacbdcedfe0f", case: :lower)
   @session_incarnation Base.decode16!("102132435465768798a9bacbdcedfe0f", case: :lower)
   @transaction_id Base.decode16!("98badcfe1032547698badcfe10325476", case: :lower)
+  @manifest_hash :crypto.hash(:sha256, "desired-state-manifest")
 
   defmodule BlockingReadFileSystem do
     alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
@@ -332,6 +333,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
           %{prepared | session_incarnation: <<0xBB::128>>},
           %{prepared | session_generation: prepared.session_generation + 1},
           put_in(prepared, [:target, :credential_epoch], 8),
+          put_in(prepared, [:target, :generation], 12),
+          put_in(prepared, [:target, :manifest_hash], <<0xDD::256>>),
           prepared
           |> put_in([:expected_head, :state], :accepted)
           |> put_in([:expected_head, :checkpoint_hash], <<0xCC::256>>),
@@ -454,7 +457,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
           put_in(transition(), [:target, :credential_epoch], -1),
           put_in(transition(), [:target, :credential_epoch], 0x1_0000_0000),
           put_in(transition(), [:target, :storage_epoch], <<0::128>>),
-          put_in(transition(), [:target, :storage_epoch], self())
+          put_in(transition(), [:target, :storage_epoch], self()),
+          put_in(transition(), [:target, :generation], -1),
+          put_in(transition(), [:target, :generation], 9_223_372_036_854_775_808),
+          put_in(transition(), [:target, :manifest_hash], <<1, 2>>),
+          put_in(transition(), [:target, :manifest_hash], self())
         ] do
       assert {:error, :invalid_checkpoint_hydration_journal} = Journal.write(path, invalid)
       refute File.exists?(path)
@@ -486,6 +493,31 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
       assert :ok = Journal.write(current_path, record)
       assert {:ok, ^record} = Journal.read(current_path)
     end
+  end
+
+  test "rejects incomplete and old-version desired-state binding evidence", %{path: path} do
+    record = transition()
+
+    for invalid <- [
+          %{record | version: 1},
+          update_in(record.target, &Map.delete(&1, :generation)),
+          update_in(record.target, &Map.delete(&1, :manifest_hash))
+        ] do
+      assert {:error, :invalid_checkpoint_hydration_journal} = Journal.write(path, invalid)
+      refute File.exists?(path)
+    end
+
+    old_target = Map.take(record.target, [:device_id, :credential_epoch, :storage_epoch])
+    old_record = %{record | version: 1, target: old_target}
+
+    File.mkdir_p!(Path.dirname(path))
+
+    File.write!(
+      path,
+      :erlang.term_to_binary({1, :checkpoint_hydration_journal, old_record}, minor_version: 2)
+    )
+
+    assert {:error, :corrupt_checkpoint_hydration_journal} = Journal.read(path)
   end
 
   test "preserves the complete stable-origin hydration envelope", %{path: path} do
@@ -598,7 +630,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
 
     persisted = File.read!(path)
     assert byte_size(canonical) == 8_285_599
-    assert byte_size(persisted) == 8_286_277
+    assert byte_size(persisted) == 8_286_343
     assert byte_size(persisted) > semantic_cap - 262_144
     assert byte_size(persisted) <= Journal.max_encoded_size()
 
@@ -633,9 +665,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
 
     corruptions = [
       canonical <> <<0xAA>>,
-      :erlang.term_to_binary({2, :checkpoint_hydration_journal, transition()}),
+      :erlang.term_to_binary({1, :checkpoint_hydration_journal, transition()}),
       :erlang.term_to_binary({1, :other_journal, transition()}),
-      :erlang.term_to_binary({1, :checkpoint_hydration_journal, transition()}, compressed: 9),
+      :erlang.term_to_binary({2, :checkpoint_hydration_journal, transition()}, compressed: 9),
       noncanonical_external_term(canonical)
     ]
 
@@ -649,7 +681,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
     for forbidden <- [self(), fn -> :unsafe end, make_ref()] do
       bytes =
         :erlang.term_to_binary(
-          {1, :checkpoint_hydration_journal, %{transition() | session_incarnation: forbidden}},
+          {2, :checkpoint_hydration_journal, %{transition() | session_incarnation: forbidden}},
           minor_version: 2
         )
 
@@ -759,7 +791,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
 
   defp transition do
     %{
-      version: 1,
+      version: 2,
       phase: :prepared,
       transaction_id: @transaction_id,
       session_incarnation: @session_incarnation,
@@ -767,7 +799,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.JournalTest 
       target: %{
         device_id: @device_id,
         credential_epoch: 7,
-        storage_epoch: @storage_epoch
+        storage_epoch: @storage_epoch,
+        generation: 11,
+        manifest_hash: @manifest_hash
       },
       expected_head: %{
         state: :absent,

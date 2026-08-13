@@ -354,6 +354,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     assert prepared.transaction_id == @transaction_id
     assert prepared.session_incarnation == @session_id
     assert prepared.session_generation == ctx.session.generation
+    assert prepared.version == 2
+    assert prepared.target == @binding
     assert Map.delete(prepared, :phase) == Map.delete(committed, :phase)
     assert Backend.data(:journal) == nil
     assert Backend.data(:manager_finished?)
@@ -728,12 +730,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
 
   defp journal_record(hydration, phase) do
     %{
-      version: 1,
+      version: 2,
       phase: phase,
       transaction_id: @transaction_id,
       session_incarnation: @session_id,
       session_generation: 42,
-      target: Map.take(hydration, [:device_id, :credential_epoch, :storage_epoch]),
+      target: @binding,
       expected_head: %{state: :absent, checkpoint_hash: Record.genesis_parent()},
       hydration: %{
         kind: hydration.kind,
