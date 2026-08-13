@@ -65,6 +65,66 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
     def script(state, key, value), do: Agent.update(state, &Map.put(&1, key, value))
   end
 
+  defmodule BlockingExecuteProvider do
+    def execute(_intent, {owner, token}) do
+      send(owner, {:execute_entered, token, self()})
+
+      receive do
+        {:finish_execute, ^token} -> {:ok, %{outcome: :applied}}
+      end
+    end
+
+    def recover(_intent, _context), do: :ambiguous
+
+    def with_non_application_lease(_intent, _proof, _reason, _context, transition),
+      do: transition.()
+  end
+
+  defmodule SequencedBlockingRecoverProvider do
+    def execute(_intent, _context), do: {:error, :not_used}
+
+    def recover(_intent, %{owner: owner, script: script, token: token}) do
+      case Agent.get_and_update(script, fn [next | rest] -> {next, rest} end) do
+        :ambiguous ->
+          send(owner, {:startup_recovery_done, token})
+          :ambiguous
+
+        :block_applied ->
+          send(owner, {:recover_entered, token, self()})
+
+          receive do
+            {:finish_recover, ^token} -> {:applied, %{outcome: :applied}}
+          end
+
+        :not_applied ->
+          {:not_applied, :effect_not_started}
+      end
+    end
+
+    def with_non_application_lease(_intent, _proof, _reason, %{owner: owner, token: token}, transition) do
+      send(owner, {:recovery_lease_entered, token, self()})
+
+      receive do
+        {:finish_recovery_lease, ^token} -> transition.()
+      end
+    end
+  end
+
+  defmodule AdvanceAfterReturnIdentitySource do
+    def next(authority) do
+      Agent.get_and_update(authority, fn
+        %{mode: :unbound} = state ->
+          {{:error, :no_verified_authority}, state}
+
+        %{mode: :bind, old: old} = state ->
+          {{:ok, old}, %{state | mode: :rotated}}
+
+        %{mode: :rotated, rotated: rotated} = state ->
+          {{:ok, rotated}, state}
+      end)
+    end
+  end
+
   setup do
     root = Path.join(System.tmp_dir!(), "command_executor_#{System.unique_integer([:positive])}")
     on_exit(fn -> File.rm_rf(root) end)
@@ -205,7 +265,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
         Agent.start_link(fn ->
           %{
             current: {:ok, durable_identity()},
-            remaining: [{:ok, durable_identity()}, {:ok, rotated}]
+            remaining: [{:ok, durable_identity()}, {:ok, durable_identity()}, {:ok, rotated}]
           }
         end)
 
@@ -226,6 +286,92 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
       assert {:ok, old_store} = open_store(ctx)
       assert Store.pending_intent(old_store).command_id == command.command_id
       assert Store.snapshot(old_store).next_expected_sequence == 1
+    end
+
+    test "identity drift during an effect cannot complete or ACK the retired ledger", ctx do
+      {:ok, authority} = Agent.start_link(fn -> {:ok, durable_identity()} end)
+      token = make_ref()
+
+      executor =
+        start_executor(ctx,
+          identity: fn -> Agent.get(authority, & &1) end,
+          identity_refresh_ms: 10_000,
+          device_id: nil,
+          credential_epoch: nil,
+          storage_epoch: nil,
+          providers: %{noop: {BlockingExecuteProvider, {self(), token}}}
+        )
+
+      command = delivery(command_id: command_id(1), payload: payload(:noop))
+      task = Task.async(fn -> Executor.deliver(executor, command) end)
+
+      assert_receive {:execute_entered, ^token, provider}
+      Agent.update(authority, fn _old -> {:ok, rotated_identity()} end)
+      send(provider, {:finish_execute, token})
+
+      assert {:defer, :command_executor_rebind_required} = Task.await(task)
+      assert Executor.identity(executor) == nil
+
+      assert {:ok, old_store} = open_store(ctx)
+      snapshot = Store.snapshot(old_store)
+      assert snapshot.pending_intent.command_id == command.command_id
+      refute Map.has_key?(snapshot.outcomes, command.command_id)
+    end
+
+    test "delivery-triggered first binding rechecks authority before replaying a retained ACK", ctx do
+      duplicate = seed_applied_outcome(ctx)
+
+      {:ok, authority} =
+        Agent.start_link(fn ->
+          %{mode: :unbound, old: durable_identity(), rotated: rotated_identity()}
+        end)
+
+      executor =
+        start_executor(ctx,
+          identity: fn -> AdvanceAfterReturnIdentitySource.next(authority) end,
+          identity_refresh_ms: 10_000,
+          device_id: nil,
+          credential_epoch: nil,
+          storage_epoch: nil
+        )
+
+      assert Executor.identity(executor) == nil
+      Agent.update(authority, &%{&1 | mode: :bind})
+
+      assert {:defer, :command_executor_rebind_required} = Executor.deliver(executor, duplicate)
+      assert Executor.identity(executor) == nil
+      assert ScriptedProvider.observed(ctx.script) == []
+
+      assert {:ok, old_store} = open_store(ctx)
+      snapshot = Store.snapshot(old_store)
+      assert snapshot.pending_intent == nil
+      assert snapshot.next_expected_sequence == 2
+      assert Map.has_key?(snapshot.outcomes, duplicate.command_id)
+    end
+
+    test "bound duplicate replay rechecks authority immediately before ACK exposure", ctx do
+      duplicate = seed_applied_outcome(ctx)
+
+      {:ok, authority} =
+        Agent.start_link(fn ->
+          %{
+            current: {:ok, durable_identity()},
+            remaining: [{:ok, durable_identity()}, {:ok, durable_identity()}, {:ok, rotated_identity()}]
+          }
+        end)
+
+      executor =
+        start_executor(ctx,
+          identity: fn -> SequencedIdentitySource.next(authority) end,
+          identity_refresh_ms: 10_000,
+          device_id: nil,
+          credential_epoch: nil,
+          storage_epoch: nil
+        )
+
+      assert {:defer, :command_executor_rebind_required} = Executor.deliver(executor, duplicate)
+      assert Executor.identity(executor) == nil
+      assert ScriptedProvider.observed(ctx.script) == []
     end
 
     test "post-bind authority loss latches rebind required and preserves the old ledger", ctx do
@@ -549,6 +695,33 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
       assert Map.fetch!(Store.snapshot(reopened).outcomes, delivery.command_id).reason == :expired
     end
 
+    test "identity drift during terminal classification cannot persist or ACK", ctx do
+      {:ok, authority} = Agent.start_link(fn -> {:ok, durable_identity()} end)
+
+      executor =
+        start_executor(ctx,
+          identity: fn -> Agent.get(authority, & &1) end,
+          identity_refresh_ms: 10_000,
+          device_id: nil,
+          credential_epoch: nil,
+          storage_epoch: nil,
+          trusted_now_ms: fn ->
+            Agent.update(authority, fn _old -> {:ok, rotated_identity()} end)
+            {:ok, 5_000}
+          end
+        )
+
+      command = delivery(command_id: command_id(1), expires_at_ms: 4_999, payload: payload(:noop))
+
+      assert {:defer, :command_executor_rebind_required} = Executor.deliver(executor, command)
+      assert Executor.identity(executor) == nil
+
+      assert {:ok, old_store} = open_store(ctx)
+      snapshot = Store.snapshot(old_store)
+      assert snapshot.next_expected_sequence == 1
+      assert snapshot.outcomes == %{}
+    end
+
     test "an unusable trusted clock defers without touching the ledger", ctx do
       executor = start_executor(ctx, trusted_now_ms: fn -> :unavailable end)
 
@@ -673,6 +846,74 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
       assert Store.pending_intent(reopened) != nil
     end
 
+    test "identity drift during recovery cannot complete or replay an ACK", ctx do
+      pending = seed_pending_intent(ctx)
+      {:ok, authority} = Agent.start_link(fn -> {:ok, durable_identity()} end)
+      {:ok, script} = Agent.start_link(fn -> [:ambiguous, :block_applied] end)
+      token = make_ref()
+      provider_context = %{owner: self(), script: script, token: token}
+
+      executor =
+        start_executor(ctx,
+          identity: fn -> Agent.get(authority, & &1) end,
+          identity_refresh_ms: 10_000,
+          device_id: nil,
+          credential_epoch: nil,
+          storage_epoch: nil,
+          providers: %{noop: {SequencedBlockingRecoverProvider, provider_context}}
+        )
+
+      assert_receive {:startup_recovery_done, ^token}
+      _state = :sys.get_state(executor)
+
+      task = Task.async(fn -> Executor.deliver(executor, pending) end)
+      assert_receive {:recover_entered, ^token, provider}
+      Agent.update(authority, fn _old -> {:ok, rotated_identity()} end)
+      send(provider, {:finish_recover, token})
+
+      assert {:defer, :command_executor_rebind_required} = Task.await(task)
+      assert Executor.identity(executor) == nil
+
+      assert {:ok, old_store} = open_store(ctx)
+      snapshot = Store.snapshot(old_store)
+      assert snapshot.pending_intent.command_id == pending.command_id
+      refute Map.has_key?(snapshot.outcomes, pending.command_id)
+    end
+
+    test "identity drift during a non-application lease cannot reject or ACK", ctx do
+      pending = seed_pending_intent(ctx)
+      {:ok, authority} = Agent.start_link(fn -> {:ok, durable_identity()} end)
+      {:ok, script} = Agent.start_link(fn -> [:ambiguous, :not_applied] end)
+      token = make_ref()
+      provider_context = %{owner: self(), script: script, token: token}
+
+      executor =
+        start_executor(ctx,
+          identity: fn -> Agent.get(authority, & &1) end,
+          identity_refresh_ms: 10_000,
+          device_id: nil,
+          credential_epoch: nil,
+          storage_epoch: nil,
+          providers: %{noop: {SequencedBlockingRecoverProvider, provider_context}}
+        )
+
+      assert_receive {:startup_recovery_done, ^token}
+      _state = :sys.get_state(executor)
+
+      task = Task.async(fn -> Executor.deliver(executor, pending) end)
+      assert_receive {:recovery_lease_entered, ^token, lease_holder}
+      Agent.update(authority, fn _old -> {:ok, rotated_identity()} end)
+      send(lease_holder, {:finish_recovery_lease, token})
+
+      assert {:defer, :command_executor_rebind_required} = Task.await(task)
+      assert Executor.identity(executor) == nil
+
+      assert {:ok, old_store} = open_store(ctx)
+      snapshot = Store.snapshot(old_store)
+      assert snapshot.pending_intent.command_id == pending.command_id
+      refute Map.has_key?(snapshot.outcomes, pending.command_id)
+    end
+
     test "startup with a pending intent requires the exact verifier and fails closed without wiping", ctx do
       pending = seed_pending_intent(ctx)
       Process.flag(:trap_exit, true)
@@ -762,6 +1003,14 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
     }
   end
 
+  defp rotated_identity do
+    %{
+      durable_identity()
+      | credential_epoch: @credential_epoch + 1,
+        storage_epoch: @other_storage_epoch
+    }
+  end
+
   defp assert_eventually(predicate, attempts \\ 100)
   defp assert_eventually(predicate, 0), do: assert(predicate.())
 
@@ -836,16 +1085,28 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
     command = delivery(command_id: command_id(1), payload: payload(:noop))
     assert {:ok, store} = open_store(ctx)
 
-    assert {:ok, _intent, _store} =
-             Store.begin_intent(store, %{
-               action: :execute,
-               delivery: command,
-               command_type: :noop,
-               reserved_result_bytes: 256,
-               reset_epoch?: false
-             })
+    assert {:ok, _intent, _store} = Store.begin_intent(store, execution_plan(command))
 
     command
+  end
+
+  defp seed_applied_outcome(ctx) do
+    command = delivery(command_id: command_id(1), payload: payload(:noop))
+    assert {:ok, store} = open_store(ctx)
+    assert {:ok, _intent, store} = Store.begin_intent(store, execution_plan(command))
+    {:ok, result} = Canonical.encode(%{"outcome" => "applied"})
+    assert {:ok, _ack, _store} = Store.complete_intent(store, result)
+    command
+  end
+
+  defp execution_plan(command) do
+    %{
+      action: :execute,
+      delivery: command,
+      command_type: :noop,
+      reserved_result_bytes: 256,
+      reset_epoch?: false
+    }
   end
 
   defp payload(type, args \\ %{}) do

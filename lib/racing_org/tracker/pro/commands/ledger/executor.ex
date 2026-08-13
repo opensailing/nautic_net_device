@@ -169,6 +169,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
       case bind_identity(state) do
         {:ok, state} -> {:ok, state, {:continue, :recover_pending}}
         {:unbound, state} -> {:ok, schedule_identity_refresh(state)}
+        {:rebind_required, state} -> {:ok, state}
         {:error, reason} -> {:stop, reason}
       end
     else
@@ -254,8 +255,8 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
     case Ledger.classify(delivery, context(state)) do
       {:execute, plan} -> execute(plan, state)
       {:terminal, plan} -> record_terminal(plan, state)
-      {:duplicate, ack} -> {:reply, {:ack, ack}, state}
-      {:transient, ack} -> {:reply, {:ack, ack}, state}
+      {:duplicate, ack} -> ack_or_rebind(ack, state)
+      {:transient, ack} -> ack_or_rebind(ack, state)
       {:defer, reason} -> {:reply, {:defer, reason}, state}
     end
   end
@@ -268,8 +269,14 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
         state = %{state | store: store}
 
         case run_effect(intent, state) do
-          {:ok, result, state} -> complete(intent, result, state)
-          {:rebind_required, state} -> {:reply, {:defer, :command_executor_rebind_required}, state}
+          {:ok, result, state} ->
+            case verify_live_identity(state) do
+              {:ok, state} -> complete(intent, result, state)
+              {:rebind_required, state} -> rebind_reply(state)
+            end
+
+          {:rebind_required, state} ->
+            rebind_reply(state)
         end
 
       {:error, reason} ->
@@ -284,7 +291,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
   defp complete(intent, {:ok, result_term}, state) do
     case Store.complete_intent(state.store, encoded_result(intent, result_term)) do
       {:ok, ack, store} ->
-        {:reply, {:ack, ack}, %{state | store: store}}
+        ack_or_rebind(ack, %{state | store: store})
 
       {:error, reason} ->
         # The effect already happened but its outcome is not durable, so the
@@ -301,7 +308,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
     {resolution, state} = resolve_pending(state)
 
     case resolution do
-      {:resolved, ack} -> {:reply, {:ack, ack}, state}
+      {:resolved, ack} -> ack_or_rebind(ack, state)
       {:pending, pending_reason} -> {:reply, {:defer, pending_reason}, state}
       :none -> {:reply, {:defer, reason}, state}
     end
@@ -325,13 +332,19 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
   end
 
   defp record_terminal(plan, state) do
-    case Store.record_terminal(state.store, plan) do
-      {:ok, ack, store} ->
-        {:reply, {:ack, ack}, %{state | store: store}}
+    case verify_live_identity(state) do
+      {:ok, state} ->
+        case Store.record_terminal(state.store, plan) do
+          {:ok, ack, store} ->
+            ack_or_rebind(ack, %{state | store: store})
 
-      {:error, reason} ->
-        log_refusal(:terminal, plan.delivery, reason)
-        {:reply, {:defer, reason}, state}
+          {:error, reason} ->
+            log_refusal(:terminal, plan.delivery, reason)
+            {:reply, {:defer, reason}, state}
+        end
+
+      {:rebind_required, state} ->
+        rebind_reply(state)
     end
   end
 
@@ -344,14 +357,30 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
       {:recover, intent} ->
         case with_live_identity(state, fn state -> invoke_provider(intent, :recover, state) end) do
-          {:ok, {:applied, result_term}, state} -> complete_recovered(intent, result_term, state)
-          {:ok, {:not_applied, proof}, state} -> reject_recovered(intent, proof, state)
-          {:ok, :ambiguous, state} -> {{:pending, :ambiguous_command_recovery}, state}
-          {:ok, _invalid, state} -> {{:pending, :ambiguous_command_recovery}, state}
+          {:ok, recovery, state} -> finish_recovery(intent, recovery, state)
           {:rebind_required, state} -> {{:pending, :command_executor_rebind_required}, state}
         end
     end
   end
+
+  defp finish_recovery(intent, recovery, state) do
+    case verify_live_identity(state) do
+      {:ok, state} -> resolve_recovery(intent, recovery, state)
+      {:rebind_required, state} -> {{:pending, :command_executor_rebind_required}, state}
+    end
+  end
+
+  defp resolve_recovery(intent, {:applied, result_term}, state),
+    do: complete_recovered(intent, result_term, state)
+
+  defp resolve_recovery(intent, {:not_applied, proof}, state),
+    do: reject_recovered(intent, proof, state)
+
+  defp resolve_recovery(_intent, :ambiguous, state),
+    do: {{:pending, :ambiguous_command_recovery}, state}
+
+  defp resolve_recovery(_intent, _invalid, state),
+    do: {{:pending, :ambiguous_command_recovery}, state}
 
   defp complete_recovered(intent, result_term, state) do
     case Store.complete_intent(state.store, encoded_result(intent, result_term)) do
@@ -376,9 +405,13 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
       reason: :operational_gate_closed
     }
 
-    case Store.reject_intent(state.store, plan) do
+    case Store.reject_intent(state.store, plan, before_transition: fn -> ensure_live_identity(state) end) do
       {:ok, ack, store} ->
         {{:resolved, ack}, %{state | store: store}}
+
+      {:error, :command_executor_rebind_required} ->
+        state = latch_rebind_required(state, :identity_drift)
+        {{:pending, :command_executor_rebind_required}, state}
 
       {:error, reason} ->
         log_refusal(:recovery_rejection, intent, reason)
@@ -395,12 +428,37 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
   end
 
   defp with_live_identity(state, fun) do
+    case verify_live_identity(state) do
+      {:ok, state} -> {:ok, fun.(state), state}
+      {:rebind_required, state} -> {:rebind_required, state}
+    end
+  end
+
+  defp verify_live_identity(state) do
     case read_identity(state.identity_source) do
-      {:ok, identity} when identity == state.identity -> {:ok, fun.(state), state}
+      {:ok, identity} when identity == state.identity -> {:ok, state}
       {:ok, _identity} -> {:rebind_required, latch_rebind_required(state, :identity_drift)}
       {:error, reason} -> {:rebind_required, latch_rebind_required(state, reason)}
     end
   end
+
+  defp ensure_live_identity(state) do
+    case read_identity(state.identity_source) do
+      {:ok, identity} when identity == state.identity -> :ok
+      {:ok, _identity} -> {:error, :command_executor_rebind_required}
+      {:error, _reason} -> {:error, :command_executor_rebind_required}
+    end
+  end
+
+  defp ack_or_rebind(ack, state) do
+    case verify_live_identity(state) do
+      {:ok, state} -> {:reply, {:ack, ack}, state}
+      {:rebind_required, state} -> rebind_reply(state)
+    end
+  end
+
+  defp rebind_reply(state),
+    do: {:reply, {:defer, :command_executor_rebind_required}, state}
 
   defp invoke_provider(intent, function, state) do
     case Map.fetch(state.providers, intent.command_type) do
@@ -503,6 +561,9 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
       {:unbound, state} ->
         {:unbound, state}
 
+      {:rebind_required, state} ->
+        {:rebind_required, state}
+
       {:error, :command_ledger_identity_mismatch} ->
         {:rebind_required, latch_rebind_required(state, :command_ledger_identity_mismatch)}
 
@@ -528,7 +589,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
     case read_identity(state.identity_source) do
       {:ok, identity} ->
         case open_store(Keyword.put(state.opts, :canonical_path, state.path), identity, state.providers) do
-          {:ok, store} -> {:ok, %{state | store: store, identity: identity}}
+          {:ok, store} -> finish_bind(state, identity, store)
           {:error, reason} -> {:error, reason}
         end
 
@@ -537,6 +598,22 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp finish_bind(%{identity_source: {:static, _identity}} = state, identity, store),
+    do: {:ok, %{state | store: store, identity: identity}}
+
+  defp finish_bind(state, identity, store) do
+    case read_identity(state.identity_source) do
+      {:ok, current} when current == identity ->
+        {:ok, %{state | store: store, identity: identity}}
+
+      {:ok, _current} ->
+        {:rebind_required, latch_rebind_required(state, :identity_drift)}
+
+      {:error, reason} ->
+        {:rebind_required, latch_rebind_required(state, reason)}
     end
   end
 

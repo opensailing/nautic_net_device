@@ -163,21 +163,23 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   finishes or dies; the configured timeout only bounds a verifier that has not
   started a transition.
   """
-  @spec reject_intent(t(), map()) :: {:ok, map(), t()} | {:error, term()}
-  def reject_intent(%__MODULE__{} = store, plan) when is_map(plan) do
-    with_path_lock(store, fn -> reject_intent_locked(store, plan) end)
+  @spec reject_intent(t(), map(), keyword()) :: {:ok, map(), t()} | {:error, term()}
+  def reject_intent(store, plan, opts \\ [])
+
+  def reject_intent(%__MODULE__{} = store, plan, opts) when is_map(plan) and is_list(opts) do
+    with_path_lock(store, fn -> reject_intent_locked(store, plan, opts) end)
   end
 
-  def reject_intent(_store, _plan), do: {:error, :invalid_command_rejection_plan}
+  def reject_intent(_store, _plan, _opts), do: {:error, :invalid_command_rejection_plan}
 
-  defp reject_intent_locked(store, plan) do
+  defp reject_intent_locked(store, plan, opts) do
     with :ok <- current_snapshot(store),
          {:ok, intent} <- fetch_pending_intent(store.snapshot),
          :ok <- valid_rejection_plan(plan, intent),
          {:ok, ack} <- Ack.build(intent, :rejected, plan.reason, <<>>),
          outcome = retained_outcome(intent, ack),
          intended = retain_and_advance(store.snapshot, intent.command_id, outcome),
-         {:ok, persisted} <- persist_verified_rejection(store, intent, plan, intended) do
+         {:ok, persisted} <- persist_verified_rejection(store, intent, plan, intended, opts) do
       {:ok, ack, persisted}
     end
   end
@@ -302,7 +304,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
     end
   end
 
-  defp persist_verified_rejection(store, intent, plan, intended) do
+  defp persist_verified_rejection(store, intent, plan, intended, opts) do
     case Map.fetch(store.recovery_verifiers, intent.command_type) do
       {:ok, {module, context}} ->
         run_recovery_verifier(
@@ -316,12 +318,28 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
               transition
             )
           end,
-          fn -> persist_snapshot(store, intended) end
+          fn ->
+            with :ok <- before_recovery_transition(opts) do
+              persist_snapshot(store, intended)
+            end
+          end
         )
 
       :error ->
         {:error, :effect_non_application_unverified}
     end
+  end
+
+  defp before_recovery_transition(opts) do
+    case Keyword.get(opts, :before_transition) do
+      nil -> :ok
+      callback when is_function(callback, 0) -> callback.()
+      _invalid -> {:error, :invalid_command_recovery_transition_fence}
+    end
+  rescue
+    _exception -> {:error, :command_recovery_transition_fence_failed}
+  catch
+    _kind, _reason -> {:error, :command_recovery_transition_fence_failed}
   end
 
   defp run_recovery_verifier(store, verifier, transition) do
