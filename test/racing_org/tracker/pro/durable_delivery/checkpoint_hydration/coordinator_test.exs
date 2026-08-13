@@ -191,12 +191,19 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
 
     def write(_path, record, _opts) do
       operation = if record.phase == :prepared, do: :journal_write_prepared, else: :journal_write_head_committed
+      action = Backend.operation(operation, record)
 
-      Backend.operation(operation, record)
-      |> Backend.resolve(operation, fn ->
-        Backend.put(:journal, record)
-        :ok
-      end)
+      case action do
+        {:write_and_return, result} ->
+          Backend.put(:journal, record)
+          result
+
+        other ->
+          Backend.resolve(other, operation, fn ->
+            Backend.put(:journal, record)
+            :ok
+          end)
+      end
     end
 
     def remove(_path, _opts) do
@@ -450,6 +457,110 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
 
       stop_coordinator(pid)
     end
+  end
+
+  test "Manager begin immediately installs the in-memory blocker before journal work", ctx do
+    Backend.respond({:boundary, :after_begin}, {:return, {:error, :after_begin_fault}})
+
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:error, :after_begin_fault} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert %{blocked?: true, phase: :prepared} = Coordinator.status(pid)
+    assert Backend.data(:manager_blocked?)
+    assert Backend.data(:journal) == nil
+    refute :store_observe in core_operations()
+  end
+
+  test "a prepared boundary failure retains the observed head in process state", ctx do
+    Backend.respond({:boundary, :after_prepared}, {:return, {:error, :after_prepared_fault}})
+
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:error, :after_prepared_fault} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert :sys.get_state(pid).blocker.record.expected_head == %{
+             state: :absent,
+             checkpoint_hash: Record.genesis_parent()
+           }
+
+    assert %{phase: :prepared} = Backend.data(:journal)
+    assert Backend.data(:manager_blocked?)
+    refute :store_hydrate in core_operations()
+  end
+
+  test "uncertain prepared journal write retains the durable prepared phase in memory", ctx do
+    Backend.respond(
+      :journal_write_prepared,
+      {:write_and_return, {:error, {:durability_uncertain, :directory_sync}}}
+    )
+
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:error, {:durability_uncertain, :directory_sync}} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert %{phase: :prepared} = Backend.data(:journal)
+    assert Coordinator.status(pid).phase == :prepared
+    assert Backend.data(:manager_blocked?)
+    refute :store_hydrate in core_operations()
+    refute :manager_finish in core_operations()
+  end
+
+  test "uncertain head-committed journal write retains the durable committed phase in memory", ctx do
+    Backend.respond(
+      :journal_write_head_committed,
+      {:write_and_return, {:error, {:durability_uncertain, :directory_sync}}}
+    )
+
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:error, {:durability_uncertain, :directory_sync}} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert %{phase: :head_committed} = Backend.data(:journal)
+    assert Coordinator.status(pid).phase == :head_committed
+    assert Backend.data(:manager_blocked?)
+    refute :runtime_restore in core_operations()
+    refute :manager_finish in core_operations()
+  end
+
+  test "recovery reconciles stale process phase from the durable transition identity", ctx do
+    Backend.respond(
+      :journal_write_head_committed,
+      {:return, {:error, {:pre_rename, :power_loss}}}
+    )
+
+    Backend.respond(
+      :journal_read,
+      [
+        {:return, :empty},
+        {:return, {:error, :temporary_read_fault}}
+      ]
+    )
+
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:error, {:pre_rename, :power_loss}} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert Coordinator.status(pid).phase == :head_committed
+    assert %{phase: :prepared} = Backend.data(:journal)
+
+    Backend.clear_operations()
+    assert :ok = Coordinator.recover(pid)
+    assert Backend.data(:journal) == nil
+    assert Backend.data(:manager_finished?)
+    assert :store_hydrate in core_operations()
+    assert :runtime_restore in core_operations()
+    assert :manager_finish in core_operations()
   end
 
   test "uncertain removal that lost the pathname recreates a head-committed journal", ctx do

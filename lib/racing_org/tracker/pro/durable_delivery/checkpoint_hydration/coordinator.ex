@@ -179,17 +179,33 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
          {:ok, adapter} <- RuntimeRegistry.fetch(state.registry, hydration.kind, hydration.schema_version),
          :ok <- validate_hydration_integrity(state, hydration),
          {:ok, runtime} <- decode_runtime(state, adapter, hydration),
-         {:ok, transaction_id} <- transaction_id(state),
-         token = make_ref(),
-         :ok <- manager_begin(state, token, binding),
-         blocker = blocker(token, binding, authorization, transaction_id, hydration),
-         state = %{state | blocker: blocker},
-         :ok <- boundary(state, :after_begin),
-         {:ok, state} <- prepare_transition(state, runtime) do
-      complete_transition(state, runtime)
+         {:ok, transaction_id} <- transaction_id(state) do
+      begin_transition(state, authorization, transaction_id, binding, hydration, runtime)
     else
-      {:error, reason, %{} = state} -> {:error, reason, state}
       {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp begin_transition(state, authorization, transaction_id, binding, hydration, runtime) do
+    token = make_ref()
+
+    case manager_begin(state, token, binding) do
+      :ok ->
+        state = %{state | blocker: blocker(token, binding, authorization, transaction_id, hydration)}
+
+        case boundary(state, :after_begin) do
+          :ok ->
+            case prepare_transition(state, runtime) do
+              {:ok, state} -> complete_transition(state, runtime)
+              {:error, reason, state} -> {:error, reason, state}
+            end
+
+          {:error, reason} ->
+            {:error, reason, state}
+        end
+
+      {:error, reason} ->
+        {:error, reason, state}
     end
   end
 
@@ -219,15 +235,21 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     end
   end
 
-  defp recover_record(%{blocker: %{record: record}} = state, record) do
-    with {:ok, manager_state} <- manager_state(state),
-         {:ok, binding} <- active_binding(manager_state),
-         :ok <- match_binding(binding, state.blocker.binding),
-         :ok <- match_target(record.target, binding),
-         :ok <- match_target(record.target, manager_state.identity) do
-      replay_record(state, record)
+  defp recover_record(%{blocker: blocker} = state, record) when not is_nil(blocker) do
+    if same_transition?(blocker.record, record) do
+      state = put_record(state, record)
+
+      with {:ok, manager_state} <- manager_state(state),
+           {:ok, binding} <- active_binding(manager_state),
+           :ok <- match_binding(binding, state.blocker.binding),
+           :ok <- match_target(record.target, binding),
+           :ok <- match_target(record.target, manager_state.identity) do
+        replay_record(state, record)
+      else
+        {:error, reason} -> {:error, reason, state}
+      end
     else
-      {:error, reason} -> {:error, reason, state}
+      {:error, :checkpoint_hydration_transition_conflict, state}
     end
   end
 
@@ -271,39 +293,46 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   defp prepare_transition(state, _runtime) do
     with :ok <- boundary(state, :before_prepared),
-         {:ok, expected_head} <- observe_target_head(state),
-         record = %{state.blocker.record | expected_head: expected_head},
-         :ok <- journal_write(state, record),
-         state = put_record(state, record),
-         :ok <- boundary(state, :after_prepared),
-         :ok <- boundary(state, :before_head),
-         {:ok, _record} <- hydrate_head(state),
-         :ok <- boundary(state, :after_head),
-         :ok <- boundary(state, :before_head_committed),
-         committed = %{record | phase: :head_committed},
-         :ok <- journal_write(state, committed),
-         state = put_record(state, committed),
-         :ok <- boundary(state, :after_head_committed) do
-      {:ok, state}
+         {:ok, expected_head} <- observe_target_head(state) do
+      record = %{state.blocker.record | expected_head: expected_head}
+      state = put_record(state, record)
+
+      with :ok <- journal_write(state, record),
+           :ok <- boundary(state, :after_prepared) do
+        prepare_head_transition(state)
+      else
+        {:error, reason} -> {:error, reason, recover_written_record(state)}
+      end
     else
       {:error, reason} -> {:error, reason, state}
     end
   end
 
-  defp replay_phase(%{blocker: %{record: %{phase: :prepared}}} = state) do
+  defp prepare_head_transition(state) do
     with :ok <- boundary(state, :before_head),
          {:ok, _record} <- hydrate_head(state),
          :ok <- boundary(state, :after_head),
-         :ok <- boundary(state, :before_head_committed),
-         committed = %{state.blocker.record | phase: :head_committed},
-         :ok <- journal_write(state, committed),
-         state = put_record(state, committed),
-         :ok <- boundary(state, :after_head_committed) do
-      {:ok, state}
+         :ok <- boundary(state, :before_head_committed) do
+      commit_head_transition(state)
     else
       {:error, reason} -> {:error, reason, state}
     end
   end
+
+  defp commit_head_transition(state) do
+    committed = %{state.blocker.record | phase: :head_committed}
+    state = put_record(state, committed)
+
+    with :ok <- journal_write(state, committed),
+         :ok <- boundary(state, :after_head_committed) do
+      {:ok, state}
+    else
+      {:error, reason} -> {:error, reason, recover_written_record(state)}
+    end
+  end
+
+  defp replay_phase(%{blocker: %{record: %{phase: :prepared}}} = state),
+    do: prepare_head_transition(state)
 
   defp replay_phase(%{blocker: %{record: %{phase: :head_committed}}} = state),
     do: {:ok, state}
@@ -326,6 +355,26 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
         {:error, reason, state}
     end
   end
+
+  defp recover_written_record(state) do
+    case journal_read(state) do
+      {:ok, record} -> reconcile_written_record(state, record)
+      _empty_or_error -> state
+    end
+  end
+
+  defp reconcile_written_record(state, record) do
+    current = state.blocker.record
+
+    if same_transition?(current, record) do
+      put_record(state, record)
+    else
+      state
+    end
+  end
+
+  defp same_transition?(left, right),
+    do: Map.delete(left, :phase) == Map.delete(right, :phase)
 
   defp retain_recovery_evidence(state, record) do
     case journal_read(state) do
