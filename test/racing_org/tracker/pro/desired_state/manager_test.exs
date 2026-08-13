@@ -119,12 +119,17 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
       end
     end
 
+    defdelegate read(device, count), to: FileSystem
+    defdelegate file_info(device), to: FileSystem
+    defdelegate lstat(path), to: FileSystem
     defdelegate mkdir_p(path), to: FileSystem
+    defdelegate mkdir(path), to: FileSystem
     defdelegate chmod(path, mode), to: FileSystem
     defdelegate open(path, modes), to: FileSystem
     defdelegate write(device, contents), to: FileSystem
     defdelegate sync(device), to: FileSystem
     defdelegate close(device), to: FileSystem
+    defdelegate rmdir(path), to: FileSystem
   end
 
   defmodule BlockingFileSystem do
@@ -152,14 +157,19 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
       end
     end
 
+    defdelegate read(path), to: FileSystem
+    defdelegate read(device, count), to: FileSystem
+    defdelegate file_info(device), to: FileSystem
+    defdelegate lstat(path), to: FileSystem
     defdelegate mkdir_p(path), to: FileSystem
+    defdelegate mkdir(path), to: FileSystem
     defdelegate chmod(path, mode), to: FileSystem
     defdelegate open(path, modes), to: FileSystem
     defdelegate write(device, contents), to: FileSystem
     defdelegate sync(device), to: FileSystem
     defdelegate close(device), to: FileSystem
-    defdelegate read(path), to: FileSystem
     defdelegate remove(path), to: FileSystem
+    defdelegate rmdir(path), to: FileSystem
   end
 
   setup do
