@@ -5,6 +5,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem do
 
   @type root :: reference()
   @type segment :: reference()
+  @type bound_entry :: reference()
   @type identity :: {non_neg_integer(), non_neg_integer(), non_neg_integer()}
   @type file_info :: %{
           major_device: non_neg_integer(),
@@ -26,6 +27,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem do
   @callback unlink_empty(segment()) :: :ok | {:error, term()}
   @callback file_info(segment()) :: {:ok, file_info()} | {:error, term()}
   @callback close(segment()) :: :ok | {:error, term()}
+  @callback bind_entry(Path.t(), :regular | :directory, identity(), identity()) ::
+              {:ok, bound_entry()} | {:error, term()}
+  @callback bound_info(bound_entry()) :: {:ok, file_info()} | {:error, term()}
+  @callback read_bound(bound_entry(), non_neg_integer()) :: {:ok, binary()} | :eof | {:error, term()}
+  @callback sync_bound(bound_entry()) :: :ok | {:error, term()}
+  @callback remove_bound(bound_entry()) :: :ok | {:error, term()}
+  @callback close_bound(bound_entry()) :: :ok | {:error, term()}
 
   @doc false
   def adoption_prepare(_source, _destination, _directory_root), do: :erlang.nif_error(:not_loaded)
@@ -77,4 +85,22 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem do
 
   @doc false
   def close(_segment), do: :erlang.nif_error(:not_loaded)
+
+  @doc false
+  def bind_entry(_path, _type, _identity, _parent_identity), do: :erlang.nif_error(:not_loaded)
+
+  @doc false
+  def bound_info(_entry), do: :erlang.nif_error(:not_loaded)
+
+  @doc false
+  def read_bound(_entry, _count), do: :erlang.nif_error(:not_loaded)
+
+  @doc false
+  def sync_bound(_entry), do: :erlang.nif_error(:not_loaded)
+
+  @doc false
+  def remove_bound(_entry), do: :erlang.nif_error(:not_loaded)
+
+  @doc false
+  def close_bound(_entry), do: :erlang.nif_error(:not_loaded)
 end

@@ -10,6 +10,7 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
@@ -56,6 +57,7 @@ typedef struct {
   ErlNifResourceType *root_resource_type;
   ErlNifResourceType *segment_resource_type;
   ErlNifResourceType *adoption_resource_type;
+  ErlNifResourceType *bound_entry_resource_type;
   cleanup_worker cleanup;
 } nif_state;
 
@@ -102,6 +104,20 @@ typedef struct {
   cleanup_worker *cleanup_worker;
 } adoption_resource;
 
+typedef struct {
+  int parent_fd;
+  int entry_fd;
+  char *basename;
+  dev_t device;
+  ino_t inode;
+  off_t size;
+  mode_t type;
+  int removed;
+  ErlNifMutex *mutex;
+  cleanup_job *cleanup;
+  cleanup_worker *cleanup_worker;
+} bound_entry_resource;
+
 static ERL_NIF_TERM atom_ok;
 static ERL_NIF_TERM atom_error;
 static ERL_NIF_TERM atom_closed;
@@ -118,6 +134,9 @@ static ERL_NIF_TERM atom_none;
 static ERL_NIF_TERM atom_after_rename;
 static ERL_NIF_TERM atom_source_parent_sync;
 static ERL_NIF_TERM atom_destination_parent_sync;
+static ERL_NIF_TERM atom_regular;
+static ERL_NIF_TERM atom_directory;
+static ERL_NIF_TERM atom_stale_entry;
 
 static ERL_NIF_TERM make_error(ErlNifEnv *env, ERL_NIF_TERM reason) {
   return enif_make_tuple2(env, atom_error, reason);
@@ -441,6 +460,26 @@ static void adoption_destructor(ErlNifEnv *env, void *object) {
                          source_parent_fd, destination_parent_fd, names, mutex);
   adoption->cleanup = NULL;
   adoption->cleanup_worker = NULL;
+}
+
+static void bound_entry_destructor(ErlNifEnv *env, void *object) {
+  bound_entry_resource *entry = object;
+  ErlNifMutex *mutex;
+  int parent_fd;
+  int entry_fd;
+  char *basename;
+  (void)env;
+
+  parent_fd = take_fd(&entry->parent_fd);
+  entry_fd = take_fd(&entry->entry_fd);
+  basename = entry->basename;
+  entry->basename = NULL;
+  mutex = entry->mutex;
+  entry->mutex = NULL;
+  cleanup_worker_enqueue(entry->cleanup_worker, entry->cleanup, parent_fd,
+                         entry_fd, -1, basename, mutex);
+  entry->cleanup = NULL;
+  entry->cleanup_worker = NULL;
 }
 
 static int path_parent_and_name(const ErlNifBinary *path, char **parent,
@@ -1566,6 +1605,346 @@ static ERL_NIF_TERM unlink_empty_nif(ErlNifEnv *env, int argc,
   return result == -1 ? make_errno_error(env, error) : atom_ok;
 }
 
+static ERL_NIF_TERM bind_entry_nif(ErlNifEnv *env, int argc,
+                                   const ERL_NIF_TERM argv[]) {
+  nif_state *state = enif_priv_data(env);
+  ErlNifBinary path;
+  ErlNifUInt64 expected_device;
+  ErlNifUInt64 expected_special_device;
+  ErlNifUInt64 expected_inode;
+  const ERL_NIF_TERM *identity_elements;
+  int identity_arity;
+  cleanup_job *cleanup;
+  bound_entry_resource *entry;
+  struct stat stat;
+  struct stat path_stat;
+  struct stat parent_stat;
+  char *parent;
+  char *name;
+  char *parent_copy;
+  char *name_copy;
+  size_t parent_size;
+  size_t name_size;
+  mode_t expected_type;
+  int parent_fd;
+  int entry_fd;
+  int flags;
+  int error;
+  ERL_NIF_TERM result;
+
+  ErlNifUInt64 expected_parent_device;
+  ErlNifUInt64 expected_parent_special_device;
+  ErlNifUInt64 expected_parent_inode;
+  const ERL_NIF_TERM *parent_identity_elements;
+  int parent_identity_arity;
+
+  if (argc != 4 || !enif_inspect_binary(env, argv[0], &path) ||
+      !enif_get_tuple(env, argv[2], &identity_arity, &identity_elements) ||
+      identity_arity != 3 ||
+      !enif_get_uint64(env, identity_elements[0], &expected_device) ||
+      !enif_get_uint64(env, identity_elements[1], &expected_special_device) ||
+      !enif_get_uint64(env, identity_elements[2], &expected_inode) ||
+      !enif_get_tuple(env, argv[3], &parent_identity_arity,
+                      &parent_identity_elements) ||
+      parent_identity_arity != 3 ||
+      !enif_get_uint64(env, parent_identity_elements[0],
+                       &expected_parent_device) ||
+      !enif_get_uint64(env, parent_identity_elements[1],
+                       &expected_parent_special_device) ||
+      !enif_get_uint64(env, parent_identity_elements[2],
+                       &expected_parent_inode)) {
+    return enif_make_badarg(env);
+  }
+
+  if (enif_is_identical(argv[1], atom_regular)) {
+    expected_type = S_IFREG;
+    flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC;
+  } else if (enif_is_identical(argv[1], atom_directory)) {
+    expected_type = S_IFDIR;
+    flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+  } else {
+    return enif_make_badarg(env);
+  }
+
+  if (!absolute_path(&path) ||
+      !path_parent_and_name(&path, &parent, &parent_size, &name, &name_size)) {
+    return enif_make_badarg(env);
+  }
+
+  parent_copy = enif_alloc(parent_size + 1);
+  name_copy = enif_alloc(name_size + 1);
+  cleanup = enif_alloc(sizeof(*cleanup));
+  if (parent_copy == NULL || name_copy == NULL || cleanup == NULL) {
+    if (parent_copy != NULL) enif_free(parent_copy);
+    if (name_copy != NULL) enif_free(name_copy);
+    if (cleanup != NULL) enif_free(cleanup);
+    return make_errno_error(env, ENOMEM);
+  }
+  memcpy(parent_copy, parent, parent_size);
+  parent_copy[parent_size] = '\0';
+  memcpy(name_copy, name, name_size);
+  name_copy[name_size] = '\0';
+
+  parent_fd = open(parent_copy, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  error = errno;
+  enif_free(parent_copy);
+  if (parent_fd == -1) {
+    enif_free(name_copy);
+    enif_free(cleanup);
+    return make_errno_error(env, error);
+  }
+
+  if (fstat(parent_fd, &parent_stat) == -1) {
+    error = errno;
+    close_owned_fd(parent_fd);
+    enif_free(name_copy);
+    enif_free(cleanup);
+    return make_errno_error(env, error);
+  }
+  if (!S_ISDIR(parent_stat.st_mode) ||
+      (ErlNifUInt64)parent_stat.st_dev != expected_parent_device ||
+      (ErlNifUInt64)parent_stat.st_rdev != expected_parent_special_device ||
+      (ErlNifUInt64)parent_stat.st_ino != expected_parent_inode) {
+    close_owned_fd(parent_fd);
+    enif_free(name_copy);
+    enif_free(cleanup);
+    return make_error(env, atom_stale_entry);
+  }
+
+  do {
+    entry_fd = openat(parent_fd, name_copy, flags);
+  } while (entry_fd == -1 && errno == EINTR);
+  if (entry_fd == -1) {
+    error = errno;
+    close_owned_fd(parent_fd);
+    enif_free(name_copy);
+    enif_free(cleanup);
+    return make_errno_error(env, error);
+  }
+
+  if (fstat(entry_fd, &stat) == -1 ||
+      fstatat(parent_fd, name_copy, &path_stat, AT_SYMLINK_NOFOLLOW) == -1) {
+    error = errno;
+    close_owned_fd(entry_fd);
+    close_owned_fd(parent_fd);
+    enif_free(name_copy);
+    enif_free(cleanup);
+    return make_errno_error(env, error);
+  }
+
+  if (!identity_matches(&stat, (dev_t)expected_device,
+                        (ino_t)expected_inode, expected_type) ||
+      !identity_matches(&path_stat, (dev_t)expected_device,
+                        (ino_t)expected_inode, expected_type) ||
+      (ErlNifUInt64)stat.st_rdev != expected_special_device) {
+    close_owned_fd(entry_fd);
+    close_owned_fd(parent_fd);
+    enif_free(name_copy);
+    enif_free(cleanup);
+    return make_error(env, atom_stale_entry);
+  }
+
+  entry = enif_alloc_resource(state->bound_entry_resource_type, sizeof(*entry));
+  if (entry == NULL) {
+    close_owned_fd(entry_fd);
+    close_owned_fd(parent_fd);
+    enif_free(name_copy);
+    enif_free(cleanup);
+    return make_errno_error(env, ENOMEM);
+  }
+
+  memset(entry, 0, sizeof(*entry));
+  entry->parent_fd = parent_fd;
+  entry->entry_fd = entry_fd;
+  entry->basename = name_copy;
+  entry->device = stat.st_dev;
+  entry->inode = stat.st_ino;
+  entry->size = stat.st_size;
+  entry->type = expected_type;
+  entry->cleanup_worker = &state->cleanup;
+  entry->cleanup = cleanup;
+  entry->mutex = enif_mutex_create("bound_filesystem_entry");
+  if (entry->mutex == NULL) {
+    enif_release_resource(entry);
+    return make_errno_error(env, ENOMEM);
+  }
+
+  result = enif_make_tuple2(env, atom_ok, enif_make_resource(env, entry));
+  enif_release_resource(entry);
+  return result;
+}
+
+static ERL_NIF_TERM bound_info_nif(ErlNifEnv *env, int argc,
+                                   const ERL_NIF_TERM argv[]) {
+  nif_state *state = enif_priv_data(env);
+  bound_entry_resource *entry;
+  struct stat stat;
+  ERL_NIF_TERM keys[4];
+  ERL_NIF_TERM values[4];
+  ERL_NIF_TERM map;
+  int result;
+  int error;
+
+  if (argc != 1 ||
+      !enif_get_resource(env, argv[0], state->bound_entry_resource_type,
+                         (void **)&entry)) {
+    return enif_make_badarg(env);
+  }
+
+  enif_mutex_lock(entry->mutex);
+  if (entry->entry_fd == -1) {
+    enif_mutex_unlock(entry->mutex);
+    return make_error(env, atom_closed);
+  }
+  result = fstat(entry->entry_fd, &stat);
+  error = errno;
+  enif_mutex_unlock(entry->mutex);
+  if (result == -1) return make_errno_error(env, error);
+
+  keys[0] = enif_make_atom(env, "major_device");
+  keys[1] = enif_make_atom(env, "minor_device");
+  keys[2] = enif_make_atom(env, "inode");
+  keys[3] = enif_make_atom(env, "size");
+  values[0] = enif_make_uint64(env, (ErlNifUInt64)stat.st_dev);
+  values[1] = enif_make_uint64(env, (ErlNifUInt64)stat.st_rdev);
+  values[2] = enif_make_uint64(env, (ErlNifUInt64)stat.st_ino);
+  values[3] = enif_make_uint64(env, (ErlNifUInt64)stat.st_size);
+  if (!enif_make_map_from_arrays(env, keys, values, 4, &map)) {
+    return make_errno_error(env, ENOMEM);
+  }
+  return enif_make_tuple2(env, atom_ok, map);
+}
+
+static ERL_NIF_TERM read_bound_nif(ErlNifEnv *env, int argc,
+                                   const ERL_NIF_TERM argv[]) {
+  nif_state *state = enif_priv_data(env);
+  bound_entry_resource *entry;
+  unsigned int count;
+  unsigned char *bytes;
+  ERL_NIF_TERM binary;
+  ssize_t result;
+  int error;
+
+  if (argc != 2 ||
+      !enif_get_resource(env, argv[0], state->bound_entry_resource_type,
+                         (void **)&entry) ||
+      !enif_get_uint(env, argv[1], &count)) {
+    return enif_make_badarg(env);
+  }
+
+  enif_mutex_lock(entry->mutex);
+  if (entry->entry_fd == -1 || entry->type != S_IFREG) {
+    enif_mutex_unlock(entry->mutex);
+    return make_error(env, atom_closed);
+  }
+  bytes = enif_make_new_binary(env, count, &binary);
+  do {
+    result = read(entry->entry_fd, bytes, count);
+  } while (result == -1 && errno == EINTR);
+  error = errno;
+  enif_mutex_unlock(entry->mutex);
+
+  if (result == -1) return make_errno_error(env, error);
+  if (result == 0) return enif_make_atom(env, "eof");
+  return enif_make_tuple2(env, atom_ok,
+                          enif_make_sub_binary(env, binary, 0, result));
+}
+
+static ERL_NIF_TERM sync_bound_nif(ErlNifEnv *env, int argc,
+                                   const ERL_NIF_TERM argv[]) {
+  nif_state *state = enif_priv_data(env);
+  bound_entry_resource *entry;
+  int result;
+  int error;
+
+  if (argc != 1 ||
+      !enif_get_resource(env, argv[0], state->bound_entry_resource_type,
+                         (void **)&entry)) {
+    return enif_make_badarg(env);
+  }
+
+  enif_mutex_lock(entry->mutex);
+  if (entry->entry_fd == -1) {
+    enif_mutex_unlock(entry->mutex);
+    return make_error(env, atom_closed);
+  }
+  result = sync_fd(entry->entry_fd);
+  error = errno;
+  enif_mutex_unlock(entry->mutex);
+  return result == -1 ? make_errno_error(env, error) : atom_ok;
+}
+
+static ERL_NIF_TERM remove_bound_nif(ErlNifEnv *env, int argc,
+                                     const ERL_NIF_TERM argv[]) {
+  nif_state *state = enif_priv_data(env);
+  bound_entry_resource *entry;
+  struct stat stat;
+  int flags;
+  int result;
+  int error;
+
+  if (argc != 1 ||
+      !enif_get_resource(env, argv[0], state->bound_entry_resource_type,
+                         (void **)&entry)) {
+    return enif_make_badarg(env);
+  }
+
+  enif_mutex_lock(entry->mutex);
+  if (entry->entry_fd == -1 || entry->parent_fd == -1 || entry->removed) {
+    enif_mutex_unlock(entry->mutex);
+    return make_error(env, atom_closed);
+  }
+  if (fstatat(entry->parent_fd, entry->basename, &stat,
+              AT_SYMLINK_NOFOLLOW) == -1) {
+    error = errno;
+    enif_mutex_unlock(entry->mutex);
+    return make_errno_error(env, error);
+  }
+  if (!identity_matches(&stat, entry->device, entry->inode, entry->type) ||
+      (entry->type == S_IFREG && stat.st_size != entry->size)) {
+    enif_mutex_unlock(entry->mutex);
+    return make_error(env, atom_name_changed);
+  }
+
+  flags = entry->type == S_IFDIR ? AT_REMOVEDIR : 0;
+  result = unlinkat(entry->parent_fd, entry->basename, flags);
+  error = errno;
+  if (result == 0) entry->removed = 1;
+  enif_mutex_unlock(entry->mutex);
+  return result == -1 ? make_errno_error(env, error) : atom_ok;
+}
+
+static ERL_NIF_TERM close_bound_nif(ErlNifEnv *env, int argc,
+                                    const ERL_NIF_TERM argv[]) {
+  nif_state *state = enif_priv_data(env);
+  bound_entry_resource *entry;
+  int parent_fd;
+  int entry_fd;
+  int parent_result;
+  int entry_result;
+  int error;
+
+  if (argc != 1 ||
+      !enif_get_resource(env, argv[0], state->bound_entry_resource_type,
+                         (void **)&entry)) {
+    return enif_make_badarg(env);
+  }
+
+  enif_mutex_lock(entry->mutex);
+  if (entry->parent_fd == -1 && entry->entry_fd == -1) {
+    enif_mutex_unlock(entry->mutex);
+    return make_error(env, atom_closed);
+  }
+  parent_fd = take_fd(&entry->parent_fd);
+  entry_fd = take_fd(&entry->entry_fd);
+  enif_mutex_unlock(entry->mutex);
+  entry_result = close_owned_fd(entry_fd);
+  error = errno;
+  parent_result = close_owned_fd(parent_fd);
+  if (entry_result == -1) return make_errno_error(env, error);
+  return parent_result == -1 ? make_errno_error(env, errno) : atom_ok;
+}
+
 static ERL_NIF_TERM close_nif(ErlNifEnv *env, int argc,
                               const ERL_NIF_TERM argv[]) {
   nif_state *state = enif_priv_data(env);
@@ -1619,10 +1998,13 @@ static int load(ErlNifEnv *env, void **private_data, ERL_NIF_TERM load_info) {
       env, NULL, "outbox_segment_file", segment_destructor, flags, NULL);
   state->adoption_resource_type = enif_open_resource_type(
       env, NULL, "atomic_file_adoption", adoption_destructor, flags, NULL);
+  state->bound_entry_resource_type = enif_open_resource_type(
+      env, NULL, "bound_filesystem_entry", bound_entry_destructor, flags, NULL);
 
   if (state->root_resource_type == NULL ||
       state->segment_resource_type == NULL ||
       state->adoption_resource_type == NULL ||
+      state->bound_entry_resource_type == NULL ||
       cleanup_worker_start(&state->cleanup) != 0) {
     enif_free(state);
     return -1;
@@ -1645,6 +2027,9 @@ static int load(ErlNifEnv *env, void **private_data, ERL_NIF_TERM load_info) {
   atom_after_rename = enif_make_atom(env, "after_rename");
   atom_source_parent_sync = enif_make_atom(env, "source_parent_sync");
   atom_destination_parent_sync = enif_make_atom(env, "destination_parent_sync");
+  atom_regular = enif_make_atom(env, "regular");
+  atom_directory = enif_make_atom(env, "directory");
+  atom_stale_entry = enif_make_atom(env, "stale_entry");
   return 0;
 }
 
@@ -1670,7 +2055,13 @@ static ErlNifFunc nif_functions[] = {
     {"sync_directory", 1, sync_directory_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"unlink_empty", 1, unlink_empty_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"file_info", 1, file_info_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"close", 1, close_nif, ERL_NIF_DIRTY_JOB_IO_BOUND}};
+    {"close", 1, close_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"bind_entry", 4, bind_entry_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"bound_info", 1, bound_info_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"read_bound", 2, read_bound_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"sync_bound", 1, sync_bound_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"remove_bound", 1, remove_bound_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"close_bound", 1, close_bound_nif, ERL_NIF_DIRTY_JOB_IO_BOUND}};
 
 ERL_NIF_INIT(Elixir.RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem,
              nif_functions, load, NULL, NULL, unload)
