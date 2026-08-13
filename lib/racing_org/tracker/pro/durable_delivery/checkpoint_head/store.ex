@@ -113,6 +113,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
   @path_lock_attempts 8
   @read_retry_count 2
   @read_timeout_ms 1_000
+  @read_chunk_timeout_ms 10
   @corrupt_head_domain "RacingOrg-TrackerCheckpointCorruptHead-v1"
 
   @put_keys [:kind, :schema_version, :sequence, :source_generation, :parent_hash, :content]
@@ -847,7 +848,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
   defp read_head_bytes(store, path, retries_remaining) do
     result =
       if bounded_file_system?(store.file_system) do
-        bounded_head_read(store.file_system, path)
+        bounded_head_read(store.file_system, path, store.transition_timeout_ms)
       else
         {:error, :checkpoint_head_bounded_read_unsupported}
       end
@@ -855,8 +856,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
     retry_changed_read(store, path, retries_remaining, result)
   end
 
-  defp bounded_head_read(fs, path) do
+  defp bounded_head_read(fs, path, transition_timeout_ms) do
     owner = self()
+    timeout_ms = read_timeout_ms(transition_timeout_ms)
     result_ref = make_ref()
     guard_key = {__MODULE__, :transition}
     guarded? = Process.get(guard_key) == true
@@ -882,7 +884,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
       {:DOWN, ^monitor, :process, ^pid, _reason} ->
         {:error, {:checkpoint_head_io, :read_process_failed}}
     after
-      @read_timeout_ms ->
+      timeout_ms ->
         Process.exit(pid, :kill)
 
         receive do
@@ -892,6 +894,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
         drain_worker_result(result_ref)
         {:error, {:checkpoint_head_io, :read_timeout}}
     end
+  end
+
+  defp read_timeout_ms(transition_timeout_ms) do
+    required_reads = div(@max_encoded_size + @read_chunk_size - 1, @read_chunk_size) + 1
+    scaled_timeout_ms = max(@read_timeout_ms, required_reads * @read_chunk_timeout_ms)
+    min(scaled_timeout_ms, max(@read_timeout_ms, transition_timeout_ms - @read_timeout_ms))
   end
 
   defp stop_worker_on_owner_exit(owner, worker) do

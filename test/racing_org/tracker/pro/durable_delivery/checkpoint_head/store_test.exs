@@ -165,6 +165,40 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
     defdelegate close(device), to: FileSystem
   end
 
+  defmodule SlowBoundedReadFileSystem do
+    @behaviour FileSystem
+
+    def read(device, count) do
+      case :persistent_term.get(__MODULE__, nil) do
+        {owner, counter, delay_ms} ->
+          :atomics.add(counter, 1, 1)
+          Process.sleep(delay_ms)
+          send(owner, {:checkpoint_head_slow_read, count})
+
+        nil ->
+          :ok
+      end
+
+      FileSystem.read(device, count)
+    end
+
+    defdelegate read(path), to: FileSystem
+    defdelegate file_info(device), to: FileSystem
+    defdelegate list_dir(path), to: FileSystem
+    defdelegate lstat(path), to: FileSystem
+    defdelegate read_link(path), to: FileSystem
+    defdelegate mkdir_p(path), to: FileSystem
+    defdelegate mkdir(path), to: FileSystem
+    defdelegate chmod(path, mode), to: FileSystem
+    defdelegate open(path, modes), to: FileSystem
+    defdelegate write(device, contents), to: FileSystem
+    defdelegate sync(device), to: FileSystem
+    defdelegate close(device), to: FileSystem
+    defdelegate rename(source, destination), to: FileSystem
+    defdelegate remove(path), to: FileSystem
+    defdelegate rmdir(path), to: FileSystem
+  end
+
   defmodule NoReadLinkFileSystem do
     @behaviour FileSystem
 
@@ -999,6 +1033,31 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
       assert {:ok, reopened} = Store.new(opts(ctx))
       assert {:ok, ^installed} = Store.head(reopened, :polar)
       assert installed.content === canonical
+    end
+
+    test "allows a legal near-cap head to use the configured transition deadline", ctx do
+      assert {:ok, store} = Store.new(opts(ctx, transition_timeout_ms: 180_000))
+      content = near_semantic_cap_polar_content()
+
+      assert {:ok, installed} =
+               Store.put(store, put_attrs(kind: :polar, schema_version: 2, content: content))
+
+      counter = :atomics.new(1, signed: false)
+      :persistent_term.put(SlowBoundedReadFileSystem, {self(), counter, 5})
+      on_exit(fn -> :persistent_term.erase(SlowBoundedReadFileSystem) end)
+
+      assert {:ok, slow_store} =
+               Store.new(
+                 opts(ctx,
+                   file_system: SlowBoundedReadFileSystem,
+                   transition_timeout_ms: 180_000
+                 )
+               )
+
+      assert {:ok, ^installed} = Store.head(slow_store, :polar)
+      assert :atomics.get(counter, 1) > 200
+      assert_receive {:checkpoint_head_slow_read, count}
+      assert count > 0
     end
 
     test "chains the next record from the current record hash", ctx do
@@ -3350,7 +3409,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
       end)
 
       assert {:ok, blocking_store} =
-               Store.new(opts(ctx, file_system: BlockingLstatFileSystem))
+               Store.new(
+                 opts(ctx,
+                   file_system: BlockingLstatFileSystem,
+                   transition_timeout_ms: 1_500
+                 )
+               )
 
       reader = Task.async(fn -> Store.head(blocking_store, :calibration) end)
       assert_receive {:checkpoint_head_lstat_blocked, _canonical_path}, 2_000
@@ -3401,7 +3465,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
       end)
 
       assert {:ok, blocking_store} =
-               Store.new(opts(ctx, file_system: BlockingOpenFileSystem))
+               Store.new(
+                 opts(ctx,
+                   file_system: BlockingOpenFileSystem,
+                   transition_timeout_ms: 1_500
+                 )
+               )
 
       reader = Task.async(fn -> Store.head(blocking_store, :calibration) end)
       assert_receive {:checkpoint_head_open_blocked, _canonical_path}, 2_000
