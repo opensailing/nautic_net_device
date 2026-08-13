@@ -173,7 +173,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
   end
 
   setup do
-    base = Path.join(System.tmp_dir!(), "desired_manager_#{System.unique_integer([:positive])}")
+    nonce = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+    base = Path.join(System.tmp_dir!(), "desired_manager_#{nonce}")
     term_key = {__MODULE__, make_ref()}
     gate_name = {:global, {__MODULE__, term_key}}
     manager_name = {:global, {__MODULE__, term_key, :manager}}
