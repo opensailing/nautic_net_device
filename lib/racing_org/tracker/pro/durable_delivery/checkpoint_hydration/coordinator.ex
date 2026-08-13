@@ -344,6 +344,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   defp prepare_transition(state, _runtime) do
     with :ok <- boundary(state, :before_prepared),
          :ok <- authorize_fresh_effect(state),
+         :ok <- revalidate_binding(state),
          {:ok, expected_head} <- observe_target_head(state) do
       record = %{state.blocker.record | expected_head: expected_head}
       state = put_record(state, record)
@@ -362,6 +363,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   defp prepare_head_transition(state) do
     with :ok <- boundary(state, :before_head),
          :ok <- authorize_fresh_effect(state),
+         :ok <- revalidate_binding(state),
          {:ok, selected_head} <- hydrate_head(state) do
       state = %{state | selected_head: selected_head}
 
@@ -405,17 +407,20 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     with {:ok, runtime} <- selected_runtime(state, delivered_runtime),
          :ok <- boundary(state, :before_restore),
          :ok <- authorize_fresh_effect(state),
+         :ok <- revalidate_binding(state),
          :ok <- restore_runtime(state, runtime),
          :ok <- boundary(state, :after_restore),
          :ok <- ensure_selected_head_current(state),
          :ok <- boundary(state, :before_remove),
          :ok <- authorize_fresh_effect(state),
+         :ok <- revalidate_binding(state),
          :ok <- journal_remove(state),
          :ok <- boundary(state, :after_remove),
          :ok <- authorize_fresh_effect(state),
          :ok <- ensure_selected_head_current(state),
          :ok <- boundary(state, :before_finish),
          :ok <- authorize_fresh_effect(state),
+         :ok <- revalidate_binding(state),
          :ok <- manager_finish(state) do
       {:ok,
        %{
@@ -551,6 +556,18 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       {:ok, binding}
     end
   end
+
+  defp revalidate_binding(%{blocker: %{binding: binding, record: record}} = state) do
+    with {:ok, manager_state} <- manager_state(state),
+         {:ok, active_binding} <- active_binding(manager_state),
+         :ok <- match_binding(active_binding, binding),
+         :ok <- match_binding(record.target, binding),
+         :ok <- match_target(binding, manager_state.identity) do
+      :ok
+    end
+  end
+
+  defp revalidate_binding(_state), do: {:error, :checkpoint_hydration_binding_unavailable}
 
   defp manager_state(state) do
     case state.manager_module.status(state.manager) do

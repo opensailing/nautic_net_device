@@ -399,21 +399,26 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
              :session_with,
              :manager_begin,
              :session_with,
+             :manager_status,
              :store_observe,
              :journal_write_prepared,
              :session_with,
+             :manager_status,
              :store_hydrate,
              :journal_write_head_committed,
              :checkpoint_decode,
              :adapter_hydrate,
              :session_with,
+             :manager_status,
              :runtime_restore,
              :store_head,
              :session_with,
+             :manager_status,
              :journal_remove,
              :session_with,
              :store_head,
              :session_with,
+             :manager_status,
              :manager_finish
            ]
 
@@ -556,6 +561,52 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
 
     refute :manager_begin in core_operations()
     refute :checkpoint_decode in core_operations()
+  end
+
+  test "desired-state generation and manifest drift fence every fresh hydration effect", ctx do
+    stages = [
+      {:before_prepared, :store_observe, nil},
+      {:before_head, :store_hydrate, :prepared},
+      {:before_restore, :runtime_restore, :head_committed},
+      {:before_remove, :journal_remove, :head_committed},
+      {:before_finish, :manager_finish, :head_committed}
+    ]
+
+    for {field, value} <- [
+          {:generation, @binding.generation + 1},
+          {:manifest_hash, <<77::256>>}
+        ],
+        {stage, fenced_effect, expected_journal_phase} <- stages do
+      drifted_binding = Map.put(@binding, field, value)
+
+      Backend.respond(
+        {:boundary, stage},
+        {:put_and_return, :active, drifted_binding, :ok}
+      )
+
+      pid = start_coordinator(ctx)
+      Backend.clear_operations()
+
+      assert {:error, :checkpoint_hydration_binding_mismatch} =
+               Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+      refute fenced_effect in core_operations()
+      refute Backend.data(:manager_finished?)
+
+      case expected_journal_phase do
+        nil -> assert Backend.data(:journal) == nil
+        phase -> assert %{phase: ^phase} = Backend.data(:journal)
+      end
+
+      stop_coordinator(pid)
+      Backend.stop()
+
+      Backend.start(self(), %{
+        active: @binding,
+        identity: ctx.identity,
+        session: ctx.session
+      })
+    end
   end
 
   test "fresh hydration releases each session lease before checkpoint effects", ctx do
@@ -1045,10 +1096,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
              :store_head,
              :checkpoint_decode,
              :adapter_hydrate,
+             :manager_status,
              :runtime_restore,
              :store_head,
+             :manager_status,
              :journal_remove,
              :store_head,
+             :manager_status,
              :manager_finish
            ]
   end
