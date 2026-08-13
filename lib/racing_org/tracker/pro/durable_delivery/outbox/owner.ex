@@ -65,13 +65,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
           accepting: boolean(),
           quarantined: boolean(),
           storage_epoch_bound: boolean(),
-          pending_entries: non_neg_integer(),
-          pending_bytes: non_neg_integer(),
+          pending_entries: non_neg_integer() | :unavailable,
+          pending_bytes: non_neg_integer() | :unavailable,
           disk_bytes: non_neg_integer() | :unavailable,
           max_entries: pos_integer(),
           max_bytes: pos_integer(),
           max_disk_bytes: pos_integer(),
-          loss_authorizations: non_neg_integer(),
+          loss_authorizations: non_neg_integer() | :unavailable,
           streams: non_neg_integer()
         }
 
@@ -180,6 +180,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   def init(opts) do
     with {:ok, root} <- option_root(opts),
          {:ok, identity_source} <- option_identity_source(opts),
+         {:ok, store_opts} <- validate_store_options(opts),
          :ok <- claim_root(root),
          {:ok, root_lock} <- claim_root_across_vms(root, opts) do
       Process.flag(:trap_exit, true)
@@ -188,7 +189,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
         root: root,
         root_lock: root_lock,
         store: nil,
-        store_opts: opts,
+        store_opts: store_opts,
         identity: nil,
         identity_source: identity_source,
         identity_refresh_ms: identity_refresh_ms(opts),
@@ -341,13 +342,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
       {:ok, identity} ->
         case open_store(state.root, identity, state.store_opts) do
           {:ok, store} ->
-            {:ok,
-             %{
-               state
-               | store: store,
-                 identity: identity,
-                 binding_error: nil
-             }}
+            finish_deferred_bind(state, identity, store)
 
           {:error, reason}
           when reason in [:device_id_mismatch, :credential_epoch_mismatch, :storage_epoch_mismatch] ->
@@ -371,6 +366,38 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
       {:error, reason} ->
         {:error, reason, state}
     end
+  end
+
+  defp finish_deferred_bind(state, identity, store) do
+    case read_identity(state.identity_source) do
+      {:ok, current} when current == identity ->
+        {:ok,
+         %{
+           state
+           | store: store,
+             identity: identity,
+             binding_error: nil
+         }}
+
+      {:ok, current} ->
+        {:ok, quarantine_unopened(state, compare_identity(identity, current))}
+
+      {:error, :no_verified_authority} ->
+        {:ok, quarantine_unopened(state, :identity_unbound)}
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp quarantine_unopened(state, :ok), do: %{state | binding_error: :identity_unavailable, quarantined: true}
+
+  defp quarantine_unopened(state, {:error, reason}) do
+    %{state | binding_error: reason, quarantined: true}
+  end
+
+  defp quarantine_unopened(state, reason) do
+    %{state | binding_error: reason, quarantined: true}
   end
 
   defp schedule_identity_refresh(state) do
@@ -431,14 +458,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
       accepting: false,
       quarantined: state.quarantined,
       storage_epoch_bound: false,
-      pending_entries: 0,
-      pending_bytes: 0,
+      pending_entries: :unavailable,
+      pending_bytes: :unavailable,
       disk_bytes: :unavailable,
       max_entries: max_entries,
       max_bytes: max_bytes,
       max_disk_bytes: Keyword.get(state.store_opts, :max_disk_bytes, max_bytes + segment_max_bytes),
-      loss_authorizations: 0,
-      streams: state.store_opts |> Keyword.get(:streams, @default_streams) |> length()
+      loss_authorizations: :unavailable,
+      streams: state.store_opts |> Keyword.fetch!(:streams) |> length()
     }
   end
 
@@ -528,27 +555,107 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   end
 
   defp open_store(root, identity, opts) do
-    store_opts =
-      [
-        device_id: identity.device_id,
-        credential_epoch: identity.credential_epoch,
-        storage_epoch: identity.storage_epoch,
-        streams: Keyword.get(opts, :streams, @default_streams),
-        max_entries: Keyword.get(opts, :max_entries, @default_max_entries),
-        max_bytes: Keyword.get(opts, :max_bytes, @default_max_bytes),
-        segment_max_bytes: Keyword.get(opts, :segment_max_bytes, @default_segment_max_bytes)
-      ] ++
-        Keyword.take(opts, [
-          :max_disk_bytes,
-          :max_loss_authorizations,
-          :max_entry_id_tombstones,
-          :max_resolved_receipts,
-          :file_system,
-          :segment_file_system,
-          :entry_id_generator
-        ])
+    Store.open(root, store_options(identity, opts))
+  end
 
-    Store.open(root, store_opts)
+  defp validate_store_options(opts) do
+    identity = %{
+      device_id: <<1::128>>,
+      credential_epoch: 0,
+      storage_epoch: <<1::128>>
+    }
+
+    store_opts = store_options(identity, opts)
+
+    with :ok <- valid_streams(Keyword.fetch!(store_opts, :streams)),
+         :ok <- positive_store_option(store_opts, :max_entries),
+         :ok <- positive_store_option(store_opts, :max_bytes),
+         :ok <- positive_store_option(store_opts, :segment_max_bytes),
+         :ok <- positive_optional_store_option(store_opts, :max_disk_bytes),
+         :ok <- positive_optional_store_option(store_opts, :max_loss_authorizations),
+         :ok <- positive_optional_store_option(store_opts, :max_entry_id_tombstones),
+         :ok <- positive_optional_store_option(store_opts, :max_resolved_receipts),
+         :ok <- store_adapter(store_opts, :file_system, FileSystem, FileSystem),
+         :ok <-
+           store_adapter(
+             store_opts,
+             :segment_file_system,
+             SegmentFileSystem,
+             SegmentFileSystem
+           ),
+         :ok <- entry_id_generator(store_opts) do
+      {:ok, store_opts}
+    end
+  end
+
+  defp valid_streams(streams) when is_list(streams) and streams != [] do
+    if Enum.all?(streams, &is_atom/1) and length(Enum.uniq(streams)) == length(streams),
+      do: :ok,
+      else: {:error, :invalid_streams}
+  end
+
+  defp valid_streams(_streams), do: {:error, :invalid_streams}
+
+  defp positive_store_option(opts, key) do
+    case Keyword.fetch(opts, key) do
+      {:ok, value} when is_integer(value) and value > 0 -> :ok
+      _invalid -> {:error, {:invalid_option, key}}
+    end
+  end
+
+  defp positive_optional_store_option(opts, key) do
+    case Keyword.fetch(opts, key) do
+      {:ok, value} when is_integer(value) and value > 0 -> :ok
+      {:ok, _invalid} -> {:error, {:invalid_option, key}}
+      :error -> :ok
+    end
+  end
+
+  defp store_adapter(opts, key, default, behaviour) do
+    case Keyword.get(opts, key, default) do
+      module when is_atom(module) ->
+        callbacks = behaviour.behaviour_info(:callbacks)
+
+        if Code.ensure_loaded?(module) and
+             Enum.all?(callbacks, fn {function, arity} ->
+               function_exported?(module, function, arity)
+             end) do
+          :ok
+        else
+          {:error, {:invalid_option, key}}
+        end
+
+      _invalid ->
+        {:error, {:invalid_option, key}}
+    end
+  end
+
+  defp entry_id_generator(opts) do
+    case Keyword.get(opts, :entry_id_generator, fn -> :crypto.strong_rand_bytes(16) end) do
+      generator when is_function(generator, 0) -> :ok
+      _invalid -> {:error, {:invalid_option, :entry_id_generator}}
+    end
+  end
+
+  defp store_options(identity, opts) do
+    [
+      device_id: identity.device_id,
+      credential_epoch: identity.credential_epoch,
+      storage_epoch: identity.storage_epoch,
+      streams: Keyword.get(opts, :streams, @default_streams),
+      max_entries: Keyword.get(opts, :max_entries, @default_max_entries),
+      max_bytes: Keyword.get(opts, :max_bytes, @default_max_bytes),
+      segment_max_bytes: Keyword.get(opts, :segment_max_bytes, @default_segment_max_bytes)
+    ] ++
+      Keyword.take(opts, [
+        :max_disk_bytes,
+        :max_loss_authorizations,
+        :max_entry_id_tombstones,
+        :max_resolved_receipts,
+        :file_system,
+        :segment_file_system,
+        :entry_id_generator
+      ])
   end
 
   defp option_root(opts) do

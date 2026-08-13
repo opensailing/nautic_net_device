@@ -65,7 +65,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       assert File.read!(result) == "root_already_owned"
     end
 
-    test "releases the native root lock when Store startup fails", %{root: root} do
+    test "rejects invalid Store options before claiming the native root lock", %{root: root} do
       __MODULE__.RootCloseProbeSegmentFileSystem.watch(self())
       on_exit(&__MODULE__.RootCloseProbeSegmentFileSystem.clear_watch/0)
 
@@ -75,8 +75,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
                  entry_id_generator: :invalid
                )
 
-      assert_receive {:root_closed, closed_root}, 1_000
-      assert {:ok, ^closed_root} = RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store.canonical_root(root)
+      refute_receive {:root_closed, _closed_root}, 50
+      assert {:ok, _replacement} = start_owner(root)
     end
 
     test "a real supervisor can restart the owner immediately after a crash", %{root: root} do
@@ -170,7 +170,10 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
                accepting: false,
                quarantined: false,
                storage_epoch_bound: false,
-               pending_entries: 0
+               pending_entries: :unavailable,
+               pending_bytes: :unavailable,
+               disk_bytes: :unavailable,
+               loss_authorizations: :unavailable
              } = Owner.status(owner)
 
       assert Process.alive?(owner)
@@ -180,6 +183,30 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       assert [{Owner, ^owner, :worker, [Owner]}] = Supervisor.which_children(supervisor)
       assert {:ok, receipt} = Owner.enqueue(owner, :telemetry, "bound")
       assert receipt.storage_epoch == @storage_epoch
+    end
+
+    test "validates Store options before entering the unbound lifecycle", %{root: root} do
+      for {override, expected} <- [
+            {[streams: :invalid], :invalid_streams},
+            {[max_entries: "10"], {:invalid_option, :max_entries}},
+            {[max_bytes: 0], {:invalid_option, :max_bytes}},
+            {[segment_max_bytes: -1], {:invalid_option, :segment_max_bytes}},
+            {[max_disk_bytes: "unbounded"], {:invalid_option, :max_disk_bytes}},
+            {[max_loss_authorizations: 0], {:invalid_option, :max_loss_authorizations}},
+            {[file_system: "invalid"], {:invalid_option, :file_system}},
+            {[entry_id_generator: :invalid], {:invalid_option, :entry_id_generator}}
+          ] do
+        invalid_root = root <> "_#{System.unique_integer([:positive])}"
+        on_exit(fn -> File.rm_rf(invalid_root) end)
+
+        assert {:error, ^expected} =
+                 start_owner(
+                   invalid_root,
+                   [identity: fn -> {:error, :no_verified_authority} end] ++ override
+                 )
+
+        assert {:ok, _replacement} = start_owner(invalid_root)
+      end
     end
 
     test "stops and releases ownership if an unbound refresh becomes malformed", %{root: root} do
@@ -221,7 +248,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       assert eventually(
                fn ->
                  match?(
-                   %{quarantined: true, storage_epoch_bound: false, disk_bytes: :unavailable},
+                   %{
+                     quarantined: true,
+                     storage_epoch_bound: false,
+                     pending_entries: :unavailable,
+                     pending_bytes: :unavailable,
+                     disk_bytes: :unavailable,
+                     loss_authorizations: :unavailable
+                   },
                    Owner.status(owner)
                  )
                end,
@@ -234,6 +268,39 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       assert :ok = stop_owner(owner)
       assert {:ok, reopened} = start_owner(root)
       assert Enum.map(Owner.pending(reopened), & &1.payload) == ["historical"]
+    end
+
+    test "rechecks identity after Store.open before reporting bound", %{root: root} do
+      {:ok, identity_source} =
+        Agent.start_link(fn ->
+          %{calls: 0, identity: identity()}
+        end)
+
+      on_exit(fn -> if Process.alive?(identity_source), do: Agent.stop(identity_source) end)
+
+      provider = fn ->
+        Agent.get_and_update(identity_source, fn state ->
+          result =
+            case state.calls do
+              0 -> {:error, :no_verified_authority}
+              1 -> {:ok, state.identity}
+              _later -> {:error, :no_verified_authority}
+            end
+
+          {result, %{state | calls: state.calls + 1}}
+        end)
+      end
+
+      assert {:ok, owner} =
+               start_owner(root,
+                 identity: provider,
+                 identity_refresh_ms: 10
+               )
+
+      assert eventually(fn -> match?(%{quarantined: true}, Owner.status(owner)) end, 100)
+      assert %{storage_epoch_bound: false, accepting: false} = Owner.status(owner)
+      assert {:error, :quarantined} = Owner.enqueue(owner, :telemetry, "must-not-accept")
+      assert File.ls!(root) |> Enum.any?(&String.starts_with?(&1, "segment-")) == false
     end
 
     test "still refuses malformed identities at startup", %{root: root} do
