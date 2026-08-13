@@ -3277,6 +3277,219 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     end)
   end
 
+  test "checkpoint hydration synchronously blocks an open runtime and every reconciliation path", ctx do
+    fixture = fully_stage(ctx.store, DS.generation_fixture())
+    assert {:ok, nil} = Store.activate(ctx.store, 1, fixture.manifest_hash)
+
+    manager = start_manager(ctx, owner_retry_base_ms: 10)
+    assert_receive {:applier, :reconcile, _startup}
+    assert OperationalGate.status(ctx.gate) == {:open, gate_binding(fixture)}
+
+    coordinator = start_hydration_coordinator(manager)
+    token = make_ref()
+    binding = pointer(fixture)
+
+    assert :ok = hydration_command(coordinator, :begin, token, binding)
+    assert OperationalGate.status(ctx.gate) == :closed
+    refute OperationalGate.open?(ctx.term_key)
+
+    assert Manager.status(manager).checkpoint_hydration == %{
+             state: :blocked,
+             binding: binding,
+             coordinator_available?: true
+           }
+
+    gate_pid = ctx.gate_pid
+    gate_ref = Process.monitor(gate_pid)
+    assert :ok = GenServer.stop(gate_pid)
+    assert_receive {:DOWN, ^gate_ref, :process, ^gate_pid, :normal}
+
+    assert {:ok, replacement} =
+             OperationalGate.start_link(
+               name: ctx.gate,
+               term_key: ctx.term_key,
+               controller: ctx.manager_name,
+               controller_capability: ctx.controller_capability
+             )
+
+    assert Process.alive?(replacement)
+
+    eventually(fn ->
+      assert :sys.get_state(manager).gate_pid == replacement
+      assert OperationalGate.status(ctx.gate) == :closed
+    end)
+
+    refute_receive {:applier, :reconcile, _while_hydration_blocked}
+  end
+
+  test "checkpoint hydration finish requires the exact coordinator token and active binding", ctx do
+    fixture = fully_stage(ctx.store, DS.generation_fixture())
+    assert {:ok, nil} = Store.activate(ctx.store, 1, fixture.manifest_hash)
+
+    manager = start_manager(ctx)
+    assert_receive {:applier, :reconcile, _startup}
+
+    coordinator = start_hydration_coordinator(manager)
+    token = make_ref()
+    binding = pointer(fixture)
+    assert :ok = hydration_command(coordinator, :begin, token, binding)
+
+    assert {:error, :checkpoint_hydration_token_mismatch} =
+             hydration_command(coordinator, :finish, make_ref(), binding)
+
+    foreign =
+      Task.async(fn ->
+        Manager.finish_checkpoint_hydration(manager, token, binding)
+      end)
+
+    assert {:error, :checkpoint_hydration_coordinator_mismatch} = Task.await(foreign)
+
+    stale_binding = %{binding | manifest_hash: :binary.copy(<<0xFE>>, 32)}
+
+    assert {:error, :checkpoint_hydration_binding_mismatch} =
+             hydration_command(coordinator, :finish, token, stale_binding)
+
+    assert OperationalGate.status(ctx.gate) == :closed
+    assert :ok = hydration_command(coordinator, :finish, token, binding)
+    assert_receive {:applier, :reconcile, _after_hydration}
+    assert OperationalGate.status(ctx.gate) == {:open, gate_binding(fixture)}
+
+    assert Manager.status(manager).checkpoint_hydration == %{
+             state: :ready,
+             binding: binding,
+             coordinator_available?: true
+           }
+
+    assert coordinator in :sys.get_state(ctx.gate).dependency_pids
+  end
+
+  test "checkpoint hydration rejects a stale desired-state binding and permits exact rebinding", ctx do
+    first = fully_stage(ctx.store, DS.generation_fixture(generation: 1))
+    second = fully_stage(ctx.store, DS.generation_fixture(generation: 2))
+    assert {:ok, nil} = Store.activate(ctx.store, 1, first.manifest_hash)
+
+    manager = start_manager(ctx)
+    assert_receive {:applier, :reconcile, _startup}
+
+    coordinator = start_hydration_coordinator(manager)
+    first_token = make_ref()
+    first_binding = pointer(first)
+    assert :ok = hydration_command(coordinator, :begin, first_token, first_binding)
+
+    assert {:ok, ^first_binding} = Store.activate(ctx.store, 2, second.manifest_hash)
+
+    send(manager, {:reconcile_authoritative_owners, :stale_test_token})
+    Process.sleep(20)
+    assert OperationalGate.status(ctx.gate) == :closed
+    refute_receive {:applier, :reconcile, _while_hydration_blocked}
+
+    assert {:error, :checkpoint_hydration_binding_mismatch} =
+             hydration_command(coordinator, :finish, first_token, first_binding)
+
+    assert OperationalGate.status(ctx.gate) == :closed
+
+    second_token = make_ref()
+    second_binding = pointer(second)
+    assert :ok = hydration_command(coordinator, :begin, second_token, second_binding)
+    assert :ok = hydration_command(coordinator, :finish, second_token, second_binding)
+    assert_receive {:applier, :reconcile, reconcile}
+    assert reconcile.pointer == second_binding
+    assert OperationalGate.status(ctx.gate) == {:open, gate_binding(second)}
+  end
+
+  test "a completed hydration binding cannot authorize a different active generation", ctx do
+    first = fully_stage(ctx.store, DS.generation_fixture(generation: 1))
+    second = fully_stage(ctx.store, DS.generation_fixture(generation: 2))
+    assert {:ok, nil} = Store.activate(ctx.store, 1, first.manifest_hash)
+
+    manager = start_manager(ctx, owner_retry_base_ms: 10)
+    assert_receive {:applier, :reconcile, _startup}
+
+    coordinator = start_hydration_coordinator(manager)
+    first_token = make_ref()
+    first_binding = pointer(first)
+    assert :ok = hydration_command(coordinator, :begin, first_token, first_binding)
+    assert :ok = hydration_command(coordinator, :finish, first_token, first_binding)
+    assert_receive {:applier, :reconcile, _first_hydration}
+    assert OperationalGate.status(ctx.gate) == {:open, gate_binding(first)}
+
+    assert {:ok, ^first_binding} = Store.activate(ctx.store, 2, second.manifest_hash)
+
+    gate_pid = ctx.gate_pid
+    gate_ref = Process.monitor(gate_pid)
+    assert :ok = GenServer.stop(gate_pid)
+    assert_receive {:DOWN, ^gate_ref, :process, ^gate_pid, :normal}
+
+    assert {:ok, replacement} =
+             OperationalGate.start_link(
+               name: ctx.gate,
+               term_key: ctx.term_key,
+               controller: ctx.manager_name,
+               controller_capability: ctx.controller_capability
+             )
+
+    assert Process.alive?(replacement)
+
+    eventually(fn ->
+      assert OperationalGate.status(ctx.gate) == :closed
+      assert Manager.status(manager).checkpoint_hydration.state == :blocked
+    end)
+
+    second_token = make_ref()
+    second_binding = pointer(second)
+    assert :ok = hydration_command(coordinator, :begin, second_token, second_binding)
+    assert :ok = hydration_command(coordinator, :finish, second_token, second_binding)
+    assert_receive {:applier, :reconcile, reconcile}
+    assert reconcile.pointer == second_binding
+    assert OperationalGate.status(ctx.gate) == {:open, gate_binding(second)}
+  end
+
+  test "checkpoint hydration coordinator death closes the gate immediately and remains blocked", ctx do
+    fixture = fully_stage(ctx.store, DS.generation_fixture())
+    assert {:ok, nil} = Store.activate(ctx.store, 1, fixture.manifest_hash)
+
+    manager = start_manager(ctx)
+    assert_receive {:applier, :reconcile, _startup}
+
+    coordinator = start_hydration_coordinator(manager)
+    token = make_ref()
+    binding = pointer(fixture)
+    assert :ok = hydration_command(coordinator, :begin, token, binding)
+    assert :ok = hydration_command(coordinator, :finish, token, binding)
+    assert_receive {:applier, :reconcile, _after_hydration}
+    assert OperationalGate.open?(ctx.term_key)
+
+    :ok = :sys.suspend(manager)
+    on_exit(fn -> if Process.alive?(manager), do: :sys.resume(manager) end)
+
+    coordinator_ref = Process.monitor(coordinator)
+    Process.exit(coordinator, :kill)
+    assert_receive {:DOWN, ^coordinator_ref, :process, ^coordinator, :killed}
+
+    refute OperationalGate.open?(ctx.term_key)
+    assert OperationalGate.status(ctx.gate) == :closed
+
+    :ok = :sys.resume(manager)
+
+    eventually(fn ->
+      assert Manager.status(manager).checkpoint_hydration == %{
+               state: :blocked,
+               binding: binding,
+               coordinator_available?: false
+             }
+
+      assert OperationalGate.status(ctx.gate) == :closed
+    end)
+
+    replacement = start_hydration_coordinator(manager)
+    replacement_token = make_ref()
+    assert :ok = hydration_command(replacement, :begin, replacement_token, binding)
+    assert :ok = hydration_command(replacement, :finish, replacement_token, binding)
+    assert_receive {:applier, :reconcile, _replacement_hydration}
+    assert OperationalGate.status(ctx.gate) == {:open, gate_binding(fixture)}
+    assert replacement in :sys.get_state(ctx.gate).dependency_pids
+  end
+
   test "a responsive manager renews its operational lease", ctx do
     fixture = fully_stage(ctx.store, DS.generation_fixture())
     assert {:ok, nil} = Store.activate(ctx.store, 1, fixture.manifest_hash)
@@ -3498,6 +3711,38 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
 
     eventually(fn -> refute OperationalGate.open?(ctx.term_key) end)
     assert OperationalGate.status(ctx.gate) == :closed
+  end
+
+  defp start_hydration_coordinator(manager) do
+    start_supervised!(
+      Supervisor.child_spec(
+        {Task, fn -> hydration_coordinator_loop(manager) end},
+        id: make_ref(),
+        restart: :temporary
+      )
+    )
+  end
+
+  defp hydration_coordinator_loop(manager) do
+    receive do
+      {:hydration_command, caller, ref, :begin, token, binding} ->
+        result = Manager.begin_checkpoint_hydration(manager, token, binding)
+        send(caller, {:hydration_result, ref, result})
+        hydration_coordinator_loop(manager)
+
+      {:hydration_command, caller, ref, :finish, token, binding} ->
+        result = Manager.finish_checkpoint_hydration(manager, token, binding)
+        send(caller, {:hydration_result, ref, result})
+        hydration_coordinator_loop(manager)
+    end
+  end
+
+  defp hydration_command(coordinator, operation, token, binding) do
+    ref = make_ref()
+    send(coordinator, {:hydration_command, self(), ref, operation, token, binding})
+
+    assert_receive {:hydration_result, ^ref, result}, 1_000
+    result
   end
 
   defp start_manager(ctx, opts \\ []) do

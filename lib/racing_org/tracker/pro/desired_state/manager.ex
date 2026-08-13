@@ -19,6 +19,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
 
   @identity_keys [:device_id, :credential_epoch, :boot_id, :storage_epoch]
   @durable_identity_keys [:device_id, :credential_epoch, :storage_epoch]
+  @pointer_keys [:device_id, :credential_epoch, :storage_epoch, :generation, :manifest_hash]
   @non_network_sections Enum.reject(Contract.sections(), &(&1 == :wifi))
   @owner_sections MapSet.new(Contract.sections())
   @default_owner_retry_base_ms 25
@@ -89,6 +90,20 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
           :ok | {:error, :stale_session}
   def replay(server \\ __MODULE__, session_generation) do
     GenServer.call(server, {:replay, session_generation}, :infinity)
+  end
+
+  @doc "Close operational output while the calling coordinator hydrates one exact active binding."
+  @spec begin_checkpoint_hydration(GenServer.server(), reference(), pointer()) ::
+          :ok | {:error, term()}
+  def begin_checkpoint_hydration(server \\ __MODULE__, token, binding) do
+    GenServer.call(server, {:begin_checkpoint_hydration, token, binding}, :infinity)
+  end
+
+  @doc "Release a checkpoint blocker only for its exact coordinator, token, and current binding."
+  @spec finish_checkpoint_hydration(GenServer.server(), reference(), pointer()) ::
+          :ok | {:error, term()}
+  def finish_checkpoint_hydration(server \\ __MODULE__, token, binding) do
+    GenServer.call(server, {:finish_checkpoint_hydration, token, binding}, :infinity)
   end
 
   @impl true
@@ -165,7 +180,9 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
       owner_retry_ref: nil,
       owner_retry_token: nil,
       recovery_error: nil,
-      recovery_quiescent?: false
+      recovery_quiescent?: false,
+      checkpoint_hydration: nil,
+      checkpoint_hydration_monitor_ref: nil
     }
 
     case register_applier_manager(applier) do
@@ -184,8 +201,19 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
        active: active_pointer_status(state.store),
        gate: gate_status(state),
        identity: state.identity,
-       recovery_error: state.recovery_error
+       recovery_error: state.recovery_error,
+       checkpoint_hydration: checkpoint_hydration_status(state)
      }, state}
+  end
+
+  def handle_call({:begin_checkpoint_hydration, token, binding}, {coordinator_pid, _tag}, state) do
+    {reply, state} = begin_checkpoint_hydration_fenced(state, coordinator_pid, token, binding)
+    {:reply, reply, state}
+  end
+
+  def handle_call({:finish_checkpoint_hydration, token, binding}, {coordinator_pid, _tag}, state) do
+    {reply, state} = finish_checkpoint_hydration_fenced(state, coordinator_pid, token, binding)
+    {:reply, reply, state}
   end
 
   def handle_call({:deliver_manifest, session_generation, delivery}, _from, state) do
@@ -298,6 +326,22 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
   end
 
   def handle_info({:lease_heartbeat, _stale_token}, state), do: {:noreply, state}
+
+  def handle_info(
+        {:DOWN, monitor_ref, :process, coordinator_pid, _reason},
+        %{
+          checkpoint_hydration_monitor_ref: monitor_ref,
+          checkpoint_hydration: %{coordinator_pid: coordinator_pid} = hydration
+        } = state
+      ) do
+    state =
+      state
+      |> Map.put(:checkpoint_hydration_monitor_ref, nil)
+      |> Map.put(:checkpoint_hydration, %{hydration | state: :blocked, coordinator_available?: false})
+      |> close_runtime_quiescent()
+
+    {:noreply, state}
+  end
 
   def handle_info(
         {:DOWN, monitor_ref, :process, gate_pid, _reason},
@@ -1410,6 +1454,9 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
 
   defp reconcile_active_runtime(%{identity: nil} = state), do: close_runtime_quiescent(state)
 
+  defp reconcile_active_runtime(%{checkpoint_hydration: %{state: :blocked}} = state),
+    do: close_runtime_quiescent(state)
+
   defp reconcile_active_runtime(state) do
     case Store.activation_journal(state.store) do
       :empty ->
@@ -1443,10 +1490,19 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
   end
 
   defp reconcile_active_pointer(state, pointer) do
-    if pointer_matches_identity?(pointer, state.identity) do
-      if current_runtime_matches?(state, pointer) do
+    cond do
+      not pointer_matches_identity?(pointer, state.identity) ->
+        close_runtime_quiescent(state)
+
+      not checkpoint_hydration_binding_current?(state, pointer) ->
+        state
+        |> mark_checkpoint_hydration_stale()
+        |> close_runtime_quiescent()
+
+      current_runtime_matches?(state, pointer) ->
         reset_owner_reconcile(state)
-      else
+
+      true ->
         case ensure_runtime_closed(state) do
           {:ok, state} ->
             action =
@@ -1473,9 +1529,6 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
           {:error, state} ->
             state
         end
-      end
-    else
-      close_runtime_quiescent(state)
     end
   end
 
@@ -1526,6 +1579,12 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
 
   defp apply_runtime_action(%{identity: nil} = state, {:open_prepared, _transition}),
     do: close_runtime_quiescent(state)
+
+  defp apply_runtime_action(
+         %{checkpoint_hydration: %{state: :blocked}} = state,
+         {:open_prepared, _transition}
+       ),
+       do: close_runtime_quiescent(state)
 
   defp apply_runtime_action(state, {:open_prepared, transition}) do
     case Store.active(state.store) do
@@ -1761,9 +1820,11 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
   defp gate_open_prepared(state, pointer, owner_pids, transition_token) do
     dependency_pids =
       Enum.uniq([
-        state.lease_sentinel_pid
+        state.lease_sentinel_pid,
+        checkpoint_hydration_dependency(state)
         | owner_pids
       ])
+      |> Enum.reject(&is_nil/1)
 
     case call_gate(fn ->
            OperationalGate.open_prepared(
@@ -2124,6 +2185,9 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
       action -> apply_runtime_action(state, action)
     end
   end
+
+  defp finish_recovery_transition(%{checkpoint_hydration: %{state: :blocked}} = state, _transition),
+    do: close_runtime_quiescent(state)
 
   defp finish_recovery_transition(state, transition) do
     case Store.active(state.store) do
@@ -2588,6 +2652,196 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
 
   defp gate_binding(pointer) do
     Map.take(pointer, [:credential_epoch, :storage_epoch, :generation, :manifest_hash])
+  end
+
+  defp begin_checkpoint_hydration_fenced(state, coordinator_pid, token, binding)
+       when is_pid(coordinator_pid) and is_reference(token) do
+    with {:ok, binding} <- validate_checkpoint_hydration_binding(binding),
+         {:ok, active} <- current_checkpoint_hydration_binding(state),
+         true <- active == binding,
+         :ok <- validate_checkpoint_hydration_begin(state, coordinator_pid, token, binding) do
+      state =
+        state
+        |> install_checkpoint_hydration(coordinator_pid, token, binding)
+        |> close_runtime_quiescent()
+
+      {:ok, state}
+    else
+      false -> {{:error, :checkpoint_hydration_binding_mismatch}, close_runtime_quiescent(state)}
+      {:error, reason} -> {{:error, reason}, close_runtime_quiescent(state)}
+    end
+  end
+
+  defp begin_checkpoint_hydration_fenced(state, _coordinator_pid, _token, _binding),
+    do: {{:error, :invalid_checkpoint_hydration_blocker}, close_runtime_quiescent(state)}
+
+  defp finish_checkpoint_hydration_fenced(state, coordinator_pid, token, binding) do
+    with {:ok, binding} <- validate_checkpoint_hydration_binding(binding),
+         :ok <- validate_checkpoint_hydration_finish(state, coordinator_pid, token, binding),
+         {:ok, active} <- current_checkpoint_hydration_binding(state),
+         true <- active == binding do
+      state =
+        state
+        |> Map.update!(:checkpoint_hydration, &%{&1 | state: :ready})
+        |> reconcile_active_runtime()
+
+      {:ok, state}
+    else
+      false -> {{:error, :checkpoint_hydration_binding_mismatch}, close_runtime_quiescent(state)}
+      {:error, reason} -> {{:error, reason}, close_runtime_quiescent(state)}
+    end
+  end
+
+  defp validate_checkpoint_hydration_begin(
+         %{checkpoint_hydration: nil},
+         _coordinator_pid,
+         _token,
+         _binding
+       ),
+       do: :ok
+
+  defp validate_checkpoint_hydration_begin(
+         %{checkpoint_hydration: %{coordinator_pid: coordinator_pid, coordinator_available?: true}},
+         coordinator_pid,
+         _token,
+         _binding
+       ),
+       do: :ok
+
+  defp validate_checkpoint_hydration_begin(
+         %{checkpoint_hydration: %{coordinator_available?: false, state: :blocked}},
+         _coordinator_pid,
+         _token,
+         _binding
+       ),
+       do: :ok
+
+  defp validate_checkpoint_hydration_begin(_state, _coordinator_pid, _token, _binding),
+    do: {:error, :checkpoint_hydration_coordinator_mismatch}
+
+  defp validate_checkpoint_hydration_finish(
+         %{
+           checkpoint_hydration: %{
+             coordinator_pid: expected_coordinator_pid,
+             coordinator_available?: true,
+             token: expected_token,
+             binding: expected_binding,
+             state: :blocked
+           }
+         },
+         coordinator_pid,
+         token,
+         binding
+       ) do
+    cond do
+      coordinator_pid != expected_coordinator_pid ->
+        {:error, :checkpoint_hydration_coordinator_mismatch}
+
+      token != expected_token ->
+        {:error, :checkpoint_hydration_token_mismatch}
+
+      binding != expected_binding ->
+        {:error, :checkpoint_hydration_binding_mismatch}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp validate_checkpoint_hydration_finish(_state, _coordinator_pid, _token, _binding),
+    do: {:error, :checkpoint_hydration_not_blocked}
+
+  defp install_checkpoint_hydration(state, coordinator_pid, token, binding) do
+    state = clear_checkpoint_hydration_monitor(state)
+
+    %{
+      state
+      | checkpoint_hydration: %{
+          state: :blocked,
+          coordinator_pid: coordinator_pid,
+          coordinator_available?: true,
+          token: token,
+          binding: binding
+        },
+        checkpoint_hydration_monitor_ref: Process.monitor(coordinator_pid)
+    }
+  end
+
+  defp clear_checkpoint_hydration_monitor(%{checkpoint_hydration_monitor_ref: nil} = state),
+    do: state
+
+  defp clear_checkpoint_hydration_monitor(%{checkpoint_hydration_monitor_ref: monitor_ref} = state) do
+    Process.demonitor(monitor_ref, [:flush])
+    %{state | checkpoint_hydration_monitor_ref: nil}
+  end
+
+  defp current_checkpoint_hydration_binding(state) do
+    case Store.active(state.store) do
+      {:ok, pointer} ->
+        if pointer_matches_identity?(pointer, state.identity),
+          do: {:ok, Map.take(pointer, @pointer_keys)},
+          else: {:error, :checkpoint_hydration_binding_mismatch}
+
+      :empty ->
+        {:error, :checkpoint_hydration_binding_mismatch}
+
+      {:error, _reason} ->
+        {:error, :checkpoint_hydration_binding_unavailable}
+    end
+  end
+
+  defp validate_checkpoint_hydration_binding(
+         %{
+           device_id: device_id,
+           credential_epoch: credential_epoch,
+           storage_epoch: storage_epoch,
+           generation: generation,
+           manifest_hash: manifest_hash
+         } = binding
+       )
+       when map_size(binding) == 5 and is_binary(device_id) and byte_size(device_id) == 16 and
+              device_id != @zero_identifier and is_integer(credential_epoch) and
+              credential_epoch >= 0 and credential_epoch <= 0xFFFF_FFFF and
+              is_binary(storage_epoch) and byte_size(storage_epoch) == 16 and
+              storage_epoch != @zero_identifier and is_integer(generation) and generation > 0 and
+              is_binary(manifest_hash) and byte_size(manifest_hash) == 32 do
+    {:ok, Map.take(binding, @pointer_keys)}
+  end
+
+  defp validate_checkpoint_hydration_binding(_binding),
+    do: {:error, :invalid_checkpoint_hydration_binding}
+
+  defp checkpoint_hydration_binding_current?(%{checkpoint_hydration: nil}, _pointer), do: true
+
+  defp checkpoint_hydration_binding_current?(
+         %{checkpoint_hydration: %{state: :ready, binding: binding}},
+         pointer
+       ),
+       do: binding == Map.take(pointer, @pointer_keys)
+
+  defp checkpoint_hydration_binding_current?(_state, _pointer), do: false
+
+  defp mark_checkpoint_hydration_stale(%{checkpoint_hydration: nil} = state), do: state
+
+  defp mark_checkpoint_hydration_stale(%{checkpoint_hydration: hydration} = state) do
+    %{state | checkpoint_hydration: %{hydration | state: :blocked}}
+  end
+
+  defp checkpoint_hydration_dependency(%{
+         checkpoint_hydration: %{
+           state: :ready,
+           coordinator_available?: true,
+           coordinator_pid: coordinator_pid
+         }
+       }),
+       do: coordinator_pid
+
+  defp checkpoint_hydration_dependency(_state), do: nil
+
+  defp checkpoint_hydration_status(%{checkpoint_hydration: nil}), do: nil
+
+  defp checkpoint_hydration_status(%{checkpoint_hydration: hydration}) do
+    Map.take(hydration, [:state, :binding, :coordinator_available?])
   end
 
   defp active_pointer_status(store) do

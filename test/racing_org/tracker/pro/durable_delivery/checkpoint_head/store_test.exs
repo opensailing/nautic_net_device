@@ -423,8 +423,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
 
     def lstat(path) do
       case :persistent_term.get(__MODULE__, nil) do
-        {pid, configured_path, _replacement, _file_info_counter, lstat_counter,
-         retry_lstat_result} ->
+        {pid, configured_path, _replacement, _file_info_counter, lstat_counter, retry_lstat_result} ->
           if Path.basename(path) == Path.basename(configured_path) do
             count = :atomics.add_get(lstat_counter, 1, 1)
             send(pid, {:checkpoint_head_changed_read_lstat, count})
@@ -805,8 +804,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
 
       assert {:ok, store} = Store.new(opts(ctx, identity: duplicate_authority))
 
-      assert_receive {:identity_transition_results, {:ok, ^store},
-                      {:error, :invalid_identity_authority}}
+      assert_receive {:identity_transition_results, {:ok, ^store}, {:error, :invalid_identity_authority}}
     end
 
     test "bounds an authority that never invokes the constructor transition", ctx do
@@ -1050,15 +1048,108 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
       assert {:error, :checkpoint_secret_forbidden} =
                Store.put(
                  store,
-                 put_attrs(
-                   chained ++ [content: content(:calibration) |> Map.put("wifi_psk", "hunter2")]
-                 )
+                 put_attrs(chained ++ [content: content(:calibration) |> Map.put("wifi_psk", "hunter2")])
                )
 
       assert {:error, :invalid_delivery_sequence} =
                Store.put(store, put_attrs(chained ++ [sequence: 0]))
 
       assert {:ok, ^first} = Store.head(store, :calibration)
+    end
+  end
+
+  describe "observe_target_head/2" do
+    test "returns the exact absent, accepted, and local-unaccepted CAS observations", ctx do
+      assert {:ok, store} = Store.new(opts(ctx))
+      genesis = Record.genesis_parent()
+
+      assert {:ok, %{state: :absent, checkpoint_hash: ^genesis}} =
+               Store.observe_target_head(store, :calibration)
+
+      assert {:ok, accepted} = Store.hydrate(store, hydrate_attrs())
+
+      assert {:ok, %{state: :accepted, checkpoint_hash: accepted_hash}} =
+               Store.observe_target_head(store, :calibration)
+
+      assert accepted_hash == accepted.checkpoint_hash
+
+      assert {:ok, local} =
+               Store.put(
+                 store,
+                 put_attrs(
+                   sequence: 2,
+                   source_generation: 43,
+                   parent_hash: accepted.checkpoint_hash
+                 )
+               )
+
+      assert {:ok, %{state: :local_unaccepted, checkpoint_hash: local_hash}} =
+               Store.observe_target_head(store, :calibration)
+
+      assert local_hash == local.checkpoint_hash
+    end
+
+    test "classifies fenced and corrupt heads with the exact hashes accepted by hydrate/3", ctx do
+      assert {:ok, store} = Store.new(opts(ctx))
+      assert {:ok, local} = Store.put(store, put_attrs())
+
+      assert {:ok, rotated} = Store.new(opts(ctx, credential_epoch: @credential_epoch + 1))
+
+      assert {:ok, %{state: :fenced, checkpoint_hash: fenced_hash} = fenced} =
+               Store.observe_target_head(rotated, :calibration)
+
+      assert fenced_hash == local.checkpoint_hash
+
+      assert {:ok, rebound} =
+               Store.hydrate(
+                 rotated,
+                 hydrate_attrs(
+                   credential_epoch: @credential_epoch + 1,
+                   sequence: local.sequence,
+                   source_generation: local.source_generation,
+                   parent_hash: local.parent_hash,
+                   origin_credential_epoch: @credential_epoch,
+                   origin_storage_epoch: @storage_epoch
+                 ),
+                 fenced
+               )
+
+      assert rebound.checkpoint_hash == local.checkpoint_hash
+
+      corrupt = <<0xDE, 0xAD, 0xBE, 0xEF>>
+      File.write!(Store.head_path(rotated, :calibration), corrupt)
+
+      assert {:ok, %{state: :corrupt, checkpoint_hash: corrupt_hash} = corrupt_head} =
+               Store.observe_target_head(rotated, :calibration)
+
+      assert corrupt_hash == corrupt_head_hash(corrupt)
+
+      assert {:ok, hydrated} =
+               Store.hydrate(
+                 rotated,
+                 hydrate_attrs(
+                   credential_epoch: @credential_epoch + 1,
+                   sequence: rebound.sequence + 1,
+                   source_generation: rebound.source_generation + 1,
+                   parent_hash: rebound.checkpoint_hash
+                 ),
+                 corrupt_head
+               )
+
+      assert hydrated.accepted
+    end
+
+    test "fails closed for unknown kinds and stale current identity authority", ctx do
+      {:ok, authority} = Agent.start_link(fn -> identity() end)
+      identity_source = fn transition -> transition.(Agent.get(authority, & &1)) end
+      assert {:ok, store} = Store.new(opts(ctx, identity: identity_source))
+
+      assert {:error, :unknown_checkpoint_kind} = Store.observe_target_head(store, :telemetry)
+
+      Agent.update(authority, &%{&1 | credential_epoch: @credential_epoch + 1})
+
+      assert {:error, :credential_epoch_mismatch} =
+               Store.observe_target_head(store, :calibration)
     end
   end
 
@@ -2583,9 +2674,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
       end)
 
       assert {:ok, store} =
-               Store.new(
-                 opts(ctx, file_system: BlockingListDirFileSystem, transition_timeout_ms: 5_000)
-               )
+               Store.new(opts(ctx, file_system: BlockingListDirFileSystem, transition_timeout_ms: 5_000))
 
       bounded_store = Map.put(store, :transition_timeout_ms, 1_000)
       writer = Task.async(fn -> Store.put(bounded_store, put_attrs()) end)
@@ -2755,9 +2844,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
       writer = Task.async(fn -> Store.put(store, put_attrs()) end)
       assert_receive :global_lock_release_suspended, 2_000
 
-      assert {:ok,
-              {:error,
-               {:pre_rename, {:fault_injected, :before_rename, :simulated_pre_rename_failure}}}} =
+      assert {:ok, {:error, {:pre_rename, {:fault_injected, :before_rename, :simulated_pre_rename_failure}}}} =
                Task.yield(writer, 2_500)
 
       :ok = :sys.resume(global_name_server)
@@ -2921,8 +3008,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
 
       assert {:ok, _first_head} = Store.put(first_store, put_attrs())
 
-      assert_receive {:other_store_during_transition, {:ok, ^second_head},
-                      %{present: 1, unavailable: 0}}
+      assert_receive {:other_store_during_transition, {:ok, ^second_head}, %{present: 1, unavailable: 0}}
     end
 
     test "rejects canonical-path callback reentry in its bounded worker", ctx do
@@ -2940,8 +3026,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
 
       assert {:ok, outer} = Store.put(store, put_attrs())
 
-      assert_receive {:canonical_checkpoint_reentry,
-                      {:error, :checkpoint_head_reentrant_transition}},
+      assert_receive {:canonical_checkpoint_reentry, {:error, :checkpoint_head_reentrant_transition}},
                      2_000
 
       assert outer.source_generation == 42
@@ -3974,9 +4059,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
             accepted_bytes::binary>>
       )
 
-    :erlang.term_to_binary(
-      {2, :checkpoint_head_snapshot, Map.put(snapshot, :snapshot_hash, hash)}
-    )
+    :erlang.term_to_binary({2, :checkpoint_head_snapshot, Map.put(snapshot, :snapshot_hash, hash)})
   end
 
   defp encode_checkpoint_summary(nil), do: <<>>
@@ -3986,9 +4069,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
     {:ok, kind_code, _schema_version} = Contract.checkpoint_kind(summary.kind)
 
     <<summary.device_id::binary-size(16), summary.origin_credential_epoch::32,
-      summary.origin_storage_epoch::binary-size(16), summary.sequence::64, kind_code,
-      summary.schema_version::16, summary.source_generation::64,
-      summary.parent_hash::binary-size(32), summary.content_hash::binary-size(32),
+      summary.origin_storage_epoch::binary-size(16), summary.sequence::64, kind_code, summary.schema_version::16,
+      summary.source_generation::64, summary.parent_hash::binary-size(32), summary.content_hash::binary-size(32),
       summary.checkpoint_hash::binary-size(32)>>
   end
 

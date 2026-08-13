@@ -177,9 +177,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
          {:ok, storage_epoch} <- storage_epoch(Keyword.get(opts, :storage_epoch)),
          {:ok, identity_source} <- identity_source(opts),
          {:ok, transition_timeout_ms} <-
-           transition_timeout_ms(
-             Keyword.get(opts, :transition_timeout_ms, @default_transition_timeout_ms)
-           ) do
+           transition_timeout_ms(Keyword.get(opts, :transition_timeout_ms, @default_transition_timeout_ms)) do
       store = %__MODULE__{
         base_dir: base_dir,
         device_id: device_id,
@@ -202,6 +200,22 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
   def head(%__MODULE__{} = store, kind) do
     with {:ok, kind} <- known_kind(kind) do
       with_bounded_authority(store, fn -> read_head(store, kind) end)
+    end
+  end
+
+  @doc "Observe the exact target-head state and digest consumed by `hydrate/3` CAS."
+  @spec observe_target_head(t(), atom()) ::
+          {:ok, %{state: atom(), checkpoint_hash: <<_::256>>}} | {:error, term()}
+  def observe_target_head(%__MODULE__{} = store, kind) do
+    with {:ok, kind} <- known_kind(kind) do
+      with_bounded_authority(store, fn ->
+        with_kind_lock(store, kind, fn ->
+          case observe_target_head_snapshot(store, kind) do
+            {:ok, observed_head, _snapshot} -> {:ok, observed_head}
+            {:error, _reason} = error -> error
+          end
+        end)
+      end)
     end
   end
 
@@ -387,7 +401,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
   end
 
   defp hydrate_locked(store, kind, record, expected_head) do
-    with {:ok, observed_head, snapshot} <- observe_target_head(store, kind),
+    with {:ok, observed_head, snapshot} <- observe_target_head_snapshot(store, kind),
          {:continue, snapshot} <-
            expected_retry_or_match(store, kind, record, expected_head, observed_head, snapshot) do
       reconcile_expected_hydration(store, kind, record, snapshot)
@@ -612,7 +626,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
   end
 
   defp replace_ambiguous_expected_hydration(_store, _kind, _record, %{current: %{accepted: true}}),
-       do: {:error, :checkpoint_hydration_ambiguous}
+    do: {:error, :checkpoint_hydration_ambiguous}
 
   defp replace_ambiguous_expected_hydration(store, kind, record, snapshot) do
     with :ok <- accepted_watermark_allows(snapshot, record) do
@@ -673,7 +687,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
     end
   end
 
-  defp observe_target_head(store, kind) do
+  defp observe_target_head_snapshot(store, kind) do
     case read_head_bytes(store, transition_path(store, kind)) do
       :empty ->
         {:ok, %{state: :absent, checkpoint_hash: Record.genesis_parent()}, nil}
@@ -1221,9 +1235,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
 
     case safe_fs_call(store.file_system, :lstat, [parent]) do
       {:ok, %File.Stat{type: :directory} = stat} ->
-        {:ok,
-         {__MODULE__, :destination, stat.major_device, stat.minor_device, stat.inode,
-          Path.basename(destination)}}
+        {:ok, {__MODULE__, :destination, stat.major_device, stat.minor_device, stat.inode, Path.basename(destination)}}
 
       {:ok, %File.Stat{}} ->
         {:error, {:checkpoint_head_path, :enotdir}}
