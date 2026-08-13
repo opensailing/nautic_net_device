@@ -12,7 +12,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   alias RacingOrg.Tracker.Pro.Calibration.Observer, as: CalibrationObserver
   alias RacingOrg.Tracker.Pro.DesiredState.Manager
-  alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store
+  alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.{Record, Store}
   alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.{Journal, RuntimeRegistry}
   alias RacingOrg.Tracker.Pro.Polar.Observer, as: PolarObserver
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint
@@ -113,9 +113,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       manager_module: Keyword.get(opts, :manager_module, Manager),
       session_holder_module: Keyword.get(opts, :session_holder_module, SessionHolder),
       checkpoint_module: Keyword.get(opts, :checkpoint_module, Checkpoint),
+      record_module: Keyword.get(opts, :record_module, Record),
       journal_opts: Keyword.get(opts, :journal_opts, []),
       boundary: Keyword.get(opts, :boundary, fn _stage -> :ok end),
       blocker: nil,
+      selected_head: nil,
       recovery_error: nil
     }
 
@@ -227,7 +229,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   defp recover_state(state) do
     case journal_read(state) do
       :empty ->
-        {:ok, %{state | blocker: nil, recovery_error: nil}}
+        {:ok, %{state | blocker: nil, selected_head: nil, recovery_error: nil}}
 
       {:ok, record} ->
         recover_record(state, record)
@@ -325,10 +327,15 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   defp prepare_head_transition(state) do
     with :ok <- boundary(state, :before_head),
-         {:ok, _record} <- hydrate_head(state),
-         :ok <- boundary(state, :after_head),
-         :ok <- boundary(state, :before_head_committed) do
-      commit_head_transition(state)
+         {:ok, selected_head} <- hydrate_head(state) do
+      state = %{state | selected_head: selected_head}
+
+      with :ok <- boundary(state, :after_head),
+           :ok <- boundary(state, :before_head_committed) do
+        commit_head_transition(state)
+      else
+        {:error, reason} -> {:error, reason, state}
+      end
     else
       {:error, reason} -> {:error, reason, state}
     end
@@ -349,13 +356,19 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   defp replay_phase(%{blocker: %{record: %{phase: :prepared}}} = state),
     do: prepare_head_transition(state)
 
-  defp replay_phase(%{blocker: %{record: %{phase: :head_committed}}} = state),
-    do: {:ok, state}
+  defp replay_phase(%{blocker: %{record: %{phase: :head_committed}}} = state) do
+    case state.store_module.head(state.head_store, state.blocker.record.hydration.kind) do
+      {:ok, selected_head} -> {:ok, %{state | selected_head: selected_head}}
+      :empty -> {:error, :checkpoint_hydration_head_missing, state}
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
 
-  defp complete_transition(state, runtime) do
+  defp complete_transition(state, delivered_runtime) do
     evidence = state.blocker.record
 
-    with :ok <- boundary(state, :before_restore),
+    with {:ok, runtime} <- selected_runtime(state, delivered_runtime),
+         :ok <- boundary(state, :before_restore),
          :ok <- restore_runtime(state, runtime),
          :ok <- boundary(state, :after_restore),
          :ok <- boundary(state, :before_remove),
@@ -363,7 +376,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
          :ok <- boundary(state, :after_remove),
          :ok <- boundary(state, :before_finish),
          :ok <- manager_finish(state) do
-      {:ok, %{state | blocker: nil, recovery_error: nil}}
+      {:ok, %{state | blocker: nil, selected_head: nil, recovery_error: nil}}
     else
       {:error, reason} ->
         state = retain_recovery_evidence(state, evidence)
@@ -552,6 +565,32 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     _exception -> {:error, :invalid_checkpoint_runtime}
   catch
     _kind, _reason -> {:error, :invalid_checkpoint_runtime}
+  end
+
+  defp selected_runtime(%{selected_head: nil}, delivered_runtime), do: {:ok, delivered_runtime}
+
+  defp selected_runtime(%{selected_head: selected_head} = state, _delivered_runtime) do
+    with :ok <- state.record_module.verify(selected_head),
+         :ok <- match_selected_head(state, selected_head),
+         {:ok, adapter} <-
+           RuntimeRegistry.fetch(state.registry, selected_head.kind, selected_head.schema_version) do
+      decode_runtime(state, adapter, selected_head)
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp match_selected_head(state, selected_head) do
+    record = state.blocker.record
+
+    if selected_head.kind == record.hydration.kind and
+         selected_head.device_id == record.target.device_id and
+         selected_head.local_credential_epoch == record.target.credential_epoch and
+         selected_head.local_storage_epoch == record.target.storage_epoch do
+      :ok
+    else
+      {:error, :checkpoint_hydration_selected_head_mismatch}
+    end
   end
 
   defp restore_runtime(state, runtime) do

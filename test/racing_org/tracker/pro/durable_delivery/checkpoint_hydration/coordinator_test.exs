@@ -234,9 +234,53 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     end
 
     def hydrate(_store, attrs, expected_head) do
-      Backend.operation(:store_hydrate, %{attrs: attrs, expected_head: expected_head})
-      |> Backend.resolve(:store_hydrate, fn -> {:ok, %{checkpoint_hash: attrs.checkpoint_hash}} end)
+      result =
+        Backend.operation(:store_hydrate, %{attrs: attrs, expected_head: expected_head})
+        |> Backend.resolve(:store_hydrate, fn -> {:ok, selected_record(attrs)} end)
+
+      case result do
+        {:ok, record} ->
+          Backend.put(:head, record)
+          result
+
+        _other ->
+          result
+      end
     end
+
+    def head(_store, kind) do
+      Backend.operation(:store_head, kind)
+      |> Backend.resolve(:store_head, fn ->
+        case Backend.data(:head) do
+          nil -> :empty
+          record -> {:ok, record}
+        end
+      end)
+    end
+
+    defp selected_record(attrs) do
+      %{
+        device_id: attrs.device_id,
+        local_credential_epoch: attrs.credential_epoch,
+        local_storage_epoch: attrs.storage_epoch,
+        origin_credential_epoch: attrs.origin_credential_epoch,
+        origin_storage_epoch: attrs.origin_storage_epoch,
+        sequence: attrs.sequence,
+        kind: attrs.kind,
+        schema_version: attrs.schema_version,
+        source_generation: attrs.source_generation,
+        parent_hash: attrs.parent_hash,
+        content: attrs.content,
+        content_hash: :crypto.hash(:sha256, attrs.content),
+        checkpoint_hash: attrs.checkpoint_hash,
+        binding_hash: :crypto.hash(:sha256, "fake-binding"),
+        accepted: true
+      }
+    end
+  end
+
+  defmodule FakeRecord do
+    def verify(_record), do: :ok
   end
 
   defmodule FakeCheckpoint do
@@ -345,6 +389,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
              :journal_write_prepared,
              :store_hydrate,
              :journal_write_head_committed,
+             :checkpoint_decode,
+             :adapter_hydrate,
              :runtime_restore,
              :journal_remove,
              :manager_finish
@@ -366,6 +412,57 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     assert Map.delete(prepared, :phase) == Map.delete(committed, :phase)
     assert Backend.data(:journal) == nil
     assert Backend.data(:manager_finished?)
+  end
+
+  test "restores the exact Store-selected descendant instead of the delivered ancestor", ctx do
+    selected = selected_record(ctx.hydration, content: "newer-canonical-runtime", sequence: 10)
+    Backend.respond(:store_hydrate, {:return, {:ok, selected}})
+
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:ok, :hydrated} = Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert Backend.data(:restored) == [%{runtime: %{content: selected.content}}]
+
+    assert Backend.operations()
+           |> Enum.filter(&match?({:checkpoint_decode, _payload}, &1))
+           |> Enum.map(fn {_operation, payload} -> payload.content end) == [
+             ctx.hydration.content,
+             selected.content
+           ]
+  end
+
+  test "head-committed recovery restores the actual current Store head", ctx do
+    selected = selected_record(ctx.hydration, content: "recovered-newer-runtime", sequence: 10)
+    Backend.put(:journal, journal_record(ctx.hydration, :head_committed))
+    Backend.put(:head, selected)
+
+    pid = start_coordinator(ctx)
+
+    assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+    assert Backend.data(:restored) == [%{runtime: %{content: selected.content}}]
+    assert Backend.data(:journal) == nil
+    assert Backend.data(:manager_finished?)
+  end
+
+  test "a selected Store head with the wrong local identity remains blocked", ctx do
+    selected =
+      ctx.hydration
+      |> selected_record(content: "wrong-target-runtime", sequence: 10)
+      |> Map.put(:local_storage_epoch, <<99::128>>)
+
+    Backend.respond(:store_hydrate, {:return, {:ok, selected}})
+
+    pid = start_coordinator(ctx)
+
+    assert {:error, :checkpoint_hydration_selected_head_mismatch} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert %{blocked?: true, phase: :head_committed} = Coordinator.status(pid)
+    assert %{phase: :head_committed} = Backend.data(:journal)
+    assert Backend.data(:restored) == []
+    refute Backend.data(:manager_finished?)
   end
 
   test "unsupported runtime schema and durable identity mismatch fail before mutation", ctx do
@@ -608,6 +705,10 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
       Backend.start(self(), %{active: @binding, identity: ctx.identity, session: ctx.session})
       Backend.put(:journal, journal_record(ctx.hydration, phase))
 
+      if phase == :head_committed do
+        Backend.put(:head, selected_record(ctx.hydration, content: ctx.hydration.content, sequence: 9))
+      end
+
       pid = start_coordinator(ctx)
 
       operations = core_operations()
@@ -629,6 +730,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
 
   test "boot blocker installation and replay complete synchronously before start_link returns", ctx do
     Backend.put(:journal, journal_record(ctx.hydration, :head_committed))
+    Backend.put(:head, selected_record(ctx.hydration, content: ctx.hydration.content, sequence: 9))
     Backend.respond(:runtime_restore, {:block, :default})
 
     task =
@@ -698,6 +800,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
   test "failed restore can be replayed in place without releasing the gate", ctx do
     record = journal_record(ctx.hydration, :head_committed)
     Backend.put(:journal, record)
+    Backend.put(:head, selected_record(ctx.hydration, content: ctx.hydration.content, sequence: 9))
     Backend.respond(:runtime_restore, {:return, {:error, :restore_conflict}})
 
     pid = start_coordinator(ctx)
@@ -715,6 +818,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     assert core_operations() == [
              :journal_read,
              :manager_status,
+             :checkpoint_decode,
+             :adapter_hydrate,
+             :store_head,
              :checkpoint_decode,
              :adapter_hydrate,
              :runtime_restore,
@@ -896,6 +1002,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
       manager_module: FakeManager,
       session_holder_module: FakeSessionHolder,
       checkpoint_module: FakeCheckpoint,
+      record_module: FakeRecord,
       journal_opts: [],
       boundary: &boundary/1
     ]
@@ -904,6 +1011,29 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
   defp boundary(stage) do
     Backend.operation({:boundary, stage})
     |> Backend.resolve({:boundary, stage}, fn -> :ok end)
+  end
+
+  defp selected_record(hydration, overrides) do
+    content = Keyword.fetch!(overrides, :content)
+    sequence = Keyword.fetch!(overrides, :sequence)
+
+    %{
+      device_id: hydration.device_id,
+      local_credential_epoch: hydration.credential_epoch,
+      local_storage_epoch: hydration.storage_epoch,
+      origin_credential_epoch: hydration.origin_credential_epoch,
+      origin_storage_epoch: hydration.origin_storage_epoch,
+      sequence: sequence,
+      kind: hydration.kind,
+      schema_version: hydration.schema_version,
+      source_generation: hydration.source_generation + 1,
+      parent_hash: hydration.checkpoint_hash,
+      content: content,
+      content_hash: :crypto.hash(:sha256, content),
+      checkpoint_hash: :crypto.hash(:sha256, "selected-checkpoint"),
+      binding_hash: :crypto.hash(:sha256, "selected-binding"),
+      accepted: false
+    }
   end
 
   defp journal_record(hydration, phase) do
