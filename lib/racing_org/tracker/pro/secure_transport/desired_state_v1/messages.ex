@@ -28,6 +28,37 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
 
   @identity_keys [:device_id, :credential_epoch, :boot_id, :storage_epoch]
   @durable_identity_keys [:device_id, :credential_epoch, :storage_epoch]
+  @checkpoint_submission_common_keys @durable_identity_keys ++
+                                       [
+                                         :sequence,
+                                         :kind,
+                                         :schema_version,
+                                         :source_generation,
+                                         :parent_hash,
+                                         :content_hash,
+                                         :checkpoint_hash
+                                       ]
+  @checkpoint_hydration_common_keys @durable_identity_keys ++
+                                      [
+                                        :origin_credential_epoch,
+                                        :origin_storage_epoch,
+                                        :sequence,
+                                        :kind,
+                                        :schema_version,
+                                        :source_generation,
+                                        :parent_hash,
+                                        :content_hash,
+                                        :checkpoint_hash
+                                      ]
+  @checkpoint_chunk_keys [
+    :total_content_length,
+    :chunk_index,
+    :chunk_count,
+    :chunk_offset,
+    :chunk_hash,
+    :chunk
+  ]
+  @checkpoint_resume_keys [:total_content_length, :chunk_count, :missing_ranges]
   @command_fence_keys [
     :device_id,
     :credential_epoch,
@@ -91,6 +122,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   defp encode_body(:delivery_receipt, attrs), do: encode_delivery_receipt(attrs)
   defp encode_body(:checkpoint_submission, attrs), do: encode_checkpoint_submission(attrs)
   defp encode_body(:checkpoint_hydration, attrs), do: encode_checkpoint_hydration(attrs)
+
+  defp encode_body(:checkpoint_submission_chunk, attrs),
+    do: encode_checkpoint_submission_chunk(attrs)
+
+  defp encode_body(:checkpoint_submission_resume, attrs),
+    do: encode_checkpoint_submission_resume(attrs)
+
+  defp encode_body(:checkpoint_hydration_chunk, attrs),
+    do: encode_checkpoint_hydration_chunk(attrs)
+
+  defp encode_body(:checkpoint_hydration_resume, attrs),
+    do: encode_checkpoint_hydration_resume(attrs)
+
   defp encode_body(:delivery_submission, attrs), do: encode_delivery_submission(attrs)
   defp encode_body(_type, _attrs), do: {:error, :unsupported_message_type}
 
@@ -106,6 +150,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   defp decode_body(:delivery_receipt, bytes), do: decode_delivery_receipt(bytes)
   defp decode_body(:checkpoint_submission, bytes), do: decode_checkpoint_submission(bytes)
   defp decode_body(:checkpoint_hydration, bytes), do: decode_checkpoint_hydration(bytes)
+
+  defp decode_body(:checkpoint_submission_chunk, bytes),
+    do: decode_checkpoint_submission_chunk(bytes)
+
+  defp decode_body(:checkpoint_submission_resume, bytes),
+    do: decode_checkpoint_submission_resume(bytes)
+
+  defp decode_body(:checkpoint_hydration_chunk, bytes),
+    do: decode_checkpoint_hydration_chunk(bytes)
+
+  defp decode_body(:checkpoint_hydration_resume, bytes),
+    do: decode_checkpoint_hydration_resume(bytes)
+
   defp decode_body(:delivery_submission, bytes), do: decode_delivery_submission(bytes)
   defp decode_body(_type, _bytes), do: {:error, :unsupported_message_type}
 
@@ -976,6 +1033,375 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   end
 
   defp decode_checkpoint_hydration(_), do: {:error, :truncated}
+
+  # checkpoint_submission_chunk
+
+  defp encode_checkpoint_submission_chunk(attrs) do
+    expected = @checkpoint_submission_common_keys ++ @checkpoint_chunk_keys
+
+    with :ok <- exact_keys(attrs, expected, :invalid_checkpoint_submission_chunk),
+         {:ok, common} <- encode_checkpoint_submission_common(attrs),
+         {:ok, chunk} <- encode_checkpoint_chunk(attrs) do
+      {:ok, common <> chunk}
+    end
+  end
+
+  defp decode_checkpoint_submission_chunk(bytes) do
+    with {:ok, common, rest} <- take_checkpoint_submission_common(bytes),
+         <<total_content_length::64, chunk_index::32, chunk_count::32, chunk_offset::64,
+           chunk_hash::binary-size(@hash_size), chunk_length::32, rest::binary>> <- rest,
+         true <- byte_size(rest) >= chunk_length || {:error, :truncated},
+         <<chunk::binary-size(chunk_length), trailing::binary>> <- rest,
+         attrs =
+           Map.merge(common, %{
+             total_content_length: total_content_length,
+             chunk_index: chunk_index,
+             chunk_count: chunk_count,
+             chunk_offset: chunk_offset,
+             chunk_hash: chunk_hash,
+             chunk: chunk
+           }),
+         {:ok, _encoded} <- encode_body(:checkpoint_submission_chunk, attrs) do
+      {:ok, attrs, trailing}
+    else
+      false -> {:error, :truncated}
+      {:error, _reason} = error -> error
+      _ -> {:error, :truncated}
+    end
+  end
+
+  # checkpoint_submission_resume
+
+  defp encode_checkpoint_submission_resume(attrs) do
+    expected = @checkpoint_submission_common_keys ++ @checkpoint_resume_keys
+
+    with :ok <- exact_keys(attrs, expected, :invalid_checkpoint_submission_resume),
+         {:ok, common} <- encode_checkpoint_submission_common(attrs),
+         {:ok, resume} <- encode_checkpoint_resume(attrs) do
+      {:ok, common <> resume}
+    end
+  end
+
+  defp decode_checkpoint_submission_resume(bytes) do
+    with {:ok, common, rest} <- take_checkpoint_submission_common(bytes),
+         <<total_content_length::64, chunk_count::32, range_count::16, rest::binary>> <- rest,
+         :ok <-
+           ensure(
+             range_count <= Contract.max_checkpoint_missing_ranges(),
+             :too_many_missing_ranges
+           ),
+         {:ok, missing_ranges, trailing} <- take_missing_ranges(rest, range_count, []),
+         attrs =
+           Map.merge(common, %{
+             total_content_length: total_content_length,
+             chunk_count: chunk_count,
+             missing_ranges: missing_ranges
+           }),
+         {:ok, _encoded} <- encode_body(:checkpoint_submission_resume, attrs) do
+      {:ok, attrs, trailing}
+    else
+      {:error, _reason} = error -> error
+      _ -> {:error, :truncated}
+    end
+  end
+
+  # checkpoint_hydration_chunk
+
+  defp encode_checkpoint_hydration_chunk(attrs) do
+    expected = @checkpoint_hydration_common_keys ++ @checkpoint_chunk_keys
+
+    with :ok <- exact_keys(attrs, expected, :invalid_checkpoint_hydration_chunk),
+         {:ok, common} <- encode_checkpoint_hydration_common(attrs),
+         {:ok, chunk} <- encode_checkpoint_chunk(attrs) do
+      {:ok, common <> chunk}
+    end
+  end
+
+  defp decode_checkpoint_hydration_chunk(bytes) do
+    with {:ok, common, rest} <- take_checkpoint_hydration_common(bytes),
+         <<total_content_length::64, chunk_index::32, chunk_count::32, chunk_offset::64,
+           chunk_hash::binary-size(@hash_size), chunk_length::32, rest::binary>> <- rest,
+         true <- byte_size(rest) >= chunk_length || {:error, :truncated},
+         <<chunk::binary-size(chunk_length), trailing::binary>> <- rest,
+         attrs =
+           Map.merge(common, %{
+             total_content_length: total_content_length,
+             chunk_index: chunk_index,
+             chunk_count: chunk_count,
+             chunk_offset: chunk_offset,
+             chunk_hash: chunk_hash,
+             chunk: chunk
+           }),
+         {:ok, _encoded} <- encode_body(:checkpoint_hydration_chunk, attrs) do
+      {:ok, attrs, trailing}
+    else
+      false -> {:error, :truncated}
+      {:error, _reason} = error -> error
+      _ -> {:error, :truncated}
+    end
+  end
+
+  # checkpoint_hydration_resume
+
+  defp encode_checkpoint_hydration_resume(attrs) do
+    expected = @checkpoint_hydration_common_keys ++ @checkpoint_resume_keys
+
+    with :ok <- exact_keys(attrs, expected, :invalid_checkpoint_hydration_resume),
+         {:ok, common} <- encode_checkpoint_hydration_common(attrs),
+         {:ok, resume} <- encode_checkpoint_resume(attrs) do
+      {:ok, common <> resume}
+    end
+  end
+
+  defp decode_checkpoint_hydration_resume(bytes) do
+    with {:ok, common, rest} <- take_checkpoint_hydration_common(bytes),
+         <<total_content_length::64, chunk_count::32, range_count::16, rest::binary>> <- rest,
+         :ok <-
+           ensure(
+             range_count <= Contract.max_checkpoint_missing_ranges(),
+             :too_many_missing_ranges
+           ),
+         {:ok, missing_ranges, trailing} <- take_missing_ranges(rest, range_count, []),
+         attrs =
+           Map.merge(common, %{
+             total_content_length: total_content_length,
+             chunk_count: chunk_count,
+             missing_ranges: missing_ranges
+           }),
+         {:ok, _encoded} <- encode_body(:checkpoint_hydration_resume, attrs) do
+      {:ok, attrs, trailing}
+    else
+      {:error, _reason} = error -> error
+      _ -> {:error, :truncated}
+    end
+  end
+
+  defp encode_checkpoint_submission_common(attrs) do
+    with :ok <- fixed_binary(attrs.device_id, @device_id_size, :invalid_device_id),
+         :ok <- u32(attrs.credential_epoch, :invalid_credential_epoch),
+         :ok <-
+           nonzero_binary(
+             attrs.storage_epoch,
+             @incarnation_id_size,
+             :invalid_storage_epoch
+           ),
+         :ok <- positive_database_int(attrs.sequence, :invalid_delivery_sequence),
+         {:ok, kind_code} <- checkpoint_identity(attrs.kind, attrs.schema_version),
+         :ok <- database_int(attrs.source_generation, :invalid_source_generation),
+         :ok <- fixed_binary(attrs.parent_hash, @hash_size, :invalid_parent_hash),
+         :ok <- fixed_binary(attrs.content_hash, @hash_size, :invalid_checkpoint_content_hash),
+         :ok <- fixed_binary(attrs.checkpoint_hash, @hash_size, :invalid_checkpoint_hash),
+         {:ok, expected_checkpoint_hash} <-
+           Checkpoint.hash(Map.take(attrs, @checkpoint_submission_common_keys -- [:checkpoint_hash])),
+         :ok <-
+           ensure(
+             secure_equal(expected_checkpoint_hash, attrs.checkpoint_hash),
+             :checkpoint_hash_mismatch
+           ) do
+      {:ok,
+       <<attrs.device_id::binary-size(@device_id_size), attrs.credential_epoch::32,
+         attrs.storage_epoch::binary-size(@incarnation_id_size), attrs.sequence::64, kind_code,
+         attrs.schema_version::16, attrs.source_generation::64, attrs.parent_hash::binary-size(@hash_size),
+         attrs.content_hash::binary-size(@hash_size), attrs.checkpoint_hash::binary-size(@hash_size)>>}
+    end
+  end
+
+  defp take_checkpoint_submission_common(
+         <<device_id::binary-size(@device_id_size), credential_epoch::32,
+           storage_epoch::binary-size(@incarnation_id_size), sequence::64, kind_code, schema_version::16,
+           source_generation::64, parent_hash::binary-size(@hash_size), content_hash::binary-size(@hash_size),
+           checkpoint_hash::binary-size(@hash_size), rest::binary>>
+       ) do
+    with {:ok, kind} <- Contract.checkpoint_schema(kind_code, schema_version) do
+      {:ok,
+       %{
+         device_id: device_id,
+         credential_epoch: credential_epoch,
+         storage_epoch: storage_epoch,
+         sequence: sequence,
+         kind: kind,
+         schema_version: schema_version,
+         source_generation: source_generation,
+         parent_hash: parent_hash,
+         content_hash: content_hash,
+         checkpoint_hash: checkpoint_hash
+       }, rest}
+    end
+  end
+
+  defp take_checkpoint_submission_common(_), do: {:error, :truncated}
+
+  defp encode_checkpoint_hydration_common(attrs) do
+    with :ok <- fixed_binary(attrs.device_id, @device_id_size, :invalid_device_id),
+         :ok <- u32(attrs.credential_epoch, :invalid_credential_epoch),
+         :ok <-
+           nonzero_binary(
+             attrs.storage_epoch,
+             @incarnation_id_size,
+             :invalid_storage_epoch
+           ),
+         :ok <- u32(attrs.origin_credential_epoch, :invalid_origin_credential_epoch),
+         :ok <-
+           nonzero_binary(
+             attrs.origin_storage_epoch,
+             @incarnation_id_size,
+             :invalid_origin_storage_epoch
+           ),
+         :ok <- positive_database_int(attrs.sequence, :invalid_delivery_sequence),
+         {:ok, kind_code} <- checkpoint_identity(attrs.kind, attrs.schema_version),
+         :ok <- database_int(attrs.source_generation, :invalid_source_generation),
+         :ok <- fixed_binary(attrs.parent_hash, @hash_size, :invalid_parent_hash),
+         :ok <- fixed_binary(attrs.content_hash, @hash_size, :invalid_checkpoint_content_hash),
+         :ok <- fixed_binary(attrs.checkpoint_hash, @hash_size, :invalid_checkpoint_hash),
+         {:ok, expected_checkpoint_hash} <- hydration_checkpoint_hash(attrs),
+         :ok <-
+           ensure(
+             secure_equal(expected_checkpoint_hash, attrs.checkpoint_hash),
+             :checkpoint_hash_mismatch
+           ) do
+      {:ok,
+       <<attrs.device_id::binary-size(@device_id_size), attrs.credential_epoch::32,
+         attrs.storage_epoch::binary-size(@incarnation_id_size), attrs.origin_credential_epoch::32,
+         attrs.origin_storage_epoch::binary-size(@incarnation_id_size), attrs.sequence::64, kind_code,
+         attrs.schema_version::16, attrs.source_generation::64, attrs.parent_hash::binary-size(@hash_size),
+         attrs.content_hash::binary-size(@hash_size), attrs.checkpoint_hash::binary-size(@hash_size)>>}
+    end
+  end
+
+  defp take_checkpoint_hydration_common(
+         <<device_id::binary-size(@device_id_size), credential_epoch::32,
+           storage_epoch::binary-size(@incarnation_id_size), origin_credential_epoch::32,
+           origin_storage_epoch::binary-size(@incarnation_id_size), sequence::64, kind_code, schema_version::16,
+           source_generation::64, parent_hash::binary-size(@hash_size), content_hash::binary-size(@hash_size),
+           checkpoint_hash::binary-size(@hash_size), rest::binary>>
+       ) do
+    with {:ok, kind} <- Contract.checkpoint_schema(kind_code, schema_version) do
+      {:ok,
+       %{
+         device_id: device_id,
+         credential_epoch: credential_epoch,
+         storage_epoch: storage_epoch,
+         origin_credential_epoch: origin_credential_epoch,
+         origin_storage_epoch: origin_storage_epoch,
+         sequence: sequence,
+         kind: kind,
+         schema_version: schema_version,
+         source_generation: source_generation,
+         parent_hash: parent_hash,
+         content_hash: content_hash,
+         checkpoint_hash: checkpoint_hash
+       }, rest}
+    end
+  end
+
+  defp take_checkpoint_hydration_common(_), do: {:error, :truncated}
+
+  defp encode_checkpoint_chunk(attrs) do
+    with :ok <- validate_checkpoint_chunk_geometry(attrs),
+         :ok <- fixed_binary(attrs.chunk_hash, @hash_size, :invalid_checkpoint_chunk_hash),
+         {:ok, expected_chunk_hash} <-
+           Checkpoint.chunk_hash(
+             Map.take(attrs, [
+               :checkpoint_hash,
+               :total_content_length,
+               :chunk_index,
+               :chunk_count,
+               :chunk_offset,
+               :chunk
+             ])
+           ),
+         :ok <-
+           ensure(
+             secure_equal(expected_chunk_hash, attrs.chunk_hash),
+             :checkpoint_chunk_hash_mismatch
+           ) do
+      {:ok,
+       <<attrs.total_content_length::64, attrs.chunk_index::32, attrs.chunk_count::32, attrs.chunk_offset::64,
+         attrs.chunk_hash::binary-size(@hash_size), byte_size(attrs.chunk)::32, attrs.chunk::binary>>}
+    end
+  end
+
+  defp validate_checkpoint_chunk_geometry(attrs) do
+    with :ok <- positive_u64(attrs.total_content_length, :invalid_total_content_length),
+         :ok <-
+           ensure(
+             attrs.total_content_length <= Contract.max_checkpoint_content_size(),
+             :checkpoint_too_large
+           ),
+         :ok <- u32(attrs.chunk_index, :invalid_chunk_index),
+         :ok <- positive_u32(attrs.chunk_count, :invalid_chunk_count),
+         :ok <-
+           ensure(
+             attrs.chunk_count <= Contract.max_checkpoint_chunks(),
+             :invalid_chunk_count
+           ),
+         expected_count = checkpoint_chunk_count(attrs.total_content_length),
+         :ok <- ensure(attrs.chunk_count == expected_count, :invalid_chunk_count),
+         :ok <- ensure(attrs.chunk_index < attrs.chunk_count, :invalid_chunk_index),
+         :ok <- u64(attrs.chunk_offset, :invalid_chunk_offset),
+         expected_offset = attrs.chunk_index * Contract.chunk_size(),
+         :ok <- ensure(attrs.chunk_offset == expected_offset, :invalid_chunk_offset),
+         :ok <- ensure(is_binary(attrs.chunk), :invalid_chunk),
+         expected_length =
+           min(Contract.chunk_size(), attrs.total_content_length - attrs.chunk_offset),
+         :ok <- ensure(byte_size(attrs.chunk) == expected_length, :invalid_chunk_length) do
+      :ok
+    end
+  end
+
+  defp encode_checkpoint_resume(attrs) do
+    with :ok <- validate_checkpoint_transfer_geometry(attrs),
+         {:ok, ranges} <-
+           validate_checkpoint_missing_ranges(attrs.missing_ranges, attrs.chunk_count) do
+      encoded_ranges =
+        Enum.map(ranges, &<<&1.first_chunk_index::32, &1.chunk_count::32>>)
+
+      {:ok,
+       IO.iodata_to_binary([
+         <<attrs.total_content_length::64, attrs.chunk_count::32, length(ranges)::16>>,
+         encoded_ranges
+       ])}
+    end
+  end
+
+  defp validate_checkpoint_transfer_geometry(attrs) do
+    with :ok <- positive_u64(attrs.total_content_length, :invalid_total_content_length),
+         :ok <-
+           ensure(
+             attrs.total_content_length <= Contract.max_checkpoint_content_size(),
+             :checkpoint_too_large
+           ),
+         :ok <- positive_u32(attrs.chunk_count, :invalid_chunk_count),
+         :ok <-
+           ensure(
+             attrs.chunk_count <= Contract.max_checkpoint_chunks(),
+             :invalid_chunk_count
+           ),
+         expected_count = checkpoint_chunk_count(attrs.total_content_length),
+         :ok <- ensure(attrs.chunk_count == expected_count, :invalid_chunk_count) do
+      :ok
+    end
+  end
+
+  defp validate_checkpoint_missing_ranges(ranges, total_chunks) when is_list(ranges) do
+    with :ok <- ensure_proper_list(ranges, :invalid_missing_ranges),
+         :ok <- ensure(ranges != [], :invalid_missing_ranges),
+         :ok <-
+           ensure(
+             length(ranges) <= Contract.max_checkpoint_missing_ranges(),
+             :too_many_missing_ranges
+           ),
+         {:ok, normalized} <- normalize_missing_ranges(ranges, total_chunks),
+         :ok <- validate_minimal_ranges(normalized) do
+      {:ok, normalized}
+    end
+  end
+
+  defp validate_checkpoint_missing_ranges(_ranges, _total_chunks),
+    do: {:error, :invalid_missing_ranges}
+
+  defp checkpoint_chunk_count(total_content_length),
+    do: div(total_content_length + Contract.chunk_size() - 1, Contract.chunk_size())
 
   defp single_frame_checkpoint_content(content) when is_binary(content) do
     if byte_size(content) in 1..Contract.max_checkpoint_size(),

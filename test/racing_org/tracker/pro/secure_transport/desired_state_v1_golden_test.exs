@@ -6,6 +6,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1GoldenTest do
 
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{
     Canonical,
+    Checkpoint,
     Control,
     KATVectors,
     Manifest,
@@ -82,7 +83,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1GoldenTest do
     manifest_hash = Manifest.hash(manifest_bytes)
     offer_hash = hex(expected["offer_hash_hex"])
 
-    payloads = message_payloads(inputs, sections, manifest_bytes, manifest_hash, offer_hash)
+    payloads =
+      message_payloads(inputs, sections, manifest_bytes, manifest_hash, offer_hash)
+      |> Map.merge(checkpoint_transfer_payloads(inputs))
 
     for {name, {type, attrs}} <- payloads do
       assert {:ok, payload} = Messages.encode(type, attrs)
@@ -327,6 +330,62 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1GoldenTest do
              section_hash: tracking.hash
            }
          })}
+    }
+  end
+
+  defp checkpoint_transfer_payloads(inputs) do
+    checkpoint_attrs = %{
+      device_id: hex(inputs["device_id_hex"]),
+      credential_epoch: 7,
+      storage_epoch: hex(inputs["storage_epoch_hex"]),
+      sequence: 11,
+      kind: :polar,
+      schema_version: 2,
+      source_generation: 42,
+      parent_hash: :binary.copy(<<0xB2>>, 32),
+      content_hash: :binary.copy(<<0xA1>>, 32)
+    }
+
+    assert {:ok, checkpoint_hash} = Checkpoint.hash(checkpoint_attrs)
+
+    chunk = <<0x00, 0x01, 0x02, 0xFE, 0xFF>>
+
+    chunk_attrs = %{
+      checkpoint_hash: checkpoint_hash,
+      total_content_length: 245_765,
+      chunk_index: 4,
+      chunk_count: 5,
+      chunk_offset: 245_760,
+      chunk: chunk
+    }
+
+    assert {:ok, chunk_hash} = Checkpoint.chunk_hash(chunk_attrs)
+
+    submission_common = Map.put(checkpoint_attrs, :checkpoint_hash, checkpoint_hash)
+
+    hydration_common =
+      submission_common
+      |> Map.put(:credential_epoch, 8)
+      |> Map.put(:storage_epoch, hex("102132435465768798a9bacbdcedfe0f"))
+      |> Map.put(:origin_credential_epoch, 7)
+      |> Map.put(:origin_storage_epoch, hex(inputs["storage_epoch_hex"]))
+
+    chunk_tail = Map.put(chunk_attrs, :chunk_hash, chunk_hash) |> Map.delete(:checkpoint_hash)
+
+    resume_tail = %{
+      total_content_length: 245_765,
+      chunk_count: 5,
+      missing_ranges: [
+        %{first_chunk_index: 0, chunk_count: 1},
+        %{first_chunk_index: 2, chunk_count: 2}
+      ]
+    }
+
+    %{
+      "checkpoint_submission_chunk" => {:checkpoint_submission_chunk, Map.merge(submission_common, chunk_tail)},
+      "checkpoint_submission_resume" => {:checkpoint_submission_resume, Map.merge(submission_common, resume_tail)},
+      "checkpoint_hydration_chunk" => {:checkpoint_hydration_chunk, Map.merge(hydration_common, chunk_tail)},
+      "checkpoint_hydration_resume" => {:checkpoint_hydration_resume, Map.merge(hydration_common, resume_tail)}
     }
   end
 

@@ -134,6 +134,46 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
     end
   end
 
+  @checkpoint_chunk_keys [
+    :checkpoint_hash,
+    :total_content_length,
+    :chunk_index,
+    :chunk_count,
+    :chunk_offset,
+    :chunk
+  ]
+
+  @doc """
+  Hash one checkpoint content chunk under the chunk-content domain.
+
+  Chunk carriage is validated independently of assembled content: the hash binds
+  the exact fixed-width placement fields (total length, index, count, offset) and
+  the chunk bytes themselves to one already-hashed checkpoint record, so a relayed
+  or replayed chunk cannot be reattached to a different record or position. Chunk
+  bytes are nonempty and never exceed `Contract.chunk_size/0`; whether they decode
+  to schema-valid assembled content is a verdict only the complete reassembly can
+  reach, never this per-chunk hash.
+  """
+  def chunk_hash(attrs) when is_map(attrs) do
+    with :ok <- exact_atom_keys(attrs, @checkpoint_chunk_keys, :invalid_checkpoint_chunk),
+         :ok <- fixed_binary(attrs.checkpoint_hash, @hash_size, :invalid_checkpoint_hash),
+         :ok <- positive_u64(attrs.total_content_length, :invalid_total_content_length),
+         :ok <- u32(attrs.chunk_index, :invalid_chunk_index),
+         :ok <- positive_u32(attrs.chunk_count, :invalid_chunk_count),
+         :ok <- u64(attrs.chunk_offset, :invalid_chunk_offset),
+         :ok <- chunk_bytes(attrs.chunk, :invalid_chunk_length) do
+      preimage =
+        Contract.checkpoint_content_chunk_hash_domain() <>
+          <<Contract.version(), attrs.checkpoint_hash::binary-size(@hash_size), attrs.total_content_length::64,
+            attrs.chunk_index::32, attrs.chunk_count::32, attrs.chunk_offset::64, byte_size(attrs.chunk)::32,
+            attrs.chunk::binary>>
+
+      {:ok, :crypto.hash(:sha256, preimage)}
+    end
+  end
+
+  def chunk_hash(_attrs), do: {:error, :invalid_checkpoint_chunk}
+
   @checkpoint_hash_domain_size byte_size(Contract.checkpoint_hash_domain())
   @checkpoint_preimage_size 153
   @checkpoint_keys [
@@ -1179,6 +1219,25 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
 
   defp u32(value, _error) when is_integer(value) and value >= 0 and value <= @u32_max, do: :ok
   defp u32(_value, error), do: {:error, error}
+
+  defp positive_u32(value, _error) when is_integer(value) and value > 0 and value <= @u32_max,
+    do: :ok
+
+  defp positive_u32(_value, error), do: {:error, error}
+
+  defp u64(value, _error) when is_integer(value) and value >= 0 and value <= @u64_max, do: :ok
+  defp u64(_value, error), do: {:error, error}
+
+  defp positive_u64(value, _error) when is_integer(value) and value > 0 and value <= @u64_max,
+    do: :ok
+
+  defp positive_u64(_value, error), do: {:error, error}
+
+  defp chunk_bytes(value, error) do
+    if is_binary(value) and byte_size(value) in 1..Contract.chunk_size(),
+      do: :ok,
+      else: {:error, error}
+  end
 
   defp database_int(value, _error)
        when is_integer(value) and value >= 0 and value <= @database_int_max,

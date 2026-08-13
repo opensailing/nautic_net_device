@@ -21,6 +21,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   @max_command_result_size 65_337
   @max_checkpoint_size 65_327
   @max_checkpoint_content_size 8_388_608
+  @max_checkpoint_chunks 137
+  @max_checkpoint_missing_ranges 69
   @max_capability_versions 8
   @max_capabilities 64
   @max_missing_ranges_per_section 512
@@ -122,7 +124,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
     delivery_receipt: {0x30, :server_to_device},
     checkpoint_submission: {0x31, :device_to_server},
     checkpoint_hydration: {0x32, :server_to_device},
-    delivery_submission: {0x33, :device_to_server}
+    delivery_submission: {0x33, :device_to_server},
+    checkpoint_submission_chunk: {0x34, :device_to_server},
+    checkpoint_submission_resume: {0x35, :server_to_device},
+    checkpoint_hydration_chunk: {0x36, :server_to_device},
+    checkpoint_hydration_resume: {0x37, :device_to_server}
   }
   @message_by_code Map.new(@message_types, fn {name, {code, direction}} ->
                      {code, {name, direction}}
@@ -141,7 +147,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
     delivery_receipt: "RacingOrg-DurableDeliveryReceipt-v1",
     checkpoint_submission: "RacingOrg-CheckpointSubmission-v1",
     checkpoint_hydration: "RacingOrg-CheckpointHydration-v1",
-    delivery_submission: "RacingOrg-DurableDeliverySubmission-v1"
+    delivery_submission: "RacingOrg-DurableDeliverySubmission-v1",
+    checkpoint_submission_chunk: "RacingOrg-CheckpointSubmissionChunk-v1",
+    checkpoint_submission_resume: "RacingOrg-CheckpointSubmissionResume-v1",
+    checkpoint_hydration_chunk: "RacingOrg-CheckpointHydrationChunk-v1",
+    checkpoint_hydration_resume: "RacingOrg-CheckpointHydrationResume-v1"
   }
 
   @offer_domain "RacingOrg-ControlOffer-v1"
@@ -153,6 +163,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   @delivery_receipt_hash_domain "RacingOrg-DurableDeliveryReceiptHash-v1"
   @checkpoint_content_hash_domain "RacingOrg-CheckpointContentHash-v1"
   @checkpoint_hash_domain "RacingOrg-CheckpointRecordHash-v1"
+  @checkpoint_content_chunk_hash_domain "RacingOrg-CheckpointContentChunkHash-v1"
 
   @secret_kinds %{wifi_psk: 0x01}
   @secret_kind_by_code Map.new(@secret_kinds, fn {name, code} -> {code, name} end)
@@ -245,6 +256,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   def max_command_result_size, do: @max_command_result_size
   def max_checkpoint_size, do: @max_checkpoint_size
   def max_checkpoint_content_size, do: @max_checkpoint_content_size
+  def max_checkpoint_chunks, do: @max_checkpoint_chunks
+  def max_checkpoint_missing_ranges, do: @max_checkpoint_missing_ranges
   def max_capability_versions, do: @max_capability_versions
   def max_capabilities, do: @max_capabilities
   def max_missing_ranges_per_section, do: @max_missing_ranges_per_section
@@ -399,6 +412,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   def delivery_receipt_hash_domain, do: @delivery_receipt_hash_domain
   def checkpoint_content_hash_domain, do: @checkpoint_content_hash_domain
   def checkpoint_hash_domain, do: @checkpoint_hash_domain
+  def checkpoint_content_chunk_hash_domain, do: @checkpoint_content_chunk_hash_domain
 
   def secret_kind(kind) when is_atom(kind) do
     case Map.fetch(@secret_kinds, kind) do
