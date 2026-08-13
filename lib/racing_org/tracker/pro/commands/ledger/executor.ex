@@ -145,8 +145,6 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
   @impl true
   def init(opts) do
-    Process.flag(:trap_exit, true)
-
     with {:ok, path} <- canonical_ledger_path(configured_path(opts)),
          {:ok, providers} <- resolve_providers(opts),
          {:ok, identity_source} <- resolve_identity_source(opts) do
@@ -245,6 +243,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
   end
 
   def handle_info({:refresh_identity, _stale_token}, state), do: {:noreply, state}
+  def handle_info(_message, state), do: {:noreply, state}
 
   @impl true
   def format_status(status), do: redact(status)
@@ -524,7 +523,14 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
     end
   end
 
-  defp invoke(fun) when is_function(fun, 0), do: fun.()
+  defp invoke(fun) when is_function(fun, 0) do
+    fun.()
+  rescue
+    _exception -> :unavailable
+  catch
+    _kind, _reason -> :unavailable
+  end
+
   defp invoke(_fun), do: :unavailable
 
   # --- init helpers ---

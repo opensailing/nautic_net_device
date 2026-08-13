@@ -133,6 +133,15 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
   end
 
   describe "identity lifecycle" do
+    test "ignores unrelated info messages without crashing the permanent executor", ctx do
+      executor = start_executor(ctx)
+
+      send(executor, {:unexpected_command_executor_message, make_ref()})
+
+      assert Executor.identity(executor) == durable_identity()
+      assert Process.alive?(executor)
+    end
+
     test "starts unbound and fails delivery closed while verified authority is unavailable", ctx do
       {:ok, authority} = Agent.start_link(fn -> {:error, :no_verified_authority} end)
       executor = start_dynamic_executor(ctx, authority)
@@ -731,6 +740,36 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
       assert ScriptedProvider.observed(ctx.script) == []
       assert {:ok, reopened} = open_store(ctx)
       assert Store.snapshot(reopened).next_expected_sequence == 1
+    end
+
+    test "classification collaborators fail closed on raise, throw, and exit", ctx do
+      collaborators = [
+        {:desired_state, {:ack, :generation_mismatch}},
+        {:gate, {:ack, :operational_gate_closed}},
+        {:trusted_now_ms, {:defer, :trusted_clock_unavailable}}
+      ]
+
+      failures = [fn -> raise "unavailable" end, fn -> throw(:unavailable) end, fn -> exit(:unavailable) end]
+
+      for {{collaborator, expected}, failure} <-
+            List.flatten(for item <- collaborators, do: for(failure <- failures, do: {item, failure})) do
+        path = ctx.path <> ".#{collaborator}.#{System.unique_integer([:positive])}"
+        opts = Keyword.put(executor_opts(ctx, [{collaborator, failure}, {:path, path}]), :name, nil)
+        executor = start_supervised!({Executor, opts}, id: make_ref())
+        result = Executor.deliver(executor, delivery(command_id: command_id(1), payload: payload(:noop)))
+
+        case expected do
+          {:ack, reason} ->
+            assert {:ack, %{reason: ^reason}} = result
+
+          expected ->
+            assert ^expected = result
+        end
+
+        assert Process.alive?(executor)
+      end
+
+      assert ScriptedProvider.observed(ctx.script) == []
     end
 
     test "an unsupported payload or type is a durable terminal outcome, not an effect", ctx do
