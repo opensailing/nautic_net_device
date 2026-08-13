@@ -93,6 +93,32 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverSnapshotTest do
     observer
   end
 
+  test "observer authority is canonical UTF-8 at startup and snapshot preflight" do
+    base = [
+      name: nil,
+      sample_ms: 0,
+      dir: nil,
+      calibration: nil,
+      sender: fn _channel, _update -> :ok end
+    ]
+
+    for invalid <- ["é", <<0xFF>>] do
+      assert {:error, :invalid_checkpoint_config} =
+               Observer.start_link(Keyword.put(base, :boat_identifier, invalid))
+    end
+
+    clock = start_clock(10_000)
+    observer = start_observer(clock, boat_identifier: "Café")
+    assert {:ok, snapshot} = Observer.snapshot(observer)
+    assert snapshot.authority == %{boat_identifier: "Café"}
+    assert :ok = Snapshot.preflight(snapshot)
+
+    for invalid <- ["é", <<0xFF>>] do
+      assert {:error, :invalid_runtime_snapshot} =
+               Snapshot.preflight(put_in(snapshot, [:authority, :boat_identifier], invalid))
+    end
+  end
+
   defp leg do
     %Leg{
       started_ms: 1_000,
@@ -547,6 +573,27 @@ defmodule RacingOrg.Tracker.Pro.Calibration.ObserverSnapshotTest do
     known_but_unbound_window = put_in(snapshot, [:window_sources, :awa], "BEEF")
     assert {:error, :invalid_runtime_snapshot} = Observer.restore(target, known_but_unbound_window)
     assert {:ok, ^before_restore} = Observer.snapshot(target)
+  end
+
+  test "snapshot projection never returns runtime state that its own preflight rejects" do
+    clock = start_clock(10_000)
+    observer = start_observer(clock)
+    legs = for index <- 0..255, do: {10.0 - index / 1_000, 6.0}
+
+    estimator = %{
+      AwsScale.new()
+      | regimes: %{upwind: legs, reach: legs, downwind: legs},
+        legs_seen: 768
+    }
+
+    estimators =
+      Map.new(0..21, fn index ->
+        hardware_identifier = index |> Integer.to_string(16) |> String.upcase() |> String.pad_leading(4, "0")
+        {hardware_identifier, estimator}
+      end)
+
+    :sys.replace_state(observer, &%{&1 | aws_estimators: estimators})
+    assert {:error, :invalid_runtime_snapshot} = Observer.snapshot(observer)
   end
 
   test "oversized runtime collections fail closed before canonical learner hydration" do

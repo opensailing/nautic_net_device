@@ -198,10 +198,18 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer do
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts \\ []) do
-    case Keyword.fetch(opts, :name) do
-      {:ok, nil} -> GenServer.start_link(__MODULE__, opts)
-      {:ok, name} -> GenServer.start_link(__MODULE__, opts, name: name)
-      :error -> GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+    boat_identifier = Keyword.get_lazy(opts, :boat_identifier, &RacingOrg.Tracker.Pro.boat_identifier/0)
+
+    with {:ok, _authority} <- Snapshot.authority(%{boat_identifier: boat_identifier}) do
+      opts = Keyword.put(opts, :boat_identifier, boat_identifier)
+
+      case Keyword.fetch(opts, :name) do
+        {:ok, nil} -> GenServer.start_link(__MODULE__, opts)
+        {:ok, name} -> GenServer.start_link(__MODULE__, opts, name: name)
+        :error -> GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+      end
+    else
+      _ -> {:error, :invalid_checkpoint_config}
     end
   end
 

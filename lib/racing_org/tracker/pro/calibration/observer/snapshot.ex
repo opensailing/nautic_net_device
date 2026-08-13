@@ -129,24 +129,25 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.Snapshot do
          {:ok, current_entries} <- derive_entries(hydrated, state.modes),
          {:ok, sync} <- project_sync(state, current_entries, captured_at_ms),
          {:ok, tick} <- project_tick(state, captured_at_ms),
-         :ok <- validate_stats(state.stats) do
-      {:ok,
-       %{
-         version: RuntimeSnapshot.version(),
-         captured_at_utc_ms: captured_at_utc_ms,
-         authority: authority,
-         policy: policy,
-         learner: learner,
-         learner_time_basis: learner_time_basis,
-         latest: latest,
-         legs: legs,
-         tack: tack,
-         window_binding: window_binding,
-         window_sources: window_sources,
-         sync: sync,
-         tick: tick,
-         stats: state.stats
-       }}
+         :ok <- validate_stats(state.stats),
+         snapshot = %{
+           version: RuntimeSnapshot.version(),
+           captured_at_utc_ms: captured_at_utc_ms,
+           authority: authority,
+           policy: policy,
+           learner: learner,
+           learner_time_basis: learner_time_basis,
+           latest: latest,
+           legs: legs,
+           tack: tack,
+           window_binding: window_binding,
+           window_sources: window_sources,
+           sync: sync,
+           tick: tick,
+           stats: state.stats
+         },
+         :ok <- preflight(snapshot) do
+      {:ok, snapshot}
     else
       _ -> @error
     end
@@ -1277,8 +1278,10 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.Snapshot do
 
   defp validate_authority(authority) do
     with :ok <- RuntimeSnapshot.exact_keys(authority, @authority_fields),
-         true <- is_binary(authority.boat_identifier),
-         true <- byte_size(authority.boat_identifier) in 1..@max_boat_identifier_bytes do
+         boat_identifier when is_binary(boat_identifier) <- authority.boat_identifier,
+         true <- byte_size(boat_identifier) in 1..@max_boat_identifier_bytes,
+         true <- String.valid?(boat_identifier),
+         true <- String.normalize(boat_identifier, :nfc) == boat_identifier do
       :ok
     else
       _ -> :error
