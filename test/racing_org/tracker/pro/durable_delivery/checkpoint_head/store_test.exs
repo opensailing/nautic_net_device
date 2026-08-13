@@ -1,8 +1,24 @@
 defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
   use ExUnit.Case, async: false
 
+  alias RacingOrg.Tracker.Pro.Calibration.Observer, as: CalibrationObserver
   alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.{Record, Snapshot, Store}
+  alias RacingOrg.Tracker.Pro.Polar.Observer.{Bins, Gate}
+  alias RacingOrg.Tracker.Pro.Polar.Observer.Snapshot, as: PolarSnapshot
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime.Calibration,
+    as: CalibrationRuntime
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime.Polar,
+    as: PolarRuntime
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime.WindShift,
+    as: WindShiftRuntime
+
+  alias RacingOrg.Tracker.Pro.WindShift.Observer, as: WindShiftObserver
+
   alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store.FileSystem
 
   defmodule PathReadObserverFileSystem do
@@ -872,6 +888,29 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
       assert {:error, :unknown_checkpoint_kind} = Store.head(store, "calibration")
     end
 
+    test "puts and explicitly reopens every exact runtime schema", ctx do
+      assert {:ok, store} = Store.new(opts(ctx))
+
+      installed =
+        for {kind, schema_version, content} <- runtime_schema_fixtures(), into: %{} do
+          assert {:ok, record} =
+                   Store.put(
+                     store,
+                     put_attrs(kind: kind, schema_version: schema_version, content: content)
+                   )
+
+          assert record.kind == kind
+          assert record.schema_version == schema_version
+          {kind, record}
+        end
+
+      assert {:ok, reopened} = Store.new(opts(ctx))
+
+      for {kind, record} <- installed do
+        assert {:ok, ^record} = Store.head(reopened, kind)
+      end
+    end
+
     test "fails closed when a stale handle reads after identity rotation", ctx do
       {:ok, authority} = Agent.start_link(fn -> identity() end)
       identity_source = fn transition -> transition.(Agent.get(authority, & &1)) end
@@ -903,6 +942,63 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
       assert {:ok, first} = Store.put(store, put_attrs())
       assert first.parent_hash == Record.genesis_parent()
       assert {:ok, ^first} = Store.head(store, :calibration)
+    end
+
+    test "rejects local and hydrated schema downgrade after exact-runtime adoption", ctx do
+      assert {:ok, store} = Store.new(opts(ctx))
+
+      for {kind, runtime_schema, runtime_content} <- runtime_schema_fixtures() do
+        assert {:ok, runtime} =
+                 Store.put(
+                   store,
+                   put_attrs(kind: kind, schema_version: runtime_schema, content: runtime_content)
+                 )
+
+        {legacy_schema, legacy_content} = legacy_schema_fixture(kind)
+
+        legacy_successor = [
+          kind: kind,
+          schema_version: legacy_schema,
+          sequence: runtime.sequence + 1,
+          source_generation: runtime.source_generation + 1,
+          parent_hash: runtime.checkpoint_hash,
+          content: legacy_content
+        ]
+
+        assert {:error, :checkpoint_schema_downgrade} =
+                 Store.put(store, put_attrs(legacy_successor))
+
+        assert {:error, :checkpoint_schema_downgrade} =
+                 Store.hydrate(store, hydrate_attrs(legacy_successor))
+
+        assert {:ok, ^runtime} = Store.head(store, kind)
+      end
+    end
+
+    test "persists and exactly reopens a schema-valid record near the semantic cap", ctx do
+      assert {:ok, store} = Store.new(opts(ctx, transition_timeout_ms: 180_000))
+      semantic_cap = Contract.max_checkpoint_content_size()
+      content = near_semantic_cap_polar_content()
+
+      assert {:ok, canonical} = Checkpoint.canonical_content(:polar, 2, content)
+      assert byte_size(canonical) == 8_285_599
+      assert byte_size(canonical) > semantic_cap - 262_144
+      assert byte_size(canonical) <= semantic_cap
+
+      assert {:ok, installed} =
+               Store.put(
+                 store,
+                 put_attrs(kind: :polar, schema_version: 2, content: canonical)
+               )
+
+      persisted = File.read!(Store.head_path(store, :polar))
+      assert byte_size(persisted) == 8_286_230
+      assert byte_size(persisted) > semantic_cap - 262_144
+      assert byte_size(persisted) <= Snapshot.max_encoded_size()
+
+      assert {:ok, reopened} = Store.new(opts(ctx))
+      assert {:ok, ^installed} = Store.head(reopened, :polar)
+      assert installed.content === canonical
     end
 
     test "chains the next record from the current record hash", ctx do
@@ -4080,6 +4176,130 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
       "RacingOrg-TrackerCheckpointCorruptHead-v1" <>
         <<byte_size(bytes)::64, bytes::binary>>
     )
+  end
+
+  defp near_semantic_cap_polar_content, do: polar_content(36_500)
+
+  defp polar_content(cell_count) do
+    %{
+      "cells" =>
+        for tws_bin <- 0..(cell_count - 1) do
+          %{
+            "count" => 5,
+            "quantile" => %{
+              "buffer" => [],
+              "n" => [2, 3, 4],
+              "np" => [1.0, 2.8, 4.6, 4.8, 5.0],
+              "q" => [1.0, 2.0, 3.0, 4.0, 5.0]
+            },
+            "twa_bin" => rem(tws_bin, 72),
+            "tws_bin" => tws_bin
+          }
+        end,
+      "max_tws_mps" => 65_535.0,
+      "p" => 0.9,
+      "twa_width_deg" => 2.5,
+      "tws_width_mps" => 1.0
+    }
+  end
+
+  defp runtime_schema_fixtures do
+    [
+      {:calibration, 2, runtime_calibration_content()},
+      {:polar, 3, runtime_polar_content()},
+      {:wind_shift, 2, runtime_wind_shift_content()}
+    ]
+  end
+
+  defp legacy_schema_fixture(:calibration), do: {1, content(:calibration)}
+  defp legacy_schema_fixture(:polar), do: {2, content(:polar)}
+  defp legacy_schema_fixture(:wind_shift), do: {1, content(:wind_shift)}
+
+  defp runtime_calibration_content do
+    {:ok, observer} =
+      CalibrationObserver.start_link(
+        name: nil,
+        sample_ms: 0,
+        dir: nil,
+        calibration: nil,
+        boat_identifier: "boat-runtime",
+        sender: fn _channel, _update -> :ok end,
+        now_fn: fn -> 10_000 end,
+        utc_now_fn: fn -> ~U[2026-08-10 12:00:00Z] end,
+        sync_ms: 60_000,
+        persist_ms: 60_000,
+        legs: [min_duration_s: 30.0]
+      )
+
+    assert {:ok, snapshot} = CalibrationObserver.snapshot(observer)
+    assert {:ok, content} = CalibrationRuntime.project(snapshot)
+    content
+  end
+
+  defp runtime_polar_content do
+    bins = Bins.new()
+    gate = Gate.new(min_dwell: 1)
+    assert {:ok, admission_hash} = PolarSnapshot.policy_hash(gate, 0.3, 1, 0.9)
+    assert {:ok, learner} = PolarSnapshot.capture("boat-runtime", admission_hash, bins, 0.9, 10, %{})
+
+    internal = %{
+      version: 1,
+      captured_at_utc_ms: 1_786_536_000_000,
+      authority: %{boat_identifier: "boat-runtime"},
+      policy: %{
+        admission_hash: admission_hash,
+        gate: Map.from_struct(gate),
+        min_stw_mps: 0.3,
+        window_size: 1,
+        p: 0.9,
+        sample_ms: 60_000,
+        sync_ms: 60_000,
+        persist_ms: 60_000,
+        persistence_enabled: true,
+        bins: Map.from_struct(bins)
+      },
+      learner: %{source_generation: 10, content: learner},
+      upstream_seq: 41,
+      window: [],
+      sync: %{dirty_keys: [], last_sync_age_ms: 45_000},
+      persistence_phase: %{dirty_keys: [], force: true, last_persist_age_ms: 30_000},
+      tick: %{remaining_ms: 45_000}
+    }
+
+    assert {:ok, content} = PolarRuntime.project(internal)
+    content
+  end
+
+  defp runtime_wind_shift_content do
+    {:ok, clock} =
+      Agent.start_link(fn ->
+        %{monotonic_ms: 10_000, utc: ~U[2026-08-12 12:00:00Z]}
+      end)
+
+    {:ok, observer} =
+      WindShiftObserver.start_link(
+        name: nil,
+        sample_ms: 0,
+        dir: nil,
+        config: nil,
+        commands: nil,
+        boat_identifier: "boat-runtime",
+        broadcast_enabled: false,
+        authority_fn: fn ->
+          {:ok, %{device_id: @device_id, credential_epoch: 7, storage_epoch: @storage_epoch}}
+        end,
+        signals_fn: fn -> %{"true_wind_direction" => {200.0, 10_000}} end,
+        now_fn: fn -> Agent.get(clock, & &1.monotonic_ms) end,
+        utc_now_fn: fn -> Agent.get(clock, & &1.utc) end,
+        put_signals_fn: fn _updates, _monotonic_ms -> :ok end,
+        sender: fn _channel, _update -> :ok end,
+        transmit_fn: fn _priority, _pgn, _payload -> :ok end
+      )
+
+    :ok = WindShiftObserver.tick(observer)
+    assert {:ok, snapshot} = WindShiftObserver.snapshot(observer)
+    assert {:ok, content} = WindShiftRuntime.project(snapshot)
+    content
   end
 
   defp content(:calibration) do

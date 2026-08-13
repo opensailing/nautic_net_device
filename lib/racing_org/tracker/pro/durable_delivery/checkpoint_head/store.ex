@@ -382,6 +382,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
         not secure_equal(record.parent_hash, current.checkpoint_hash) ->
           {:error, :checkpoint_parent_mismatch}
 
+        schema_downgrade?(current, record) ->
+          {:error, :checkpoint_schema_downgrade}
+
         true ->
           with {:ok, successor} <- Snapshot.successor(snapshot, record),
                :ok <- write_snapshot(store, kind, successor) do
@@ -415,6 +418,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
     current = snapshot.current
 
     with :ok <- safe_rebinding(store, current),
+         :ok <- reject_schema_downgrade(current, record),
          :ok <- verify_unknown_ancestry_acceptance(snapshot, record) do
       cond do
         secure_equal(record.checkpoint_hash, current.checkpoint_hash) ->
@@ -649,6 +653,22 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
     case accepted_relation(record, last_accepted) do
       relation when relation in [:same, :successor] -> :ok
       {:error, _reason} = error -> error
+    end
+  end
+
+  defp reject_schema_downgrade(current, candidate) do
+    if schema_downgrade?(current, candidate),
+      do: {:error, :checkpoint_schema_downgrade},
+      else: :ok
+  end
+
+  defp schema_downgrade?(current, candidate) do
+    case Enum.find(Contract.checkpoint_runtime_schemas(), &match?({kind, _code, _schema} when kind == current.kind, &1)) do
+      {_, _, runtime_schema} ->
+        current.schema_version == runtime_schema and candidate.schema_version != runtime_schema
+
+      nil ->
+        false
     end
   end
 
@@ -1656,10 +1676,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store do
   end
 
   defp known_kind(kind) do
-    case Contract.checkpoint_kind(kind) do
-      {:ok, _code, _schema_version} -> {:ok, kind}
-      {:error, _reason} -> {:error, :unknown_checkpoint_kind}
-    end
+    if Enum.any?(Contract.checkpoint_schemas(), &match?({^kind, _code, _schemas}, &1)),
+      do: {:ok, kind},
+      else: {:error, :unknown_checkpoint_kind}
   end
 
   defp base_dir(value) when is_binary(value) and value != "", do: {:ok, Path.absname(value)}
