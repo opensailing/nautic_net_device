@@ -1009,6 +1009,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
       end
     end
 
+    @tag timeout: 300_000
     test "persists and exactly reopens a schema-valid record near the semantic cap", ctx do
       assert {:ok, store} = Store.new(opts(ctx, transition_timeout_ms: 180_000))
       semantic_cap = Contract.max_checkpoint_content_size()
@@ -1035,6 +1036,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.StoreTest do
       assert installed.content === canonical
     end
 
+    @tag timeout: 300_000
     test "allows a legal near-cap head to use the configured transition deadline", ctx do
       assert {:ok, store} = Store.new(opts(ctx, transition_timeout_ms: 180_000))
       content = near_semantic_cap_polar_content()

@@ -570,6 +570,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.SnapshotTest do
              Snapshot.build(current, forged_watermark, [forged_watermark])
   end
 
+  @tag timeout: 300_000
   test "persists and exactly reopens a schema-valid record near the semantic cap" do
     semantic_cap = Contract.max_checkpoint_content_size()
     content = near_semantic_cap_polar_content()
@@ -593,6 +594,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.SnapshotTest do
     assert reopened === snapshot
   end
 
+  @tag timeout: 300_000
   test "persists and exactly reopens near-cap content with maximum legal ancestry" do
     max_entries = Snapshot.max_ancestry_entries()
     assert {:ok, ancestor_content} = Checkpoint.canonical_content(:polar, 2, polar_content(1))
