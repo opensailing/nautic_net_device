@@ -126,14 +126,29 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   end
 
   @impl true
+  def format_status(status) when is_map(status) do
+    state = Map.get(status, :state)
+
+    %{
+      state: safe_status(state),
+      message: :redacted,
+      reason: :redacted,
+      log: :redacted
+    }
+  end
+
+  def format_status(_status) do
+    %{
+      state: safe_status(nil),
+      message: :redacted,
+      reason: :redacted,
+      log: :redacted
+    }
+  end
+
+  @impl true
   def handle_call(:status, _from, state) do
-    {:reply,
-     %{
-       blocked?: not is_nil(state.blocker),
-       recovery_error: state.recovery_error,
-       transaction_id: state.blocker && state.blocker.record.transaction_id,
-       phase: state.blocker && state.blocker.record.phase
-     }, state}
+    {:reply, safe_status(state), state}
   end
 
   def handle_call(:recover, _from, %{blocker: nil} = state) do
@@ -646,6 +661,26 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   end
 
   defp put_record(state, record), do: put_in(state.blocker.record, record)
+
+  defp safe_status(%{blocker: blocker, recovery_error: recovery_error}) do
+    %{
+      blocked?: not is_nil(blocker),
+      phase: blocker && blocker.record.phase,
+      recovery_error: safe_recovery_error(recovery_error)
+    }
+  end
+
+  defp safe_status(_state) do
+    %{
+      blocked?: true,
+      phase: nil,
+      recovery_error: :checkpoint_hydration_failed
+    }
+  end
+
+  defp safe_recovery_error(nil), do: nil
+  defp safe_recovery_error(reason) when is_atom(reason), do: reason
+  defp safe_recovery_error(_reason), do: :checkpoint_hydration_failed
 
   defp sequence(%{sequence: sequence}), do: sequence
   defp sequence(%{revision: revision}), do: revision

@@ -784,6 +784,73 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     assert List.last(core_operations()) == :manager_finish
   end
 
+  test "public and crash status omit transition secrets", ctx do
+    Backend.respond({:boundary, :after_begin}, {:return, {:error, :after_begin_fault}})
+
+    pid = start_coordinator(ctx)
+
+    assert {:error, :after_begin_fault} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert %{blocked?: true, phase: :prepared, recovery_error: :after_begin_fault} =
+             Coordinator.status(pid)
+
+    refute Map.has_key?(Coordinator.status(pid), :transaction_id)
+
+    formatted =
+      Coordinator.format_status(%{
+        state: %{
+          journal_path: "/data/private-checkpoint-journal",
+          blocker: %{
+            token: make_ref(),
+            binding: Map.put(@binding, :secret, "binding-secret"),
+            record: %{
+              phase: :head_committed,
+              transaction_id: @transaction_id,
+              session_incarnation: @session_id,
+              hydration: %{
+                content: "checkpoint-secret",
+                content_hash: <<8::256>>,
+                checkpoint_hash: <<9::256>>
+              }
+            }
+          },
+          recovery_error: {:journal_fault, "recovery-secret"}
+        },
+        message: {:hydrate, "message-secret"},
+        reason: {:badmatch, "reason-secret"},
+        log: [{:in, "log-secret"}]
+      })
+
+    assert formatted == %{
+             state: %{
+               blocked?: true,
+               phase: :head_committed,
+               recovery_error: :checkpoint_hydration_failed
+             },
+             message: :redacted,
+             reason: :redacted,
+             log: :redacted
+           }
+
+    rendered = formatted |> then(&:io_lib.format(~c"~0p", [&1])) |> IO.iodata_to_binary()
+
+    for secret <- [
+          "private-checkpoint-journal",
+          "binding-secret",
+          "checkpoint-secret",
+          "recovery-secret",
+          "message-secret",
+          "reason-secret",
+          "log-secret"
+        ] do
+      refute rendered =~ secret
+    end
+
+    refute rendered =~ Base.encode16(@transaction_id)
+    refute rendered =~ Base.encode16(@session_id)
+  end
+
   test "production registry is closed to the three exact runtime schemas" do
     registry = Coordinator.production_registry()
 
