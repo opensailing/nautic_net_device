@@ -60,14 +60,18 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Producer.RaceRecording do
     end
   end
 
-  defp chunk_entry_id(race_recording_id, chunk_id) do
+  @doc "Return the deterministic Outbox entry id for one recording chunk source identity."
+  @spec chunk_entry_id(binary(), binary()) :: binary()
+  def chunk_entry_id(race_recording_id, chunk_id) do
     :crypto.hash(
       :sha256,
       [@chunk_entry_id_domain, lp(race_recording_id), lp(chunk_id)]
     )
   end
 
-  defp manifest_entry_id(race_recording_id) do
+  @doc "Return the deterministic Outbox entry id for one recording manifest source identity."
+  @spec manifest_entry_id(binary()) :: binary()
+  def manifest_entry_id(race_recording_id) do
     :crypto.hash(:sha256, [@manifest_entry_id_domain, lp(race_recording_id)])
   end
 

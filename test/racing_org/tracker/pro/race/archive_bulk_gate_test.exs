@@ -99,6 +99,8 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveBulkGateTest do
          commands: commands,
          device_id: "dev",
          enqueue_fn: fn binary -> send(test_pid, {:enqueued, binary}) end,
+         durable_enqueue_fn: fn _stream, _payload, _opts -> {:ok, %{}} end,
+         durable_pending_fn: fn -> [] end,
          now_fn: fn -> ~U[2026-06-03 12:00:00Z] end,
          name: nil}
       )

@@ -18,6 +18,7 @@ defmodule RacingOrg.Tracker.Pro.Race.Archive do
   require Logger
 
   alias RacingOrg.Tracker.Pro.Commands
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Producer.RaceRecording, as: RaceRecordingProducer
   alias RacingOrg.Tracker.Protobuf.DataSet
   alias RacingOrg.Tracker.Protobuf.DeviceCommand
   alias RacingOrg.Tracker.Pro.Race.BulkUploader
@@ -52,6 +53,9 @@ defmodule RacingOrg.Tracker.Pro.Race.Archive do
       now_fn: opts[:now_fn] || (&DateTime.utc_now/0),
       device_id: opts[:device_id],
       keep: opts[:keep] || @default_keep,
+      durable_enqueue_fn: opts[:durable_enqueue_fn],
+      durable_pending_fn: opts[:durable_pending_fn],
+      retention_prune_fn: opts[:retention_prune_fn] || (&Retention.prune/3),
       # Post-race signed bulk upload trigger. Defaults to the config-gated
       # BulkUploader.upload_async; injectable for tests. See `maybe_bulk_upload/3`.
       bulk_upload_fn: opts[:bulk_upload_fn] || (&default_bulk_upload/1),
@@ -120,16 +124,24 @@ defmodule RacingOrg.Tracker.Pro.Race.Archive do
     {recording, manifest} =
       Recording.finalize(state.recording, finished_at: state.now_fn.(), device_status: "complete")
 
-    send_manifest(state, manifest)
-    # Post-race: in addition to the legacy UDP manifest reconciliation above, trigger
-    # the signed HTTPS bulk upload of the finalized recording. Fire-and-forget +
-    # idempotent (the uploader resumes from the server's verified rows) and the local
-    # recording is NEVER deleted here — that still waits for the server's
-    # `manifest_verification_result` command (see `handle_verification/2`).
-    maybe_bulk_upload(state, recording)
-    Retention.prune(state.base_dir, state.keep)
-    Logger.info("Race recording finalized: #{recording.recording_id}")
-    %{state | recording: nil}
+    case admit_recording(state, recording) do
+      :ok ->
+        send_manifest(state, manifest)
+        # Post-race: legacy UDP and HTTP bulk paths remain compatibility transports,
+        # not authoritative durable receipts. Durable Outbox admission protects the
+        # exact sealed local artifacts until authenticated receipt or audited loss.
+        maybe_bulk_upload(state, recording)
+        prune_recordings(state)
+        Logger.info("Race recording finalized and durably admitted: #{recording.recording_id}")
+        %{state | recording: nil}
+
+      {:error, reason} ->
+        Logger.warning(
+          "Race recording durable admission failed; retaining #{recording.recording_id}: #{inspect(reason)}"
+        )
+
+        %{state | recording: recording}
+    end
   end
 
   # Trigger the bulk upload for a just-finalized recording. We need the server-side
@@ -185,10 +197,11 @@ defmodule RacingOrg.Tracker.Pro.Race.Archive do
 
   # --- reconciliation ---
 
-  defp handle_verification(%{complete: true, race_recording_id: id}, %{base_dir: base} = state)
-       when is_binary(base) and id != "" do
-    Recording.delete(base, id)
-    Logger.info("Race recording confirmed complete and deleted: #{id}")
+  defp handle_verification(%{complete: true, race_recording_id: id}, state) when id != "" do
+    Logger.info(
+      "Legacy manifest verification is non-authoritative for durable race recording #{id}; retaining local artifacts"
+    )
+
     state
   end
 
@@ -232,20 +245,65 @@ defmodule RacingOrg.Tracker.Pro.Race.Archive do
 
   defp recover(state) do
     for id <- Recording.list(state.base_dir) do
-      with {:ok, recording} <- Recording.load(state.base_dir, id),
-           false <- Recording.finalized?(recording) do
-        {_recording, manifest} =
-          Recording.finalize(recording, finished_at: state.now_fn.(), device_status: "recovered")
+      with {:ok, recording} <- Recording.load(state.base_dir, id) do
+        recording = recover_recording(recording, state)
 
-        send_manifest(state, manifest)
-        Logger.info("Recovered and finalized in-progress race recording: #{id}")
+        case admit_recording(state, recording) do
+          :ok ->
+            if {:ok, %{manifest: manifest}} = Recording.manifest_artifact(recording) do
+              send_manifest(state, manifest)
+            end
+
+            Logger.info("Recovered and durably admitted race recording: #{id}")
+
+          {:error, reason} ->
+            Logger.warning("Recovered race recording durable admission failed; retaining #{id}: #{inspect(reason)}")
+        end
       end
     end
 
     state
   end
 
+  defp recover_recording(recording, state) do
+    if Recording.finalized?(recording) do
+      recording
+    else
+      {recording, _manifest} =
+        Recording.finalize(recording, finished_at: state.now_fn.(), device_status: "recovered")
+
+      recording
+    end
+  end
+
   # --- helpers ---
+
+  defp admit_recording(%{durable_enqueue_fn: enqueue}, recording) when is_function(enqueue, 3) do
+    with {:ok, chunks} <- Recording.sealed_chunk_artifacts(recording),
+         :ok <- admit_chunks(enqueue, recording.recording_id, chunks),
+         {:ok, %{manifest: manifest}} <- Recording.manifest_artifact(recording),
+         {:ok, _receipt} <-
+           RaceRecordingProducer.admit_manifest(enqueue, recording.recording_id, manifest) do
+      :ok
+    end
+  end
+
+  defp admit_recording(_state, _recording), do: {:error, :durable_admission_unconfigured}
+
+  defp admit_chunks(enqueue, recording_id, chunks) do
+    Enum.reduce_while(chunks, :ok, fn %{descriptor: descriptor, bytes: bytes}, :ok ->
+      case RaceRecordingProducer.admit_chunk(enqueue, recording_id, descriptor.chunk_id, bytes) do
+        {:ok, _receipt} -> {:cont, :ok}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp prune_recordings(%{durable_pending_fn: pending} = state) when is_function(pending, 0) do
+    state.retention_prune_fn.(state.base_dir, state.keep, pending: pending)
+  end
+
+  defp prune_recordings(_state), do: []
 
   defp send_manifest(state, manifest) do
     RacingOrg.Tracker.Pro.data_set([], manifest: manifest) |> DataSet.encode() |> state.enqueue.()

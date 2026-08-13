@@ -2,11 +2,13 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
   use ExUnit.Case, async: true
 
   alias RacingOrg.Tracker.Pro.Commands
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Producer.RaceRecording, as: RaceRecordingProducer
   alias RacingOrg.Tracker.Protobuf.DataSet
   alias RacingOrg.Tracker.Protobuf.DeviceCommand
   alias RacingOrg.Tracker.Protobuf.ManifestVerificationResult
   alias RacingOrg.Tracker.Protobuf.MissingChunkRequest
   alias RacingOrg.Tracker.Protobuf.RaceAssignment
+  alias RacingOrg.Tracker.Protobuf.RaceManifest
   alias RacingOrg.Tracker.Protobuf.ServerReply
   alias RacingOrg.Tracker.Pro.Race.Archive
   alias RacingOrg.Tracker.Pro.Race.Recording
@@ -21,18 +23,22 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
     test_pid = self()
     commands = start_supervised!({Commands, device_id: "dev"})
 
-    archive =
-      start_supervised!(
-        {Archive,
-         [
-           base_dir: base,
-           commands: commands,
-           device_id: "dev",
-           enqueue_fn: fn binary -> send(test_pid, {:enqueued, binary}) end,
-           now_fn: fn -> ~U[2026-06-03 12:00:00Z] end,
-           name: nil
-         ] ++ opts}
+    archive_opts =
+      Keyword.merge(
+        [
+          base_dir: base,
+          commands: commands,
+          device_id: "dev",
+          enqueue_fn: fn binary -> send(test_pid, {:enqueued, binary}) end,
+          durable_enqueue_fn: fn _stream, _payload, _opts -> {:ok, %{}} end,
+          durable_pending_fn: fn -> [] end,
+          now_fn: fn -> ~U[2026-06-03 12:00:00Z] end,
+          name: nil
+        ],
+        opts
       )
+
+    archive = start_supervised!({Archive, archive_opts})
 
     %{commands: commands, archive: archive}
   end
@@ -70,14 +76,30 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
     assert Archive.current_recording_id(archive) == nil
   end
 
+  defp durable_opts(test_pid, overrides \\ []) do
+    enqueue =
+      Keyword.get(overrides, :durable_enqueue_fn, fn stream, payload, opts ->
+        send(test_pid, {:durable_enqueue, stream, payload, opts})
+        {:ok, %{stream: stream}}
+      end)
+
+    pending = Keyword.get(overrides, :durable_pending_fn, fn -> [] end)
+
+    [
+      durable_enqueue_fn: enqueue,
+      durable_pending_fn: pending
+    ]
+  end
+
   test "opens a recording on race start and tracks the active recording id", %{base: base} do
     %{commands: c, archive: a} = start_archive(base)
     race(a, c, "2026-06-03-7", [1, 2])
     assert Archive.current_recording_id(a) == "2026-06-03-7"
   end
 
-  test "finalizes at complete, uploads a manifest, and keeps the recording on disk", %{base: base} do
-    %{commands: c, archive: a} = start_archive(base)
+  test "durably admits exact sealed chunks and manifest before completing finalization", %{base: base} do
+    test_pid = self()
+    %{commands: c, archive: a} = start_archive(base, durable_opts(test_pid))
     race(a, c, "2026-06-03-7", [1, 2, 3])
     finish(a)
 
@@ -86,14 +108,61 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
     assert manifest.race_recording_id == "2026-06-03-7"
     assert manifest.total_sample_count == 3
     assert manifest.device_status == "complete"
-    assert [_chunk] = manifest.chunks
+    assert [chunk] = manifest.chunks
 
+    assert {:ok, recording} = Recording.load(base, "2026-06-03-7")
+    chunk_bytes = File.read!(Path.join(recording.dir, "chunk-#{chunk.chunk_id}"))
+    manifest_bytes = File.read!(Path.join(recording.dir, "manifest.pb"))
+
+    assert_receive {:durable_enqueue, :race_recording_chunk, ^chunk_bytes, chunk_opts}
+    assert_receive {:durable_enqueue, :race_recording_manifest, ^manifest_bytes, manifest_opts}
+
+    expected_chunk_id =
+      capture_entry_id(fn enqueue ->
+        RaceRecordingProducer.admit_chunk(
+          enqueue,
+          "2026-06-03-7",
+          chunk.chunk_id,
+          chunk_bytes
+        )
+      end)
+
+    expected_manifest_id =
+      capture_entry_id(fn enqueue ->
+        RaceRecordingProducer.admit_manifest(enqueue, "2026-06-03-7", manifest)
+      end)
+
+    assert chunk_opts == [entry_id: expected_chunk_id]
+    assert manifest_opts == [entry_id: expected_manifest_id]
     assert Archive.current_recording_id(a) == nil
     assert "2026-06-03-7" in Recording.list(base)
   end
 
-  test "deletes the recording once RacingOrg confirms it complete", %{base: base} do
-    %{commands: c, archive: a} = start_archive(base)
+  test "durable admission errors retain the finalized recording and fail closed", %{base: base} do
+    test_pid = self()
+
+    opts =
+      durable_opts(test_pid,
+        durable_enqueue_fn: fn stream, payload, opts ->
+          send(test_pid, {:durable_attempt, stream, payload, opts})
+          {:error, {:backpressure, :disk_capacity}}
+        end
+      )
+
+    %{commands: c, archive: a} = start_archive(base, opts)
+    race(a, c, "2026-06-03-7", [1])
+    send(a, {:sampling_phase, :finish, :complete})
+
+    assert Archive.current_recording_id(a) == "2026-06-03-7"
+    assert "2026-06-03-7" in Recording.list(base)
+    assert_receive {:durable_attempt, :race_recording_chunk, _payload, _opts}
+    refute_receive {:durable_attempt, :race_recording_manifest, _payload, _opts}
+    refute_receive {:enqueued, _legacy_manifest}
+  end
+
+  test "legacy completion is not an authoritative durable receipt", %{base: base} do
+    test_pid = self()
+    %{commands: c, archive: a} = start_archive(base, durable_opts(test_pid))
     race(a, c, "2026-06-03-7", [1])
     finish(a)
     assert_receive {:enqueued, _manifest}
@@ -107,9 +176,8 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
       )
 
     send(a, {:racing_org_command, verification})
-    # let the cast/info be processed
     _ = Archive.current_recording_id(a)
-    refute "2026-06-03-7" in Recording.list(base)
+    assert "2026-06-03-7" in Recording.list(base)
   end
 
   test "re-sends requested missing chunks", %{base: base} do
@@ -175,19 +243,46 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
     refute_receive {:bulk_upload, _opts}
   end
 
-  test "recovers and finalizes an in-progress recording left by a power loss", %{base: base} do
+  test "recovers and durably admits an in-progress recording left by a power loss", %{base: base} do
+    test_pid = self()
     # A recording written but never finalized (power loss mid-race).
     rec = Recording.open(base, %{recording_id: "2026-06-03-3", device_id: "dev"})
     Enum.reduce(1..2, rec, &Recording.append(&2, ds(&1)))
 
     # Booting the archive recovers it.
-    start_archive(base)
+    start_archive(base, durable_opts(test_pid))
 
+    assert_receive {:durable_enqueue, :race_recording_chunk, _chunk_bytes, _chunk_opts}
+    assert_receive {:durable_enqueue, :race_recording_manifest, manifest_bytes, _manifest_opts}
     assert_receive {:enqueued, binary}
     manifest = DataSet.decode(binary).manifest
     assert manifest.race_recording_id == "2026-06-03-3"
     assert manifest.device_status == "recovered"
+    assert RaceManifest.decode(manifest_bytes) == manifest
     assert {:ok, reloaded} = Recording.load(base, "2026-06-03-3")
     assert Recording.finalized?(reloaded)
+  end
+
+  test "retries durable admission for an already finalized recording after restart", %{base: base} do
+    test_pid = self()
+
+    {_recording, expected_manifest} =
+      base
+      |> Recording.open(%{recording_id: "2026-06-03-3", device_id: "dev"})
+      |> Recording.append(ds(1))
+      |> Recording.finalize(device_status: "recovered")
+
+    start_archive(base, durable_opts(test_pid))
+
+    assert_receive {:durable_enqueue, :race_recording_chunk, _chunk_bytes, _chunk_opts}
+    assert_receive {:durable_enqueue, :race_recording_manifest, manifest_bytes, _manifest_opts}
+    assert RaceManifest.decode(manifest_bytes) == expected_manifest
+  end
+
+  defp capture_entry_id(admit) do
+    {:ok, entry_id} =
+      admit.(fn _stream, _payload, entry_id: entry_id -> {:ok, entry_id} end)
+
+    entry_id
   end
 end
