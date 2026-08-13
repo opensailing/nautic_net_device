@@ -1,0 +1,627 @@
+defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator do
+  @moduledoc """
+  Serializes crash-safe installation of exact-runtime checkpoint hydrations.
+
+  The coordinator closes the active Desired State runtime before observing or
+  mutating a checkpoint head. Its journal is the recovery authority across the
+  checkpoint-head and observer stores; the Manager blocker is released only after
+  the exact observer restore and durable journal removal both succeed.
+  """
+
+  use GenServer
+
+  alias RacingOrg.Tracker.Pro.Calibration.Observer, as: CalibrationObserver
+  alias RacingOrg.Tracker.Pro.DesiredState.Manager
+  alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store
+  alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.{Journal, RuntimeRegistry}
+  alias RacingOrg.Tracker.Pro.Polar.Observer, as: PolarObserver
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime
+  alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
+  alias RacingOrg.Tracker.Pro.WindShift.Observer, as: WindShiftObserver
+
+  @zero_identifier <<0::128>>
+  @hydrate_keys [
+    :device_id,
+    :credential_epoch,
+    :storage_epoch,
+    :origin_credential_epoch,
+    :origin_storage_epoch,
+    :sequence,
+    :kind,
+    :schema_version,
+    :source_generation,
+    :parent_hash,
+    :content_hash,
+    :checkpoint_hash,
+    :content
+  ]
+
+  @type hydration :: %{
+          required(:device_id) => <<_::128>>,
+          required(:credential_epoch) => non_neg_integer(),
+          required(:storage_epoch) => <<_::128>>,
+          required(:origin_credential_epoch) => non_neg_integer(),
+          required(:origin_storage_epoch) => <<_::128>>,
+          required(:sequence) => pos_integer(),
+          required(:kind) => atom(),
+          required(:schema_version) => pos_integer(),
+          required(:source_generation) => non_neg_integer(),
+          required(:parent_hash) => <<_::256>>,
+          required(:content_hash) => <<_::256>>,
+          required(:checkpoint_hash) => <<_::256>>,
+          required(:content) => binary()
+        }
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) when is_list(opts) do
+    case Keyword.get(opts, :name, __MODULE__) do
+      nil -> GenServer.start_link(__MODULE__, opts)
+      name -> GenServer.start_link(__MODULE__, opts, name: name)
+    end
+  end
+
+  @doc "Install one already-authenticated exact-runtime checkpoint."
+  @spec hydrate(GenServer.server(), SessionHolder.generation(), hydration()) ::
+          {:ok, :hydrated} | {:error, term()}
+  def hydrate(server \\ __MODULE__, session_generation, hydration) do
+    GenServer.call(server, {:hydrate, session_generation, hydration}, :infinity)
+  end
+
+  @doc "Retry the retained recovery transition synchronously."
+  @spec recover(GenServer.server()) :: :ok | {:error, term()}
+  def recover(server \\ __MODULE__), do: GenServer.call(server, :recover, :infinity)
+
+  @spec status(GenServer.server()) :: map()
+  def status(server \\ __MODULE__), do: GenServer.call(server, :status)
+
+  @doc "Return the production closed dispatch for exact observer runtimes."
+  @spec production_registry() :: RuntimeRegistry.t()
+  def production_registry do
+    {:ok, registry} =
+      RuntimeRegistry.new([
+        {:calibration, 2, CheckpointRuntime.Calibration},
+        {:polar, 3, CheckpointRuntime.Polar},
+        {:wind_shift, 2, CheckpointRuntime.WindShift}
+      ])
+
+    registry
+  end
+
+  @doc false
+  @spec production_restorers() :: map()
+  def production_restorers do
+    %{
+      calibration: {CalibrationObserver, :restore},
+      polar: {PolarObserver, :restore_runtime},
+      wind_shift: {WindShiftObserver, :restore}
+    }
+  end
+
+  @impl true
+  def init(opts) do
+    state = %{
+      journal_path: Keyword.fetch!(opts, :journal_path),
+      head_store: Keyword.fetch!(opts, :head_store),
+      manager: Keyword.get(opts, :manager, Manager),
+      session_holder: Keyword.get(opts, :session_holder, SessionHolder),
+      registry: Keyword.get_lazy(opts, :registry, &production_registry/0),
+      restorers: Keyword.get_lazy(opts, :restorers, &production_restorers/0),
+      transaction_id: Keyword.get(opts, :transaction_id, fn -> :crypto.strong_rand_bytes(16) end),
+      journal_module: Keyword.get(opts, :journal_module, Journal),
+      store_module: Keyword.get(opts, :store_module, Store),
+      manager_module: Keyword.get(opts, :manager_module, Manager),
+      session_holder_module: Keyword.get(opts, :session_holder_module, SessionHolder),
+      checkpoint_module: Keyword.get(opts, :checkpoint_module, Checkpoint),
+      journal_opts: Keyword.get(opts, :journal_opts, []),
+      boundary: Keyword.get(opts, :boundary, fn _stage -> :ok end),
+      blocker: nil,
+      recovery_error: nil
+    }
+
+    case recover_state(state) do
+      {:ok, state} -> {:ok, state}
+      {:error, reason, state} -> {:ok, %{state | recovery_error: reason}}
+    end
+  end
+
+  @impl true
+  def handle_call(:status, _from, state) do
+    {:reply,
+     %{
+       blocked?: not is_nil(state.blocker),
+       recovery_error: state.recovery_error,
+       transaction_id: state.blocker && state.blocker.record.transaction_id,
+       phase: state.blocker && state.blocker.record.phase
+     }, state}
+  end
+
+  def handle_call(:recover, _from, %{blocker: nil} = state) do
+    case recover_state(state) do
+      {:ok, state} -> {:reply, :ok, state}
+      {:error, reason, state} -> {:reply, {:error, reason}, %{state | recovery_error: reason}}
+    end
+  end
+
+  def handle_call(:recover, _from, state) do
+    case recover_blocked_state(state) do
+      {:ok, state} -> {:reply, :ok, state}
+      {:error, reason, state} -> {:reply, {:error, reason}, %{state | recovery_error: reason}}
+    end
+  end
+
+  def handle_call({:hydrate, _session_generation, _hydration}, _from, %{blocker: blocker} = state)
+      when not is_nil(blocker) do
+    {:reply, {:error, :checkpoint_hydration_recovery_required}, state}
+  end
+
+  def handle_call({:hydrate, session_generation, hydration}, _from, state) do
+    case start_hydration(state, session_generation, hydration) do
+      {:ok, state} -> {:reply, {:ok, :hydrated}, state}
+      {:error, reason, state} -> {:reply, {:error, reason}, %{state | recovery_error: reason}}
+    end
+  end
+
+  defp start_hydration(state, session_generation, hydration) do
+    with {:ok, hydration} <- validate_hydration_shape(hydration) do
+      with_current_session(state, session_generation, fn authorization ->
+        start_authorized_hydration(state, authorization, hydration)
+      end)
+    else
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp start_authorized_hydration(state, authorization, hydration) do
+    with {:ok, binding} <- current_binding(state),
+         :ok <- match_target(hydration, binding),
+         :ok <- match_session(authorization, binding),
+         {:ok, adapter} <- RuntimeRegistry.fetch(state.registry, hydration.kind, hydration.schema_version),
+         :ok <- validate_hydration_integrity(state, hydration),
+         {:ok, runtime} <- decode_runtime(state, adapter, hydration),
+         {:ok, transaction_id} <- transaction_id(state),
+         token = make_ref(),
+         :ok <- manager_begin(state, token, binding),
+         blocker = blocker(token, binding, authorization, transaction_id, hydration),
+         state = %{state | blocker: blocker},
+         :ok <- boundary(state, :after_begin),
+         {:ok, state} <- prepare_transition(state, runtime) do
+      complete_transition(state, runtime)
+    else
+      {:error, reason, %{} = state} -> {:error, reason, state}
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp recover_state(state) do
+    case journal_read(state) do
+      :empty ->
+        {:ok, %{state | blocker: nil, recovery_error: nil}}
+
+      {:ok, record} ->
+        recover_record(state, record)
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp recover_blocked_state(state) do
+    case journal_read(state) do
+      {:ok, record} ->
+        recover_record(state, record)
+
+      :empty ->
+        {:error, :checkpoint_hydration_recovery_evidence_missing, state}
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp recover_record(%{blocker: %{record: record}} = state, record) do
+    with {:ok, manager_state} <- manager_state(state),
+         {:ok, binding} <- active_binding(manager_state),
+         :ok <- match_binding(binding, state.blocker.binding),
+         :ok <- match_target(record.target, binding),
+         :ok <- match_target(record.target, manager_state.identity) do
+      replay_record(state, record)
+    else
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp recover_record(%{blocker: nil} = state, record) do
+    with {:ok, manager_state} <- manager_state(state),
+         {:ok, binding} <- active_binding(manager_state),
+         token = make_ref(),
+         :ok <- manager_begin(state, token, binding) do
+      state = %{state | blocker: %{token: token, binding: binding, record: record}}
+
+      with :ok <- match_target(record.target, binding),
+           :ok <- match_target(record.target, manager_state.identity) do
+        replay_record(state, record)
+      else
+        {:error, reason} -> {:error, reason, state}
+      end
+    else
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp recover_record(state, _record),
+    do: {:error, :checkpoint_hydration_transition_conflict, state}
+
+  defp replay_record(state, record) do
+    with {:ok, adapter} <-
+           RuntimeRegistry.fetch(
+             state.registry,
+             record.hydration.kind,
+             record.hydration.schema_version
+           ),
+         :ok <- validate_hydration_integrity(state, record.hydration, record.target),
+         {:ok, runtime} <- decode_runtime(state, adapter, record.hydration),
+         {:ok, state} <- replay_phase(state) do
+      complete_transition(state, runtime)
+    else
+      {:error, reason, %{} = state} -> {:error, reason, state}
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp prepare_transition(state, _runtime) do
+    with :ok <- boundary(state, :before_prepared),
+         {:ok, expected_head} <- observe_target_head(state),
+         record = %{state.blocker.record | expected_head: expected_head},
+         :ok <- journal_write(state, record),
+         state = put_record(state, record),
+         :ok <- boundary(state, :after_prepared),
+         :ok <- boundary(state, :before_head),
+         {:ok, _record} <- hydrate_head(state),
+         :ok <- boundary(state, :after_head),
+         :ok <- boundary(state, :before_head_committed),
+         committed = %{record | phase: :head_committed},
+         :ok <- journal_write(state, committed),
+         state = put_record(state, committed),
+         :ok <- boundary(state, :after_head_committed) do
+      {:ok, state}
+    else
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp replay_phase(%{blocker: %{record: %{phase: :prepared}}} = state) do
+    with :ok <- boundary(state, :before_head),
+         {:ok, _record} <- hydrate_head(state),
+         :ok <- boundary(state, :after_head),
+         :ok <- boundary(state, :before_head_committed),
+         committed = %{state.blocker.record | phase: :head_committed},
+         :ok <- journal_write(state, committed),
+         state = put_record(state, committed),
+         :ok <- boundary(state, :after_head_committed) do
+      {:ok, state}
+    else
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp replay_phase(%{blocker: %{record: %{phase: :head_committed}}} = state),
+    do: {:ok, state}
+
+  defp complete_transition(state, runtime) do
+    evidence = state.blocker.record
+
+    with :ok <- boundary(state, :before_restore),
+         :ok <- restore_runtime(state, runtime),
+         :ok <- boundary(state, :after_restore),
+         :ok <- boundary(state, :before_remove),
+         :ok <- journal_remove(state),
+         :ok <- boundary(state, :after_remove),
+         :ok <- boundary(state, :before_finish),
+         :ok <- manager_finish(state) do
+      {:ok, %{state | blocker: nil, recovery_error: nil}}
+    else
+      {:error, reason} ->
+        state = retain_recovery_evidence(state, evidence)
+        {:error, reason, state}
+    end
+  end
+
+  defp retain_recovery_evidence(state, record) do
+    case journal_read(state) do
+      {:ok, ^record} ->
+        state
+
+      _empty_or_error ->
+        prepared = %{record | phase: :prepared}
+
+        case journal_write(state, prepared) do
+          :ok ->
+            case journal_write(state, record) do
+              :ok -> state
+              {:error, _reason} -> state
+            end
+
+          {:error, _reason} ->
+            state
+        end
+    end
+  end
+
+  defp with_current_session(state, session_generation, transition) when is_function(transition, 1) do
+    callback = fn session ->
+      authorization = %{
+        session_generation: session.generation,
+        session_id: session.session_id,
+        credential_epoch: session.credential_epoch
+      }
+
+      {:checkpoint_hydration_result, transition.(authorization)}
+    end
+
+    case state.session_holder_module.with_session(
+           state.session_holder,
+           session_generation,
+           callback
+         ) do
+      {:ok, {:checkpoint_hydration_result, result}} ->
+        result
+
+      {:error, reason} when reason in [:no_session, :stale_session, :session_holder_unavailable] ->
+        {:error, :stale_session, state}
+
+      {:error, reason} ->
+        {:error, reason, state}
+
+      _other ->
+        {:error, :invalid_session_authorization, state}
+    end
+  end
+
+  defp current_binding(state) do
+    with {:ok, manager_state} <- manager_state(state),
+         {:ok, binding} <- active_binding(manager_state),
+         :ok <- match_target(binding, manager_state.identity) do
+      {:ok, binding}
+    end
+  end
+
+  defp manager_state(state) do
+    case state.manager_module.status(state.manager) do
+      %{active: active, identity: identity} when is_map(active) and is_map(identity) ->
+        {:ok, %{active: active, identity: identity}}
+
+      _other ->
+        {:error, :checkpoint_hydration_binding_unavailable}
+    end
+  end
+
+  defp active_binding(%{active: active}) when is_map(active) do
+    {:ok,
+     Map.take(active, [
+       :device_id,
+       :credential_epoch,
+       :storage_epoch,
+       :generation,
+       :manifest_hash
+     ])}
+  end
+
+  defp match_binding(left, right) do
+    if left == right,
+      do: :ok,
+      else: {:error, :checkpoint_hydration_binding_mismatch}
+  end
+
+  defp match_target(left, right) do
+    if Map.take(left, [:device_id, :credential_epoch, :storage_epoch]) ==
+         Map.take(right, [:device_id, :credential_epoch, :storage_epoch]) do
+      :ok
+    else
+      {:error, :checkpoint_hydration_target_mismatch}
+    end
+  end
+
+  defp match_session(authorization, binding) do
+    if authorization.credential_epoch == binding.credential_epoch,
+      do: :ok,
+      else: {:error, :stale_session}
+  end
+
+  defp validate_hydration_integrity(state, hydration, target \\ nil) do
+    target =
+      target || Map.take(hydration, [:device_id, :credential_epoch, :storage_epoch])
+
+    with {:ok, content_hash} <-
+           state.checkpoint_module.content_hash(
+             hydration.kind,
+             hydration.schema_version,
+             hydration.content
+           ),
+         true <- secure_equal(content_hash, hydration.content_hash),
+         :ok <-
+           state.checkpoint_module.validate_authority(
+             hydration.kind,
+             hydration.schema_version,
+             hydration.content,
+             %{
+               device_id: target.device_id,
+               credential_epoch: hydration.origin_credential_epoch,
+               storage_epoch: hydration.origin_storage_epoch
+             }
+           ),
+         {:ok, checkpoint_hash} <-
+           state.checkpoint_module.hash(%{
+             device_id: target.device_id,
+             credential_epoch: hydration.origin_credential_epoch,
+             storage_epoch: hydration.origin_storage_epoch,
+             sequence: sequence(hydration),
+             kind: hydration.kind,
+             schema_version: hydration.schema_version,
+             source_generation: hydration.source_generation,
+             parent_hash: hydration.parent_hash,
+             content_hash: hydration.content_hash
+           }),
+         true <- secure_equal(checkpoint_hash, hydration.checkpoint_hash) do
+      :ok
+    else
+      false -> {:error, :checkpoint_hydration_hash_mismatch}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp decode_runtime(state, adapter, hydration) do
+    with {:ok, wire} <-
+           state.checkpoint_module.decode_canonical_content(
+             hydration.kind,
+             hydration.schema_version,
+             hydration.content
+           ),
+         {:ok, runtime} <- invoke_adapter(adapter, wire) do
+      {:ok, runtime}
+    end
+  end
+
+  defp invoke_adapter(adapter, wire) do
+    adapter.hydrate(wire)
+  rescue
+    _exception -> {:error, :invalid_checkpoint_runtime}
+  catch
+    _kind, _reason -> {:error, :invalid_checkpoint_runtime}
+  end
+
+  defp restore_runtime(state, runtime) do
+    with {:ok, {module, function}} <- Map.fetch(state.restorers, state.blocker.record.hydration.kind) do
+      case apply(module, function, [runtime]) do
+        :ok -> :ok
+        {:error, reason} -> {:error, reason}
+        _other -> {:error, :invalid_checkpoint_runtime_restore}
+      end
+    else
+      :error -> {:error, :unknown_checkpoint_runtime_restorer}
+    end
+  rescue
+    _exception -> {:error, :checkpoint_runtime_restore_failed}
+  catch
+    _kind, _reason -> {:error, :checkpoint_runtime_restore_failed}
+  end
+
+  defp observe_target_head(state),
+    do: state.store_module.observe_target_head(state.head_store, state.blocker.record.hydration.kind)
+
+  defp hydrate_head(state) do
+    record = state.blocker.record
+    state.store_module.hydrate(state.head_store, store_attrs(record), record.expected_head)
+  end
+
+  defp store_attrs(record) do
+    hydration = record.hydration
+
+    %{
+      device_id: record.target.device_id,
+      credential_epoch: record.target.credential_epoch,
+      storage_epoch: record.target.storage_epoch,
+      origin_credential_epoch: hydration.origin_credential_epoch,
+      origin_storage_epoch: hydration.origin_storage_epoch,
+      kind: hydration.kind,
+      schema_version: hydration.schema_version,
+      sequence: hydration.revision,
+      source_generation: hydration.source_generation,
+      parent_hash: hydration.parent_hash,
+      content: hydration.content,
+      checkpoint_hash: hydration.checkpoint_hash
+    }
+  end
+
+  defp manager_begin(state, token, binding),
+    do: state.manager_module.begin_checkpoint_hydration(state.manager, token, binding)
+
+  defp manager_finish(state) do
+    state.manager_module.finish_checkpoint_hydration(
+      state.manager,
+      state.blocker.token,
+      state.blocker.binding
+    )
+  end
+
+  defp journal_read(state),
+    do: state.journal_module.read(state.journal_path, state.journal_opts)
+
+  defp journal_write(state, record),
+    do: state.journal_module.write(state.journal_path, record, state.journal_opts)
+
+  defp journal_remove(state),
+    do: state.journal_module.remove(state.journal_path, state.journal_opts)
+
+  defp boundary(state, stage) do
+    case state.boundary.(stage) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+      _other -> {:error, :invalid_checkpoint_hydration_boundary}
+    end
+  end
+
+  defp blocker(token, binding, authorization, transaction_id, hydration) do
+    %{
+      token: token,
+      binding: binding,
+      record: %{
+        version: 1,
+        phase: :prepared,
+        transaction_id: transaction_id,
+        session_incarnation: authorization.session_id,
+        session_generation: authorization.session_generation,
+        target: Map.take(binding, [:device_id, :credential_epoch, :storage_epoch]),
+        expected_head: nil,
+        hydration: %{
+          kind: hydration.kind,
+          schema_version: hydration.schema_version,
+          origin_credential_epoch: hydration.origin_credential_epoch,
+          origin_storage_epoch: hydration.origin_storage_epoch,
+          revision: hydration.sequence,
+          source_generation: hydration.source_generation,
+          parent_hash: hydration.parent_hash,
+          content_hash: hydration.content_hash,
+          checkpoint_hash: hydration.checkpoint_hash,
+          content: hydration.content
+        }
+      }
+    }
+  end
+
+  defp put_record(state, record), do: put_in(state.blocker.record, record)
+
+  defp sequence(%{sequence: sequence}), do: sequence
+  defp sequence(%{revision: revision}), do: revision
+
+  defp secure_equal(left, right) when is_binary(left) and is_binary(right),
+    do: byte_size(left) == byte_size(right) and :crypto.hash_equals(left, right)
+
+  defp secure_equal(_left, _right), do: false
+
+  defp transaction_id(state), do: transaction_id(state.transaction_id, 8)
+
+  defp transaction_id(_generator, 0), do: {:error, :checkpoint_hydration_transaction_id_unavailable}
+
+  defp transaction_id(generator, attempts) do
+    case generator.() do
+      <<transaction_id::binary-size(16)>> when transaction_id != @zero_identifier ->
+        {:ok, transaction_id}
+
+      _invalid ->
+        transaction_id(generator, attempts - 1)
+    end
+  rescue
+    _exception -> {:error, :checkpoint_hydration_transaction_id_unavailable}
+  catch
+    _kind, _reason -> {:error, :checkpoint_hydration_transaction_id_unavailable}
+  end
+
+  defp validate_hydration_shape(hydration) when is_map(hydration) do
+    if Enum.sort(Map.keys(hydration)) == Enum.sort(@hydrate_keys),
+      do: {:ok, hydration},
+      else: {:error, :invalid_checkpoint_hydration}
+  end
+
+  defp validate_hydration_shape(_hydration), do: {:error, :invalid_checkpoint_hydration}
+end
