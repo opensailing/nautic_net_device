@@ -28,6 +28,8 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.Snapshot do
   alias RacingOrg.Tracker.Pro.Polar.Observer.PSquare
   alias RacingOrg.Tracker.Pro.RuntimeSnapshot
 
+  @negative_zero_bits 0x8000_0000_0000_0000
+
   @top_fields ~w(
     authority captured_at_utc_ms latest learner learner_time_basis legs policy
     stats sync tack tick version window_binding window_sources
@@ -471,7 +473,14 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.Snapshot do
       else: :error
   end
 
-  defp safe_numeric_tree(term, node_budget, binary_budget, _depth) when is_number(term) do
+  defp safe_numeric_tree(term, node_budget, binary_budget, _depth) when is_float(term) do
+    if RuntimeSnapshot.finite_between?(term, -@max_counter, @max_counter) and
+         not negative_zero?(term),
+       do: {:ok, node_budget - 1, binary_budget},
+       else: :error
+  end
+
+  defp safe_numeric_tree(term, node_budget, binary_budget, _depth) when is_integer(term) do
     if RuntimeSnapshot.finite_between?(term, -@max_counter, @max_counter),
       do: {:ok, node_budget - 1, binary_budget},
       else: :error
@@ -505,6 +514,11 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.Snapshot do
   end
 
   defp safe_numeric_tree(_term, _node_budget, _binary_budget, _depth), do: :error
+
+  defp negative_zero?(value) do
+    <<bits::unsigned-big-integer-size(64)>> = <<value::float-big-size(64)>>
+    bits == @negative_zero_bits
+  end
 
   defp reduce_safe_terms(terms, node_budget, binary_budget, depth) do
     Enum.reduce_while(terms, {:ok, node_budget, binary_budget}, fn

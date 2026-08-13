@@ -9,6 +9,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime
 
   @capture_utc ~U[2026-08-10 12:00:00Z]
   @wire_sha256 "1bd6a9ccf506d2905a3b0470560bf1404f6377f3c9f2f5e8f33c21bb781e228a"
+  @content_hash_sha256 "cdfead677dff2d3b418ed3964d139febf2852550a991b3e3c007285552f8c4a6"
   @wire_size 2266
 
   test "projects and hydrates the complete exact Observer snapshot" do
@@ -23,6 +24,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime
     assert byte_size(bytes) == @wire_size
     assert Base.encode16(:crypto.hash(:sha256, bytes), case: :lower) == @wire_sha256
     assert {:ok, ^bytes} = ContractCheckpoint.canonical_content(:calibration, 2, wire)
+    assert {:ok, content_hash} = ContractCheckpoint.content_hash(:calibration, 2, bytes)
+    assert Base.encode16(content_hash, case: :lower) == @content_hash_sha256
     assert {:ok, ^wire} = ContractCheckpoint.decode_canonical_content(:calibration, 2, bytes)
 
     assert Map.keys(wire) |> Enum.sort() ==
@@ -63,6 +66,19 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime
       assert {:error, :invalid_checkpoint_content} = Calibration.validate(candidate)
       assert {:error, :invalid_checkpoint_content} = Calibration.hydrate(candidate)
     end)
+  end
+
+  test "rejects negative-zero floats before canonicalization" do
+    snapshot = put_in(internal_snapshot(), [:policy, :min_stw_mps], -0.0)
+
+    assert {:error, :invalid_runtime_snapshot} = Snapshot.preflight(snapshot)
+    assert {:error, :invalid_checkpoint_content} = Calibration.project(snapshot)
+
+    assert {:ok, wire} = Calibration.project(internal_snapshot())
+    invalid = put_in(wire, ["policy", "min_stw_mps"], -0.0)
+
+    assert {:error, :invalid_checkpoint_content} = Calibration.validate(invalid)
+    assert {:error, :invalid_checkpoint_content} = Calibration.hydrate(invalid)
   end
 
   test "preserves secret rejection and never creates atoms from input" do
