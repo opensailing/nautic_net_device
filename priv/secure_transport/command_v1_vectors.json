@@ -1,0 +1,273 @@
+{
+  "command_ack": {
+    "binds": "race_assignment_server_reply",
+    "expected": {
+      "command_ack_hex": "526163696e674f72672d436f6d6d616e6441636b2d7631012100112233445566778899aabbccddeeff00000007ffeeddccbbaa99887766554433221100000000000000002ab2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b200000009000000000000000b0123456789abcdeffedcba9876543210cad4f443bc5d3cdaa0b98db37b137c616a58cec91e3b805e7c222cc63c9d32b401007efa217b69da816b4dc692ea720b45e26a22dffab7a1b13220b165177192fbd60000000401ff6f6b",
+      "result_hash_hex": "7efa217b69da816b4dc692ea720b45e26a22dffab7a1b13220b165177192fbd6"
+    },
+    "inputs": {
+      "reason": "none",
+      "result_hex": "01ff6f6b",
+      "status": "applied"
+    }
+  },
+  "command_delivery": {
+    "vectors": [
+      {
+        "expected": {
+          "command_delivery_hex": "526163696e674f72672d436f6d6d616e6444656c69766572792d7631012000112233445566778899aabbccddeeff00000007ffeeddccbbaa99887766554433221100000000000000002ab2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b200000009000000000000000b0123456789abcdeffedcba9876543210000001a3185c50000bd6f32d2ba5e6d0c2a7d4107c92b47531ee055e8c62821b4f6bff24db3841d6cad4f443bc5d3cdaa0b98db37b137c616a58cec91e3b805e7c222cc63c9d32b4000002330801122430303131323233332d343435352d363637372d383839392d6161626263636464656566661a88040a2430313233343536372d383961622d636465662d666564632d6261393837363534333231301213676f6c64656e2d61737369676e6d656e742d311807222035663866303466366132613163376630663065316432633362346135393638372a0b08c0bcabcf061080e59a77320608d0d8abcf068a0190030a07626f61742d3432122430303131323233332d343435352d363637372d383839392d6161626263636464656566661a06706c616e2d39220973657373696f6e2d332a0c323032362d30382d31332d3132060898c1abcf0638982a42280a12090000000000c044401100000000009051c01212090000000000c444401100000000009251c04a280a12090000000000d044401100000000009851c01212090000000000d444401100000000009a51c0521b0a01311212090000000000e04440110000000000a051c018012001521c0a0232611212090000000000e84440110000000000a451c018022002521c0a02574c1212090000000000f04440110000000000a851c0180320035801620232616a0131720d0801100218032078289601305a7a0c726f7574652d7265712d3131820112090000000000c844401100000000009451c0820112090000000000d844401100000000009c51c0820112090000000000dc44401100000000009e51c08a01206131623263336434653566363037313832393361346235633664376538663930",
+          "command_hash_hex": "cad4f443bc5d3cdaa0b98db37b137c616a58cec91e3b805e7c222cc63c9d32b4",
+          "payload_hash_hex": "0bd6f32d2ba5e6d0c2a7d4107c92b47531ee055e8c62821b4f6bff24db3841d6"
+        },
+        "inputs": {
+          "command_epoch": 9,
+          "command_id_hex": "0123456789abcdeffedcba9876543210",
+          "command_sequence": 11,
+          "credential_epoch": 7,
+          "device_id_hex": "00112233445566778899aabbccddeeff",
+          "expires_at_ms": 1800000000000,
+          "payload_vector": "race_assignment",
+          "required_generation": 42,
+          "required_manifest_hash_hex": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+          "storage_epoch_hex": "ffeeddccbbaa99887766554433221100"
+        },
+        "name": "race_assignment_server_reply"
+      },
+      {
+        "expected": {
+          "command_delivery_hex": "526163696e674f72672d436f6d6d616e6444656c69766572792d7631012000112233445566778899aabbccddeeff00000007ffeeddccbbaa99887766554433221100000000000000002ab2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b200000009000000000000000c1123456789abcdeffedcba9876543211000001a3185c50003f53e1e76820084ac8d6e4aa170c05be4cefa178cd8882121fc30bd425869ef5aa250225dfd0c1fda405bcc9b55d268475c5b63c84d15630a36b747ecf0bb8a20000001f0900000002000461726773090000000000047479706507000000046e6f6f70",
+          "command_hash_hex": "aa250225dfd0c1fda405bcc9b55d268475c5b63c84d15630a36b747ecf0bb8a2",
+          "payload_hash_hex": "3f53e1e76820084ac8d6e4aa170c05be4cefa178cd8882121fc30bd425869ef5"
+        },
+        "inputs": {
+          "command_epoch": 9,
+          "command_id_hex": "1123456789abcdeffedcba9876543211",
+          "command_sequence": 12,
+          "credential_epoch": 7,
+          "device_id_hex": "00112233445566778899aabbccddeeff",
+          "expires_at_ms": 1800000000000,
+          "payload_canonical": {
+            "args": {},
+            "type": "noop"
+          },
+          "required_generation": 42,
+          "required_manifest_hash_hex": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2",
+          "storage_epoch_hex": "ffeeddccbbaa99887766554433221100"
+        },
+        "name": "canonical_noop"
+      }
+    ]
+  },
+  "description": "Frozen command_v1 golden vectors: the DeviceCommand/ServerReply protobuf control envelope plus the command_delivery/command_ack secure-transport envelope, pinning both in-flight payload shapes (protobuf ServerReply bytes and the canonical type/args command envelope). Shared byte-for-byte between the tracker and backend repositories; any edit is a cross-repo wire-contract break. All identifiers and geometry are synthetic; no credential material is present.",
+  "vectors": [
+    {
+      "expected": {
+        "device_command_hex": "0a2430313233343536372d383961622d636465662d666564632d6261393837363534333231301213676f6c64656e2d61737369676e6d656e742d311807222035663866303466366132613163376630663065316432633362346135393638372a0b08c0bcabcf061080e59a77320608d0d8abcf068a0190030a07626f61742d3432122430303131323233332d343435352d363637372d383839392d6161626263636464656566661a06706c616e2d39220973657373696f6e2d332a0c323032362d30382d31332d3132060898c1abcf0638982a42280a12090000000000c044401100000000009051c01212090000000000c444401100000000009251c04a280a12090000000000d044401100000000009851c01212090000000000d444401100000000009a51c0521b0a01311212090000000000e04440110000000000a051c018012001521c0a0232611212090000000000e84440110000000000a451c018022002521c0a02574c1212090000000000f04440110000000000a851c0180320035801620232616a0131720d0801100218032078289601305a7a0c726f7574652d7265712d3131820112090000000000c844401100000000009451c0820112090000000000d844401100000000009c51c0820112090000000000dc44401100000000009e51c08a01206131623263336434653566363037313832393361346235633664376538663930",
+        "server_reply_hex": "0801122430303131323233332d343435352d363637372d383839392d6161626263636464656566661a88040a2430313233343536372d383961622d636465662d666564632d6261393837363534333231301213676f6c64656e2d61737369676e6d656e742d311807222035663866303466366132613163376630663065316432633362346135393638372a0b08c0bcabcf061080e59a77320608d0d8abcf068a0190030a07626f61742d3432122430303131323233332d343435352d363637372d383839392d6161626263636464656566661a06706c616e2d39220973657373696f6e2d332a0c323032362d30382d31332d3132060898c1abcf0638982a42280a12090000000000c044401100000000009051c01212090000000000c444401100000000009251c04a280a12090000000000d044401100000000009851c01212090000000000d444401100000000009a51c0521b0a01311212090000000000e04440110000000000a051c018012001521c0a0232611212090000000000e84440110000000000a451c018022002521c0a02574c1212090000000000f04440110000000000a851c0180320035801620232616a0131720d0801100218032078289601305a7a0c726f7574652d7265712d3131820112090000000000c844401100000000009451c0820112090000000000d844401100000000009c51c0820112090000000000dc44401100000000009e51c08a01206131623263336434653566363037313832393361346235633664376538663930"
+      },
+      "name": "race_assignment",
+      "server_reply": {
+        "command": {
+          "assignment_hash": "5f8f04f6a2a1c7f0f0e1d2c3b4a59687",
+          "assignment_id": "golden-assignment-1",
+          "assignment_version": 7,
+          "command_id": "01234567-89ab-cdef-fedc-ba9876543210",
+          "expires_at": {
+            "nanos": 0,
+            "seconds": 1777003600
+          },
+          "issued_at": {
+            "nanos": 250000000,
+            "seconds": 1777000000
+          },
+          "payload": {
+            "race_assignment": {
+              "active_mark_code": "1",
+              "boat_id": "boat-42",
+              "course_marks": [
+                {
+                  "code": "1",
+                  "position": {
+                    "latitude": 41.75,
+                    "longitude": -70.5
+                  },
+                  "rounding": "MARK_ROUNDING_PORT",
+                  "sequence": 1
+                },
+                {
+                  "code": "2a",
+                  "position": {
+                    "latitude": 41.8125,
+                    "longitude": -70.5625
+                  },
+                  "rounding": "MARK_ROUNDING_STARBOARD",
+                  "sequence": 2
+                },
+                {
+                  "code": "WL",
+                  "position": {
+                    "latitude": 41.875,
+                    "longitude": -70.625
+                  },
+                  "rounding": "MARK_ROUNDING_GATE",
+                  "sequence": 3
+                }
+              ],
+              "device_id": "00112233-4455-6677-8899-aabbccddeeff",
+              "expected_duration_seconds": 5400,
+              "finish_line": {
+                "end_a": {
+                  "latitude": 41.625,
+                  "longitude": -70.375
+                },
+                "end_b": {
+                  "latitude": 41.65625,
+                  "longitude": -70.40625
+                }
+              },
+              "official_start_time": {
+                "nanos": 0,
+                "seconds": 1777000600
+              },
+              "race_plan_id": "plan-9",
+              "race_recording_id": "2026-08-13-1",
+              "race_session_id": "session-3",
+              "route_geometry": [
+                {
+                  "latitude": 41.5625,
+                  "longitude": -70.3125
+                },
+                {
+                  "latitude": 41.6875,
+                  "longitude": -70.4375
+                },
+                {
+                  "latitude": 41.71875,
+                  "longitude": -70.46875
+                }
+              ],
+              "route_hash": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+              "route_request_id": "route-req-11",
+              "sampling_rules": {
+                "default_mode": "SAMPLE_MODE_OUTING_1HZ",
+                "event_mode": "SAMPLE_MODE_EVENT_10HZ",
+                "finish_window_seconds": 90,
+                "mark_proximity_meters": 150,
+                "race_mode": "SAMPLE_MODE_RACE_5HZ",
+                "start_window_seconds": 120
+              },
+              "shortened_course": true,
+              "shortened_final_mark_code": "2a",
+              "start_line": {
+                "end_a": {
+                  "latitude": 41.5,
+                  "longitude": -70.25
+                },
+                "end_b": {
+                  "latitude": 41.53125,
+                  "longitude": -70.28125
+                }
+              }
+            }
+          }
+        },
+        "device_id": "00112233-4455-6677-8899-aabbccddeeff",
+        "protocol_version": 1
+      }
+    },
+    {
+      "expected": {
+        "device_command_hex": "0a2431313233343536372d383961622d636465662d666564632d6261393837363534333231311213676f6c64656e2d61737369676e6d656e742d311808222036663866303466366132613163376630663065316432633362346135393638382a0608a8c4abcf06320608b8e0abcf0692015c0a0c726f7574652d7265712d31321212090000000000cc44401100000000009651c01212090000000000ce44401100000000009751c01a20623263336434653566363037313832393361346235633664376538663930613122023261",
+        "server_reply_hex": "0801122430303131323233332d343435352d363637372d383839392d6161626263636464656566661ace010a2431313233343536372d383961622d636465662d666564632d6261393837363534333231311213676f6c64656e2d61737369676e6d656e742d311808222036663866303466366132613163376630663065316432633362346135393638382a0608a8c4abcf06320608b8e0abcf0692015c0a0c726f7574652d7265712d31321212090000000000cc44401100000000009651c01212090000000000ce44401100000000009751c01a20623263336434653566363037313832393361346235633664376538663930613122023261"
+      },
+      "name": "route_update",
+      "server_reply": {
+        "command": {
+          "assignment_hash": "6f8f04f6a2a1c7f0f0e1d2c3b4a59688",
+          "assignment_id": "golden-assignment-1",
+          "assignment_version": 8,
+          "command_id": "11234567-89ab-cdef-fedc-ba9876543211",
+          "expires_at": {
+            "nanos": 0,
+            "seconds": 1777004600
+          },
+          "issued_at": {
+            "nanos": 0,
+            "seconds": 1777001000
+          },
+          "payload": {
+            "route_update": {
+              "active_mark_code": "2a",
+              "route_geometry": [
+                {
+                  "latitude": 41.59375,
+                  "longitude": -70.34375
+                },
+                {
+                  "latitude": 41.609375,
+                  "longitude": -70.359375
+                }
+              ],
+              "route_hash": "b2c3d4e5f60718293a4b5c6d7e8f90a1",
+              "route_request_id": "route-req-12"
+            }
+          }
+        },
+        "device_id": "00112233-4455-6677-8899-aabbccddeeff",
+        "protocol_version": 1
+      }
+    },
+    {
+      "expected": {
+        "device_command_hex": "0a2432313233343536372d383961622d636465662d666564632d6261393837363534333231321213676f6c64656e2d61737369676e6d656e742d311809222037663866303466366132613163376630663065316432633362346135393638399a01040a02574c",
+        "server_reply_hex": "0801122430303131323233332d343435352d363637372d383839392d6161626263636464656566661a660a2432313233343536372d383961622d636465662d666564632d6261393837363534333231321213676f6c64656e2d61737369676e6d656e742d311809222037663866303466366132613163376630663065316432633362346135393638399a01040a02574c"
+      },
+      "name": "active_waypoint_update",
+      "server_reply": {
+        "command": {
+          "assignment_hash": "7f8f04f6a2a1c7f0f0e1d2c3b4a59689",
+          "assignment_id": "golden-assignment-1",
+          "assignment_version": 9,
+          "command_id": "21234567-89ab-cdef-fedc-ba9876543212",
+          "payload": {
+            "active_waypoint_update": {
+              "active_mark_code": "WL"
+            }
+          }
+        },
+        "device_id": "00112233-4455-6677-8899-aabbccddeeff",
+        "protocol_version": 1
+      }
+    },
+    {
+      "expected": {
+        "device_command_hex": "0a2433313233343536372d383961622d636465662d666564632d6261393837363534333231331213676f6c64656e2d61737369676e6d656e742d31180a222038663866303466366132613163376630663065316432633362346135393638612a060890ccabcf06320608a0e8abcf06a201100a0e726163655f6162616e646f6e6564",
+        "server_reply_hex": "0801122430303131323233332d343435352d363637372d383839392d6161626263636464656566661a82010a2433313233343536372d383961622d636465662d666564632d6261393837363534333231331213676f6c64656e2d61737369676e6d656e742d31180a222038663866303466366132613163376630663065316432633362346135393638612a060890ccabcf06320608a0e8abcf06a201100a0e726163655f6162616e646f6e6564"
+      },
+      "name": "cancel_assignment",
+      "server_reply": {
+        "command": {
+          "assignment_hash": "8f8f04f6a2a1c7f0f0e1d2c3b4a5968a",
+          "assignment_id": "golden-assignment-1",
+          "assignment_version": 10,
+          "command_id": "31234567-89ab-cdef-fedc-ba9876543213",
+          "expires_at": {
+            "nanos": 0,
+            "seconds": 1777005600
+          },
+          "issued_at": {
+            "nanos": 0,
+            "seconds": 1777002000
+          },
+          "payload": {
+            "cancel_assignment": {
+              "reason": "race_abandoned"
+            }
+          }
+        },
+        "device_id": "00112233-4455-6677-8899-aabbccddeeff",
+        "protocol_version": 1
+      }
+    }
+  ]
+}
