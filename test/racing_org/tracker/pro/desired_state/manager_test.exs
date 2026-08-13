@@ -3277,6 +3277,65 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     end)
   end
 
+  test "opt-in checkpoint hydration startup barrier stays closed until exact begin and finish", ctx do
+    fixture = fully_stage(ctx.store, DS.generation_fixture())
+    assert {:ok, nil} = Store.activate(ctx.store, 1, fixture.manifest_hash)
+
+    manager =
+      start_manager(ctx,
+        checkpoint_hydration_startup_barrier: true,
+        owner_retry_base_ms: 10
+      )
+
+    refute_receive {:applier, :reconcile, _startup}
+    assert OperationalGate.status(ctx.gate) == :closed
+
+    assert Manager.status(manager).checkpoint_hydration == %{
+             state: :blocked,
+             binding: nil,
+             coordinator_available?: false
+           }
+
+    coordinator = start_hydration_coordinator(manager)
+    token = make_ref()
+    binding = pointer(fixture)
+
+    assert :ok = hydration_command(coordinator, :begin, token, binding)
+
+    assert Manager.status(manager).checkpoint_hydration == %{
+             state: :blocked,
+             binding: binding,
+             coordinator_available?: true
+           }
+
+    assert {:error, :checkpoint_hydration_token_mismatch} =
+             hydration_command(coordinator, :finish, make_ref(), binding)
+
+    assert OperationalGate.status(ctx.gate) == :closed
+    assert :ok = hydration_command(coordinator, :finish, token, binding)
+    assert_receive {:applier, :reconcile, reconcile}
+    assert reconcile.pointer == binding
+    assert OperationalGate.status(ctx.gate) == {:open, gate_binding(fixture)}
+  end
+
+  test "an unowned startup hydration barrier fails closed without an active binding", ctx do
+    manager = start_manager(ctx, checkpoint_hydration_startup_barrier: true)
+    coordinator = start_hydration_coordinator(manager)
+    binding = pointer(DS.generation_fixture())
+
+    assert {:error, :checkpoint_hydration_binding_mismatch} =
+             hydration_command(coordinator, :begin, make_ref(), binding)
+
+    refute_receive {:applier, :reconcile, _startup}
+    assert OperationalGate.status(ctx.gate) == :closed
+
+    assert Manager.status(manager).checkpoint_hydration == %{
+             state: :blocked,
+             binding: nil,
+             coordinator_available?: false
+           }
+  end
+
   test "checkpoint hydration synchronously blocks an open runtime and every reconciliation path", ctx do
     fixture = fully_stage(ctx.store, DS.generation_fixture())
     assert {:ok, nil} = Store.activate(ctx.store, 1, fixture.manifest_hash)
@@ -3766,6 +3825,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
       owner_retry_base_ms: Keyword.get(opts, :owner_retry_base_ms, 25),
       owner_retry_max_ms: Keyword.get(opts, :owner_retry_max_ms, 5_000),
       owner_resolution_timeout_ms: Keyword.get(opts, :owner_resolution_timeout_ms, 100),
+      checkpoint_hydration_startup_barrier: Keyword.get(opts, :checkpoint_hydration_startup_barrier, false),
       compatibility: compatibility(),
       applier: Keyword.get(opts, :applier, applier(ctx)),
       ack_sink: Keyword.get(opts, :ack_sink, ack_sink(ctx))

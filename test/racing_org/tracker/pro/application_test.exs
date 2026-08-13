@@ -183,6 +183,7 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
 
       assert is_reference(gate_capability)
       assert manager_capability == gate_capability
+      assert Keyword.fetch!(manager_opts, :checkpoint_hydration_startup_barrier)
     end
 
     test "logger starts the complete desired-state runtime before channel traffic" do

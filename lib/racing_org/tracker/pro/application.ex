@@ -400,7 +400,10 @@ defmodule RacingOrg.Tracker.Pro.Application do
 
   defp desired_state_manager_children(:logger, controller_capability) do
     [
-      RacingOrg.Tracker.Pro.DesiredState.Runtime.manager_child_spec(controller_capability: controller_capability)
+      RacingOrg.Tracker.Pro.DesiredState.Runtime.manager_child_spec(
+        controller_capability: controller_capability,
+        checkpoint_hydration_startup_barrier: true
+      )
     ]
   end
 

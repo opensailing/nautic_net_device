@@ -190,7 +190,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.RuntimeTest do
     assert_receive {:reset_to_compile_default, ^owner_pid_map}
   end
 
-  test "forwards operational lease timing overrides to the Manager" do
+  test "forwards hydration startup barrier and operational lease timing to the Manager" do
     base = Path.join(System.tmp_dir!(), "desired_runtime_#{System.unique_integer([:positive])}")
     boot_term_key = {__MODULE__, make_ref()}
     gate_term_key = {__MODULE__, make_ref()}
@@ -228,6 +228,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.RuntimeTest do
           identity_refresh_ms: 10_000,
           lease_heartbeat_ms: 17,
           lease_timeout_ms: 43,
+          checkpoint_hydration_startup_barrier: true,
           applier_callbacks: %{owners: fn -> %{} end}
         )
       )
@@ -235,5 +236,13 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.RuntimeTest do
     state = :sys.get_state(manager)
     assert state.lease_heartbeat_ms == 17
     assert state.lease_timeout_ms == 43
+
+    assert state.checkpoint_hydration == %{
+             state: :blocked,
+             coordinator_pid: nil,
+             coordinator_available?: false,
+             token: nil,
+             binding: nil
+           }
   end
 end

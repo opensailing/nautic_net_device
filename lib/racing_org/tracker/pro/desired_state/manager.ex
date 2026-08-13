@@ -181,7 +181,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
       owner_retry_token: nil,
       recovery_error: nil,
       recovery_quiescent?: false,
-      checkpoint_hydration: nil,
+      checkpoint_hydration: checkpoint_hydration_startup_barrier(opts),
       checkpoint_hydration_monitor_ref: nil
     }
 
@@ -2640,6 +2640,20 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     end
   end
 
+  defp checkpoint_hydration_startup_barrier(opts) do
+    if Keyword.get(opts, :checkpoint_hydration_startup_barrier, false) == true do
+      %{
+        state: :blocked,
+        coordinator_pid: nil,
+        coordinator_available?: false,
+        token: nil,
+        binding: nil
+      }
+    else
+      nil
+    end
+  end
+
   defp pointer_from(binding) do
     %{
       device_id: binding.device_id,
@@ -2824,7 +2838,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
   defp mark_checkpoint_hydration_stale(%{checkpoint_hydration: nil} = state), do: state
 
   defp mark_checkpoint_hydration_stale(%{checkpoint_hydration: hydration} = state) do
-    %{state | checkpoint_hydration: %{hydration | state: :blocked}}
+    %{state | checkpoint_hydration: Map.put(hydration, :state, :blocked)}
   end
 
   defp checkpoint_hydration_dependency(%{

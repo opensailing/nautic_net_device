@@ -76,6 +76,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Runtime do
       owner_retry_max_ms: Keyword.get(opts, :owner_retry_max_ms, 5_000),
       lease_heartbeat_ms: Keyword.get(opts, :lease_heartbeat_ms, 1_000),
       lease_timeout_ms: Keyword.get(opts, :lease_timeout_ms, 5_000),
+      checkpoint_hydration_startup_barrier: Keyword.get(opts, :checkpoint_hydration_startup_barrier, false),
       compatibility: Keyword.get_lazy(opts, :compatibility, fn -> compatibility(opts) end),
       applier:
         Keyword.get_lazy(opts, :applier_callbacks, fn ->
