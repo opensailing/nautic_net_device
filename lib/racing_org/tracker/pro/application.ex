@@ -91,7 +91,8 @@ defmodule RacingOrg.Tracker.Pro.Application do
       coordinator_starter.(
         name: Keyword.get(opts, :name, RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator),
         journal_path: Keyword.fetch!(opts, :journal_path),
-        head_store: head_store
+        head_store: head_store,
+        reconcile_empty_journal: Keyword.get(opts, :reconcile_empty_journal, false)
       )
     end
   rescue
@@ -274,6 +275,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
                journal_path: checkpoint_hydration_journal_path(),
                head_store_base_dir: checkpoint_head_root(),
                head_store_transition_timeout_ms: @checkpoint_head_transition_timeout_ms,
+               reconcile_empty_journal: true,
                identity: &RacingOrg.Tracker.Pro.DesiredState.Runtime.identity/0,
                identity_authority: &checkpoint_head_identity_authority/1,
                coordinator_starter: &coordinator.start_link/1

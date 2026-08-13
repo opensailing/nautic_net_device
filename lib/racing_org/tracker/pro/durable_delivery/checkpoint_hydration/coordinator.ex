@@ -122,8 +122,10 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       record_module: Keyword.get(opts, :record_module, Record),
       journal_opts: Keyword.get(opts, :journal_opts, []),
       boundary: Keyword.get(opts, :boundary, fn _stage -> :ok end),
+      reconcile_empty_journal?: Keyword.get(opts, :reconcile_empty_journal, false) == true,
       blocker: nil,
       selected_head: nil,
+      reconciliation_heads: %{},
       fresh_request?: false,
       recovery_error: nil
     }
@@ -304,6 +306,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   defp recover_state(state) do
     case journal_read(state) do
+      :empty when state.reconcile_empty_journal? ->
+        reconcile_empty_journal(state)
+
       :empty ->
         {:ok, %{state | blocker: nil, selected_head: nil, recovery_error: nil}}
 
@@ -314,6 +319,107 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
         {:error, reason, state}
     end
   end
+
+  defp reconcile_empty_journal(state) do
+    with {:ok, manager_state} <- manager_state(state),
+         {:ok, binding} <- active_binding(manager_state),
+         :ok <- match_target(binding, manager_state.identity),
+         token = make_ref(),
+         :ok <- manager_begin(state, token, binding) do
+      state = %{
+        state
+        | blocker: %{token: token, binding: binding, record: nil},
+          selected_head: nil,
+          reconciliation_heads: %{},
+          fresh_request?: false
+      }
+
+      with {:ok, state} <- restore_current_heads(state, RuntimeRegistry.entries(state.registry)),
+           :ok <- revalidate_binding_without_record(state),
+           :ok <- ensure_reconciliation_heads_current(state),
+           :ok <- manager_finish(state) do
+        {:ok,
+         %{
+           state
+           | blocker: nil,
+             selected_head: nil,
+             reconciliation_heads: %{},
+             recovery_error: nil
+         }}
+      else
+        {:error, reason, %{} = state} -> {:error, reason, state}
+        {:error, reason} -> {:error, reason, state}
+      end
+    else
+      {:error, reason} -> {:error, reason, state}
+    end
+  end
+
+  defp restore_current_heads(state, entries) do
+    Enum.reduce_while(entries, {:ok, state}, fn {kind, schema_version, adapter}, {:ok, state} ->
+      case state.store_module.head(state.head_store, kind) do
+        :empty ->
+          {:cont, {:ok, state}}
+
+        {:ok, selected_head} ->
+          with true <- selected_head.schema_version == schema_version,
+               :ok <- state.record_module.verify(selected_head),
+               :ok <- match_reconciliation_head(state, selected_head),
+               {:ok, runtime} <- decode_runtime(state, adapter, selected_head),
+               {:ok, {module, function}} <- Map.fetch(state.restorers, kind),
+               :ok <- restore_with(module, function, runtime) do
+            state = put_in(state.reconciliation_heads[kind], selected_head)
+            {:cont, {:ok, state}}
+          else
+            false -> {:halt, {:error, :checkpoint_hydration_head_schema_mismatch, state}}
+            :error -> {:halt, {:error, :unknown_checkpoint_runtime_restorer, state}}
+            {:error, reason} -> {:halt, {:error, reason, state}}
+          end
+
+        {:error, reason} ->
+          {:halt, {:error, reason, state}}
+      end
+    end)
+  end
+
+  defp ensure_reconciliation_heads_current(state) do
+    Enum.reduce_while(state.reconciliation_heads, :ok, fn {kind, selected_head}, :ok ->
+      case state.store_module.head(state.head_store, kind) do
+        {:ok, current_head} ->
+          if same_selected_head?(selected_head, current_head),
+            do: {:cont, :ok},
+            else: {:halt, {:error, :checkpoint_hydration_head_changed}}
+
+        :empty ->
+          {:halt, {:error, :checkpoint_hydration_head_changed}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+  end
+
+  defp revalidate_binding_without_record(%{blocker: %{binding: binding}} = state) do
+    with {:ok, manager_state} <- manager_state(state),
+         {:ok, active_binding} <- active_binding(manager_state),
+         :ok <- match_binding(active_binding, binding),
+         :ok <- match_target(binding, manager_state.identity) do
+      :ok
+    end
+  end
+
+  defp match_reconciliation_head(%{blocker: %{binding: binding}}, selected_head) do
+    if selected_head.device_id == binding.device_id and
+         selected_head.local_credential_epoch == binding.credential_epoch and
+         selected_head.local_storage_epoch == binding.storage_epoch do
+      :ok
+    else
+      {:error, :checkpoint_hydration_selected_head_mismatch}
+    end
+  end
+
+  defp recover_blocked_state(%{blocker: %{record: nil}, reconcile_empty_journal?: true} = state),
+    do: retry_empty_journal_reconciliation(state)
 
   defp recover_blocked_state(state) do
     case journal_read(state) do
@@ -330,6 +436,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   defp recover_for_retry(%{blocker: nil} = state), do: recover_state(state)
 
+  defp recover_for_retry(%{blocker: %{record: nil}, reconcile_empty_journal?: true} = state),
+    do: retry_empty_journal_reconciliation(state)
+
   defp recover_for_retry(state) do
     case journal_read(state) do
       {:ok, record} ->
@@ -343,6 +452,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
       {:error, reason} ->
         {:error, reason, state}
+    end
+  end
+
+  defp retry_empty_journal_reconciliation(state) do
+    case reconcile_empty_journal(%{state | blocker: nil, reconciliation_heads: %{}}) do
+      {:error, reason, %{blocker: nil}} -> {:error, reason, state}
+      result -> result
     end
   end
 
@@ -852,13 +968,17 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   defp restore_runtime(state, runtime) do
     with {:ok, {module, function}} <- Map.fetch(state.restorers, state.blocker.record.hydration.kind) do
-      case apply(module, function, [runtime]) do
-        :ok -> :ok
-        {:error, reason} -> {:error, reason}
-        _other -> {:error, :invalid_checkpoint_runtime_restore}
-      end
+      restore_with(module, function, runtime)
     else
       :error -> {:error, :unknown_checkpoint_runtime_restorer}
+    end
+  end
+
+  defp restore_with(module, function, runtime) do
+    case apply(module, function, [runtime]) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+      _other -> {:error, :invalid_checkpoint_runtime_restore}
     end
   rescue
     _exception -> {:error, :checkpoint_runtime_restore_failed}
@@ -959,9 +1079,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   defp put_record(state, record), do: put_in(state.blocker.record, record)
 
   defp safe_status(%{blocker: blocker, recovery_error: recovery_error}) do
+    phase = if is_map(blocker) and is_map(blocker.record), do: blocker.record.phase, else: nil
+
     %{
       blocked?: not is_nil(blocker),
-      phase: blocker && blocker.record.phase,
+      phase: phase,
       recovery_error: safe_recovery_error(recovery_error)
     }
   end

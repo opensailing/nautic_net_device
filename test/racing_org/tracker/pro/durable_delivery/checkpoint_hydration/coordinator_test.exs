@@ -402,6 +402,48 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
     %{hydration: hydration, registry: registry, identity: identity, session: session}
   end
 
+  test "production empty-journal startup restores current exact heads before releasing the barrier", ctx do
+    selected = selected_record(ctx.hydration, content: "startup-current-runtime", sequence: 10)
+    Backend.put(:head, selected)
+
+    pid = start_coordinator(ctx, reconcile_empty_journal: true)
+
+    assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+    assert Backend.data(:restored) == [%{runtime: %{content: selected.content}}]
+    assert Backend.data(:manager_finished?)
+    assert :manager_begin in core_operations()
+    assert :store_head in core_operations()
+  end
+
+  test "empty-journal head changes before finish retain the startup blocker", ctx do
+    selected = selected_record(ctx.hydration, content: "startup-current-runtime", sequence: 10)
+
+    advanced =
+      selected_record(ctx.hydration,
+        content: "startup-advanced-runtime",
+        sequence: 11,
+        parent_hash: selected.checkpoint_hash
+      )
+
+    Backend.put(:head, selected)
+    Backend.respond(:store_head, [{:return, {:ok, selected}}, {:return, {:ok, advanced}}])
+
+    pid = start_coordinator(ctx, reconcile_empty_journal: true)
+
+    assert %{
+             blocked?: true,
+             phase: nil,
+             recovery_error: :checkpoint_hydration_head_changed
+           } = Coordinator.status(pid)
+
+    assert Backend.data(:manager_blocked?)
+    refute Backend.data(:manager_finished?)
+
+    assert :ok = Coordinator.recover(pid)
+    assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+    assert Backend.data(:manager_finished?)
+  end
+
   test "fresh hydration follows the crash-safe order and binds the session and transaction", ctx do
     pid = start_coordinator(ctx)
     Backend.clear_operations()
@@ -1097,6 +1139,56 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
       assert Backend.data(:manager_finished?)
       assert Backend.data(:journal) == nil
       assert Backend.data(:installed_binding) == @binding
+    end)
+  end
+
+  test "manager replacement reclaims a retained empty-journal blocker and retries automatically", ctx do
+    selected = selected_record(ctx.hydration, content: "startup-current-runtime", sequence: 10)
+
+    advanced =
+      selected_record(ctx.hydration,
+        content: "startup-advanced-runtime",
+        sequence: 11,
+        parent_hash: selected.checkpoint_hash
+      )
+
+    Backend.put(:head, selected)
+    Backend.respond(:store_head, [{:return, {:ok, selected}}, {:return, {:ok, advanced}}])
+
+    pid = start_coordinator(ctx, reconcile_empty_journal: true)
+
+    assert %{
+             blocked?: true,
+             phase: nil,
+             recovery_error: :checkpoint_hydration_head_changed
+           } = Coordinator.status(pid)
+
+    assert Backend.data(:manager_blocked?)
+    refute Backend.data(:manager_finished?)
+    assert Backend.data(:journal) == nil
+
+    Backend.put(:head, advanced)
+    old_manager = Backend.data(:manager_pid)
+    Process.exit(old_manager, :kill)
+    Process.sleep(30)
+
+    assert Process.alive?(pid)
+
+    replacement = spawn(fn -> Process.sleep(:infinity) end)
+    Backend.put(:manager_pid, replacement)
+    Backend.put(:manager_blocked?, false)
+    Backend.put(:installed_binding, nil)
+    Backend.put(:installed_token, nil)
+
+    eventually(fn ->
+      assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+      assert Backend.data(:manager_finished?)
+      assert Backend.data(:installed_binding) == @binding
+
+      assert Backend.data(:restored) == [
+               %{runtime: %{content: advanced.content}},
+               %{runtime: %{content: selected.content}}
+             ]
     end)
   end
 

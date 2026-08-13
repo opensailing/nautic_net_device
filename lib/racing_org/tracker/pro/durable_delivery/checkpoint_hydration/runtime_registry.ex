@@ -41,6 +41,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.RuntimeRegis
 
   def new(_entries), do: {:error, :invalid_checkpoint_runtime_registry}
 
+  @spec entries(t()) :: [{atom(), pos_integer(), module()}]
+  def entries(%__MODULE__{} = registry) do
+    registry.entries
+    |> Enum.map(fn {{kind, schema_version}, adapter} -> {kind, schema_version, adapter} end)
+    |> Enum.sort()
+  end
+
   @spec fetch(t(), atom(), pos_integer()) ::
           {:ok, module()}
           | {:error,

@@ -24,6 +24,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.RuntimeRegis
     assert {:ok, PolarV3Adapter} = RuntimeRegistry.fetch(registry, :polar, 3)
     assert {:ok, WindShiftV2Adapter} = RuntimeRegistry.fetch(registry, :wind_shift, 2)
 
+    assert RuntimeRegistry.entries(registry) == [
+             {:calibration, 2, CalibrationV2Adapter},
+             {:polar, 3, PolarV3Adapter},
+             {:wind_shift, 2, WindShiftV2Adapter}
+           ]
+
     assert {:error, :unsupported_checkpoint_runtime_schema} =
              RuntimeRegistry.fetch(registry, :calibration, 1)
 

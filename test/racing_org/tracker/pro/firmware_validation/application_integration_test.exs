@@ -151,6 +151,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.ApplicationIntegrationTest do
     assert Path.type(opts[:journal_path]) == :absolute
     assert Path.type(opts[:head_store_base_dir]) == :absolute
     assert opts[:head_store_transition_timeout_ms] == 180_000
+    assert opts[:reconcile_empty_journal]
     assert is_function(opts[:identity], 0)
     assert is_function(opts[:identity_authority], 1)
     assert is_function(opts[:coordinator_starter], 1)
@@ -171,6 +172,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.ApplicationIntegrationTest do
       name: nil,
       journal_path: journal,
       head_store_base_dir: Path.join(base, "heads"),
+      reconcile_empty_journal: true,
       identity: fn -> {:ok, identity} end,
       identity_authority: fn transition -> transition.(identity) end,
       coordinator_starter: fn coordinator_opts ->
@@ -183,6 +185,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.ApplicationIntegrationTest do
 
     assert_receive {:hydration_coordinator_opts, coordinator_opts}
     assert coordinator_opts[:journal_path] == journal
+    assert coordinator_opts[:reconcile_empty_journal]
     assert %CheckpointHeadStore{} = coordinator_opts[:head_store]
     assert coordinator_opts[:head_store].base_dir == Path.join(base, "heads")
     assert coordinator_opts[:head_store].device_id == identity.device_id
