@@ -11,8 +11,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.RegistryTest do
     assert Registry.command_types() == [
              :noop,
              :persist_checkpoints,
-             :sync_checkpoints,
-             :validate_firmware
+             :sync_checkpoints
            ]
 
     for type <- Registry.command_types() do
@@ -23,16 +22,25 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.RegistryTest do
       assert function_exported?(module, :with_non_application_lease, 5)
     end
 
+    assert {:error, :unsupported_command} = Registry.provider(:validate_firmware)
     assert {:error, :unsupported_command} = Registry.provider(:arbitrary)
     assert {:error, :unsupported_command} = Registry.provider("noop")
   end
 
-  test "recovery verifiers cover exactly the supported types" do
+  test "recovery verifiers cover exactly the supported types plus the retired firmware reader" do
     verifiers = Registry.recovery_verifiers()
 
-    assert Map.keys(verifiers) |> Enum.sort() == Registry.command_types()
+    assert Map.keys(verifiers) |> Enum.sort() == [
+             :noop,
+             :persist_checkpoints,
+             :sync_checkpoints,
+             :validate_firmware
+           ]
 
-    for {type, {module, _context}} <- verifiers do
+    assert {RacingOrg.Tracker.Pro.Commands.Ledger.Provider.ValidateFirmware, nil} =
+             verifiers.validate_firmware
+
+    for {type, {module, _context}} <- Map.delete(verifiers, :validate_firmware) do
       assert {:ok, ^module} = Registry.provider(type)
     end
   end
@@ -46,6 +54,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.RegistryTest do
                Registry.decode_payload(payload("persist_checkpoints", %{"targets" => ["polar"]}))
 
       assert decoded == %{type: :persist_checkpoints, args: %{targets: [:polar]}}
+      assert {:error, :unsupported_command} = Registry.decode_payload(payload("validate_firmware", %{}))
     end
 
     test "rejects noncanonical, unknown, and malformed envelopes without raising" do

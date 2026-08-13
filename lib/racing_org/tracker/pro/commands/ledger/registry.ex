@@ -32,9 +32,12 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Registry do
   @commands [
     {:noop, Provider.Noop, 512},
     {:persist_checkpoints, Provider.PersistCheckpoints, 1_024},
-    {:sync_checkpoints, Provider.SyncCheckpoints, 1_024},
-    {:validate_firmware, Provider.ValidateFirmware, 512}
+    {:sync_checkpoints, Provider.SyncCheckpoints, 1_024}
   ]
+
+  @retired_recovery_verifiers %{
+    validate_firmware: {Provider.ValidateFirmware, nil}
+  }
 
   @command_types @commands |> Enum.map(&elem(&1, 0)) |> Enum.sort()
   @provider_by_type Map.new(@commands, fn {type, module, _reserved} -> {type, module} end)
@@ -66,10 +69,11 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Registry do
 
   def provider(_type), do: {:error, :unsupported_command}
 
-  @doc "The `Store` recovery-verifier map covering exactly the supported types."
+  @doc "The `Store` verifier map for supported types and read-only recovery of retired intents."
   @spec recovery_verifiers() :: %{command_type() => {module(), nil}}
   def recovery_verifiers do
-    Map.new(@commands, fn {type, module, _reserved} -> {type, {module, nil}} end)
+    @retired_recovery_verifiers
+    |> Map.merge(Map.new(@commands, fn {type, module, _reserved} -> {type, {module, nil}} end))
   end
 
   @doc """

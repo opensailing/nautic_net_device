@@ -333,8 +333,6 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
       # "computed_values_status". A {module, server} pair (bare module = both).
       compute_broadcaster:
         normalize_collaborator(Keyword.get(opts, :compute_broadcaster, RacingOrg.Tracker.Pro.Compute.Broadcaster)),
-      firmware_validator:
-        Keyword.get(opts, :firmware_validator, &RacingOrg.Tracker.Pro.FirmwareValidator.validate_on_connect/0),
       backoff_opts: Keyword.get(opts, :backoff, Backoff.defaults()),
       control_offer: control_offer,
       control_selection: control_selection,
@@ -465,10 +463,6 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
             |> assign(:owned_session_generation, published_session.generation)
             |> report_authenticated()
 
-          # The device has connected to RacingOrg correctly -> mark the running
-          # firmware VALID (idempotent, best-effort). A bad OTA that never reaches
-          # this point stays unvalidated and auto-reverts on the next reboot.
-          _ = socket.assigns.firmware_validator.()
           # Report current WiFi status once the session is live so the server
           # reflects the device's actual state on (re)connect.
           send(self(), :report_wifi_status)

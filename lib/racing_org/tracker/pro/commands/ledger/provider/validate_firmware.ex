@@ -1,45 +1,35 @@
 defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Provider.ValidateFirmware do
   @moduledoc """
-  Mark the running firmware valid on the owner's explicit instruction.
+  Read-only recovery provider for retired `validate_firmware` command intents.
 
-  Unlike the checkpoint commands this effect is IRREVERSIBLE: once Nerves records
-  the running slot as validated, U-Boot will no longer revert it. Recovery
-  therefore never re-runs the effect. It reads the firmware's own validation flag,
-  which is the authoritative record of whether the effect landed:
+  Firmware validation is owned exclusively by the supervised
+  `RacingOrg.Tracker.Pro.FirmwareValidation.Trial` health gate. New command
+  deliveries are not registered, and `execute/2` fails closed so this provider
+  cannot bypass the trial and invoke the irreversible validation writer.
 
-    * already valid  -> `{:applied, ...}`. The flag is the effect's own receipt.
-      It cannot distinguish "this command validated it" from "it was already
-      valid", but both are the same terminal device state and the command's
-      contract is `the running firmware is valid`, so completing is truthful.
-    * not valid      -> `{:not_applied, :effect_verified_absent}`. The effect
-      provably did not land, so the intent is rejected under the lease.
+  Existing pending intents may still be present in durable ledgers. Recovery
+  never runs the effect; it reads the firmware's own validation flag, which is the
+  authoritative record of whether the old effect landed:
+
+    * already valid -> `:ambiguous`. The flag cannot prove whether the retired
+      command performed validation or the supervised trial did, so recovery does
+      not fabricate an applied result or ACK.
+    * not valid -> `{:not_applied, :effect_verified_absent}`. The old command's
+      effect provably did not land, so the intent is rejected under the lease.
     * flag unreadable -> `:ambiguous`. The intent stays pending and no ACK is
       emitted rather than guessing about an irreversible effect.
   """
 
   use RacingOrg.Tracker.Pro.Commands.Ledger.Provider
 
-  alias RacingOrg.Tracker.Pro.FirmwareValidator
-
   @impl true
-  def execute(_intent, context) do
-    case FirmwareValidator.validate_on_connect(validator_opts(context)) do
-      :validated -> {:ok, %{outcome: :applied, detail: :validated}}
-      :already_valid -> {:ok, %{outcome: :applied, detail: :already_valid}}
-      :unavailable -> {:ok, %{outcome: :failed, detail: :unavailable}}
-      :error -> {:ok, %{outcome: :failed, detail: :validation_failed}}
-    end
-  rescue
-    _exception -> {:ok, %{outcome: :failed, detail: :validation_failed}}
-  catch
-    _kind, _reason -> {:ok, %{outcome: :failed, detail: :validation_failed}}
-  end
+  def execute(_intent, _context), do: {:error, :firmware_validation_requires_supervised_trial}
 
   @impl true
   def recover(_intent, context) do
     case firmware_valid?(context) do
-      {:ok, true} -> {:applied, %{outcome: :applied, detail: :already_valid}}
       {:ok, false} -> {:not_applied, :effect_verified_absent}
+      {:ok, true} -> :ambiguous
       :error -> :ambiguous
     end
   end

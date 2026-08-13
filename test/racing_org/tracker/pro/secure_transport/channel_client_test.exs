@@ -1199,7 +1199,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       assert {:ok, 4} = BootProvisioner.credential_epoch(boot_provisioner)
     end
 
-    test "validates the running firmware once the RacingOrg session is live", ctx do
+    test "an authenticated WSS handshake does not invoke firmware validation", ctx do
       {:ok, holder} = start_supervised({SessionHolder, name: nil})
       parent = self()
       topic = "device:" <> ctx.identity.fingerprint
@@ -1233,8 +1233,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
 
       push(client, topic, "handshake_ok", %{"session_id" => Base.encode64(server_session.session_id)})
 
-      # The firmware is validated exactly when the device connects to RacingOrg correctly.
-      assert_receive :firmware_validated
+      assert_push(^topic, "wifi_status", _status)
+      assert SessionHolder.live?(holder)
+      refute_received :firmware_validated
     end
 
     test "reports authenticated readiness and clears it with the live session on disconnect", ctx do
