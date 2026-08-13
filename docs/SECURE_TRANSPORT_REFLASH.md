@@ -1,316 +1,200 @@
-# Secure-Transport Reflash + Enforcement Runbook (one device, end to end)
+# Secure Transport Reflash Runbook
 
-Operator runbook for the secure-transport rollout of a SINGLE Nautic Net device
-against the RacingOrg server, covering: server prep, device provisioning + reflash,
-and verification.
+Operator procedure for building, installing, and verifying one RacingOrg tracker
+image with Secure Transport v2. Stateless identity recovery, desired-state
+hydration, durable delivery, and migration policy are covered in
+[STATELESS_RECOVERY_RUNBOOK.md](STATELESS_RECOVERY_RUNBOOK.md).
 
-> The device firmware is now ALWAYS secure-only for UDP telemetry: each DataSet is
-> sealed into an AEAD frame when a live session exists, and DROPPED (never sent in
-> the clear) when there is no live session. There is no plaintext fallback and no
-> device-side flag to flip — provisioning + verifying secure transport is the whole
-> device-side job. The only remaining coordinated cutover is on the SERVER (§4):
-> flipping the per-device column so the server REJECTS any plaintext attributed to
-> the device.
+The backend must already support the image before it is installed. Do not use a
+tracker reflash as the first rollout step.
 
-This is the operational counterpart to the device wiring landed in P9-job-6
-(`RacingOrg.Tracker.Pro.SecureTransport.SessionHolder` / `ChannelClient` / `BootProvisioner` in
-the supervision tree, and the post-race `BulkUploader` trigger from
-`RacingOrg.Tracker.Pro.Race.Archive`).
+## 1. Security invariants
 
-> Terminology: "device" = the Nerves firmware in `racing_org_tracker_pro`; "server" =
-> RacingOrg (`backend`, deployed on Fly). All crypto is Ed25519 + ChaCha20-Poly1305;
-> there is no PKI — the device PINS the server's public key and the server records
-> the device's self-registered public key (a `DeviceKey`).
->
-> Provisioning is TOKENLESS (Phase AC7): there is no claim token / server nonce. On
-> boot the device generates its Ed25519 identity and self-registers it with the server
-> via proof-of-possession (`POST /api/devices/register`). The device starts UNASSIGNED;
-> an admin associates it to an account (by email) in the web panel afterward.
+- Tracker telemetry is AEAD-only. With a live authenticated session, telemetry
+  is sealed; without one, telemetry is dropped. The tracker never sends a
+  plaintext fallback.
+- Backend UDP ingest also rejects non-AEAD telemetry unconditionally. There is
+  no per-device plaintext cutover column and no fleet-wide plaintext kill
+  switch to operate.
+- The tracker pins the backend Ed25519 public key. The corresponding private
+  material remains backend-only and must never be copied into firmware notes,
+  shell history, tickets, or this repository.
+- Registration and development serial recovery are proof-of-possession flows.
+  The Raspberry Pi serial is not a credential and must not be printed or
+  recorded in operator evidence.
+- A new image must preserve `/data` unless replacement of the storage
+  incarnation is intentional. The device identity, bootstrap authority,
+  desired-state storage epoch, outbox, command ledger, and recovery journals
+  are durable state.
 
----
+## 2. Backend-first preflight
 
-## 0. Invariants and ordering (read first)
+Before building or installing firmware, the backend operator must confirm:
 
-- **Single-machine UDP invariant.** RacingOrg's UDP telemetry listener binds ONE
-  IPv4 socket on the fly-global-services address and command replies egress from
-  that same socket. Telemetry ingest, the per-device enforcement gate, and replies
-  are all on that single machine. Do not assume multi-machine UDP fan-out.
-- **Device is secure-only.** The firmware NEVER emits plaintext telemetry: with a
-  live session it sends AEAD; with no live session it drops the datagram. There is
-  no device-side flag and nothing to flip on the device — so the only coordinated
-  cutover left is on the SERVER (turning ON `requires_secure_transport=true` for the
-  device so the server rejects any plaintext attributed to it).
-- **Server-side coexistence default.** The server's per-device
-  `requires_secure_transport` defaults OFF (it still accepts plaintext from other
-  devices). Confirm AEAD telemetry is arriving and the channel session is healthy
-  before flipping it ON for this device (§4).
+1. Schema and application support for the firmware version are deployed.
+2. Secure transport is healthy and the pinned public key for the image is the
+   currently intended trust anchor.
+3. The device is visible in the admin device detail page and its current
+   credential epoch, desired-state status, and recovery gate are understood.
+4. If legacy serial recovery will be needed, the one-time binding and explicit
+   development enrollment are completed while both recovery kill switches
+   remain under operator control.
+5. Rollback remains available. For a local reflash, retain the prior known-good
+   image or media. For OTA, retain the prior Nerves partition/image and use the
+   safe trial procedure in the stateless recovery runbook.
 
----
+Do not install firmware first and hope that a later backend deployment will
+make it operable.
 
-## 1. Server prep (Fly / RacingOrg)
+## 3. Build-host configuration
 
-### 1.1 Ensure the server identity seed is set (prod REQUIRES it)
+Use `.envrc-example` as the configuration template, but never copy a PSK,
+token-shaped value, live domain, serial, or private key into operational notes.
+Do not inspect or quote `.envrc`.
 
-The server signs its handshake HELLO with its Ed25519 identity seed. In prod the seed
-MUST be configured (`RacingOrg.SecureTransport.ServerIdentity.private_seed/0` raises
-otherwise); dev/test falls back to a fixed non-secret seed.
-
-```sh
-# 32-byte seed, raw or hex. Generate once, store as a Fly secret.
-SEED_HEX=$(openssl rand -hex 32)
-fly secrets set SECURE_TRANSPORT_SERVER_SEED="$SEED_HEX" -a <your-app>
-```
-
-### 1.2 Obtain the server's pinned PUBLIC key (to pin on the device)
-
-The device authenticates the server against the server's Ed25519 PUBLIC key, derived
-from the seed. Derive it ON THE SERVER so it is exactly what the server will sign with:
+Safe local placeholders from `.envrc-example` are:
 
 ```sh
-fly ssh console -a <your-app> -C \
-  "/app/bin/racing_org eval 'IO.puts(Base.encode16(RacingOrg.SecureTransport.ServerIdentity.public_key(), case: :lower))'"
+export MIX_TARGET='racing_org_rpi3'
+export PRODUCT='logger'
+export API_ENDPOINT='http://localhost:4000'
+export UDP_ENDPOINT='localhost:4001'
+export NERVES_DL_DIR='/Volumes/Nerves/dl'
+export NERVES_ARTIFACTS_DIR='/Volumes/Nerves/artifacts'
 ```
 
-This prints a 64-char lowercase hex string — the value you set as
-`SECURE_TRANSPORT_SERVER_PUBLIC_KEY` on the device (section 2.1). It is the device's
-only server-trust anchor; treat a change to it as a firmware re-pin.
+For a non-local build, set the endpoints through the normal secret-managed
+operator environment without recording their values here.
 
-> Equivalent low-level form (same result):
-> `Base.encode16(RacingOrg.SecureTransport.Primitives.ed25519_public_from_secret(RacingOrg.SecureTransport.ServerIdentity.private_seed()), case: :lower)`
+Set `SECURE_TRANSPORT_SERVER_PUBLIC_KEY` in the build environment to the
+approved 32-byte Ed25519 public key representation. This value is a public
+trust anchor, not private signing material, but it should still be handled as
+controlled configuration because changing it changes which backend the image
+trusts. There is no separate secure-transport enable flag: a real device target
+plus this configured pin starts the secure-transport children.
 
-### 1.3 Create an admin account (for the post-registration association)
+NervesHub configuration is optional. If it is used, provide its host and
+credentials through the existing operator secret path; never paste them into a
+runbook or command transcript.
 
-There is NO claim token to mint. The device self-registers UNASSIGNED; an admin then
-associates it to an account by email (§3.6). Bootstrap an admin in the release:
+## 4. Build and install
+
+Build in the configured shell:
 
 ```sh
-fly ssh console -a <your-app> -C \
-  "/app/bin/racing_org eval 'RacingOrg.Release.create_admin(\"ops@example.com\", \"a sufficiently long password\")'"
+mix firmware
 ```
 
-Idempotent: re-running with the same email updates the password and re-confirms.
-
-> That is the entire server prep for provisioning: the server seed (§1.1), its pinned
-> public key (§1.2), and an admin account to do the association afterward. No token /
-> nonce mint step exists anymore.
-
----
-
-## 2. Device prep — build-host environment (baked into firmware)
-
-`config/config.exs` reads the values below from the **build-host environment at
-firmware-compile time** (the same mechanism as the existing `API_ENDPOINT` /
-`UDP_ENDPOINT`), so they are baked into the image. You do NOT edit `config/target.exs`
-or set anything on the running device — you `export` them in the shell that runs
-`mix firmware`. Any value left unset is `nil`/`false`, which leaves the
-secure-transport stack dormant (the safe default: `ServerIdentity` unpinned →
-`ChannelClient` won't connect AND `BootProvisioner` has no trusted server to register
-against → it no-ops).
-
-Provisioning values:
-
-| Env var | Maps to (wired in config.exs) | Purpose |
-|---|---|---|
-| `SECURE_TRANSPORT_SERVER_PUBLIC_KEY` | `ServerIdentity, public_key:` | The server pubkey from §1.2 (64-char hex or raw 32 bytes). The device's server-trust anchor, the only config the boot self-registration needs, AND the SINGLE enable for the secure-transport children. **Setting it enables secure transport; unset = legacy/plaintext.** |
-| `API_ENDPOINT` | `:api_endpoint` | Server HTTPS base (register + bulk upload, and WS derivation). |
-| `UDP_ENDPOINT` | `:udp_endpoint` | Server UDP host:port for telemetry. |
-| `SECURE_TRANSPORT_WS_URL` (optional) | read directly by `ChannelClient` | Override the WSS channel URL. Default derives from `API_ENDPOINT` (`https`→`wss`, path `/device_socket/websocket`). |
-
-> There is NO `CLAIM_TOKEN_SECRET` / `CLAIM_TOKEN_SERVER_NONCE` anymore. Registration
-> is tokenless: the only provisioning secret the device needs is the pinned server
-> public key, and the same image is safe to flash onto any number of devices (each
-> generates its own identity and registers independently; the server is idempotent).
-
-> There is NO device-side plaintext kill switch / fallback flag. UDP telemetry is
-> AEAD-only unconditionally: with a live session the device seals + sends each
-> DataSet; with no live session it DROPS the datagram (never plaintext). Nothing to
-> set or flip on the device for transport security.
-
-> There is NO separate build-time enable flag. The `BootProvisioner` / `ChannelClient`
-> / `BulkUploader` start only on a real device target (`MIX_TARGET` != `host`) AND when
-> `SECURE_TRANSPORT_SERVER_PUBLIC_KEY` is set (the pinned key IS the enable), matching
-> how NervesHubLink / the UDP path are gated. `SessionHolder` starts in every
-> environment (cheap, idle). Even when started, `ChannelClient` self-gates idle until
-> registered + identity provisioned + server pinned, so the order of provisioning is
-> forgiving.
-
-### 2.1 Reflash the firmware
-
-Export the environment, then build + flash, all in the same shell:
+For an SD-card installation, use the repository's existing alias:
 
 ```sh
-export API_ENDPOINT="https://racing.org"      # your server base
-export UDP_ENDPOINT="racing.org:4001"
-export PRODUCT="logger"
-export SECURE_TRANSPORT_SERVER_PUBLIC_KEY="<64-char hex from §1.2>"  # the SINGLE enable: setting it turns on register + channel + bulk
-
-MIX_TARGET=<target> mix firmware
-MIX_TARGET=<target> mix burn                # or: fwup / NervesHub OTA push
+mix firmware.burn
 ```
 
-> This image carries NO per-device secret (registration is tokenless), so the SAME
-> image is safe to flash onto any number of devices: each generates its own Ed25519
-> identity on first boot and self-registers independently. The server is idempotent —
-> re-flashing / rebooting a device just refreshes its existing `DeviceKey`.
-
-### 2.2 What the device does on boot (automatic)
-
-1. `KeyStore.load_or_generate/1` generates the device's long-term Ed25519 identity on
-   first boot and persists the 32-byte seed `0600` at `/data/secure_transport/device_ed25519.key`
-   (reloaded unchanged on every later boot).
-2. `BootProvisioner` self-registers the device: `POST /api/devices/register` with the
-   PoP signature over `("RacingOrg-TrackerRegister-v1", public_key, timestamp)` — no
-   claim token, no server nonce. On success it persists a register marker
-   (`/data/secure_transport/register_marker.json`). The device is recorded UNASSIGNED;
-   an admin associates it to an account in §3.6. A rejected registration is logged, NOT
-   crash-looped — the device retries on the next boot.
-3. `ChannelClient` connects the WSS channel (`/device_socket`), joins `device:<fp>`,
-   runs the initiator handshake, and on `handshake_ok` publishes the live `Session`
-   into `SessionHolder`.
-4. UDP telemetry is AEAD-only (the `UDPClient` reserves a counter from
-   `SessionHolder` and seals each DataSet). Any moment without a live session DROPS
-   the datagram — the device never falls back to plaintext.
-5. Post-race, `Race.Archive` finalizes the recording and triggers
-   `BulkUploader.upload_async` (signed HTTPS bulk plane). Local recordings are kept
-   until the server confirms completeness via `manifest_verification_result`.
-
----
-
-## 3. Verification
-
-### 3.1 Confirm the device registered (a `device_key` row exists)
+For the repository's direct network upload path:
 
 ```sh
-# Find the device key by the device's identity fingerprint (see 3.2 for the fp).
-fly ssh console -a <your-app> -C \
-  "/app/bin/racing_org eval 'IO.inspect(RacingOrg.Devices.get_device_key_by_fingerprint(\"<fingerprint-hex>\"))'"
+mix firmware && mix upload nerves.local
 ```
 
-A non-nil `DeviceKey` with the expected `device_id` confirms the registration landed.
-The device starts UNASSIGNED until an admin associates it (§3.6).
+Do not invent an OTA release or signing command. The repository contains
+NervesHubLink configuration and pinned fwup public keys, but release signing,
+upload, cohort assignment, and deployment remain the operator's external
+release workflow.
 
-### 3.2 Find the device's fingerprint (from the device)
+## 5. First-boot expectations
 
-On the device console (`/data` identity), the fingerprint is lowercase hex
-`SHA-256(public_key)`:
+On boot, the tracker reconciles durable bootstrap state with the current SoC
+identity and the active or staged signing key.
+
+- A fresh, unbound tracker may register through the signed v2 registration
+  flow.
+- A tracker with verified authority reuses it and refuses credential-epoch
+  downgrade.
+- A missing or mismatched active signer stages a candidate; it does not
+  overwrite the previous authority before a signed recovery commit is durably
+  persisted.
+- A lost recovery commit response is reconciled through signed status replay.
+- A legacy marker that cannot yet be enrolled leaves the tracker in a closed
+  limbo state rather than silently replacing identity.
+- Hardware-identity mismatch, invalid signed authority, corrupt durable state,
+  or unavailable identity keeps the tracker blocked or retrying; it must not be
+  bypassed by deleting individual files.
+
+## 6. Verification
+
+Use sanitized runtime surfaces only. Do not print complete signed receipts,
+public-key fingerprints, serials, session keys, nonces, payloads, or filesystem
+contents.
+
+On the tracker console, the following implemented read-only calls are safe when
+their returned maps are kept in the operator session rather than copied
+verbatim into a ticket:
 
 ```elixir
-{:ok, id} = RacingOrg.Tracker.Pro.SecureTransport.KeyStore.load()
-id.fingerprint
+RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner.current_state()
+RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner.credential_epoch()
+RacingOrg.Tracker.Pro.SecureTransport.SessionHolder.live?()
+RacingOrg.Tracker.Pro.DesiredState.Manager.status()
+RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner.status(
+  RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner
+)
 ```
 
-It is the SAME id used as the WSS connect param and the `device:<fp>` topic, and the
-value to use in §3.1 and §4.
+Expected evidence:
 
-### 3.3 Confirm the channel session is live
+1. Bootstrap phase progresses to `registered` or `committed`, then to
+   `authenticated`, `hydrating`, and `effective` as the channel and desired
+   state become ready.
+2. The verified credential epoch agrees with the backend device detail page.
+3. `SessionHolder.live?/0` is `true` while the secure channel is established.
+4. Desired State reports an active generation and an open gate only after the
+   exact generation is effective.
+5. Outbox status is accepting, storage-epoch-bound, not quarantined, and below
+   its entry, byte, and disk limits.
+6. Backend diagnostics show AEAD traffic and current signed device readiness;
+   no plaintext coexistence check is necessary or possible.
 
-- Device side: `RacingOrg.Tracker.Pro.SecureTransport.SessionHolder.live?()` returns `true`, and
-  device logs show `"[ChannelClient] secure session established"`.
-- Server side: the session is in the `SessionStore` (routed by `session_id`), and the
-  device log line above only prints after the server's `handshake_ok`.
+A gap in telemetry while the session is down is expected secure behavior. It is
+not permission to enable plaintext or clear durable state.
 
-### 3.4 Confirm AEAD telemetry is arriving (not plaintext)
+## 7. Abort and rollback
 
-On the server, `SecureUDPIngest` routes AEAD frames through the secure path. Watch the
-UDP audit / ingest: AEAD datagrams ingest normally and do NOT show
-`:plaintext_rejected`. The device is secure-only, so you should see NO plaintext
-telemetry from it at all — a no-session window shows up as a gap (dropped datagrams),
-never as plaintext.
+Abort the installation or trial when any of the following occurs:
 
-### 3.5 Confirm a bulk upload completed
+- the backend cannot authenticate the tracker at the expected credential epoch;
+- bootstrap enters a durable mismatch or invalid-receipt limbo state;
+- desired state is rejected or never becomes effective;
+- the outbox is quarantined or reaches critical pressure;
+- required control or telemetry receipt round trips do not complete; or
+- the new firmware cannot meet its validation deadline.
 
-After a race finishes, the device logs `"Bulk upload starting: recording=..."` and
-then `"Bulk upload complete: recording=..."`. Server side, check the manifest status:
+For a local reflash, restore the prior known-good image while preserving `/data`
+unless the incident has been explicitly classified as storage loss. If storage
+must be replaced, follow the storage-epoch procedure in
+[STATELESS_RECOVERY_RUNBOOK.md](STATELESS_RECOVERY_RUNBOOK.md); do not copy
+selected durable files into a new storage incarnation.
 
-```sh
-curl -sS https://<host>/api/race_recordings/<recording_id>/manifest_status
-# -> verification_status: "complete", no missing_chunk_indexes
-```
+For OTA, retain the prior Nerves partition/image and follow the integration
+status in [STATELESS_RECOVERY_RUNBOOK.md](STATELESS_RECOVERY_RUNBOOK.md). The
+health-trial foundations exist, but the complete production coordinator is not
+yet integrated; do not manually mark firmware valid merely because it booted or
+connected once, and do not classify the OTA as safely validated without that
+integration.
 
-### 3.6 Associate the registered device to an account (admin, replaces the old claim)
+## 8. Completion record
 
-The device registers UNASSIGNED. An admin then associates it to an account by email
-in the web admin panel (the post-registration step that replaces the old owner claim).
-Identify the device by its fingerprint (§3.2) or the `device_id` from §3.1, find the
-account by email (§1.3), and associate them in the panel. Once associated, the device's
-telemetry and channel session are attributed to that account.
+Record only:
 
----
+- firmware version and Git commit;
+- build target and product;
+- installation method;
+- backend application/schema version;
+- sanitized bootstrap phase and credential epoch;
+- desired-state generation/status and closed rejection diagnostics, if any;
+- sanitized outbox counters and limits; and
+- validation or rollback outcome.
 
-## 4. SERVER ENFORCEMENT (the only coordinated cutover)
-
-The device is ALREADY secure-only: the firmware never emits plaintext telemetry (with
-a live session it sends AEAD; with no live session it drops the datagram). There is no
-plaintext-fallback stage and NO device flag to flip — provisioning + verifying secure
-transport (§2–§3) is the entire device-side job.
-
-The only remaining cutover is on the SERVER: flip the per-device
-`requires_secure_transport` column so the server REJECTS any plaintext that is
-attributed to this device. Because the device never sends plaintext, this is a safe,
-no-window change — there is no "turn off device plaintext first" step and no rollback
-ordering hazard.
-
-Do NOT proceed until §3.3 + §3.4 are green for this device.
-
-> **SERVER-ENFORCEMENT FINDING (verified read-only for this runbook):**
-> The server's per-device `requires_secure_transport` column IS actually ENFORCED.
-> The live UDP listener (`RacingOrg.UDPServer.process_datagram/5`) calls
-> `SecureUDPIngest.handle_datagram/3` for EVERY datagram; on the legacy plaintext
-> branch it resolves the attributable `%Device{}` and
-> `plaintext_rejected?/1` rejects (`{:error, {:auth_error, :plaintext_rejected}}`,
-> not ingested) when `match?(%Device{requires_secure_transport: true}, device)` — i.e.
-> the per-device DB column is read and acted on. Covered by
-> `backend/test/racing_org/racing_org/secure_udp_coexistence_test.exs`
-> ("plaintext from a secure-capable device is REJECTED").
-
-### Step A — Pre-checks
-Confirm: device sending AEAD (§3.4), channel session healthy (§3.3), device-key row
-present (§3.1) and associated (§3.6). The device emits no plaintext, so there is
-nothing to change on the device.
-
-### Step B — Turn ON server rejection for this device
-Flip the per-device column so the server rejects any (now-impossible) plaintext from it:
-
-```sh
-fly ssh console -a <your-app> -C \
-  "/app/bin/racing_org eval '
-    fp = \"<fingerprint-hex>\"
-    %{device_id: id} = RacingOrg.Devices.get_device_key_by_fingerprint(fp)
-    dev = RacingOrg.Devices.get_device(id)
-    {:ok, _} = RacingOrg.Devices.update_device(dev, %{requires_secure_transport: true})
-  '"
-```
-
-From now on, a plaintext datagram attributable to this device is rejected
-(`:plaintext_rejected`) and only its AEAD frames are accepted. The device only ever
-sends AEAD, so telemetry keeps flowing unaffected.
-
-### Rollback
-Set the device's `requires_secure_transport` back to `false`
-(`RacingOrg.Devices.update_device(dev, %{requires_secure_transport: false})`). The
-server again accepts plaintext from it — though this device never sends any. There is
-no device-side rollback step.
-
----
-
-## 5. The GLOBAL device-transport flag (separate, fleet-wide — NOT this device)
-
-> User-facing web/API auth is NO LONGER a flag. It is ALWAYS ON (the old
-> `WEB_AUTH_ENFORCE` / `:web_auth` flag was removed): every web/API user surface
-> requires a logged-in user + bearer token and is owner-scoped. The iOS app + web log
-> in with an account; device telemetry ingest is device-authenticated and unaffected.
-> So the only remaining global cutover is the UDP plaintext kill switch below.
-
-The per-device server flip above (§4) is one device. One global SERVER flag remains;
-do it ONLY after the WHOLE fleet is reflashed + verified:
-
-- **`require_authenticated_device` (UDP telemetry kill switch).**
-  `config :racing_org, :device_auth, require_authenticated_device: true`. When ON, the
-  server rejects ALL plaintext telemetry from ANY device (even unknown), regardless of
-  the per-device column — same `:plaintext_rejected` path
-  (`SecureUDPIngest.plaintext_rejected?/1`). This bricks any not-yet-reflashed device,
-  so it is the LAST step after the entire fleet is on AEAD.
-
-Both `requires_secure_transport` (per-device DB column) and
-`require_authenticated_device` (global config) are SERVER-side switches; the device
-itself carries no transport flag (it is unconditionally secure-only).
+Never include a serial, private key, PSK, token, live endpoint, control
+plaintext, full receipt, nonce, session identifier, payload, or complete
+fingerprint in the completion record.
