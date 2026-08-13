@@ -63,6 +63,36 @@ defmodule RacingOrg.Tracker.Pro.Application do
   @spec child_specs(:logger | :uplink, atom() | nil) :: [Supervisor.child_spec() | module() | {module(), term()}]
   def child_specs(product, target), do: children(product, target)
 
+  @doc false
+  @spec start_checkpoint_hydration(keyword()) :: GenServer.on_start()
+  def start_checkpoint_hydration(opts) when is_list(opts) do
+    alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Store
+
+    identity_reader = Keyword.fetch!(opts, :identity)
+    identity_authority = Keyword.fetch!(opts, :identity_authority)
+    coordinator_starter = Keyword.fetch!(opts, :coordinator_starter)
+
+    with {:ok, identity} <- identity_reader.(),
+         {:ok, head_store} <-
+           Store.new(
+             base_dir: Keyword.fetch!(opts, :head_store_base_dir),
+             device_id: identity.device_id,
+             credential_epoch: identity.credential_epoch,
+             storage_epoch: identity.storage_epoch,
+             identity: identity_authority
+           ) do
+      coordinator_starter.(
+        name: Keyword.get(opts, :name, RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator),
+        journal_path: Keyword.fetch!(opts, :journal_path),
+        head_store: head_store
+      )
+    end
+  rescue
+    _exception -> {:error, :checkpoint_hydration_unavailable}
+  catch
+    _kind, _reason -> {:error, :checkpoint_hydration_unavailable}
+  end
+
   # Product: NMEA 2000 standalone, on-board device
   defp children(:logger, target) do
     controller_capability = make_ref()
@@ -98,7 +128,8 @@ defmodule RacingOrg.Tracker.Pro.Application do
       wifi_manager_children(target) ++
       desired_state_children(target, controller_capability) ++
       secure_transport_children(:logger, target, controller_capability) ++
-      data_set_uploader_children(:logger)
+      data_set_uploader_children(:logger) ++
+      firmware_validation_children(:logger, target)
   end
 
   # Product: Base station receiver node for racing_org_tracker_mini
@@ -178,6 +209,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
         operational_gate_children(product, controller_capability) ++
         command_executor_children(product) ++
         outbox_owner_children(product) ++
+        checkpoint_hydration_children(product) ++
         [
           RacingOrg.Tracker.Pro.SecureTransport.ChannelClient,
           RacingOrg.Tracker.Pro.Race.BulkUploader
@@ -217,6 +249,45 @@ defmodule RacingOrg.Tracker.Pro.Application do
 
   defp outbox_owner_children(:uplink), do: []
 
+  # The hydration coordinator starts only after Manager, SessionHolder, every
+  # observer restorer, and the exact durable identity authority are live. Its
+  # start MFA constructs the identity-bound checkpoint-head store before starting
+  # the coordinator. ChannelClient comes later, so no authenticated hydration can
+  # arrive before recovery has inspected the durable journal.
+  defp checkpoint_hydration_children(:logger) do
+    coordinator = RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator
+
+    [
+      %{
+        id: coordinator,
+        start:
+          {__MODULE__, :start_checkpoint_hydration,
+           [
+             [
+               journal_path: checkpoint_hydration_journal_path(),
+               head_store_base_dir: checkpoint_head_root(),
+               identity: &RacingOrg.Tracker.Pro.DesiredState.Runtime.identity/0,
+               identity_authority: &checkpoint_head_identity_authority/1,
+               coordinator_starter: &coordinator.start_link/1
+             ]
+           ]},
+        restart: :permanent,
+        shutdown: 5_000,
+        type: :worker,
+        modules: [coordinator]
+      }
+    ]
+  end
+
+  defp checkpoint_hydration_children(:uplink), do: []
+
+  defp checkpoint_head_identity_authority(transition) when is_function(transition, 1) do
+    case RacingOrg.Tracker.Pro.DesiredState.Runtime.identity() do
+      {:ok, identity} -> transition.(identity)
+      {:error, _reason} = error -> error
+    end
+  end
+
   # Logger legacy spool migration starts only after the durable Outbox owner is
   # open and identity-bound. The Recorder is started earlier so newly persisted
   # files can always notify a live admission worker once it boots. Uplink has no
@@ -235,11 +306,80 @@ defmodule RacingOrg.Tracker.Pro.Application do
     ]
   end
 
+  # Firmware validation starts last, after every source it must inspect. The
+  # Coordinator owns the one boot-relative rollback deadline and waits for exact
+  # target authority before starting a single Trial. Health readers fail closed;
+  # missing receipt evidence therefore consumes the original deadline instead of
+  # delaying coordinator startup and granting a fresh budget later.
+  defp firmware_validation_children(:logger, target) do
+    if secure_transport_configured?(target) do
+      [{RacingOrg.Tracker.Pro.FirmwareValidation.Coordinator, firmware_validation_options()}]
+    else
+      []
+    end
+  end
+
+  defp firmware_validation_options do
+    alias RacingOrg.Tracker.Pro.FirmwareValidation
+
+    config = Application.fetch_env!(:racing_org_tracker_pro, FirmwareValidation.Coordinator)
+    soak_period_ms = Keyword.fetch!(config, :soak_period_ms)
+
+    default_target_reader = fn ->
+      FirmwareValidation.Target.read(soak_period_ms: soak_period_ms)
+    end
+
+    default_snapshot_opts = [
+      process_health_reader: &FirmwareValidation.RequiredProcesses.status/0,
+      receipt_health_reader: &FirmwareValidation.ReceiptHealth.read/0,
+      outbox_reader: &FirmwareValidation.OutboxHealth.read/0
+    ]
+
+    default_health_event_sink = fn event ->
+      RacingOrg.Tracker.Pro.DurableDelivery.Producer.HealthEvent.admit(event,
+        outbox: RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner
+      )
+    end
+
+    trial_opts =
+      config
+      |> Keyword.get(:trial_opts, [])
+      |> Keyword.put_new(:store_dir, Keyword.fetch!(config, :store_dir))
+      |> Keyword.put_new(:retry_ms, Keyword.fetch!(config, :retry_ms))
+      |> Keyword.put_new(:health_event_sink, default_health_event_sink)
+      |> Keyword.put_new(:health_event_context, %{
+        target_source: :firmware_validation_target,
+        manifest_hash_reader: &RacingOrg.Tracker.Pro.DesiredState.Manager.status/0
+      })
+      |> Keyword.update(:snapshot_opts, default_snapshot_opts, &Keyword.merge(default_snapshot_opts, &1))
+
+    config
+    |> Keyword.take([:name, :clock, :trial_starter])
+    |> Keyword.put(:rollback_after_ms, Keyword.fetch!(config, :rollback_after_ms))
+    |> Keyword.put(:retry_ms, Keyword.fetch!(config, :retry_ms))
+    |> Keyword.put(:target_reader, Keyword.get(config, :target_reader, default_target_reader))
+    |> Keyword.put(:trial_opts, trial_opts)
+  end
+
   defp outbox_root do
     Application.get_env(:racing_org_tracker_pro, :durable_outbox_root) ||
       RacingOrg.Tracker.Pro.DesiredState.RuntimeIdentity.storage_epoch_path()
       |> Path.dirname()
       |> Path.join("outbox")
+  end
+
+  defp checkpoint_head_root do
+    Application.get_env(:racing_org_tracker_pro, :checkpoint_head_root) ||
+      RacingOrg.Tracker.Pro.DesiredState.RuntimeIdentity.storage_epoch_path()
+      |> Path.dirname()
+      |> Path.join("checkpoint_heads")
+  end
+
+  defp checkpoint_hydration_journal_path do
+    Application.get_env(:racing_org_tracker_pro, :checkpoint_hydration_journal_path) ||
+      RacingOrg.Tracker.Pro.DesiredState.RuntimeIdentity.storage_epoch_path()
+      |> Path.dirname()
+      |> Path.join("checkpoint_hydration.journal")
   end
 
   defp command_ledger_path do
@@ -420,11 +560,15 @@ defmodule RacingOrg.Tracker.Pro.Application do
 
   # Durable local race archiving + reconciliation with RacingOrg.
   defp archive_child do
+    outbox = RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner
+
     {RacingOrg.Tracker.Pro.Race.Archive,
      name: RacingOrg.Tracker.Pro.Race.Archive,
      base_dir: Application.get_env(:racing_org_tracker_pro, :race_archive_directory),
      sampling: RacingOrg.Tracker.Pro.Sampling,
-     device_id: RacingOrg.Tracker.Pro.boat_identifier()}
+     device_id: RacingOrg.Tracker.Pro.boat_identifier(),
+     durable_enqueue_fn: fn stream, payload, opts -> outbox.enqueue(outbox, stream, payload, opts) end,
+     durable_pending_fn: fn -> outbox.pending(outbox) end}
   end
 
   # Broadcasts the B&G race-start countdown (PGN 130824 Key 117) at ~1 Hz whenever the

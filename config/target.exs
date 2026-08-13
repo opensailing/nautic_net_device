@@ -57,7 +57,20 @@ config :racing_org_tracker_pro,
   computed_values_directory: "/data/computed_values",
   clock_source_directory: "/data/clock_source",
   calibration_directory: "/data/calibration",
-  wind_shift_directory: "/data/wind_shift"
+  wind_shift_directory: "/data/wind_shift",
+  checkpoint_head_root: "/data/checkpoint_heads",
+  checkpoint_hydration_journal_path: "/data/checkpoint_hydration.journal"
+
+# A/B OTA validation starts with the logger application, not when readiness later
+# appears. These millisecond values map directly to Coordinator/Target vocabulary:
+# the fixed rollback budget includes authority, hydration, session, receipt, Outbox,
+# process-readiness, and continuous-soak waits. Diagnostics survive restarts in
+# /data, while the Coordinator's VM-boot-relative deadline is never recomputed.
+config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.FirmwareValidation.Coordinator,
+  rollback_after_ms: 30 * 60 * 1_000,
+  soak_period_ms: 5 * 60 * 1_000,
+  retry_ms: 1_000,
+  store_dir: "/data/firmware_validation"
 
 # NervesHub remote management (OTA firmware updates + remote console).
 #

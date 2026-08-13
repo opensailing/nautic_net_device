@@ -21,7 +21,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Coordinator do
     %{
       id: Keyword.get(opts, :id, __MODULE__),
       start: {__MODULE__, :start_link, [opts]},
-      restart: :transient,
+      restart: :temporary,
       shutdown: 5_000,
       type: :worker
     }
@@ -130,6 +130,9 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Coordinator do
            | phase: :trial_started,
              trial: trial
          }}
+
+      {:error, :firmware_validation_unavailable} ->
+        schedule_check(state)
 
       {:error, reason} ->
         {:stop, {:trial_start_failed, reason}, state}

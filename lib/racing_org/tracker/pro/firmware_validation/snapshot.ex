@@ -33,6 +33,11 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Snapshot do
         Keyword.get(opts, :owner_alive_reader, &default_owner_alive?/1)
       )
 
+    source_process_health = %{
+      supervisor: health_status(session_source_healthy? and manager_source_healthy? and applier_source_healthy?),
+      owner: owner_health
+    }
+
     %{
       firmware: %{
         version:
@@ -46,14 +51,8 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Snapshot do
       },
       session: session,
       desired_state: desired_state,
-      process_health: %{
-        supervisor: health_status(session_source_healthy? and manager_source_healthy? and applier_source_healthy?),
-        owner: owner_health
-      },
-      receipts: %{
-        control: receipt_status(Keyword.get(opts, :control_receipt_reader, fn -> :pending end)),
-        telemetry: receipt_status(Keyword.get(opts, :telemetry_receipt_reader, fn -> :pending end))
-      },
+      process_health: process_health(opts, source_process_health),
+      receipts: receipt_health(opts),
       outbox: outbox_status(Keyword.get(opts, :outbox_reader, fn -> :unavailable end)),
       timing: normalize_timing(timing)
     }
@@ -186,6 +185,49 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Snapshot do
     _exception -> false
   catch
     _kind, _reason -> false
+  end
+
+  defp process_health(opts, source_process_health) do
+    case Keyword.fetch(opts, :process_health_reader) do
+      {:ok, reader} -> aggregate_process_health(reader)
+      :error -> source_process_health
+    end
+  end
+
+  defp aggregate_process_health(reader) do
+    case safe_read(reader) do
+      {:ok, %{supervisor: supervisor, owner: owner}}
+      when supervisor in [:healthy, :unhealthy] and owner in [:healthy, :unhealthy] ->
+        %{supervisor: supervisor, owner: owner}
+
+      _unavailable ->
+        %{supervisor: :unhealthy, owner: :unhealthy}
+    end
+  end
+
+  defp receipt_health(opts) do
+    case Keyword.fetch(opts, :receipt_health_reader) do
+      {:ok, reader} -> aggregate_receipt_health(reader)
+      :error -> legacy_receipt_health(opts)
+    end
+  end
+
+  defp aggregate_receipt_health(reader) do
+    case safe_read(reader) do
+      {:ok, %{control: control, telemetry: telemetry}}
+      when control in @receipt_statuses and telemetry in @receipt_statuses ->
+        %{control: control, telemetry: telemetry}
+
+      _unavailable ->
+        %{control: :failed, telemetry: :failed}
+    end
+  end
+
+  defp legacy_receipt_health(opts) do
+    %{
+      control: receipt_status(Keyword.get(opts, :control_receipt_reader, fn -> :pending end)),
+      telemetry: receipt_status(Keyword.get(opts, :telemetry_receipt_reader, fn -> :pending end))
+    }
   end
 
   defp receipt_status(reader) do

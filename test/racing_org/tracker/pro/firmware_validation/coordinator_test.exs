@@ -43,6 +43,69 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.CoordinatorTest do
     refute_receive {:trial_started, _opts}
   end
 
+  test "forwards health event admission options without changing target authority" do
+    parent = self()
+    health_event_sink = fn event -> send(parent, {:health_event, event}) end
+    health_event_context = %{target_source: :firmware_validation_target}
+
+    coordinator =
+      start_supervised!(
+        {Coordinator,
+         name: nil,
+         clock: fn -> 100 end,
+         target_reader: fn -> {:ok, target_identity()} end,
+         trial_starter: fn opts ->
+           send(parent, {:trial_started, opts})
+           {:ok, self()}
+         end,
+         trial_opts: [
+           store_dir: "/tmp/not-used-by-injected-starter",
+           health_event_sink: health_event_sink,
+           health_event_context: health_event_context
+         ],
+         rollback_after_ms: 50,
+         retry_ms: 60_000}
+      )
+
+    assert_receive {:trial_started, opts}
+    assert opts[:target] == Map.put(target_identity(), :deadline_at_ms, 150)
+    assert opts[:health_event_sink] == health_event_sink
+    assert opts[:health_event_context] == health_event_context
+    assert %{phase: :trial_started, deadline_at_ms: 150} = Coordinator.status(coordinator)
+  end
+
+  test "unavailable Trial runtime keeps the original deadline while retrying startup" do
+    clock = start_supervised!({Agent, fn -> 100 end}, id: {:clock, make_ref()})
+    parent = self()
+
+    coordinator =
+      start_supervised!(
+        {Coordinator,
+         name: nil,
+         clock: fn -> Agent.get(clock, & &1) end,
+         target_reader: fn -> {:ok, target_identity()} end,
+         trial_starter: fn opts ->
+           send(parent, {:trial_start_attempt, opts})
+           {:error, :firmware_validation_unavailable}
+         end,
+         trial_opts: [store_dir: "/tmp/not-used-by-injected-starter"],
+         rollback_after_ms: 50,
+         retry_ms: 60_000}
+      )
+
+    assert_receive {:trial_start_attempt, first_opts}
+    assert first_opts[:target].deadline_at_ms == 150
+    assert %{phase: :target_pending, deadline_at_ms: 150} = Coordinator.status(coordinator)
+
+    Agent.update(clock, fn _current -> 200 end)
+    assert :ok = Coordinator.check_now(coordinator)
+
+    assert_receive {:trial_start_attempt, second_opts}
+    assert second_opts[:target].deadline_at_ms == 150
+    assert second_opts[:clock].() == 200
+    assert %{phase: :target_pending, deadline_at_ms: 150} = Coordinator.status(coordinator)
+  end
+
   test "invalid clocks fail startup closed" do
     Process.flag(:trap_exit, true)
 

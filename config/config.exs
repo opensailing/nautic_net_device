@@ -58,6 +58,19 @@ config :racing_org_tracker_pro,
 config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.SecureTransport.ServerIdentity,
   public_key: System.get_env("SECURE_TRANSPORT_SERVER_PUBLIC_KEY")
 
+# Host/test fallback for Application.child_specs/2 inspection. Device builds
+# override this in target.exs with the persistent /data diagnostics path and the
+# same direct Coordinator/Target option vocabulary.
+config :racing_org_tracker_pro,
+  checkpoint_head_root: Path.join(System.tmp_dir!(), "racing_org_tracker_checkpoint_heads"),
+  checkpoint_hydration_journal_path: Path.join(System.tmp_dir!(), "racing_org_tracker_checkpoint_hydration.journal")
+
+config :racing_org_tracker_pro, RacingOrg.Tracker.Pro.FirmwareValidation.Coordinator,
+  rollback_after_ms: 30 * 60 * 1_000,
+  soak_period_ms: 5 * 60 * 1_000,
+  retry_ms: 1_000,
+  store_dir: Path.join(System.tmp_dir!(), "racing_org_tracker_firmware_validation")
+
 # Data upload filter modes:
 # :permissive - Allow data to be uploaded by any sensor for a data type
 # :strict - Only allow data to be uploaded if a sensor is selected -- via a filter -- for the data type
