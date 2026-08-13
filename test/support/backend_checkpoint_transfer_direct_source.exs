@@ -2,7 +2,7 @@ defmodule RacingOrg.Tracker.Pro.TestSupport.BackendCheckpointTransferDirectSourc
   @moduledoc false
 
   @backend_env "RACING_ORG_BACKEND_PATH"
-  @default_backend_root Path.expand("../racing_org/website/backend", File.cwd!())
+  @default_backend_root Path.expand("../../../racing_org/website/backend", __DIR__)
 
   @source_files [
     "lib/racing_org/secure_transport/desired_state_v1.ex",
@@ -11,6 +11,7 @@ defmodule RacingOrg.Tracker.Pro.TestSupport.BackendCheckpointTransferDirectSourc
     "lib/racing_org/secure_transport/desired_state_v1/checkpoint_runtime/polar.ex",
     "lib/racing_org/secure_transport/desired_state_v1/checkpoint_runtime/wind_shift.ex",
     "lib/racing_org/secure_transport/desired_state_v1/checkpoint.ex",
+    "lib/racing_org/secure_transport/desired_state_v1/checkpoint_hydration_transfer.ex",
     "lib/racing_org/secure_transport/desired_state_v1/section.ex",
     "lib/racing_org/secure_transport/desired_state_v1/manifest.ex",
     "lib/racing_org/secure_transport/desired_state_v1/command.ex",
@@ -27,13 +28,16 @@ defmodule RacingOrg.Tracker.Pro.TestSupport.BackendCheckpointTransferDirectSourc
     :checkpoint_hydration_resume
   ]
 
+  def default_backend_root, do: @default_backend_root
+
   def snapshot! do
     backend_root = backend_root!()
-    script = script(backend_root)
+    executable = System.find_executable("elixir") || raise "elixir executable is unavailable"
+    script = script(backend_root, executable)
 
     {output, status} =
-      System.cmd("elixir", ["-e", script],
-        cd: File.cwd!(),
+      System.cmd(executable, ["-e", script],
+        cd: __DIR__,
         env: [{"ERL_AFLAGS", "+S 2:2"}],
         stderr_to_stdout: true
       )
@@ -75,18 +79,34 @@ defmodule RacingOrg.Tracker.Pro.TestSupport.BackendCheckpointTransferDirectSourc
     end
   end
 
-  defp script(backend_root) do
+  defp script(backend_root, executable) do
     source_paths = Enum.map(@source_files, &Path.join(backend_root, &1))
     kat_path = Path.join(backend_root, @kat_path)
 
     """
     Code.put_compiler_option(:no_warn_undefined, :all)
 
+    launcher = #{inspect(executable)}
+
+    unless :code.is_loaded(Mix) == false do
+      raise "Mix was loaded before direct backend source evaluation"
+    end
+
+    if Enum.any?(Application.started_applications(), fn {application, _description, _version} ->
+         application == :racing_org
+       end) do
+      raise ":racing_org was started before direct backend source evaluation"
+    end
+
+    unless Path.basename(launcher) == "elixir" do
+      raise "direct backend source launcher was not elixir: \#{launcher}"
+    end
+
     Enum.each(#{inspect(source_paths)}, &Code.require_file/1)
 
     defmodule BackendCheckpointTransferDirectSourceProbe do
       alias RacingOrg.SecureTransport.DesiredStateV1, as: Contract
-      alias RacingOrg.SecureTransport.DesiredStateV1.{Checkpoint, Messages}
+      alias RacingOrg.SecureTransport.DesiredStateV1.{Checkpoint, CheckpointHydrationTransfer, Messages}
 
       @types #{inspect(@types)}
       @chunk_size 61_440
@@ -97,16 +117,19 @@ defmodule RacingOrg.Tracker.Pro.TestSupport.BackendCheckpointTransferDirectSourc
       @parent_hash :binary.copy(<<0xB2>>, 32)
       @content_hash :binary.copy(<<0xA1>>, 32)
 
-      def run(kat_path) do
+      def run(kat_path, isolation) do
         valid_vectors = valid_vectors()
 
         %{
+          isolation: isolation,
+          kat_decoder: :json,
           contract: contract(),
           reverse_message_types: reverse_message_types(),
           kat_entries: kat_entries(kat_path),
           kat_codecs: kat_codecs(kat_path),
           valid_vectors: valid_vectors,
           over_capacity_vectors: over_capacity_vectors(),
+          hydration_resume_transfer: hydration_resume_transfer(),
           mutations: mutations(valid_vectors)
         }
       end
@@ -135,10 +158,11 @@ defmodule RacingOrg.Tracker.Pro.TestSupport.BackendCheckpointTransferDirectSourc
       end
 
       defp kat_entries(kat_path) do
-        messages = json_kat_messages(kat_path)
+        messages = kat_path |> File.read!() |> :json.decode() |> get_in(["expected", "messages"])
 
         Map.new(@types, fn type ->
-          {type, extract_json_hex!(messages, Atom.to_string(type) <> "_hex")}
+          key = Atom.to_string(type) <> "_hex"
+          {type, Map.fetch!(messages, key)}
         end)
       end
 
@@ -155,43 +179,6 @@ defmodule RacingOrg.Tracker.Pro.TestSupport.BackendCheckpointTransferDirectSourc
 
           {type, %{encode: encode, decode: decode}}
         end)
-      end
-
-      defp json_kat_messages(kat_path) do
-        json = File.read!(kat_path)
-        marker = ~S("messages": {)
-        start = :binary.match(json, marker) |> elem(0)
-        open = start + byte_size(marker) - 1
-        extract_json_object(json, open)
-      end
-
-      defp extract_json_object(json, open) do
-        length = find_json_object_end(json, open + 1, 1, false, false)
-        binary_part(json, open, length - open + 1)
-      end
-
-      defp find_json_object_end(json, index, depth, in_string, escaped) do
-        <<_prefix::binary-size(index), byte, _rest::binary>> = json
-
-        cond do
-          in_string and escaped -> find_json_object_end(json, index + 1, depth, true, false)
-          in_string and byte == 0x5C -> find_json_object_end(json, index + 1, depth, true, true)
-          byte == ?" -> find_json_object_end(json, index + 1, depth, not in_string, false)
-          in_string -> find_json_object_end(json, index + 1, depth, true, false)
-          byte == ?{ -> find_json_object_end(json, index + 1, depth + 1, false, false)
-          byte == ?} and depth == 1 -> index
-          byte == ?} -> find_json_object_end(json, index + 1, depth - 1, false, false)
-          true -> find_json_object_end(json, index + 1, depth, false, false)
-        end
-      end
-
-      defp extract_json_hex!(messages, key) do
-        pattern = ~r/"\#{Regex.escape(key)}"\\s*:\\s*"([0-9a-f]+)"/
-
-        case Regex.run(pattern, messages, capture: :all_but_first) do
-          [hex] -> hex
-          _ -> raise "missing backend JSON KAT entry \#{key}"
-        end
       end
 
       defp valid_vectors do
@@ -225,24 +212,96 @@ defmodule RacingOrg.Tracker.Pro.TestSupport.BackendCheckpointTransferDirectSourc
         end
       end
 
+      defp hydration_resume_transfer do
+        selected = hydration_transfer_head()
+        content = selected.content
+
+        request =
+          selected
+          |> Map.delete(:content)
+          |> Map.merge(%{
+            total_content_length: byte_size(content),
+            chunk_count: chunk_count(byte_size(content)),
+            missing_ranges: [
+              %{first_chunk_index: 0, chunk_count: 1},
+              %{first_chunk_index: 2, chunk_count: 2}
+            ]
+          })
+
+        newer = newer_hydration_head(selected)
+
+        %{
+          valid_requested_indexes:
+            case CheckpointHydrationTransfer.resume([selected], request) do
+              {:ok, frames} -> {:ok, Enum.map(frames, & &1.attrs.chunk_index)}
+              {:error, _reason} = error -> error
+            end,
+          no_candidate: CheckpointHydrationTransfer.resume([], request),
+          duplicate_candidate: CheckpointHydrationTransfer.resume([selected, selected], request),
+          target_mismatch:
+            CheckpointHydrationTransfer.resume(
+              [selected],
+              %{request | credential_epoch: request.credential_epoch + 1}
+            ),
+          summary_mismatch:
+            CheckpointHydrationTransfer.resume(
+              [selected],
+              %{request | total_content_length: byte_size(content) - 1}
+            ),
+          stale_candidate: CheckpointHydrationTransfer.resume([newer], request)
+        }
+      end
+
       defp mutations(valid_vectors) do
         submission_chunk = vector_attrs!(valid_vectors, "checkpoint_submission_chunk:61441:0.chunk")
+        submission_final = vector_attrs!(valid_vectors, "checkpoint_submission_chunk:8388608:136.chunk")
         hydration_chunk = vector_attrs!(valid_vectors, "checkpoint_hydration_chunk:1:0.chunk")
+        hydration_geometry = vector_attrs!(valid_vectors, "checkpoint_hydration_chunk:61441:0.chunk")
+        hydration_final = vector_attrs!(valid_vectors, "checkpoint_hydration_chunk:8388608:136.chunk")
         submission_resume = vector_attrs!(valid_vectors, "checkpoint_submission_resume:8388608.resume")
+        hydration_resume = vector_attrs!(valid_vectors, "checkpoint_hydration_resume:8388608.resume")
+
+        hydration_target_changed =
+          hydration_chunk
+          |> Map.put(:credential_epoch, 9)
+          |> Map.put(:storage_epoch, :binary.copy(<<0x33>>, 16))
+          |> rehash_chunk()
+
+        hydration_resume_target_changed =
+          hydration_resume
+          |> Map.put(:credential_epoch, 9)
+          |> Map.put(:storage_epoch, :binary.copy(<<0x33>>, 16))
 
         encode_mutations = [
           encode_mutation("checkpoint_submission_chunk.total_content_length", :checkpoint_submission_chunk, rehash_chunk(%{submission_chunk | total_content_length: 0})),
           encode_mutation("checkpoint_submission_chunk.chunk_count", :checkpoint_submission_chunk, rehash_chunk(%{submission_chunk | chunk_count: 1})),
+          encode_mutation("checkpoint_submission_chunk.chunk_count_138", :checkpoint_submission_chunk, rehash_chunk(%{submission_final | chunk_count: 138})),
           encode_mutation("checkpoint_submission_chunk.chunk_index", :checkpoint_submission_chunk, rehash_chunk(%{submission_chunk | chunk_index: 2, chunk_offset: 2 * @chunk_size})),
           encode_mutation("checkpoint_submission_chunk.chunk_offset", :checkpoint_submission_chunk, rehash_chunk(%{submission_chunk | chunk_offset: 1})),
           encode_mutation("checkpoint_submission_chunk.chunk", :checkpoint_submission_chunk, submission_chunk |> Map.put(:chunk, binary_part(submission_chunk.chunk, 0, @chunk_size - 1)) |> rehash_chunk()),
+          encode_mutation("checkpoint_submission_chunk.final_chunk_length", :checkpoint_submission_chunk, submission_final |> Map.put(:chunk, submission_final.chunk <> <<0>>) |> rehash_chunk()),
           encode_mutation("checkpoint_submission_chunk.chunk_hash", :checkpoint_submission_chunk, %{submission_chunk | chunk_hash: :binary.copy(<<0xFF>>, 32)}),
           encode_mutation("checkpoint_submission_chunk.credential_epoch", :checkpoint_submission_chunk, %{submission_chunk | credential_epoch: 8}),
           encode_mutation("checkpoint_hydration_chunk.boot_id", :checkpoint_hydration_chunk, Map.put(hydration_chunk, :boot_id, <<0::128>>)),
+          successful_encode_mutation("checkpoint_hydration_chunk.target_identity_changed", :checkpoint_hydration_chunk, hydration_target_changed),
+          encode_mutation("checkpoint_hydration_chunk.origin_identity_changed", :checkpoint_hydration_chunk, hydration_chunk |> Map.put(:origin_credential_epoch, 8) |> Map.put(:origin_storage_epoch, @target_storage_epoch) |> rehash_chunk()),
+          encode_mutation("checkpoint_hydration_chunk.target_bound_checkpoint_hash", :checkpoint_hydration_chunk, hydration_chunk |> target_bound_checkpoint_hash() |> rehash_chunk()),
+          encode_mutation("checkpoint_hydration_chunk.chunk_count_138", :checkpoint_hydration_chunk, rehash_chunk(%{hydration_final | chunk_count: 138})),
+          encode_mutation("checkpoint_hydration_chunk.chunk_offset", :checkpoint_hydration_chunk, rehash_chunk(%{hydration_geometry | chunk_offset: 1})),
+          encode_mutation("checkpoint_hydration_chunk.chunk_hash", :checkpoint_hydration_chunk, %{hydration_chunk | chunk_hash: :binary.copy(<<0xFF>>, 32)}),
+          encode_mutation("checkpoint_hydration_chunk.final_chunk_length", :checkpoint_hydration_chunk, hydration_final |> Map.put(:chunk, hydration_final.chunk <> <<0>>) |> rehash_chunk()),
           encode_mutation("checkpoint_submission_resume.missing_ranges_empty", :checkpoint_submission_resume, %{submission_resume | missing_ranges: []}),
           encode_mutation("checkpoint_submission_resume.missing_range_zero", :checkpoint_submission_resume, %{submission_resume | missing_ranges: [%{first_chunk_index: 0, chunk_count: 0}]}),
           encode_mutation("checkpoint_submission_resume.missing_ranges_adjacent", :checkpoint_submission_resume, %{submission_resume | missing_ranges: [%{first_chunk_index: 0, chunk_count: 1}, %{first_chunk_index: 1, chunk_count: 1}]}),
-          encode_mutation("checkpoint_submission_resume.missing_ranges_over_cap", :checkpoint_submission_resume, %{submission_resume | missing_ranges: for(index <- 0..69, do: %{first_chunk_index: index, chunk_count: 1})})
+          encode_mutation("checkpoint_submission_resume.missing_ranges_over_cap", :checkpoint_submission_resume, %{submission_resume | missing_ranges: for(index <- 0..69, do: %{first_chunk_index: index, chunk_count: 1})}),
+          successful_encode_mutation("checkpoint_hydration_resume.target_identity_changed", :checkpoint_hydration_resume, hydration_resume_target_changed),
+          encode_mutation("checkpoint_hydration_resume.origin_identity_changed", :checkpoint_hydration_resume, hydration_resume |> Map.put(:origin_credential_epoch, 8) |> Map.put(:origin_storage_epoch, @target_storage_epoch)),
+          encode_mutation("checkpoint_hydration_resume.target_bound_checkpoint_hash", :checkpoint_hydration_resume, target_bound_checkpoint_hash(hydration_resume)),
+          encode_mutation("checkpoint_hydration_resume.chunk_count_138", :checkpoint_hydration_resume, %{hydration_resume | chunk_count: 138}),
+          encode_mutation("checkpoint_hydration_resume.missing_range_out_of_range", :checkpoint_hydration_resume, %{hydration_resume | missing_ranges: [%{first_chunk_index: 137, chunk_count: 1}]}),
+          encode_mutation("checkpoint_hydration_resume.missing_ranges_unsorted", :checkpoint_hydration_resume, %{hydration_resume | missing_ranges: [%{first_chunk_index: 2, chunk_count: 1}, %{first_chunk_index: 0, chunk_count: 1}]}),
+          encode_mutation("checkpoint_hydration_resume.missing_ranges_overlapping", :checkpoint_hydration_resume, %{hydration_resume | missing_ranges: [%{first_chunk_index: 0, chunk_count: 3}, %{first_chunk_index: 2, chunk_count: 1}]}),
+          encode_mutation("checkpoint_hydration_resume.missing_ranges_adjacent", :checkpoint_hydration_resume, %{hydration_resume | missing_ranges: [%{first_chunk_index: 0, chunk_count: 1}, %{first_chunk_index: 1, chunk_count: 1}]})
         ]
 
         decode_mutations =
@@ -285,6 +344,11 @@ defmodule RacingOrg.Tracker.Pro.TestSupport.BackendCheckpointTransferDirectSourc
 
       defp encode_mutation(id, type, input),
         do: %{id: id, operation: :encode, type: type, input: input, result: Messages.encode(type, input)}
+
+      defp successful_encode_mutation(id, type, input) do
+        result = Messages.encode(type, input)
+        %{id: id, operation: :valid_encode, type: type, input: input, result: result, expected: result}
+      end
 
       defp decode_mutation(id, type, input),
         do: %{id: id, operation: :decode, type: type, input: input, result: Messages.decode(type, input)}
@@ -339,6 +403,111 @@ defmodule RacingOrg.Tracker.Pro.TestSupport.BackendCheckpointTransferDirectSourc
         |> Map.put(:origin_storage_epoch, @submission_storage_epoch)
       end
 
+      defp hydration_transfer_head do
+        started_at_ms = 86_400_000
+
+        timeline =
+          for index <- 0..2_999 do
+            %{
+              "amplitude_deg" => nil,
+              "mean_twd_deg" => nil,
+              "period_s" => nil,
+              "phase_deg" => nil,
+              "t_ms" => started_at_ms + index,
+              "trend_deg_per_hr" => nil,
+              "tws_mps" => nil
+            }
+          end
+
+        value = %{
+          "last_summary" => nil,
+          "pending_events" => [],
+          "pending_timeline" => timeline,
+          "seq" => 0,
+          "session" => %{
+            "lat_sum" => 0.0,
+            "lon_sum" => 0.0,
+            "pos_n" => 0,
+            "started_at_ms" => started_at_ms,
+            "tws_n" => 0,
+            "tws_sum" => 0.0
+          }
+        }
+
+        {:ok, content} = Checkpoint.canonical_content(:wind_shift, 1, value)
+        {:ok, content_hash} = Checkpoint.content_hash(:wind_shift, 1, content)
+
+        head = %{
+          device_id: @device_id,
+          credential_epoch: 7,
+          storage_epoch: @submission_storage_epoch,
+          sequence: 11,
+          kind: :wind_shift,
+          schema_version: 1,
+          source_generation: 42,
+          parent_hash: @parent_hash,
+          content_hash: content_hash
+        }
+
+        {:ok, checkpoint_hash} = Checkpoint.hash(head)
+
+        %{
+          device_id: @device_id,
+          credential_epoch: 8,
+          storage_epoch: @target_storage_epoch,
+          origin_credential_epoch: head.credential_epoch,
+          origin_storage_epoch: head.storage_epoch,
+          sequence: head.sequence,
+          kind: head.kind,
+          schema_version: head.schema_version,
+          source_generation: head.source_generation,
+          parent_hash: head.parent_hash,
+          content_hash: content_hash,
+          checkpoint_hash: checkpoint_hash,
+          content: content
+        }
+      end
+
+      defp target_bound_checkpoint_hash(attrs) do
+        {:ok, checkpoint_hash} =
+          Checkpoint.hash(%{
+            device_id: attrs.device_id,
+            credential_epoch: attrs.credential_epoch,
+            storage_epoch: attrs.storage_epoch,
+            sequence: attrs.sequence,
+            kind: attrs.kind,
+            schema_version: attrs.schema_version,
+            source_generation: attrs.source_generation,
+            parent_hash: attrs.parent_hash,
+            content_hash: attrs.content_hash
+          })
+
+        Map.put(attrs, :checkpoint_hash, checkpoint_hash)
+      end
+
+      defp newer_hydration_head(hydration) do
+        attrs = %{
+          device_id: hydration.device_id,
+          credential_epoch: hydration.origin_credential_epoch,
+          storage_epoch: hydration.origin_storage_epoch,
+          sequence: hydration.sequence + 1,
+          kind: hydration.kind,
+          schema_version: hydration.schema_version,
+          source_generation: hydration.source_generation,
+          parent_hash: hydration.checkpoint_hash,
+          content_hash: hydration.content_hash
+        }
+
+        {:ok, checkpoint_hash} = Checkpoint.hash(attrs)
+
+        %{
+          hydration
+          | sequence: attrs.sequence,
+            parent_hash: attrs.parent_hash,
+            checkpoint_hash: checkpoint_hash
+        }
+      end
+
       defp rehash_chunk(attrs) do
         hash_attrs = Map.take(attrs, [:checkpoint_hash, :total_content_length, :chunk_index, :chunk_count, :chunk_offset, :chunk])
 
@@ -365,7 +534,17 @@ defmodule RacingOrg.Tracker.Pro.TestSupport.BackendCheckpointTransferDirectSourc
       end
     end
 
-    snapshot = BackendCheckpointTransferDirectSourceProbe.run(#{inspect(kat_path)})
+    isolation = %{
+      mix_loaded?: :code.is_loaded(Mix) != false,
+      racing_org_started?:
+        Enum.any?(Application.started_applications(), fn {application, _description, _version} ->
+          application == :racing_org
+        end),
+      launcher: launcher,
+      launcher_basename: Path.basename(launcher)
+    }
+
+    snapshot = BackendCheckpointTransferDirectSourceProbe.run(#{inspect(kat_path)}, isolation)
     IO.write("BACKEND_CHECKPOINT_TRANSFER_FIXTURE:" <> (snapshot |> :erlang.term_to_binary() |> Base.encode64()))
     """
   end
