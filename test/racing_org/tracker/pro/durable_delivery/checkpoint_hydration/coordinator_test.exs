@@ -71,6 +71,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
 
     def resolve(:default, _operation, default), do: default.()
     def resolve({:return, result}, _operation, _default), do: result
+
+    def resolve({:put_and_return, key, value, result}, _operation, _default) do
+      put(key, value)
+      result
+    end
+
     def resolve({:crash, reason}, _operation, _default), do: exit(reason)
 
     def resolve({:block, next}, operation, default) do
@@ -168,7 +174,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
         session = Backend.data(:session)
 
         if session.generation == generation do
-          {:ok, fun.(session)}
+          result = fun.(session)
+
+          Backend.update(fn state ->
+            Map.update(state, :session_callback_results, [result], &[result | &1])
+          end)
+
+          {:ok, result}
         else
           {:error, :stale_session}
         end
@@ -384,17 +396,24 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
              :manager_status,
              :checkpoint_decode,
              :adapter_hydrate,
+             :session_with,
              :manager_begin,
+             :session_with,
              :store_observe,
              :journal_write_prepared,
+             :session_with,
              :store_hydrate,
              :journal_write_head_committed,
              :checkpoint_decode,
              :adapter_hydrate,
+             :session_with,
              :runtime_restore,
              :store_head,
+             :session_with,
              :journal_remove,
+             :session_with,
              :store_head,
+             :session_with,
              :manager_finish
            ]
 
@@ -537,6 +556,157 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.CoordinatorT
 
     refute :manager_begin in core_operations()
     refute :checkpoint_decode in core_operations()
+  end
+
+  test "fresh hydration releases each session lease before checkpoint effects", ctx do
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:ok, :hydrated} = Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert Backend.data(:session_callback_results)
+           |> Enum.reverse()
+           |> Enum.all?(&match?({:checkpoint_hydration_authorization, _authorization}, &1))
+  end
+
+  test "durable recovery does not require the historical session to remain live", ctx do
+    Backend.put(:journal, journal_record(ctx.hydration, :head_committed))
+    Backend.put(:head, selected_record(ctx.hydration, content: ctx.hydration.content, sequence: 9))
+    Backend.put(:session, %{ctx.session | session_id: <<55::128>>, generation: 99})
+
+    pid = start_coordinator(ctx)
+
+    assert Coordinator.status(pid) == %{blocked?: false, phase: nil, recovery_error: nil}
+    assert Backend.data(:journal) == nil
+    assert Backend.data(:manager_finished?)
+    refute :session_with in core_operations()
+  end
+
+  test "session drift before Manager begin prevents all durable effects", ctx do
+    drifted = %{ctx.session | session_id: <<43::128>>, generation: ctx.session.generation + 1}
+
+    Backend.respond(
+      :checkpoint_decode,
+      {:put_and_return, :session, drifted, {:ok, %{content: ctx.hydration.content}}}
+    )
+
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:error, :stale_session} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    refute Backend.data(:manager_blocked?)
+    assert Backend.data(:journal) == nil
+    refute :manager_begin in core_operations()
+    refute :store_observe in core_operations()
+    refute :runtime_restore in core_operations()
+  end
+
+  test "session drift before a fresh head effect remains blocked without touching the Store", ctx do
+    drifted = %{ctx.session | session_id: <<44::128>>, generation: ctx.session.generation + 1}
+
+    Backend.respond(
+      {:boundary, :after_prepared},
+      {:put_and_return, :session, drifted, :ok}
+    )
+
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:error, :stale_session} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert %{phase: :prepared} = Backend.data(:journal)
+    assert Backend.data(:manager_blocked?)
+    refute :store_hydrate in core_operations()
+    refute :runtime_restore in core_operations()
+    refute :manager_finish in core_operations()
+  end
+
+  test "session drift before fresh runtime restore retains committed evidence", ctx do
+    drifted = %{ctx.session | session_id: <<45::128>>, generation: ctx.session.generation + 1}
+
+    Backend.respond(
+      {:boundary, :after_head_committed},
+      {:put_and_return, :session, drifted, :ok}
+    )
+
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:error, :stale_session} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert %{phase: :head_committed} = Backend.data(:journal)
+    assert Backend.data(:manager_blocked?)
+    refute :runtime_restore in core_operations()
+    refute :journal_remove in core_operations()
+    refute :manager_finish in core_operations()
+  end
+
+  test "session drift immediately before cleanup retains committed evidence", ctx do
+    drifted = %{ctx.session | session_id: <<46::128>>, generation: ctx.session.generation + 1}
+
+    Backend.respond(
+      {:boundary, :before_remove},
+      {:put_and_return, :session, drifted, :ok}
+    )
+
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:error, :stale_session} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert Backend.data(:restored) == [%{runtime: %{content: ctx.hydration.content}}]
+    assert %{phase: :head_committed} = Backend.data(:journal)
+    assert Backend.data(:manager_blocked?)
+    refute :journal_remove in core_operations()
+    refute :manager_finish in core_operations()
+  end
+
+  test "session drift after cleanup recreates committed evidence before finish", ctx do
+    drifted = %{ctx.session | session_id: <<47::128>>, generation: ctx.session.generation + 1}
+
+    Backend.respond(
+      {:boundary, :after_remove},
+      {:put_and_return, :session, drifted, :ok}
+    )
+
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:error, :stale_session} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert Backend.data(:restored) == [%{runtime: %{content: ctx.hydration.content}}]
+    assert %{phase: :head_committed} = Backend.data(:journal)
+    assert Backend.data(:manager_blocked?)
+    assert :journal_remove in core_operations()
+    refute :manager_finish in core_operations()
+  end
+
+  test "session drift immediately before finish recreates committed evidence", ctx do
+    drifted = %{ctx.session | session_id: <<48::128>>, generation: ctx.session.generation + 1}
+
+    Backend.respond(
+      {:boundary, :before_finish},
+      {:put_and_return, :session, drifted, :ok}
+    )
+
+    pid = start_coordinator(ctx)
+    Backend.clear_operations()
+
+    assert {:error, :stale_session} =
+             Coordinator.hydrate(pid, ctx.session.generation, ctx.hydration)
+
+    assert Backend.data(:restored) == [%{runtime: %{content: ctx.hydration.content}}]
+    assert %{phase: :head_committed} = Backend.data(:journal)
+    assert Backend.data(:manager_blocked?)
+    assert :journal_remove in core_operations()
+    assert Enum.count(core_operations(), &(&1 == :store_head)) == 2
+    refute :manager_finish in core_operations()
   end
 
   test "a binding race is rejected by Manager without creating a journal", ctx do

@@ -118,6 +118,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
       boundary: Keyword.get(opts, :boundary, fn _stage -> :ok end),
       blocker: nil,
       selected_head: nil,
+      fresh_request?: false,
       recovery_error: nil
     }
 
@@ -174,16 +175,18 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   def handle_call({:hydrate, session_generation, hydration}, _from, state) do
     case start_hydration(state, session_generation, hydration) do
-      {:ok, state} -> {:reply, {:ok, :hydrated}, state}
-      {:error, reason, state} -> {:reply, {:error, reason}, %{state | recovery_error: reason}}
+      {:ok, state} ->
+        {:reply, {:ok, :hydrated}, state}
+
+      {:error, reason, state} ->
+        {:reply, {:error, reason}, %{state | fresh_request?: false, recovery_error: reason}}
     end
   end
 
   defp start_hydration(state, session_generation, hydration) do
-    with {:ok, hydration} <- validate_hydration_shape(hydration) do
-      with_current_session(state, session_generation, fn authorization ->
-        start_authorized_hydration(state, authorization, hydration)
-      end)
+    with {:ok, hydration} <- validate_hydration_shape(hydration),
+         {:ok, authorization} <- current_session_authorization(state, session_generation) do
+      start_authorized_hydration(state, authorization, hydration)
     else
       {:error, reason} -> {:error, reason, state}
     end
@@ -206,9 +209,39 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
   defp begin_transition(state, authorization, transaction_id, binding, hydration, runtime) do
     token = make_ref()
 
+    case revalidate_authorization(state, authorization) do
+      :ok ->
+        begin_authorized_transition(
+          state,
+          token,
+          binding,
+          authorization,
+          transaction_id,
+          hydration,
+          runtime
+        )
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp begin_authorized_transition(
+         state,
+         token,
+         binding,
+         authorization,
+         transaction_id,
+         hydration,
+         runtime
+       ) do
     case manager_begin(state, token, binding) do
       :ok ->
-        state = %{state | blocker: blocker(token, binding, authorization, transaction_id, hydration)}
+        state = %{
+          state
+          | blocker: blocker(token, binding, authorization, transaction_id, hydration),
+            fresh_request?: true
+        }
 
         case boundary(state, :after_begin) do
           :ok ->
@@ -310,6 +343,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   defp prepare_transition(state, _runtime) do
     with :ok <- boundary(state, :before_prepared),
+         :ok <- authorize_fresh_effect(state),
          {:ok, expected_head} <- observe_target_head(state) do
       record = %{state.blocker.record | expected_head: expected_head}
       state = put_record(state, record)
@@ -327,6 +361,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
   defp prepare_head_transition(state) do
     with :ok <- boundary(state, :before_head),
+         :ok <- authorize_fresh_effect(state),
          {:ok, selected_head} <- hydrate_head(state) do
       state = %{state | selected_head: selected_head}
 
@@ -369,16 +404,27 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
 
     with {:ok, runtime} <- selected_runtime(state, delivered_runtime),
          :ok <- boundary(state, :before_restore),
+         :ok <- authorize_fresh_effect(state),
          :ok <- restore_runtime(state, runtime),
          :ok <- boundary(state, :after_restore),
          :ok <- ensure_selected_head_current(state),
          :ok <- boundary(state, :before_remove),
+         :ok <- authorize_fresh_effect(state),
          :ok <- journal_remove(state),
          :ok <- boundary(state, :after_remove),
+         :ok <- authorize_fresh_effect(state),
          :ok <- ensure_selected_head_current(state),
          :ok <- boundary(state, :before_finish),
+         :ok <- authorize_fresh_effect(state),
          :ok <- manager_finish(state) do
-      {:ok, %{state | blocker: nil, selected_head: nil, recovery_error: nil}}
+      {:ok,
+       %{
+         state
+         | blocker: nil,
+           selected_head: nil,
+           fresh_request?: false,
+           recovery_error: nil
+       }}
     else
       {:error, reason} ->
         state = retain_recovery_evidence(state, evidence)
@@ -427,15 +473,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
     end
   end
 
-  defp with_current_session(state, session_generation, transition) when is_function(transition, 1) do
+  defp current_session_authorization(state, session_generation) do
     callback = fn session ->
-      authorization = %{
-        session_generation: session.generation,
-        session_id: session.session_id,
-        credential_epoch: session.credential_epoch
-      }
-
-      {:checkpoint_hydration_result, transition.(authorization)}
+      {:checkpoint_hydration_authorization,
+       %{
+         session_generation: session.generation,
+         session_id: session.session_id,
+         credential_epoch: session.credential_epoch
+       }}
     end
 
     case state.session_holder_module.with_session(
@@ -443,17 +488,59 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator 
            session_generation,
            callback
          ) do
-      {:ok, {:checkpoint_hydration_result, result}} ->
-        result
+      {:ok, {:checkpoint_hydration_authorization, authorization}} when is_map(authorization) ->
+        {:ok, authorization}
 
       {:error, reason} when reason in [:no_session, :stale_session, :session_holder_unavailable] ->
-        {:error, :stale_session, state}
+        {:error, :stale_session}
 
       {:error, reason} ->
-        {:error, reason, state}
+        {:error, reason}
 
       _other ->
-        {:error, :invalid_session_authorization, state}
+        {:error, :invalid_session_authorization}
+    end
+  end
+
+  defp authorize_fresh_effect(%{fresh_request?: false}), do: :ok
+
+  defp authorize_fresh_effect(%{fresh_request?: true, blocker: %{record: record}} = state),
+    do: authorize_fresh_effect(state, record)
+
+  defp authorize_fresh_effect(_state), do: {:error, :invalid_session_authorization}
+
+  defp revalidate_authorization(state, authorization) do
+    record = %{
+      session_generation: authorization.session_generation,
+      session_incarnation: authorization.session_id,
+      target: %{credential_epoch: authorization.credential_epoch}
+    }
+
+    authorize_fresh_effect(state, record)
+  end
+
+  defp authorize_fresh_effect(state, record) do
+    if fresh_transition?(record) do
+      with {:ok, authorization} <-
+             current_session_authorization(state, record.session_generation),
+           :ok <- match_authorization(authorization, record) do
+        :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp fresh_transition?(record),
+    do: not is_nil(record.session_generation) and not is_nil(record.session_incarnation)
+
+  defp match_authorization(authorization, record) do
+    if authorization.session_generation == record.session_generation and
+         authorization.session_id == record.session_incarnation and
+         authorization.credential_epoch == record.target.credential_epoch do
+      :ok
+    else
+      {:error, :stale_session}
     end
   end
 
