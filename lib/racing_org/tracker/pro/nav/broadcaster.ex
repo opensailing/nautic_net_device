@@ -1,4 +1,6 @@
 defmodule RacingOrg.Tracker.Pro.Nav.Broadcaster do
+  alias RacingOrg.Tracker.Pro.DesiredState.OutputFence
+
   @moduledoc """
   Periodically broadcasts NMEA 2000 navigation *display* PGNs (active waypoint,
   bearing/range, active leg, cross-track error, and the route list) onto the bus
@@ -46,6 +48,7 @@ defmodule RacingOrg.Tracker.Pro.Nav.Broadcaster do
     state = %{
       commands: opts[:commands] || Commands,
       transmit: opts[:transmit_fn] || (&default_transmit/3),
+      output_fence: opts[:output_fence] || OutputFence.default(),
       # The compute engine to feed `bearing_to_mark` into (so the `vmc` library calc can
       # compute). `{module, server}` or a bare module (used as both). Defaults to the
       # named Compute.Engine; pass `nil` to disable the push (host tests not exercising
@@ -80,7 +83,14 @@ defmodule RacingOrg.Tracker.Pro.Nav.Broadcaster do
   defp do_broadcast(state) do
     assignment = safe_assignment(state.commands)
     nav = State.derive(assignment, state.position)
-    messages = PGN.nav_messages(nav, waypoints(assignment), state.route_name)
+
+    # External NMEA output stays fenced while a desired-state generation reloads
+    # (OutputFence keeps the legacy carve-out); the compute-engine feeds below are
+    # internal signal plumbing and keep running so calcs stay warm.
+    messages =
+      if OutputFence.permitted?(state.output_fence),
+        do: PGN.nav_messages(nav, waypoints(assignment), state.route_name),
+        else: []
 
     for {priority, pgn, payload} <- messages, do: safe_transmit(state.transmit, priority, pgn, payload)
 

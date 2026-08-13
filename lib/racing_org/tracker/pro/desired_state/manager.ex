@@ -644,6 +644,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
 
     case gate_close(state) do
       :ok ->
+        :ok = record_output_authority(state)
+
         with_prepared_transition(state, fn transition ->
           activate_candidate_with_closed_gate(
             state,
@@ -1501,6 +1503,8 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
   end
 
   defp reconcile_active_pointer(state, pointer) do
+    :ok = record_output_authority(state)
+
     cond do
       not pointer_matches_identity?(pointer, state.identity) ->
         close_runtime_quiescent(state)
@@ -1868,6 +1872,14 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
     _exception -> {:error, :gate_unavailable}
   catch
     _kind, _reason -> {:error, :gate_unavailable}
+  end
+
+  # Mark that v1 desired-state authority exists so the closed gate fences
+  # external output. Best-effort: a gate outage must not block activation or
+  # reconciliation, and legacy incarnations without authority stay unmarked.
+  defp record_output_authority(state) do
+    _ = call_gate(fn -> OperationalGate.record_authority_established_for(state.gate_pid) end)
+    :ok
   end
 
   defp install_lease_sentinel(state, owner_pid_map, authority_bindings) do

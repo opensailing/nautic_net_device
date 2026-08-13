@@ -3277,6 +3277,27 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.ManagerTest do
     end)
   end
 
+  test "reconciling an active generation records durable output authority", ctx do
+    on_exit(fn -> OperationalGate.clear_authority_established(ctx.term_key) end)
+    fixture = fully_stage(ctx.store, DS.generation_fixture())
+    assert {:ok, nil} = Store.activate(ctx.store, 1, fixture.manifest_hash)
+
+    refute OperationalGate.authority_established?(ctx.term_key)
+    _manager = start_manager(ctx, owner_retry_base_ms: 10)
+    assert_receive {:applier, :reconcile, _startup}
+
+    assert OperationalGate.authority_established?(ctx.term_key)
+    assert OperationalGate.output_permitted?(ctx.term_key)
+  end
+
+  test "a device without desired-state authority keeps output permitted", ctx do
+    on_exit(fn -> OperationalGate.clear_authority_established(ctx.term_key) end)
+    _manager = start_manager(ctx)
+
+    refute OperationalGate.authority_established?(ctx.term_key)
+    assert OperationalGate.output_permitted?(ctx.term_key)
+  end
+
   test "opt-in checkpoint hydration startup barrier stays closed until exact begin and finish", ctx do
     fixture = fully_stage(ctx.store, DS.generation_fixture())
     assert {:ok, nil} = Store.activate(ctx.store, 1, fixture.manifest_hash)

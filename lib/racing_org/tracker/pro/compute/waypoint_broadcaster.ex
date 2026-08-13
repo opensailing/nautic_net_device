@@ -1,4 +1,6 @@
 defmodule RacingOrg.Tracker.Pro.Compute.WaypointBroadcaster do
+  alias RacingOrg.Tracker.Pro.DesiredState.OutputFence
+
   @moduledoc """
   Broadcasts the NEXT WAYPOINT to steer to on the NMEA 2000 bus at ~1 Hz so the boat's
   B&G/Zeus plotter shows bearing + distance to the next mark (and, where the plotter
@@ -113,6 +115,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.WaypointBroadcaster do
       commands: opts[:commands] || Commands,
       enabled: Keyword.get(opts, :enabled, true),
       transmit: opts[:transmit_fn] || (&default_transmit/3),
+      output_fence: opts[:output_fence] || OutputFence.default(),
       # Source of own-position as `{lat, lon}` or nil. Defaults to the last telemetry fix.
       position_fn: position_fn,
       # Monotonic-ms clock for the 1 Hz rate-limit (injectable for deterministic tests).
@@ -160,7 +163,16 @@ defmodule RacingOrg.Tracker.Pro.Compute.WaypointBroadcaster do
 
   defp do_tick(%{enabled: false} = state), do: {0, state}
 
+  # External output stays fenced while a desired-state generation reloads.
   defp do_tick(state) do
+    if OutputFence.permitted?(state.output_fence) do
+      do_permitted_tick(state)
+    else
+      {0, state}
+    end
+  end
+
+  defp do_permitted_tick(state) do
     assignment = safe_assignment(state.commands)
     position = current_position(state)
 

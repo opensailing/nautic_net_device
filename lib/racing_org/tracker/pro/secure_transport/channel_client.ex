@@ -71,7 +71,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   require Logger
 
   alias RacingOrg.Tracker.Pro.Commands.Ledger.Executor, as: CommandExecutor
-  alias RacingOrg.Tracker.Pro.DesiredState.{Manager, Runtime, RuntimeIdentity}
+  alias RacingOrg.Tracker.Pro.DesiredState.{Manager, OutputFence, Runtime, RuntimeIdentity}
   alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.{Coordinator, Staging}
   alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Entry
   alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner, as: OutboxOwner
@@ -364,6 +364,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
         end),
       delivery_planner: Keyword.get(opts, :delivery_planner, &Planner.plan/1),
       receipt_evidence: Keyword.get(opts, :receipt_evidence, &FirmwareValidation.ReceiptEvidence.record/1),
+      # Fences estimator publications (computed values, sailed polar, calibration,
+      # wind shift) while a desired-state generation reloads. Control/status pushes
+      # are never fenced — the channel must keep flowing so the device can receive
+      # the generation that reopens the gate.
+      output_fence: Keyword.get(opts, :output_fence, OutputFence.default()),
       checkpoint_hydration_coordinator: Keyword.get(opts, :checkpoint_hydration_coordinator, Coordinator),
       checkpoint_hydration_coordinator_module: Keyword.get(opts, :checkpoint_hydration_coordinator_module, Coordinator),
       checkpoint_hydration_staging_module: Keyword.get(opts, :checkpoint_hydration_staging_module, Staging),
@@ -708,22 +713,22 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   # Push them as "computed_values_data" ONLY when a secure session is live (joined
   # topic + derived session); otherwise drop the batch (best-effort, like telemetry).
   def handle_info({:send_computed_values_data, values}, socket) do
-    {:noreply, push_computed_values_data(socket, values)}
+    {:noreply, fenced_estimator_push(socket, &push_computed_values_data(&1, values))}
   end
 
   # The Phase 4 Observer streams a throttled incremental sailed-polar delta.
   # Push it as "sailed_polar_update" ONLY when a secure session is live; otherwise
   # drop it (best-effort, like telemetry — the Observer re-emits on the next sync).
   def handle_info({:send_sailed_polar_update, update}, socket) do
-    {:noreply, push_sailed_polar_update(socket, update)}
+    {:noreply, fenced_estimator_push(socket, &push_sailed_polar_update(&1, update))}
   end
 
   def handle_info({:send_calibration_update, update}, socket) do
-    {:noreply, push_calibration_update(socket, update)}
+    {:noreply, fenced_estimator_push(socket, &push_calibration_update(&1, update))}
   end
 
   def handle_info({:send_wind_shift_update, update}, socket) do
-    {:noreply, push_wind_shift_update(socket, update)}
+    {:noreply, fenced_estimator_push(socket, &push_wind_shift_update(&1, update))}
   end
 
   # The DeviationMonitor asks for a recalc when the boat deviates past the threshold.
@@ -1609,6 +1614,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   # confirms is live (i.e. the handshake completed). No `at` field — the server stamps
   # receipt time. With no live session / empty batch this is a no-op (the value is
   # simply dropped, like telemetry with no session).
+  # Estimator publications are external output: they stay fenced while a
+  # desired-state generation reloads (the fence keeps the legacy carve-out and
+  # fails closed). Dropped batches are best-effort by contract — each observer
+  # re-emits on its next throttled sync once the gate reopens.
+  defp fenced_estimator_push(socket, push) do
+    if OutputFence.permitted?(socket.assigns.output_fence), do: push.(socket), else: socket
+  end
+
   defp push_computed_values_data(%{assigns: %{topic: nil}} = socket, _values), do: socket
   defp push_computed_values_data(socket, []), do: socket
 

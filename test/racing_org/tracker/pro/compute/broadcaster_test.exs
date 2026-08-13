@@ -50,6 +50,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.BroadcasterTest do
            tick_ms: opts[:tick_ms] || 3_600_000,
            now_fn: clock,
            transmit_fn: fn priority, pgn, payload -> send(test_pid, {:tx, priority, pgn, payload}) end,
+           output_fence: Keyword.get(opts, :output_fence, fn -> true end),
            stream_fn: opts[:stream_fn] || fn streamed -> send(test_pid, {:stream, streamed}) end,
            name: nil
          ] ++ Keyword.take(opts, [:stream_interval_ms])},
@@ -70,6 +71,16 @@ defmodule RacingOrg.Tracker.Pro.Compute.BroadcasterTest do
       assert_receive {:tx, _priority, 128_259, payload}
       decoded = J1939.SpeedParams.decode(payload)
       assert_in_delta decoded.water_speed, 4.0, 0.01
+    end
+
+    test "neither the bus nor the backend stream emits while the gate fences output" do
+      values = [result(%{output_pgn: 128_259, output_field: "speed_water_referenced"}, %{"value" => 4.0}, true)]
+      %{bcast: b} = start_bcast(values, output_fence: fn -> false end)
+
+      assert Broadcaster.tick_now(b) == 0
+      refute_receive {:tx, _priority, _pgn, _payload}, 50
+      refute_receive {:stream, _streamed}, 50
+      refute Broadcaster.broadcasting?(b)
     end
 
     test "a true_wind library calc broadcasts 130306 with speed + angle + reference=true" do

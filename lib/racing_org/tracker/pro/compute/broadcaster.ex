@@ -1,4 +1,6 @@
 defmodule RacingOrg.Tracker.Pro.Compute.Broadcaster do
+  alias RacingOrg.Tracker.Pro.DesiredState.OutputFence
+
   @moduledoc """
   Periodically takes the engine's COMPUTED VALUES, damps them, encodes each to its
   target NMEA 2000 PGN, and BROADCASTS it on the bus at (approximately) the value's own
@@ -114,6 +116,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.Broadcaster do
     state = %{
       engine: normalize_engine(opts[:engine]),
       transmit: opts[:transmit_fn] || (&default_transmit/3),
+      output_fence: opts[:output_fence] || OutputFence.default(),
       # The backend streamback collaborator: a 1-arity fn taking the batch of
       # `%{id, value}` maps. Defaults to the channel client (best-effort, no-op when no
       # session); injectable so host tests capture the streamed payload without a socket.
@@ -158,6 +161,16 @@ defmodule RacingOrg.Tracker.Pro.Compute.Broadcaster do
   # --- tick ---
 
   defp do_tick(state) do
+    if OutputFence.permitted?(state.output_fence) do
+      do_permitted_tick(state)
+    else
+      # External output (bus broadcast AND backend stream) stays fenced while a
+      # desired-state generation reloads; damping resumes when the gate reopens.
+      {0, %{state | broadcasting?: false}}
+    end
+  end
+
+  defp do_permitted_tick(state) do
     now = state.now_fn.()
     values = current_values(state.engine)
 

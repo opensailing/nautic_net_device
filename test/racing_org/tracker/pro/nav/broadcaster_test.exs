@@ -9,7 +9,7 @@ defmodule RacingOrg.Tracker.Pro.Nav.BroadcasterTest do
   alias RacingOrg.Tracker.Protobuf.RaceAssignment
   alias RacingOrg.Tracker.Protobuf.ServerReply
 
-  defp start_broadcaster do
+  defp start_broadcaster(opts \\ []) do
     test_pid = self()
     commands = start_supervised!({Commands, device_id: "dev"})
 
@@ -19,6 +19,7 @@ defmodule RacingOrg.Tracker.Pro.Nav.BroadcasterTest do
          commands: commands,
          interval_ms: 60_000,
          transmit_fn: fn priority, pgn, payload -> send(test_pid, {:tx, priority, pgn, payload}) end,
+         output_fence: Keyword.get(opts, :output_fence, fn -> true end),
          name: nil}
       )
 
@@ -59,6 +60,15 @@ defmodule RacingOrg.Tracker.Pro.Nav.BroadcasterTest do
     assert_receive {:tx, 6, 129_285, _route}
   end
 
+  test "transmits nothing while the operational gate fences output" do
+    %{commands: c, broadcaster: b} = start_broadcaster(output_fence: fn -> false end)
+    assign_course(c)
+    send(b, {:nav_position, {42.05, -70.001}})
+
+    assert {%{active?: true}, 0} = Broadcaster.broadcast_now(b)
+    refute_receive {:tx, _priority, _pgn, _payload}, 50
+  end
+
   test "broadcasts nothing when there is no active waypoint" do
     %{broadcaster: b} = start_broadcaster()
     assert {%{active?: false}, 0} = Broadcaster.broadcast_now(b)
@@ -96,7 +106,7 @@ defmodule RacingOrg.Tracker.Pro.Nav.BroadcasterTest do
     def pushed(agent), do: Agent.get(agent, & &1)
   end
 
-  defp start_broadcaster_with_compute(compute_agent) do
+  defp start_broadcaster_with_compute(compute_agent, opts \\ []) do
     test_pid = self()
     commands = start_supervised!({Commands, device_id: "dev2"})
 
@@ -106,6 +116,7 @@ defmodule RacingOrg.Tracker.Pro.Nav.BroadcasterTest do
          commands: commands,
          interval_ms: 60_000,
          transmit_fn: fn priority, pgn, payload -> send(test_pid, {:tx, priority, pgn, payload}) end,
+         output_fence: Keyword.get(opts, :output_fence, fn -> true end),
          compute: {StubCompute, compute_agent},
          name: nil}
       )

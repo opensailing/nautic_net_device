@@ -2421,7 +2421,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       def current_status(agent), do: Agent.get(agent, & &1)
     end
 
-    defp connect_live(ctx) do
+    defp connect_live(ctx, extra_opts \\ []) do
       {:ok, holder} = start_supervised({SessionHolder, name: nil})
       {:ok, wifi} = start_supervised(StreamFakeWiFi)
       topic = "device:" <> ctx.identity.fingerprint
@@ -2429,13 +2429,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       client =
         start_supervised!(
           {ChannelClient,
-           name: nil,
-           auto_connect?: true,
-           test_mode?: true,
-           url: "wss://test.local/device_socket/websocket",
-           session_holder: holder,
-           wifi: {StreamFakeWiFi, wifi},
-           keystore_opts: [base_path: ctx.base]}
+           [
+             name: nil,
+             auto_connect?: true,
+             test_mode?: true,
+             url: "wss://test.local/device_socket/websocket",
+             session_holder: holder,
+             wifi: {StreamFakeWiFi, wifi},
+             keystore_opts: [base_path: ctx.base]
+           ] ++ extra_opts}
         )
 
       connect_and_assert_join(client, ^topic, %{}, :ok)
@@ -2472,6 +2474,31 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       assert payload.values == values
       # No batch/per-sample timestamp — the server stamps receipt time.
       refute Map.has_key?(payload, :at)
+    end
+
+    test "drops estimator publications while the operational gate fences output", ctx do
+      # The live-connect flow itself proves control/status pushes are NOT fenced:
+      # connect_live drains the post-handshake wifi_status push with this same
+      # closed fence installed. Only estimator publication is external output.
+      {client, topic} = connect_live(ctx, output_fence: fn -> false end)
+
+      assert :ok = ChannelClient.send_computed_values_data(client, [%{id: "abc", value: 12.3}])
+      assert :ok = ChannelClient.send_sailed_polar_update(client, %{boat_identifier: "b", seq: 1, cells: [%{a: 1}]})
+      assert :ok = ChannelClient.send_calibration_update(client, %{boat_identifier: "b", seq: 1, entries: [%{a: 1}]})
+
+      refute_push(^topic, "computed_values_data", _payload, 100)
+      refute_push(^topic, "sailed_polar_update", _polar, 10)
+      refute_push(^topic, "calibration_update", _calibration, 10)
+      assert Process.alive?(client)
+    end
+
+    test "a raising output fence fails closed without crashing the client", ctx do
+      {client, topic} = connect_live(ctx, output_fence: fn -> raise "fence unavailable" end)
+
+      assert :ok = ChannelClient.send_computed_values_data(client, [%{id: "abc", value: 12.3}])
+
+      refute_push(^topic, "computed_values_data", _payload, 100)
+      assert Process.alive?(client)
     end
 
     test "no-ops (no push) when there is no live session", ctx do
@@ -2807,7 +2834,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       def current_status(agent), do: Agent.get(agent, & &1)
     end
 
-    defp connect_live_wind_shift(ctx) do
+    defp connect_live_wind_shift(ctx, extra_opts \\ []) do
       {:ok, holder} = start_supervised({SessionHolder, name: nil})
       {:ok, wifi} = start_supervised(WindShiftFakeWiFi)
       topic = "device:" <> ctx.identity.fingerprint
@@ -2815,13 +2842,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       client =
         start_supervised!(
           {ChannelClient,
-           name: nil,
-           auto_connect?: true,
-           test_mode?: true,
-           url: "wss://test.local/device_socket/websocket",
-           session_holder: holder,
-           wifi: {WindShiftFakeWiFi, wifi},
-           keystore_opts: [base_path: ctx.base]}
+           [
+             name: nil,
+             auto_connect?: true,
+             test_mode?: true,
+             url: "wss://test.local/device_socket/websocket",
+             session_holder: holder,
+             wifi: {WindShiftFakeWiFi, wifi},
+             keystore_opts: [base_path: ctx.base]
+           ] ++ extra_opts}
         )
 
       connect_and_assert_join(client, ^topic, %{}, :ok)
@@ -2917,6 +2946,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       update = %{boat_identifier: "boat-42", seq: 1, session: nil, timeline: [], events: []}
       assert :ok = ChannelClient.send_wind_shift_update(client, update)
       refute_push("wind_shift_update", _payload, 50)
+    end
+
+    test "drops the wind-shift publication while the operational gate fences output", ctx do
+      {client, topic} = connect_live_wind_shift(ctx, output_fence: fn -> false end)
+
+      assert :ok = ChannelClient.send_wind_shift_update(client, wind_shift_update())
+      refute_push(^topic, "wind_shift_update", _payload, 100)
+      assert Process.alive?(client)
     end
 
     test "no-ops (no push) when there is no live session", ctx do

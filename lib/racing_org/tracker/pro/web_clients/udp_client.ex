@@ -37,6 +37,7 @@ defmodule RacingOrg.Tracker.Pro.WebClients.UDPClient do
 
   require Logger
 
+  alias RacingOrg.Tracker.Pro.DesiredState.OperationalGate
   alias RacingOrg.Tracker.Pro.SecureTransport.Frame
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
   alias RacingOrg.Tracker.Pro.WebClients.UDPClient.Server
@@ -63,12 +64,38 @@ defmodule RacingOrg.Tracker.Pro.WebClients.UDPClient do
     holder = Keyword.get(opts, :session_holder, SessionHolder)
     send_fun = Keyword.get(opts, :send_fun, &Server.send/1)
     expected_generation = Keyword.get(opts, :session_generation, :current)
+    output_fence = Keyword.get(opts, :output_fence, &OperationalGate.output_permitted?/0)
 
-    case secure_send(holder, expected_generation, proto_binary, send_fun) do
-      :ok -> :ok
-      :no_session -> drop_without_session()
-      :send_failed -> drop_failed_send()
+    cond do
+      not output_permitted?(output_fence) ->
+        drop_fenced_output()
+
+      true ->
+        case secure_send(holder, expected_generation, proto_binary, send_fun) do
+          :ok -> :ok
+          :no_session -> drop_without_session()
+          :send_failed -> drop_failed_send()
+        end
     end
+  end
+
+  # External telemetry stays fenced while a desired-state generation reloads;
+  # incarnations that never established v1 authority keep today's behavior. A
+  # fence fault fails closed only when authority exists (the fence itself
+  # answers that), and a raising fence never crashes the telemetry pipeline.
+  defp output_permitted?(output_fence) when is_function(output_fence, 0) do
+    output_fence.() == true
+  rescue
+    _exception -> false
+  catch
+    _kind, _reason -> false
+  end
+
+  defp output_permitted?(_output_fence), do: false
+
+  defp drop_fenced_output do
+    Logger.debug("Dropping telemetry datagram; operational gate fences external output")
+    :ok
   end
 
   # Reserve atomically, then seal and cross the final send boundary in this caller

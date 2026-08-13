@@ -462,6 +462,32 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.OperationalGateTest do
     assert OperationalGate.status(ctx.gate) == :closed
   end
 
+  test "output stays permitted for legacy devices and fences once authority exists", ctx do
+    on_exit(fn -> OperationalGate.clear_authority_established(ctx.term_key) end)
+
+    # Before any v1 desired-state authority exists, output keeps flowing so a
+    # legacy or unprovisioned device is never silenced by the closed gate.
+    refute OperationalGate.open?(ctx.term_key)
+    assert OperationalGate.output_permitted?(ctx.term_key)
+
+    # The first activation marks the incarnation; a closed gate now fences.
+    assert :ok = OperationalGate.record_authority_established(ctx.term_key)
+    assert OperationalGate.authority_established?(ctx.term_key)
+    refute OperationalGate.output_permitted?(ctx.term_key)
+
+    # An open gate permits output again.
+    assert :ok = open_gate(ctx.gate, valid_binding())
+    assert OperationalGate.output_permitted?(ctx.term_key)
+
+    # Closing for a reload fences immediately.
+    assert :ok = OperationalGate.close(ctx.gate)
+    refute OperationalGate.output_permitted?(ctx.term_key)
+
+    # The marker survives independent of lease state and is idempotent.
+    assert :ok = OperationalGate.record_authority_established(ctx.term_key)
+    assert OperationalGate.authority_established?(ctx.term_key)
+  end
+
   test "an untrusted process cannot win the first open", ctx do
     binding = %{
       credential_epoch: 7,

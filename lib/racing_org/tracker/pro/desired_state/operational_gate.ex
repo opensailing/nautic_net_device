@@ -323,6 +323,52 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.OperationalGate do
     end
   end
 
+  @doc """
+  Whether external output (telemetry, NMEA, estimator publication) may emit.
+
+  Output is permitted while the gate is open, and — the legacy carve-out — on
+  incarnations where v1 desired-state authority has never been established, so
+  a legacy or unprovisioned device is never silenced by the closed gate. Once
+  the Manager records the first activation for this incarnation, a closed gate
+  fences output until a whole compatible generation is effective again.
+  """
+  @spec output_permitted?(term()) :: boolean()
+  def output_permitted?(term_key \\ @default_term_key) do
+    open?(term_key) or not authority_established?(term_key)
+  end
+
+  @doc "Durably mark (for this boot) that v1 desired-state authority exists."
+  @spec record_authority_established(term()) :: :ok
+  def record_authority_established(term_key \\ @default_term_key) do
+    key = authority_established_key(term_key)
+
+    if :persistent_term.get(key, false) == true do
+      :ok
+    else
+      :persistent_term.put(key, true)
+    end
+  end
+
+  @doc "Whether v1 desired-state authority was recorded for this incarnation."
+  @spec authority_established?(term()) :: boolean()
+  def authority_established?(term_key \\ @default_term_key) do
+    :persistent_term.get(authority_established_key(term_key), false) == true
+  end
+
+  @doc false
+  @spec clear_authority_established(term()) :: :ok
+  def clear_authority_established(term_key \\ @default_term_key) do
+    :persistent_term.erase(authority_established_key(term_key))
+    :ok
+  end
+
+  @doc "Record established authority through the gate server owning the term key."
+  @spec record_authority_established_for(GenServer.server()) :: :ok
+  def record_authority_established_for(server),
+    do: GenServer.call(server, :record_authority_established)
+
+  defp authority_established_key(term_key), do: {term_key, :desired_state_authority}
+
   @doc "True only for the exact credential and storage incarnation currently open."
   @spec operational?(non_neg_integer(), binary(), term()) :: boolean()
   def operational?(credential_epoch, storage_epoch, term_key \\ @default_term_key) do
@@ -666,6 +712,11 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.OperationalGate do
 
   def handle_call(:close, _from, state) do
     state = close_state(state)
+    {:reply, :ok, state}
+  end
+
+  def handle_call(:record_authority_established, _from, state) do
+    :ok = record_authority_established(state.term_key)
     {:reply, :ok, state}
   end
 

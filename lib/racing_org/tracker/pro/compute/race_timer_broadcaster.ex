@@ -1,4 +1,6 @@
 defmodule RacingOrg.Tracker.Pro.Compute.RaceTimerBroadcaster do
+  alias RacingOrg.Tracker.Pro.DesiredState.OutputFence
+
   @moduledoc """
   Broadcasts a sailing race-start COUNTDOWN on the NMEA 2000 bus at ~1 Hz so the
   boat's B&G/Zeus display ticks the same countdown the device is running.
@@ -100,6 +102,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.RaceTimerBroadcaster do
       commands: opts[:commands] || Commands,
       enabled: Keyword.get(opts, :enabled, true),
       transmit: opts[:transmit_fn] || (&default_transmit/3),
+      output_fence: opts[:output_fence] || OutputFence.default(),
       now_fn: opts[:now_fn] || (&DateTime.utc_now/0),
       tick_ms: tick_ms,
       # Wall-clock unix-ms of the last transmitted frame (1 Hz rate-limit), or nil.
@@ -128,7 +131,16 @@ defmodule RacingOrg.Tracker.Pro.Compute.RaceTimerBroadcaster do
 
   defp do_tick(%{enabled: false} = state), do: {0, state}
 
+  # External output stays fenced while a desired-state generation reloads.
   defp do_tick(state) do
+    if OutputFence.permitted?(state.output_fence) do
+      do_permitted_tick(state)
+    else
+      {0, state}
+    end
+  end
+
+  defp do_permitted_tick(state) do
     now = state.now_fn.()
     assignment = safe_assignment(state.commands)
 

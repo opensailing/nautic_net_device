@@ -82,6 +82,34 @@ defmodule RacingOrg.Tracker.Pro.WebClients.UDPClientTest do
       assert {:ok, @dataset_plaintext, _} = Frame.open(server, frame)
     end
 
+    test "drops the datagram while the operational gate fences output" do
+      {device, _server} = loopback_sessions()
+      holder = start_holder(device)
+
+      :ok =
+        UDPClient.send_data_set(@dataset_plaintext,
+          session_holder: holder,
+          send_fun: capture_fun(self()),
+          output_fence: fn -> false end
+        )
+
+      refute_receive {:sent, _frame}, 50
+    end
+
+    test "a raising output fence fails closed without crashing the pipeline" do
+      {device, _server} = loopback_sessions()
+      holder = start_holder(device)
+
+      :ok =
+        UDPClient.send_data_set(@dataset_plaintext,
+          session_holder: holder,
+          send_fun: capture_fun(self()),
+          output_fence: fn -> raise "fence unavailable" end
+        )
+
+      refute_receive {:sent, _frame}, 50
+    end
+
     test "consecutive sends use strictly increasing counters (no reuse)" do
       {device, _server} = loopback_sessions()
       holder = start_holder(device)

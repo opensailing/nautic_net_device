@@ -67,6 +67,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.WaypointBroadcasterTest do
            position_fn: fn -> position end,
            now_ms_fn: clock,
            transmit_fn: fn priority, pgn, payload -> send(test_pid, {:tx, priority, pgn, payload}) end,
+           output_fence: Keyword.get(opts, :output_fence, fn -> true end),
            name: nil
          ]},
         id: {WaypointBroadcaster, System.unique_integer([:positive])}
@@ -98,6 +99,13 @@ defmodule RacingOrg.Tracker.Pro.Compute.WaypointBroadcasterTest do
   end
 
   describe "broadcasting the next waypoint" do
+    test "transmits nothing while the operational gate fences output" do
+      %{bcast: b} = start_bcast(assignment(active: "WL"), output_fence: fn -> false end)
+
+      assert WaypointBroadcaster.tick_now(b) == 0
+      refute_receive {:tx, _priority, _pgn, _payload}, 50
+    end
+
     test "a tick transmits 129284 with distance + steer-to bearing ≈ the great-circle values" do
       %{bcast: b} = start_bcast(assignment(active: "WL"))
 

@@ -64,6 +64,7 @@ defmodule RacingOrg.Tracker.Pro.Compute.RaceTimerBroadcasterTest do
            tick_ms: opts[:tick_ms] || 3_600_000,
            now_fn: clock,
            transmit_fn: fn priority, pgn, payload -> send(test_pid, {:tx, priority, pgn, payload}) end,
+           output_fence: Keyword.get(opts, :output_fence, fn -> true end),
            name: nil
          ]},
         id: {RaceTimerBroadcaster, System.unique_integer([:positive])}
@@ -82,6 +83,16 @@ defmodule RacingOrg.Tracker.Pro.Compute.RaceTimerBroadcasterTest do
       assert_receive {:tx, priority, 130_824, payload}
       assert priority == 2
       assert_in_delta decode_timer(payload), 90_000, 5
+    end
+
+    test "transmits nothing while the operational gate fences output" do
+      clock = fn -> DateTime.add(@gun, -90, :second) end
+
+      %{bcast: b} =
+        start_bcast(assignment(start: @gun), clock: clock, output_fence: fn -> false end)
+
+      assert 0 == RaceTimerBroadcaster.tick_now(b)
+      refute_receive {:tx, _priority, _pgn, _payload}, 50
     end
 
     test "counts DOWN across successive ticks before the gun" do
