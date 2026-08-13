@@ -196,6 +196,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
         identity_refresh_ref: nil,
         identity_refresh_token: nil,
         binding_error: :identity_unbound,
+        on_admit: Keyword.get(opts, :on_admit),
         quarantined: false
       }
 
@@ -228,8 +229,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
     case verify_identity(state) do
       :ok ->
         case Store.enqueue(state.store, stream, payload, opts) do
-          {:ok, entry, store} -> {:reply, {:ok, receipt_for(entry)}, %{state | store: store}}
-          {:error, reason} -> {:reply, {:error, reason}, latch_storage_fault(state, reason)}
+          {:ok, entry, store} ->
+            notify_admit(state, entry.stream)
+            {:reply, {:ok, receipt_for(entry)}, %{state | store: store}}
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, latch_storage_fault(state, reason)}
         end
 
       {:error, reason} ->
@@ -241,8 +246,12 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
     case verify_identity(state) do
       :ok ->
         case Store.enqueue_checkpoint(state.store, builder) do
-          {:ok, entry, store} -> {:reply, {:ok, receipt_for(entry)}, %{state | store: store}}
-          {:error, reason} -> {:reply, {:error, reason}, latch_storage_fault(state, reason)}
+          {:ok, entry, store} ->
+            notify_admit(state, entry.stream)
+            {:reply, {:ok, receipt_for(entry)}, %{state | store: store}}
+
+          {:error, reason} ->
+            {:reply, {:error, reason}, latch_storage_fault(state, reason)}
         end
 
       {:error, reason} ->
@@ -436,6 +445,20 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   end
 
   defp select_pending(state, opts), do: Store.pending(state.store, opts)
+
+  # Fire-and-forget admit notification so a live transport can transmit the new
+  # durable entry immediately. Runs only after the durable append succeeded and
+  # must never disturb the owner: notifier faults are swallowed.
+  defp notify_admit(%{on_admit: on_admit}, stream) when is_function(on_admit, 1) do
+    _ = on_admit.(stream)
+    :ok
+  rescue
+    _exception -> :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp notify_admit(_state, _stream), do: :ok
 
   defp receipt_for(%Entry{} = entry) do
     %{

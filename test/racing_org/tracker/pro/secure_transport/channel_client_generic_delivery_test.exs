@@ -209,6 +209,25 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientGenericDeliveryTest
       assert Process.alive?(client)
     end
 
+    test "a dispatch kick also retransmits still-pending checkpoint submissions", ctx do
+      owner = self()
+      counter = :counters.new(1, [])
+
+      checkpoint_pending = fn _outbox, opts ->
+        :counters.add(counter, 1, 1)
+        send(owner, {:checkpoint_pending_call, :counters.get(counter, 1), opts})
+        []
+      end
+
+      {client, _id, _topic, _server_control, _holder} =
+        start_generic_client(ctx, checkpoint_pending: checkpoint_pending)
+
+      assert_receive {:checkpoint_pending_call, 1, [stream: :checkpoint]}
+
+      assert :ok = ChannelClient.dispatch_durable_deliveries(client)
+      assert_receive {:checkpoint_pending_call, 2, [stream: :checkpoint]}
+    end
+
     test "a dispatch kick after readiness retransmits still-pending entries", ctx do
       entry = generic_entry(:health, 6, priority: 1, ordinal: 1)
       owner = self()

@@ -123,6 +123,44 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
     end
   end
 
+  describe "admit notification" do
+    test "notifies the configured sink after each durable admission", %{root: root} do
+      owner_pid = self()
+
+      assert {:ok, owner} =
+               start_owner(root,
+                 on_admit: fn stream -> send(owner_pid, {:admitted, stream}) end
+               )
+
+      assert {:ok, _receipt} = Owner.enqueue(owner, :telemetry, "payload")
+      assert_receive {:admitted, :telemetry}
+
+      assert {:ok, _receipt} = Owner.enqueue(owner, :health, "health")
+      assert_receive {:admitted, :health}
+    end
+
+    test "does not notify on failed admissions and survives a crashing sink", %{root: root} do
+      owner_pid = self()
+
+      assert {:ok, owner} =
+               start_owner(root,
+                 max_entries: 1,
+                 on_admit: fn stream ->
+                   send(owner_pid, {:admitted, stream})
+                   raise "sink crashed"
+                 end
+               )
+
+      assert {:ok, _receipt} = Owner.enqueue(owner, :telemetry, "payload")
+      assert_receive {:admitted, :telemetry}
+      assert Process.alive?(owner)
+
+      assert {:error, {:backpressure, _reason}} = Owner.enqueue(owner, :telemetry, "overflow")
+      refute_receive {:admitted, _stream}, 50
+      assert Process.alive?(owner)
+    end
+  end
+
   describe "storage epoch" do
     test "obtains the storage epoch from an injected identity source", %{root: root} do
       assert {:ok, owner} = start_owner(root)
@@ -927,6 +965,25 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
 
     @impl true
     def close(segment), do: SegmentFileSystem.close(segment)
+
+    @impl true
+    def bind_entry(root, path, kind, root_identity, entry_identity, identity),
+      do: SegmentFileSystem.bind_entry(root, path, kind, root_identity, entry_identity, identity)
+
+    @impl true
+    def bound_info(bound_entry), do: SegmentFileSystem.bound_info(bound_entry)
+
+    @impl true
+    def read_bound(bound_entry, count), do: SegmentFileSystem.read_bound(bound_entry, count)
+
+    @impl true
+    def sync_bound(bound_entry), do: SegmentFileSystem.sync_bound(bound_entry)
+
+    @impl true
+    def remove_bound(bound_entry), do: SegmentFileSystem.remove_bound(bound_entry)
+
+    @impl true
+    def close_bound(bound_entry), do: SegmentFileSystem.close_bound(bound_entry)
   end
 
   defmodule RootCloseProbeSegmentFileSystem do
@@ -969,6 +1026,15 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
     def unlink_empty(segment), do: SegmentFileSystem.unlink_empty(segment)
     def file_info(segment), do: SegmentFileSystem.file_info(segment)
     def close(segment), do: SegmentFileSystem.close(segment)
+
+    def bind_entry(root, path, kind, root_identity, entry_identity, identity),
+      do: SegmentFileSystem.bind_entry(root, path, kind, root_identity, entry_identity, identity)
+
+    def bound_info(bound_entry), do: SegmentFileSystem.bound_info(bound_entry)
+    def read_bound(bound_entry, count), do: SegmentFileSystem.read_bound(bound_entry, count)
+    def sync_bound(bound_entry), do: SegmentFileSystem.sync_bound(bound_entry)
+    def remove_bound(bound_entry), do: SegmentFileSystem.remove_bound(bound_entry)
+    def close_bound(bound_entry), do: SegmentFileSystem.close_bound(bound_entry)
   end
 
   defmodule StatFailureFileSystem do

@@ -738,6 +738,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   def handle_info({:dispatch_durable_deliveries, :current}, socket) do
     case socket.assigns.session do
       %Session{generation: generation} when is_integer(generation) ->
+        socket = dispatch_checkpoint_submissions(socket, generation)
         {:noreply, dispatch_generic_deliveries(socket, generation)}
 
       _no_session ->

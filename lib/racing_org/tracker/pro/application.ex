@@ -251,7 +251,10 @@ defmodule RacingOrg.Tracker.Pro.Application do
       {RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner,
        name: RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner,
        root: outbox_root(),
-       identity: &RacingOrg.Tracker.Pro.DesiredState.Runtime.identity/0}
+       identity: &RacingOrg.Tracker.Pro.DesiredState.Runtime.identity/0,
+       on_admit: fn _stream ->
+         RacingOrg.Tracker.Pro.SecureTransport.ChannelClient.dispatch_durable_deliveries()
+       end}
     ]
   end
 
