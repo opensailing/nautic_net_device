@@ -1,6 +1,7 @@
 defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
   @moduledoc false
 
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem, as: Native
   alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
 
   @dir_mode 0o700
@@ -85,6 +86,30 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
       {:error, reason} -> {:error, {:pre_remove, reason}}
     end
   end
+
+  @type adopt_error ::
+          {:pre_adopt, term()}
+          | {:durability_uncertain, term()}
+
+  @doc "Durably move one existing entry into an absent destination without copying or overwriting."
+  @spec adopt(Path.t(), Path.t(), keyword()) :: :ok | {:error, adopt_error()}
+  def adopt(source, destination, opts \\ [])
+
+  def adopt(source, destination, opts)
+      when is_binary(source) and source != "" and is_binary(destination) and destination != "" and
+             is_list(opts) do
+    with :ok <- validate_adoption_path(source),
+         :ok <- validate_adoption_path(destination),
+         {:ok, root} <- adoption_root(destination, opts),
+         :ok <- ensure_adoption_file_system(opts),
+         {:ok, adoption} <- adoption_prepare(source, destination, root, opts) do
+      commit_adoption(adoption, source, destination, opts)
+    else
+      {:error, reason} -> {:error, {:pre_adopt, normalize_adoption_error(reason, source, destination)}}
+    end
+  end
+
+  def adopt(_source, _destination, _opts), do: {:error, {:pre_adopt, :invalid_adoption}}
 
   @spec ensure_directory(Path.t(), keyword()) :: :ok | {:error, term()}
   def ensure_directory(directory, opts \\ []) do
@@ -1078,6 +1103,104 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFile do
         {:error, {:directory_open, other}}
     end
   end
+
+  defp validate_adoption_path(path) do
+    if Path.type(path) == :absolute and Path.expand(path) == path and
+         :binary.match(path, <<0>>) == :nomatch do
+      :ok
+    else
+      {:error, :invalid_adoption_path}
+    end
+  end
+
+  defp adoption_root(destination, opts) do
+    case Keyword.get(opts, :directory_root) do
+      root when is_binary(root) and root != "" ->
+        if Path.type(root) == :absolute and Path.expand(root) == root and
+             :binary.match(root, <<0>>) == :nomatch do
+          relative = Path.relative_to(destination, root)
+
+          if relative == destination or relative == ".." or String.starts_with?(relative, "../") do
+            {:error, {:directory_outside_root, destination, root}}
+          else
+            {:ok, root}
+          end
+        else
+          {:error, {:invalid_directory_root, root}}
+        end
+
+      root ->
+        {:error, {:invalid_directory_root, root}}
+    end
+  end
+
+  defp ensure_adoption_file_system(opts) do
+    case Keyword.get(opts, :file_system, FileSystem) do
+      FileSystem -> :ok
+      _other -> {:error, :unsupported_adoption_file_system}
+    end
+  end
+
+  defp adoption_prepare(source, destination, root, opts) do
+    native = Keyword.get(opts, :native, Native)
+
+    safe_fs_operation(fn -> native.adoption_prepare(source, destination, root) end)
+  end
+
+  defp commit_adoption(adoption, source, destination, opts) do
+    native = Keyword.get(opts, :native, Native)
+
+    try do
+      case inject_fault(:before_adopt, opts) do
+        :ok ->
+          native_fault = adoption_native_fault(opts)
+
+          case safe_fs_operation(fn -> native.adoption_commit(adoption, native_fault) end) do
+            :ok ->
+              :ok
+
+            {:error, {:adopted, :fault_injected}} ->
+              {:error, adoption_fault_result(opts)}
+
+            {:error, {:adopted, reason}} ->
+              {:error, {:durability_uncertain, reason}}
+
+            {:error, reason} ->
+              {:error, {:pre_adopt, normalize_adoption_error(reason, source, destination)}}
+
+            other ->
+              {:error, {:pre_adopt, {:adoption_commit, other}}}
+          end
+
+        {:error, reason} ->
+          {:error, {:pre_adopt, reason}}
+      end
+    after
+      _ = safe_fs_operation(fn -> native.adoption_close(adoption) end)
+    end
+  end
+
+  defp adoption_native_fault(opts) do
+    case inject_fault(:adopted, opts) do
+      :ok -> :none
+      {:error, _reason} -> :after_rename
+    end
+  end
+
+  defp adoption_fault_result(opts) do
+    case inject_fault(:adopted, opts) do
+      {:error, reason} -> {:durability_uncertain, reason}
+      :ok -> {:durability_uncertain, :fault_injected}
+    end
+  end
+
+  defp normalize_adoption_error(:eexist, _source, destination),
+    do: {:destination_exists, destination}
+
+  defp normalize_adoption_error(:exdev, source, destination),
+    do: {:cross_device, source, destination}
+
+  defp normalize_adoption_error(reason, _source, _destination), do: reason
 
   defp inject_fault(stage, opts) do
     case Keyword.get(opts, :fault_injector) do

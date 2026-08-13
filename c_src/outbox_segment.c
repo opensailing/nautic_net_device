@@ -1,3 +1,7 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 #include <erl_driver.h>
 #include <erl_nif.h>
 
@@ -11,6 +15,14 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+
+#ifdef __APPLE__
+#include <sys/stdio.h>
+#endif
 
 #ifndef O_CLOEXEC
 #define O_CLOEXEC 0
@@ -27,6 +39,7 @@
 typedef struct cleanup_job {
   int first_fd;
   int second_fd;
+  int third_fd;
   char *allocation;
   ErlNifMutex *mutex;
   struct cleanup_job *next;
@@ -42,6 +55,7 @@ typedef struct {
 typedef struct {
   ErlNifResourceType *root_resource_type;
   ErlNifResourceType *segment_resource_type;
+  ErlNifResourceType *adoption_resource_type;
   cleanup_worker cleanup;
 } nif_state;
 
@@ -67,6 +81,27 @@ typedef struct {
   cleanup_worker *cleanup_worker;
 } segment_resource;
 
+typedef struct {
+  int source_parent_fd;
+  int destination_parent_fd;
+  int source_fd;
+  char *names;
+  char *source_name;
+  char *destination_name;
+  char *source_parent_path;
+  char *destination_parent_path;
+  dev_t source_device;
+  ino_t source_inode;
+  dev_t source_parent_device;
+  ino_t source_parent_inode;
+  dev_t destination_parent_device;
+  ino_t destination_parent_inode;
+  int adopted;
+  ErlNifMutex *mutex;
+  cleanup_job *cleanup;
+  cleanup_worker *cleanup_worker;
+} adoption_resource;
+
 static ERL_NIF_TERM atom_ok;
 static ERL_NIF_TERM atom_error;
 static ERL_NIF_TERM atom_closed;
@@ -74,19 +109,32 @@ static ERL_NIF_TERM atom_invalid_basename;
 static ERL_NIF_TERM atom_stale_root;
 static ERL_NIF_TERM atom_unlink_forbidden;
 static ERL_NIF_TERM atom_name_changed;
+static ERL_NIF_TERM atom_stale_source;
+static ERL_NIF_TERM atom_stale_source_parent;
+static ERL_NIF_TERM atom_stale_destination_parent;
+static ERL_NIF_TERM atom_destination_mismatch;
+static ERL_NIF_TERM atom_adopted;
+static ERL_NIF_TERM atom_none;
+static ERL_NIF_TERM atom_after_rename;
+static ERL_NIF_TERM atom_source_parent_sync;
+static ERL_NIF_TERM atom_destination_parent_sync;
 
 static ERL_NIF_TERM make_error(ErlNifEnv *env, ERL_NIF_TERM reason) {
   return enif_make_tuple2(env, atom_error, reason);
 }
 
-static ERL_NIF_TERM make_errno_error(ErlNifEnv *env, int error) {
+static ERL_NIF_TERM make_errno_reason(ErlNifEnv *env, int error) {
   const char *name = erl_errno_id(error);
 
   if (name != NULL) {
-    return make_error(env, enif_make_atom(env, name));
+    return enif_make_atom(env, name);
   }
 
-  return make_error(env, enif_make_int(env, error));
+  return enif_make_int(env, error);
+}
+
+static ERL_NIF_TERM make_errno_error(ErlNifEnv *env, int error) {
+  return make_error(env, make_errno_reason(env, error));
 }
 
 static int sync_fd(int fd) {
@@ -127,6 +175,7 @@ static int close_owned_fd(int fd) {
 static void cleanup_job_run(cleanup_job *job) {
   close_owned_fd(job->first_fd);
   close_owned_fd(job->second_fd);
+  close_owned_fd(job->third_fd);
   if (job->allocation != NULL) {
     enif_free(job->allocation);
   }
@@ -257,7 +306,7 @@ static int cleanup_worker_start(cleanup_worker *state) {
 }
 
 static void cleanup_worker_enqueue(cleanup_worker *state, cleanup_job *job,
-                                   int first_fd, int second_fd,
+                                   int first_fd, int second_fd, int third_fd,
                                    char *allocation, ErlNifMutex *mutex) {
   cleanup_job *pending;
 
@@ -267,6 +316,7 @@ static void cleanup_worker_enqueue(cleanup_worker *state, cleanup_job *job,
 
   job->first_fd = first_fd;
   job->second_fd = second_fd;
+  job->third_fd = third_fd;
   job->allocation = allocation;
   job->mutex = mutex;
 
@@ -345,8 +395,8 @@ static void root_destructor(ErlNifEnv *env, void *object) {
   lock_fd = take_fd(&root->lock_fd);
   mutex = root->mutex;
   root->mutex = NULL;
-  cleanup_worker_enqueue(root->cleanup_worker, root->cleanup, fd, lock_fd, NULL,
-                         mutex);
+  cleanup_worker_enqueue(root->cleanup_worker, root->cleanup, fd, lock_fd, -1,
+                         NULL, mutex);
   root->cleanup = NULL;
   root->cleanup_worker = NULL;
 }
@@ -366,9 +416,638 @@ static void segment_destructor(ErlNifEnv *env, void *object) {
   mutex = segment->mutex;
   segment->mutex = NULL;
   cleanup_worker_enqueue(segment->cleanup_worker, segment->cleanup, file_fd,
-                         directory_fd, basename, mutex);
+                         directory_fd, -1, basename, mutex);
   segment->cleanup = NULL;
   segment->cleanup_worker = NULL;
+}
+
+static void adoption_destructor(ErlNifEnv *env, void *object) {
+  adoption_resource *adoption = object;
+  ErlNifMutex *mutex;
+  int source_fd;
+  int source_parent_fd;
+  int destination_parent_fd;
+  char *names;
+  (void)env;
+
+  source_fd = take_fd(&adoption->source_fd);
+  source_parent_fd = take_fd(&adoption->source_parent_fd);
+  destination_parent_fd = take_fd(&adoption->destination_parent_fd);
+  names = adoption->names;
+  adoption->names = NULL;
+  mutex = adoption->mutex;
+  adoption->mutex = NULL;
+  cleanup_worker_enqueue(adoption->cleanup_worker, adoption->cleanup, source_fd,
+                         source_parent_fd, destination_parent_fd, names, mutex);
+  adoption->cleanup = NULL;
+  adoption->cleanup_worker = NULL;
+}
+
+static int path_parent_and_name(const ErlNifBinary *path, char **parent,
+                                size_t *parent_size, char **name,
+                                size_t *name_size) {
+  size_t end = path->size;
+  size_t slash;
+
+  while (end > 1 && path->data[end - 1] == '/') {
+    end--;
+  }
+  if (end == 0) {
+    return 0;
+  }
+
+  slash = end;
+  while (slash > 0 && path->data[slash - 1] != '/') {
+    slash--;
+  }
+  if (slash == end || (end - slash == 1 && path->data[slash] == '.') ||
+      (end - slash == 2 && path->data[slash] == '.' &&
+       path->data[slash + 1] == '.')) {
+    return 0;
+  }
+
+  *name = (char *)path->data + slash;
+  *name_size = end - slash;
+  if (slash == 0) {
+    *parent = ".";
+    *parent_size = 1;
+  } else if (slash == 1) {
+    *parent = "/";
+    *parent_size = 1;
+  } else {
+    *parent = (char *)path->data;
+    *parent_size = slash - 1;
+  }
+  return 1;
+}
+
+static int identity_matches(const struct stat *stat, dev_t device, ino_t inode,
+                            mode_t type) {
+  return stat->st_dev == device && stat->st_ino == inode &&
+         (stat->st_mode & S_IFMT) == type;
+}
+
+static int absolute_path(const ErlNifBinary *path) {
+  return path->size > 0 && path->data[0] == '/';
+}
+
+static int path_within_root(const ErlNifBinary *path,
+                            const ErlNifBinary *root) {
+  if (!absolute_path(path) || !absolute_path(root) || root->size == 0 ||
+      path->size <= root->size ||
+      memcmp(path->data, root->data, root->size) != 0) {
+    return 0;
+  }
+
+  if (root->size == 1 && root->data[0] == '/') {
+    return 1;
+  }
+
+  return path->data[root->size] == '/';
+}
+
+static int traverse_directory_chain(const ErlNifBinary *path, int create,
+                                    mode_t mode) {
+  char *copy;
+  char *component;
+  char *save = NULL;
+  int fd;
+  int child_fd;
+  int error;
+  int created;
+
+  if (!absolute_path(path)) {
+    errno = EINVAL;
+    return -1;
+  }
+  copy = enif_alloc(path->size + 1);
+  if (copy == NULL) {
+    errno = ENOMEM;
+    return -1;
+  }
+  memcpy(copy, path->data, path->size);
+  copy[path->size] = '\0';
+
+  do {
+    fd = open("/", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  } while (fd == -1 && errno == EINTR);
+  if (fd == -1) {
+    error = errno;
+    enif_free(copy);
+    errno = error;
+    return -1;
+  }
+
+  component = strtok_r(copy + 1, "/", &save);
+  while (component != NULL) {
+    if (strcmp(component, ".") == 0 || strcmp(component, "..") == 0) {
+      error = EINVAL;
+      goto fail;
+    }
+
+    created = 0;
+    do {
+      child_fd = openat(fd, component,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (child_fd == -1 && errno == EINTR);
+    if (child_fd == -1 && errno == ENOENT && create) {
+      do {
+        error = mkdirat(fd, component, mode);
+      } while (error == -1 && errno == EINTR);
+      if (error == -1 && errno != EEXIST) {
+        error = errno;
+        goto fail;
+      }
+      created = error == 0;
+      do {
+        child_fd = openat(fd, component,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      } while (child_fd == -1 && errno == EINTR);
+    }
+    if (child_fd == -1) {
+      error = errno;
+      goto fail;
+    }
+    if (created &&
+        (fchmod(child_fd, mode) == -1 || sync_fd(child_fd) == -1 ||
+         sync_fd(fd) == -1)) {
+      error = errno;
+      close_owned_fd(child_fd);
+      goto fail;
+    }
+
+    close_owned_fd(fd);
+    fd = child_fd;
+    component = strtok_r(NULL, "/", &save);
+  }
+
+  enif_free(copy);
+  return fd;
+
+fail:
+  close_owned_fd(fd);
+  enif_free(copy);
+  errno = error;
+  return -1;
+}
+
+static int open_directory_chain_nofollow(const ErlNifBinary *path) {
+  return traverse_directory_chain(path, 0, 0700);
+}
+
+static int open_or_create_directory_chain_nofollow(const ErlNifBinary *path,
+                                                    mode_t mode) {
+  return traverse_directory_chain(path, 1, mode);
+}
+
+static int open_or_create_relative_directory_chain_nofollow(
+    int root_fd, const char *path, mode_t mode) {
+  char *copy;
+  char *component;
+  char *save = NULL;
+  int fd;
+  int child_fd;
+  int error;
+  int created;
+
+  if (path == NULL || path[0] == '/') {
+    errno = EINVAL;
+    return -1;
+  }
+  if (path[0] == '\0') {
+    return duplicate_descriptor(root_fd);
+  }
+  copy = enif_alloc(strlen(path) + 1);
+  if (copy == NULL) {
+    errno = ENOMEM;
+    return -1;
+  }
+  strcpy(copy, path);
+
+  fd = duplicate_descriptor(root_fd);
+  if (fd == -1) {
+    error = errno;
+    enif_free(copy);
+    errno = error;
+    return -1;
+  }
+
+  component = strtok_r(copy, "/", &save);
+  while (component != NULL) {
+    if (strcmp(component, ".") == 0 || strcmp(component, "..") == 0) {
+      error = EINVAL;
+      goto fail;
+    }
+
+    created = 0;
+    do {
+      child_fd = openat(fd, component,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (child_fd == -1 && errno == EINTR);
+    if (child_fd == -1 && errno == ENOENT) {
+      do {
+        error = mkdirat(fd, component, mode);
+      } while (error == -1 && errno == EINTR);
+      if (error == -1 && errno != EEXIST) {
+        error = errno;
+        goto fail;
+      }
+      created = error == 0;
+      do {
+        child_fd = openat(fd, component,
+                          O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+      } while (child_fd == -1 && errno == EINTR);
+    }
+    if (child_fd == -1) {
+      error = errno;
+      goto fail;
+    }
+    if (created &&
+        (fchmod(child_fd, mode) == -1 || sync_fd(child_fd) == -1 ||
+         sync_fd(fd) == -1)) {
+      error = errno;
+      close_owned_fd(child_fd);
+      goto fail;
+    }
+
+    close_owned_fd(fd);
+    fd = child_fd;
+    component = strtok_r(NULL, "/", &save);
+  }
+
+  enif_free(copy);
+  return fd;
+
+fail:
+  close_owned_fd(fd);
+  enif_free(copy);
+  errno = error;
+  return -1;
+}
+
+static int path_matches_identity_nofollow(const char *path, dev_t device,
+                                          ino_t inode) {
+  ErlNifBinary path_binary = {.size = strlen(path),
+                              .data = (unsigned char *)path};
+  struct stat stat;
+  int fd;
+  int matches;
+
+  fd = open_directory_chain_nofollow(&path_binary);
+  if (fd == -1) {
+    return 0;
+  }
+
+  matches = fstat(fd, &stat) == 0 &&
+            identity_matches(&stat, device, inode, S_IFDIR);
+  close_owned_fd(fd);
+  return matches;
+}
+
+static int exclusive_renameat(int source_parent_fd, const char *source_name,
+                              int destination_parent_fd,
+                              const char *destination_name) {
+#ifdef __APPLE__
+  return renameatx_np(source_parent_fd, source_name, destination_parent_fd,
+                      destination_name, RENAME_EXCL);
+#elif defined(__linux__)
+  return (int)syscall(__NR_renameat2, source_parent_fd, source_name,
+                      destination_parent_fd, destination_name, 1U);
+#else
+  errno = ENOTSUP;
+  return -1;
+#endif
+}
+
+static ERL_NIF_TERM adoption_prepare_nif(ErlNifEnv *env, int argc,
+                                         const ERL_NIF_TERM argv[]) {
+  ErlNifBinary source_path;
+  ErlNifBinary destination_path;
+  ErlNifBinary root_path;
+  nif_state *state = enif_priv_data(env);
+  adoption_resource *adoption;
+  cleanup_job *cleanup;
+  struct stat source_stat;
+  struct stat source_parent_stat;
+  struct stat destination_parent_stat;
+  char *source_parent;
+  char *source_name;
+  char *destination_parent;
+  char *destination_name;
+  char *destination_parent_relative;
+  char *cursor;
+  size_t source_parent_size;
+  size_t source_name_size;
+  size_t destination_parent_size;
+  size_t destination_name_size;
+  int root_fd = -1;
+  int source_parent_fd = -1;
+  int destination_parent_fd = -1;
+  int source_fd = -1;
+  int error;
+  ERL_NIF_TERM result;
+
+  if (argc != 3 || !enif_inspect_binary(env, argv[0], &source_path) ||
+      !enif_inspect_binary(env, argv[1], &destination_path) ||
+      !enif_inspect_binary(env, argv[2], &root_path) ||
+      memchr(source_path.data, '\0', source_path.size) != NULL ||
+      memchr(destination_path.data, '\0', destination_path.size) != NULL ||
+      memchr(root_path.data, '\0', root_path.size) != NULL ||
+      !path_within_root(&destination_path, &root_path) ||
+      !path_parent_and_name(&source_path, &source_parent, &source_parent_size,
+                            &source_name, &source_name_size) ||
+      !path_parent_and_name(&destination_path, &destination_parent,
+                            &destination_parent_size, &destination_name,
+                            &destination_name_size) ||
+      source_name_size > 255 || destination_name_size > 255) {
+    return enif_make_badarg(env);
+  }
+
+  cleanup = enif_alloc(sizeof(*cleanup));
+  if (cleanup == NULL) {
+    return make_errno_error(env, ENOMEM);
+  }
+
+  adoption = enif_alloc_resource(state->adoption_resource_type,
+                                 sizeof(*adoption));
+  if (adoption == NULL) {
+    enif_free(cleanup);
+    return make_errno_error(env, ENOMEM);
+  }
+  memset(adoption, 0, sizeof(*adoption));
+  adoption->source_parent_fd = -1;
+  adoption->destination_parent_fd = -1;
+  adoption->source_fd = -1;
+  adoption->cleanup = cleanup;
+  adoption->cleanup_worker = &state->cleanup;
+
+  adoption->names = enif_alloc(source_name_size + destination_name_size +
+                               source_parent_size + destination_parent_size + 4);
+  if (adoption->names == NULL) {
+    enif_release_resource(adoption);
+    return make_errno_error(env, ENOMEM);
+  }
+
+  cursor = adoption->names;
+  adoption->source_name = cursor;
+  memcpy(cursor, source_name, source_name_size);
+  cursor[source_name_size] = '\0';
+  cursor += source_name_size + 1;
+  adoption->destination_name = cursor;
+  memcpy(cursor, destination_name, destination_name_size);
+  cursor[destination_name_size] = '\0';
+  cursor += destination_name_size + 1;
+  adoption->source_parent_path = cursor;
+  memcpy(cursor, source_parent, source_parent_size);
+  cursor[source_parent_size] = '\0';
+  cursor += source_parent_size + 1;
+  adoption->destination_parent_path = cursor;
+  memcpy(cursor, destination_parent, destination_parent_size);
+  cursor[destination_parent_size] = '\0';
+  destination_parent_relative =
+      adoption->destination_parent_path + root_path.size;
+  while (*destination_parent_relative == '/') {
+    destination_parent_relative++;
+  }
+
+  {
+    char *source_parent_string = enif_alloc(source_parent_size + 1);
+    if (source_parent_string == NULL) {
+      enif_release_resource(adoption);
+      return make_errno_error(env, ENOMEM);
+    }
+    memcpy(source_parent_string, source_parent, source_parent_size);
+    source_parent_string[source_parent_size] = '\0';
+
+    {
+      ErlNifBinary source_parent_binary = {
+          .size = source_parent_size,
+          .data = (unsigned char *)source_parent_string};
+      root_fd = open_or_create_directory_chain_nofollow(&root_path, 0700);
+      if (root_fd != -1) {
+        source_parent_fd = open_directory_chain_nofollow(&source_parent_binary);
+      }
+      if (source_parent_fd != -1) {
+        destination_parent_fd =
+            open_or_create_relative_directory_chain_nofollow(
+                root_fd, destination_parent_relative, 0700);
+      }
+    }
+    enif_free(source_parent_string);
+  }
+  error = errno;
+  if (root_fd == -1 || source_parent_fd == -1 || destination_parent_fd == -1) {
+    close_owned_fd(root_fd);
+    close_owned_fd(source_parent_fd);
+    close_owned_fd(destination_parent_fd);
+    enif_release_resource(adoption);
+    return make_errno_error(env, error);
+  }
+  close_owned_fd(root_fd);
+
+  do {
+    source_fd = openat(source_parent_fd, adoption->source_name,
+                       O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+  } while (source_fd == -1 && errno == EINTR);
+  if (source_fd == -1 || fstat(source_fd, &source_stat) == -1 ||
+      fstat(source_parent_fd, &source_parent_stat) == -1 ||
+      fstat(destination_parent_fd, &destination_parent_stat) == -1) {
+    error = errno;
+    close_owned_fd(source_fd);
+    close_owned_fd(source_parent_fd);
+    close_owned_fd(destination_parent_fd);
+    enif_release_resource(adoption);
+    return make_errno_error(env, error);
+  }
+
+  if (source_stat.st_dev != source_parent_stat.st_dev ||
+      source_stat.st_dev != destination_parent_stat.st_dev) {
+    close_owned_fd(source_fd);
+    close_owned_fd(source_parent_fd);
+    close_owned_fd(destination_parent_fd);
+    enif_release_resource(adoption);
+    return make_errno_error(env, EXDEV);
+  }
+
+  adoption->source_parent_fd = source_parent_fd;
+  adoption->destination_parent_fd = destination_parent_fd;
+  adoption->source_fd = source_fd;
+  adoption->source_device = source_stat.st_dev;
+  adoption->source_inode = source_stat.st_ino;
+  adoption->source_parent_device = source_parent_stat.st_dev;
+  adoption->source_parent_inode = source_parent_stat.st_ino;
+  adoption->destination_parent_device = destination_parent_stat.st_dev;
+  adoption->destination_parent_inode = destination_parent_stat.st_ino;
+  adoption->mutex = enif_mutex_create("atomic_file_adoption");
+  if (adoption->mutex == NULL) {
+    enif_release_resource(adoption);
+    return make_errno_error(env, ENOMEM);
+  }
+
+  result = enif_make_tuple2(env, atom_ok, enif_make_resource(env, adoption));
+  enif_release_resource(adoption);
+  return result;
+}
+
+static ERL_NIF_TERM adoption_commit_nif(ErlNifEnv *env, int argc,
+                                        const ERL_NIF_TERM argv[]) {
+  nif_state *state = enif_priv_data(env);
+  adoption_resource *adoption;
+  struct stat stat;
+  char fault[32];
+  int rename_result;
+  int error;
+  int sync_result;
+
+  if (argc != 2 ||
+      !enif_get_resource(env, argv[0], state->adoption_resource_type,
+                         (void **)&adoption) ||
+      !enif_get_atom(env, argv[1], fault, sizeof(fault), ERL_NIF_LATIN1) ||
+      (strcmp(fault, "none") != 0 && strcmp(fault, "after_rename") != 0 &&
+       strcmp(fault, "source_parent_sync") != 0 &&
+       strcmp(fault, "destination_parent_sync") != 0)) {
+    return enif_make_badarg(env);
+  }
+
+  enif_mutex_lock(adoption->mutex);
+  if (adoption->source_fd == -1 || adoption->adopted) {
+    enif_mutex_unlock(adoption->mutex);
+    return make_error(env, atom_closed);
+  }
+
+  if (fstat(adoption->source_parent_fd, &stat) == -1 ||
+      !identity_matches(&stat, adoption->source_parent_device,
+                        adoption->source_parent_inode, S_IFDIR) ||
+      !path_matches_identity_nofollow(adoption->source_parent_path,
+                                     adoption->source_parent_device,
+                                     adoption->source_parent_inode)) {
+    enif_mutex_unlock(adoption->mutex);
+    return make_error(env, atom_stale_source_parent);
+  }
+  if (fstat(adoption->destination_parent_fd, &stat) == -1 ||
+      !identity_matches(&stat, adoption->destination_parent_device,
+                        adoption->destination_parent_inode, S_IFDIR) ||
+      !path_matches_identity_nofollow(adoption->destination_parent_path,
+                                     adoption->destination_parent_device,
+                                     adoption->destination_parent_inode)) {
+    enif_mutex_unlock(adoption->mutex);
+    return make_error(env, atom_stale_destination_parent);
+  }
+  if (fstatat(adoption->source_parent_fd, adoption->source_name, &stat,
+              AT_SYMLINK_NOFOLLOW) == -1 ||
+      stat.st_dev != adoption->source_device ||
+      stat.st_ino != adoption->source_inode) {
+    enif_mutex_unlock(adoption->mutex);
+    return make_error(env, atom_stale_source);
+  }
+
+  do {
+    rename_result = exclusive_renameat(
+        adoption->source_parent_fd, adoption->source_name,
+        adoption->destination_parent_fd, adoption->destination_name);
+  } while (rename_result == -1 && errno == EINTR);
+  if (rename_result == -1) {
+    error = errno;
+    enif_mutex_unlock(adoption->mutex);
+    return make_errno_error(env, error);
+  }
+  adoption->adopted = 1;
+
+  if (strcmp(fault, "after_rename") == 0) {
+    enif_mutex_unlock(adoption->mutex);
+    return make_error(env, enif_make_tuple2(env, atom_adopted,
+                                             enif_make_atom(env, "fault_injected")));
+  }
+
+  if (fstatat(adoption->destination_parent_fd, adoption->destination_name, &stat,
+              AT_SYMLINK_NOFOLLOW) == -1 ||
+      stat.st_dev != adoption->source_device ||
+      stat.st_ino != adoption->source_inode) {
+    enif_mutex_unlock(adoption->mutex);
+    return make_error(env, enif_make_tuple2(env, atom_adopted,
+                                             atom_destination_mismatch));
+  }
+
+  sync_result = strcmp(fault, "source_parent_sync") == 0
+                    ? (errno = EIO, -1)
+                    : sync_fd(adoption->source_parent_fd);
+  if (sync_result == -1) {
+    error = errno;
+    enif_mutex_unlock(adoption->mutex);
+    return make_error(
+        env, enif_make_tuple2(
+                 env, atom_adopted,
+                 enif_make_tuple2(env, atom_source_parent_sync,
+                                  make_errno_reason(env, error))));
+  }
+
+  sync_result = strcmp(fault, "destination_parent_sync") == 0
+                    ? (errno = EIO, -1)
+                    : sync_fd(adoption->destination_parent_fd);
+  if (sync_result == -1) {
+    error = errno;
+    enif_mutex_unlock(adoption->mutex);
+    return make_error(
+        env, enif_make_tuple2(
+                 env, atom_adopted,
+                 enif_make_tuple2(env, atom_destination_parent_sync,
+                                  make_errno_reason(env, error))));
+  }
+
+  if (fstatat(adoption->destination_parent_fd, adoption->destination_name, &stat,
+              AT_SYMLINK_NOFOLLOW) == -1 ||
+      stat.st_dev != adoption->source_device ||
+      stat.st_ino != adoption->source_inode ||
+      !path_matches_identity_nofollow(adoption->source_parent_path,
+                                     adoption->source_parent_device,
+                                     adoption->source_parent_inode) ||
+      !path_matches_identity_nofollow(adoption->destination_parent_path,
+                                     adoption->destination_parent_device,
+                                     adoption->destination_parent_inode)) {
+    enif_mutex_unlock(adoption->mutex);
+    return make_error(env, enif_make_tuple2(env, atom_adopted,
+                                             atom_destination_mismatch));
+  }
+
+  enif_mutex_unlock(adoption->mutex);
+  return atom_ok;
+}
+
+static ERL_NIF_TERM adoption_close_nif(ErlNifEnv *env, int argc,
+                                       const ERL_NIF_TERM argv[]) {
+  nif_state *state = enif_priv_data(env);
+  adoption_resource *adoption;
+  int source_fd;
+  int source_parent_fd;
+  int destination_parent_fd;
+  int result = 0;
+  int error = 0;
+
+  if (argc != 1 ||
+      !enif_get_resource(env, argv[0], state->adoption_resource_type,
+                         (void **)&adoption)) {
+    return enif_make_badarg(env);
+  }
+
+  enif_mutex_lock(adoption->mutex);
+  source_fd = take_fd(&adoption->source_fd);
+  source_parent_fd = take_fd(&adoption->source_parent_fd);
+  destination_parent_fd = take_fd(&adoption->destination_parent_fd);
+  enif_mutex_unlock(adoption->mutex);
+
+  if (close_owned_fd(source_fd) == -1) {
+    result = -1;
+    error = errno;
+  }
+  if (close_owned_fd(source_parent_fd) == -1) {
+    result = -1;
+    if (error == 0) error = errno;
+  }
+  if (close_owned_fd(destination_parent_fd) == -1) {
+    result = -1;
+    if (error == 0) error = errno;
+  }
+  return result == -1 ? make_errno_error(env, error) : atom_ok;
 }
 
 static ERL_NIF_TERM open_root_nif(ErlNifEnv *env, int argc,
@@ -938,9 +1617,12 @@ static int load(ErlNifEnv *env, void **private_data, ERL_NIF_TERM load_info) {
       env, NULL, "outbox_segment_root", root_destructor, flags, NULL);
   state->segment_resource_type = enif_open_resource_type(
       env, NULL, "outbox_segment_file", segment_destructor, flags, NULL);
+  state->adoption_resource_type = enif_open_resource_type(
+      env, NULL, "atomic_file_adoption", adoption_destructor, flags, NULL);
 
   if (state->root_resource_type == NULL ||
       state->segment_resource_type == NULL ||
+      state->adoption_resource_type == NULL ||
       cleanup_worker_start(&state->cleanup) != 0) {
     enif_free(state);
     return -1;
@@ -954,6 +1636,15 @@ static int load(ErlNifEnv *env, void **private_data, ERL_NIF_TERM load_info) {
   atom_stale_root = enif_make_atom(env, "stale_root");
   atom_unlink_forbidden = enif_make_atom(env, "unlink_forbidden");
   atom_name_changed = enif_make_atom(env, "name_changed");
+  atom_stale_source = enif_make_atom(env, "stale_source");
+  atom_stale_source_parent = enif_make_atom(env, "stale_source_parent");
+  atom_stale_destination_parent = enif_make_atom(env, "stale_destination_parent");
+  atom_destination_mismatch = enif_make_atom(env, "destination_mismatch");
+  atom_adopted = enif_make_atom(env, "adopted");
+  atom_none = enif_make_atom(env, "none");
+  atom_after_rename = enif_make_atom(env, "after_rename");
+  atom_source_parent_sync = enif_make_atom(env, "source_parent_sync");
+  atom_destination_parent_sync = enif_make_atom(env, "destination_parent_sync");
   return 0;
 }
 
@@ -966,6 +1657,9 @@ static void unload(ErlNifEnv *env, void *private_data) {
 }
 
 static ErlNifFunc nif_functions[] = {
+    {"adoption_prepare", 3, adoption_prepare_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"adoption_commit", 2, adoption_commit_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"adoption_close", 1, adoption_close_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"nif_open_root", 2, open_root_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"close_root", 1, close_root_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"try_lock_root", 1, try_lock_root_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},

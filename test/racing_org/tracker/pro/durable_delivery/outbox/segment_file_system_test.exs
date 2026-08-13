@@ -4,7 +4,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystemTest do
   alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.{FileSystem, SegmentFileSystem}
 
   setup do
-    root = Path.join(System.tmp_dir!(), "outbox_segment_fs_#{System.unique_integer([:positive])}")
+    root = Path.join(canonical_tmp_dir(), "outbox_segment_fs_#{System.unique_integer([:positive])}")
     File.mkdir_p!(root)
     on_exit(fn -> File.rm_rf(root) end)
     %{root: root}
@@ -70,6 +70,178 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystemTest do
     refute File.exists?(Path.join(root, "segment.log"))
   end
 
+  test "adoption prepare pins the source until exclusive commit", %{root: root} do
+    source_parent = Path.join(root, "legacy")
+    destination_parent = Path.join(root, "durable")
+    source = Path.join(source_parent, "ledger")
+    destination = Path.join(destination_parent, "ledger")
+    File.mkdir_p!(source_parent)
+    File.mkdir_p!(destination_parent)
+    File.write!(source, "legacy")
+
+    assert {:ok, adoption} = SegmentFileSystem.adoption_prepare(source, destination, root)
+    File.rename!(source, source <> ".moved")
+    File.write!(source, "substitute")
+
+    assert {:error, :stale_source} = SegmentFileSystem.adoption_commit(adoption, :none)
+    assert :ok = SegmentFileSystem.adoption_close(adoption)
+    assert File.read!(source) == "substitute"
+    assert File.read!(source <> ".moved") == "legacy"
+    refute File.exists?(destination)
+  end
+
+  test "adoption rejects source and destination parent substitution", %{root: root} do
+    for swapped_parent <- [:source, :destination] do
+      suffix = Atom.to_string(swapped_parent)
+      source_parent = Path.join(root, "legacy-#{suffix}")
+      destination_parent = Path.join(root, "durable-#{suffix}")
+      source = Path.join(source_parent, "outbox")
+      destination = Path.join(destination_parent, "outbox")
+      File.mkdir_p!(source_parent)
+      File.mkdir_p!(destination_parent)
+      File.write!(source, "legacy")
+
+      assert {:ok, adoption} = SegmentFileSystem.adoption_prepare(source, destination, root)
+      parent = if swapped_parent == :source, do: source_parent, else: destination_parent
+      File.rename!(parent, parent <> ".moved")
+      File.mkdir_p!(parent)
+
+      expected = if swapped_parent == :source, do: :stale_source_parent, else: :stale_destination_parent
+      assert {:error, ^expected} = SegmentFileSystem.adoption_commit(adoption, :none)
+      assert :ok = SegmentFileSystem.adoption_close(adoption)
+      refute File.exists?(destination)
+      refute File.exists?(Path.join(parent <> ".moved", "outbox")) == (swapped_parent == :destination)
+    end
+  end
+
+  test "adoption rejects symlink substitution of parent ancestors", %{root: root} do
+    for swapped_tree <- [:source, :destination] do
+      suffix = Atom.to_string(swapped_tree)
+      source_tree = Path.join(root, "source-tree-#{suffix}")
+      destination_tree = Path.join(root, "destination-tree-#{suffix}")
+      source_parent = Path.join(source_tree, "legacy")
+      destination_parent = Path.join(destination_tree, "durable")
+      source = Path.join(source_parent, "outbox")
+      destination = Path.join(destination_parent, "outbox")
+      File.mkdir_p!(source_parent)
+      File.mkdir_p!(destination_parent)
+      File.write!(source, "legacy")
+
+      assert {:ok, adoption} = SegmentFileSystem.adoption_prepare(source, destination, root)
+      tree = if swapped_tree == :source, do: source_tree, else: destination_tree
+      File.rename!(tree, tree <> ".moved")
+      File.ln_s!(tree <> ".moved", tree)
+
+      expected = if swapped_tree == :source, do: :stale_source_parent, else: :stale_destination_parent
+      assert {:error, ^expected} = SegmentFileSystem.adoption_commit(adoption, :none)
+      assert :ok = SegmentFileSystem.adoption_close(adoption)
+      assert File.read!(source) == "legacy"
+      refute File.exists?(destination)
+    end
+  end
+
+  test "adoption collision leaves both trees unchanged", %{root: root} do
+    source_parent = Path.join(root, "legacy-collision")
+    destination_parent = Path.join(root, "durable-collision")
+    source = Path.join(source_parent, "ledger")
+    destination = Path.join(destination_parent, "ledger")
+    File.mkdir_p!(source_parent)
+    File.mkdir_p!(destination_parent)
+    File.write!(source, "legacy")
+    File.write!(destination, "current")
+
+    assert {:ok, adoption} = SegmentFileSystem.adoption_prepare(source, destination, root)
+    assert {:error, :eexist} = SegmentFileSystem.adoption_commit(adoption, :none)
+    assert :ok = SegmentFileSystem.adoption_close(adoption)
+    assert File.read!(source) == "legacy"
+    assert File.read!(destination) == "current"
+  end
+
+  test "source-parent sync failure cannot return native success", %{root: root} do
+    source_parent = Path.join(root, "legacy-source-sync")
+    destination_parent = Path.join(root, "durable-source-sync")
+    source = Path.join(source_parent, "ledger")
+    destination = Path.join(destination_parent, "ledger")
+    File.mkdir_p!(source_parent)
+    File.mkdir_p!(destination_parent)
+    File.write!(source, "legacy")
+    source_inode = File.stat!(source).inode
+
+    assert {:ok, adoption} = SegmentFileSystem.adoption_prepare(source, destination, root)
+
+    assert {:error, {:adopted, {:source_parent_sync, :eio}}} =
+             SegmentFileSystem.adoption_commit(adoption, :source_parent_sync)
+
+    assert :ok = SegmentFileSystem.adoption_close(adoption)
+    refute File.exists?(source)
+    assert File.stat!(destination).inode == source_inode
+  end
+
+  test "destination-parent sync failure cannot return native success", %{root: root} do
+    source_parent = Path.join(root, "legacy-destination-sync")
+    destination_parent = Path.join(root, "durable-destination-sync")
+    source = Path.join(source_parent, "outbox")
+    destination = Path.join(destination_parent, "outbox")
+    File.mkdir_p!(source_parent)
+    File.mkdir_p!(destination_parent)
+    File.write!(source, "legacy")
+    source_inode = File.stat!(source).inode
+
+    assert {:ok, adoption} = SegmentFileSystem.adoption_prepare(source, destination, root)
+
+    assert {:error, {:adopted, {:destination_parent_sync, :eio}}} =
+             SegmentFileSystem.adoption_commit(adoption, :destination_parent_sync)
+
+    assert :ok = SegmentFileSystem.adoption_close(adoption)
+    refute File.exists?(source)
+    assert File.stat!(destination).inode == source_inode
+  end
+
+  test "adoption directory walking is descriptor-bound and component-wise nofollow" do
+    source = native_source()
+
+    assert [_, traversal] =
+             Regex.run(~r/static int traverse_directory_chain\([^\{]+\) \{(.*?)\n\}/s, source)
+
+    assert traversal =~ "openat(fd, component"
+    assert traversal =~ "mkdirat(fd, component"
+    assert traversal =~ "O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC"
+    refute traversal =~ "open(copy"
+    refute traversal =~ "mkdir(copy"
+
+    assert [_, prepare] =
+             Regex.run(~r/static ERL_NIF_TERM adoption_prepare_nif\([^\{]+\) \{(.*?)\n\}/s, source)
+
+    assert prepare =~ "open_or_create_relative_directory_chain_nofollow("
+    assert prepare =~ "root_fd, destination_parent_relative, 0700"
+    refute prepare =~ "open_or_create_directory_chain_nofollow(&destination_parent_binary"
+  end
+
+  test "adoption revalidates both parent paths after both durable syncs" do
+    source = native_source()
+
+    assert [_, commit] =
+             Regex.run(~r/static ERL_NIF_TERM adoption_commit_nif\([^\{]+\) \{(.*?)\n\}/s, source)
+
+    destination_sync = last_index!(commit, "sync_fd(adoption->destination_parent_fd)")
+
+    source_revalidation =
+      last_index!(commit, "path_matches_identity_nofollow(adoption->source_parent_path")
+
+    destination_revalidation =
+      last_index!(commit, "path_matches_identity_nofollow(adoption->destination_parent_path")
+
+    assert source_revalidation > destination_sync
+    assert destination_revalidation > destination_sync
+  end
+
+  test "adoption NIF work is scheduled as dirty IO" do
+    source = native_source()
+    assert source =~ ~s({"adoption_prepare", 3, adoption_prepare_nif, ERL_NIF_DIRTY_JOB_IO_BOUND})
+    assert source =~ ~s({"adoption_commit", 2, adoption_commit_nif, ERL_NIF_DIRTY_JOB_IO_BOUND})
+    assert source =~ ~s({"adoption_close", 1, adoption_close_nif, ERL_NIF_DIRTY_JOB_IO_BOUND})
+  end
+
   test "native lifecycle keeps cleanup out of destructor scheduler contexts" do
     source = native_source()
 
@@ -85,6 +257,14 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystemTest do
 
     refute enqueue_body =~ "close_owned_fd"
     refute enqueue_body =~ "enif_free"
+
+    assert [_, adoption_destructor] =
+             Regex.run(~r/static void adoption_destructor\([^\{]+\) \{(.*?)\n\}/s, source)
+
+    assert adoption_destructor =~ "cleanup_worker_enqueue"
+    refute adoption_destructor =~ "close_owned_fd"
+    refute adoption_destructor =~ "enif_free"
+    refute adoption_destructor =~ "enif_mutex_destroy"
   end
 
   test "native cleanup worker exits on wake-pipe EOF and fatal reads" do
@@ -162,6 +342,73 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystemTest do
     end
   end
 
+  test "process death closes abandoned adoption descriptors without moving the source", %{root: root} do
+    descriptor_count = descriptor_count!()
+    baseline = descriptor_count.()
+    source_parent = Path.join(root, "legacy-abandoned")
+    destination_parent = Path.join(root, "durable-abandoned")
+    File.mkdir_p!(source_parent)
+    File.mkdir_p!(destination_parent)
+    parent = self()
+
+    {holder, monitor} =
+      spawn_monitor(fn ->
+        adoptions =
+          for index <- 1..8 do
+            source = Path.join(source_parent, "ledger-#{index}")
+            destination = Path.join(destination_parent, "ledger-#{index}")
+            File.write!(source, "legacy-#{index}")
+            assert {:ok, adoption} = SegmentFileSystem.adoption_prepare(source, destination, root)
+            adoption
+          end
+
+        Process.put({__MODULE__, :abandoned_adoptions}, adoptions)
+        send(parent, {:native_adoptions_ready, self(), descriptor_count.()})
+
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+    assert_receive {:native_adoptions_ready, ^holder, live_count}, 1_000
+    assert live_count >= baseline + 24
+    Process.exit(holder, :kill)
+    assert_receive {:DOWN, ^monitor, :process, ^holder, :killed}, 1_000
+
+    assert eventually(fn -> descriptor_count.() <= baseline + 1 end)
+
+    for index <- 1..8 do
+      assert File.read!(Path.join(source_parent, "ledger-#{index}")) == "legacy-#{index}"
+      refute File.exists?(Path.join(destination_parent, "ledger-#{index}"))
+    end
+  end
+
+  test "repeated adoption prepare and close does not leak descriptors", %{root: root} do
+    descriptor_count = descriptor_count!()
+    source_parent = Path.join(root, "legacy-close")
+    destination_parent = Path.join(root, "durable-close")
+    File.mkdir_p!(source_parent)
+    File.mkdir_p!(destination_parent)
+    baseline = descriptor_count.()
+
+    for index <- 1..32 do
+      source = Path.join(source_parent, "ledger-#{index}")
+      destination = Path.join(destination_parent, "ledger-#{index}")
+      File.write!(source, "legacy-#{index}")
+      assert {:ok, adoption} = SegmentFileSystem.adoption_prepare(source, destination, root)
+      assert :ok = SegmentFileSystem.adoption_close(adoption)
+    end
+
+    assert eventually(fn -> descriptor_count.() <= baseline + 1 end)
+  end
+
+  defp canonical_tmp_dir do
+    case System.tmp_dir!() do
+      "/var/" <> rest -> "/private/var/" <> rest
+      path -> path
+    end
+  end
+
   defp native_source do
     __DIR__
     |> Path.join("../../../../../../c_src/outbox_segment.c")
@@ -173,6 +420,13 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystemTest do
     [{cleanup_at, _size}] = Regex.run(cleanup_pattern, body, return: :index)
     [{descriptor_at, _size}] = Regex.run(descriptor_pattern, body, return: :index)
     cleanup_at < descriptor_at
+  end
+
+  defp last_index!(body, needle) do
+    body
+    |> :binary.matches(needle)
+    |> List.last()
+    |> elem(0)
   end
 
   defp descriptor_count! do

@@ -754,7 +754,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
   end
 
   setup do
-    base = Path.join(System.tmp_dir!(), "desired_atomic_#{System.unique_integer([:positive])}")
+    base = Path.join(canonical_tmp_dir(), "desired_atomic_#{System.unique_integer([:positive])}")
 
     on_exit(fn ->
       File.rm_rf(base)
@@ -762,6 +762,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
       CallbackFailureFileSystem.reset()
       PostRenameCallbackFailureFileSystem.reset()
       DirectorySyncFailureFileSystem.reset()
+      __MODULE__.AdoptionNative.reset()
     end)
 
     %{base: base}
@@ -1390,6 +1391,191 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
     refute File.exists?(temp_path)
   end
 
+  defmodule AdoptionNative do
+    def script(steps), do: Process.put({__MODULE__, :script}, steps)
+    def reset, do: Process.delete({__MODULE__, :script})
+
+    def adoption_prepare(source, destination, root) do
+      invoke(:prepare, [source, destination, root], {:ok, make_ref()})
+    end
+
+    def adoption_commit(adoption, fault), do: invoke(:commit, [adoption, fault], :ok)
+    def adoption_close(adoption), do: invoke(:close, [adoption], :ok)
+
+    defp invoke(operation, args, default) do
+      case Process.get({__MODULE__, :script}, []) do
+        [{^operation, callback} | rest] ->
+          Process.put({__MODULE__, :script}, rest)
+          callback.(args)
+
+        _other ->
+          default
+      end
+    end
+  end
+
+  describe "adopt/3" do
+    test "moves an exact source into a missing hardened directory chain without copying", ctx do
+      source_parent = Path.join(ctx.base, "legacy")
+      source = Path.join(source_parent, "ledger")
+      destination = Path.join([ctx.base, "durable", "identity", "ledger"])
+      File.mkdir_p!(source_parent)
+      File.write!(source, "legacy-ledger")
+      source_stat = File.stat!(source)
+
+      assert :ok = AtomicFile.adopt(source, destination, directory_root: ctx.base)
+
+      refute File.exists?(source)
+      assert File.read!(destination) == "legacy-ledger"
+      destination_stat = File.stat!(destination)
+
+      assert {destination_stat.major_device, destination_stat.minor_device, destination_stat.inode} ==
+               {source_stat.major_device, source_stat.minor_device, source_stat.inode}
+
+      assert_mode(Path.join(ctx.base, "durable"), 0o700)
+      assert_mode(Path.join([ctx.base, "durable", "identity"]), 0o700)
+    end
+
+    test "never overwrites or consumes the source when the destination exists", ctx do
+      source = Path.join(ctx.base, "legacy-ledger")
+      destination = Path.join(ctx.base, "identity-ledger")
+      File.mkdir_p!(ctx.base)
+      File.write!(source, "legacy")
+      File.write!(destination, "current")
+
+      assert {:error, {:pre_adopt, {:destination_exists, ^destination}}} =
+               AtomicFile.adopt(source, destination, directory_root: ctx.base)
+
+      assert File.read!(source) == "legacy"
+      assert File.read!(destination) == "current"
+    end
+
+    test "rejects non-canonical adoption roots", ctx do
+      source = Path.join(ctx.base, "legacy-root")
+      destination = Path.join(ctx.base, "durable-root")
+      File.mkdir_p!(ctx.base)
+      File.write!(source, "legacy")
+      root = Path.join(ctx.base, "nested/..")
+
+      assert {:error, {:pre_adopt, {:invalid_directory_root, ^root}}} =
+               AtomicFile.adopt(source, destination, directory_root: root)
+
+      assert File.read!(source) == "legacy"
+      refute File.exists?(destination)
+    end
+
+    test "rejects symlink components in the destination directory chain", ctx do
+      source = Path.join(ctx.base, "legacy-outbox")
+      outside = ctx.base <> "-outside"
+      symlink = Path.join(ctx.base, "device")
+      destination = Path.join([symlink, "credential", "outbox"])
+      File.mkdir_p!(ctx.base)
+      File.mkdir_p!(outside)
+      File.write!(source, "legacy")
+      File.ln_s!(outside, symlink)
+      on_exit(fn -> File.rm_rf(outside) end)
+
+      assert {:error, {:pre_adopt, reason}} =
+               AtomicFile.adopt(source, destination, directory_root: ctx.base)
+
+      assert reason in [:eloop, :enotdir]
+      assert File.read!(source) == "legacy"
+      refute File.exists?(Path.join([outside, "credential", "outbox"]))
+    end
+
+    test "rejects cross-filesystem adoption without copying or deleting", ctx do
+      source = Path.join(ctx.base, "legacy")
+      File.mkdir_p!(ctx.base)
+      File.write!(source, "legacy")
+
+      cross_root = Enum.find(["/dev/shm", "/run/shm"], &cross_device?(&1, ctx.base))
+
+      if cross_root do
+        destination_root = Path.join(cross_root, "atomic-file-adopt-#{System.unique_integer([:positive])}")
+        destination = Path.join(destination_root, "ledger")
+        on_exit(fn -> File.rm_rf(destination_root) end)
+
+        assert {:error, {:pre_adopt, {:cross_device, ^source, ^destination}}} =
+                 AtomicFile.adopt(source, destination, directory_root: destination_root)
+
+        assert File.read!(source) == "legacy"
+        refute File.exists?(destination)
+      else
+        assert true
+      end
+    end
+
+    test "source-parent sync failure cannot return success", ctx do
+      source = Path.join(ctx.base, "legacy-source-sync")
+      destination = Path.join(ctx.base, "durable-source-sync")
+      File.mkdir_p!(ctx.base)
+      File.write!(source, "legacy")
+      owner = self()
+
+      AdoptionNative.script([
+        {:prepare, fn _args -> {:ok, :adoption} end},
+        {:commit,
+         fn [:adoption, :none] ->
+           send(owner, :source_parent_sync_attempted)
+           {:error, {:adopted, {:source_parent_sync, :eio}}}
+         end},
+        {:close, fn [:adoption] -> :ok end}
+      ])
+
+      assert {:error, {:durability_uncertain, {:source_parent_sync, :eio}}} =
+               AtomicFile.adopt(source, destination,
+                 directory_root: ctx.base,
+                 native: AdoptionNative
+               )
+
+      assert_receive :source_parent_sync_attempted
+    end
+
+    test "destination-parent sync failure cannot return success", ctx do
+      source = Path.join(ctx.base, "legacy-destination-sync")
+      destination = Path.join(ctx.base, "durable-destination-sync")
+      File.mkdir_p!(ctx.base)
+      File.write!(source, "legacy")
+      owner = self()
+
+      AdoptionNative.script([
+        {:prepare, fn _args -> {:ok, :adoption} end},
+        {:commit,
+         fn [:adoption, :none] ->
+           send(owner, :destination_parent_sync_attempted)
+           {:error, {:adopted, {:destination_parent_sync, :eio}}}
+         end},
+        {:close, fn [:adoption] -> :ok end}
+      ])
+
+      assert {:error, {:durability_uncertain, {:destination_parent_sync, :eio}}} =
+               AtomicFile.adopt(source, destination,
+                 directory_root: ctx.base,
+                 native: AdoptionNative
+               )
+
+      assert_receive :destination_parent_sync_attempted
+    end
+
+    test "reports post-rename faults as durability uncertain after moving the exact inode", ctx do
+      source = Path.join(ctx.base, "legacy")
+      destination = Path.join(ctx.base, "durable")
+      File.mkdir_p!(ctx.base)
+      File.write!(source, "legacy")
+      source_stat = File.stat!(source)
+
+      assert {:error, {:durability_uncertain, {:fault_injected, :adopted, :power_loss}}} =
+               AtomicFile.adopt(source, destination,
+                 directory_root: ctx.base,
+                 fault_injector: fail_at(:adopted)
+               )
+
+      refute File.exists?(source)
+      destination_stat = File.stat!(destination)
+      assert destination_stat.inode == source_stat.inode
+    end
+  end
+
   test "distinguishes pre-rename failure, durability uncertainty, and durable success", ctx do
     pre_path = Path.join(ctx.base, "pre")
 
@@ -1480,6 +1666,23 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
              )
 
     refute File.exists?(present)
+  end
+
+  defp canonical_tmp_dir do
+    case System.tmp_dir!() do
+      "/var/" <> rest -> "/private/var/" <> rest
+      path -> path
+    end
+  end
+
+  defp cross_device?(root, reference) do
+    with true <- File.dir?(root),
+         {:ok, root_stat} <- File.stat(root),
+         {:ok, reference_stat} <- File.stat(reference) do
+      root_stat.major_device != reference_stat.major_device
+    else
+      _other -> false
+    end
   end
 
   defp fail_at(stage) do

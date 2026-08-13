@@ -27,6 +27,15 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem do
   @callback file_info(segment()) :: {:ok, file_info()} | {:error, term()}
   @callback close(segment()) :: :ok | {:error, term()}
 
+  @doc false
+  def adoption_prepare(_source, _destination, _directory_root), do: :erlang.nif_error(:not_loaded)
+
+  @doc false
+  def adoption_commit(_adoption, _fault), do: :erlang.nif_error(:not_loaded)
+
+  @doc false
+  def adoption_close(_adoption), do: :erlang.nif_error(:not_loaded)
+
   def load_nif do
     target = Application.get_env(:racing_org_tracker_pro, :target, :host)
     path = Path.join([:code.priv_dir(:racing_org_tracker_pro), "native", to_string(target), "outbox_segment"])
