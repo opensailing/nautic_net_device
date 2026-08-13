@@ -6,6 +6,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
   use Application
 
   @max_unfragmented_udp_payload_size {508, :bytes}
+  @checkpoint_head_transition_timeout_ms 180_000
 
   @impl true
   def start(_type, _args) do
@@ -79,7 +80,13 @@ defmodule RacingOrg.Tracker.Pro.Application do
              device_id: identity.device_id,
              credential_epoch: identity.credential_epoch,
              storage_epoch: identity.storage_epoch,
-             identity: identity_authority
+             identity: identity_authority,
+             transition_timeout_ms:
+               Keyword.get(
+                 opts,
+                 :head_store_transition_timeout_ms,
+                 @checkpoint_head_transition_timeout_ms
+               )
            ) do
       coordinator_starter.(
         name: Keyword.get(opts, :name, RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHydration.Coordinator),
@@ -266,6 +273,7 @@ defmodule RacingOrg.Tracker.Pro.Application do
              [
                journal_path: checkpoint_hydration_journal_path(),
                head_store_base_dir: checkpoint_head_root(),
+               head_store_transition_timeout_ms: @checkpoint_head_transition_timeout_ms,
                identity: &RacingOrg.Tracker.Pro.DesiredState.Runtime.identity/0,
                identity_authority: &checkpoint_head_identity_authority/1,
                coordinator_starter: &coordinator.start_link/1

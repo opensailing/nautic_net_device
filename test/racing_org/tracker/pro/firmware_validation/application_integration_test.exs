@@ -150,6 +150,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.ApplicationIntegrationTest do
     assert {RacingOrg.Tracker.Pro.Application, :start_checkpoint_hydration, [opts]} = hydration_spec.start
     assert Path.type(opts[:journal_path]) == :absolute
     assert Path.type(opts[:head_store_base_dir]) == :absolute
+    assert opts[:head_store_transition_timeout_ms] == 180_000
     assert is_function(opts[:identity], 0)
     assert is_function(opts[:identity_authority], 1)
     assert is_function(opts[:coordinator_starter], 1)
@@ -187,6 +188,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.ApplicationIntegrationTest do
     assert coordinator_opts[:head_store].device_id == identity.device_id
     assert coordinator_opts[:head_store].credential_epoch == identity.credential_epoch
     assert coordinator_opts[:head_store].storage_epoch == identity.storage_epoch
+    assert coordinator_opts[:head_store].transition_timeout_ms == 180_000
   end
 
   test "production Trial receives the durable health admitter and exact target context" do
