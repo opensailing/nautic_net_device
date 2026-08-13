@@ -70,16 +70,39 @@ defmodule RacingOrg.Tracker.Pro.Race.RecordingTest do
     assert chunk.byte_count == byte_size(bytes)
   end
 
-  test "truncates a torn trailing record from a power loss", %{base: base} do
-    rec = base |> open() |> Recording.append(ds(1))
+  test "exposes exact post-truncation sealed chunk and manifest artifacts", %{base: base} do
+    encoded = ds(1)
+    expected_chunk_bytes = <<byte_size(encoded)::32, encoded::binary>>
+    rec = base |> open() |> Recording.append(encoded)
+
     # Simulate a power loss mid-write: a record header claiming 999 bytes with 3 present.
     File.write!(Path.join(rec.dir, "chunk-0001"), <<999::32, 1, 2, 3>>, [:append])
 
     {rec, manifest} = Recording.finalize(rec)
     assert [chunk] = manifest.chunks
-    assert chunk.sample_count == 1
-    assert {:ok, [record]} = Recording.read_chunk(rec, "0001")
-    assert DataSet.decode(record).counter == 1
+
+    assert {:ok, [%{descriptor: descriptor, bytes: ^expected_chunk_bytes}]} =
+             Recording.sealed_chunk_artifacts(rec)
+
+    assert descriptor.chunk_id == chunk.chunk_id
+    assert descriptor.byte_count == byte_size(expected_chunk_bytes)
+    assert descriptor.checksum == chunk.checksum
+    assert descriptor.sample_count == 1
+
+    expected_manifest_bytes = RaceManifest.encode(manifest)
+
+    assert {:ok, %{manifest: ^manifest, bytes: ^expected_manifest_bytes}} =
+             Recording.manifest_artifact(rec)
+
+    assert File.read!(Path.join(rec.dir, "manifest.pb")) == expected_manifest_bytes
+    assert {:ok, [^encoded]} = Recording.read_chunk(rec, "0001")
+  end
+
+  test "refuses sealed artifacts whose bytes no longer match their descriptor", %{base: base} do
+    {rec, _manifest} = base |> open() |> append_all(1..1) |> Recording.finalize()
+    File.write!(Path.join(rec.dir, "chunk-0001"), "tampered", [:append])
+
+    assert {:error, {:sealed_chunk_mismatch, "0001"}} = Recording.sealed_chunk_artifacts(rec)
   end
 
   test "load reconstructs a recording from disk and finalizes after reboot", %{base: base} do

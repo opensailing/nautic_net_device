@@ -141,6 +141,27 @@ defmodule RacingOrg.Tracker.Pro.Race.Recording do
   @doc "Whether the recording has been finalized (its manifest written)."
   def finalized?(%__MODULE__{dir: dir}), do: File.exists?(Path.join(dir, @manifest_file))
 
+  @doc "Return the exact sealed raw chunk bytes with their durable descriptors."
+  def sealed_chunk_artifacts(%__MODULE__{} = recording) do
+    Enum.reduce_while(recording.sealed_chunks, {:ok, []}, fn descriptor, {:ok, artifacts} ->
+      case read_sealed_chunk(recording, descriptor) do
+        {:ok, bytes} ->
+          {:cont, {:ok, artifacts ++ [%{descriptor: descriptor, bytes: bytes}]}}
+
+        {:error, _reason} = error ->
+          {:halt, error}
+      end
+    end)
+  end
+
+  @doc "Return the exact persisted `RaceManifest` protobuf bytes and decoded manifest."
+  def manifest_artifact(%__MODULE__{dir: dir}) do
+    case File.read(Path.join(dir, @manifest_file)) do
+      {:ok, bytes} -> decode_manifest_artifact(bytes)
+      error -> error
+    end
+  end
+
   @doc "Return the list of encoded `DataSet` records stored in a sealed chunk."
   def read_chunk(%__MODULE__{dir: dir}, chunk_id) do
     path = Path.join(dir, "chunk-#{chunk_id}")
@@ -166,6 +187,32 @@ defmodule RacingOrg.Tracker.Pro.Race.Recording do
   end
 
   # --- internals ---
+
+  defp read_sealed_chunk(%__MODULE__{dir: dir}, descriptor) do
+    case File.read(Path.join(dir, "chunk-#{descriptor.chunk_id}")) do
+      {:ok, bytes} ->
+        if sealed_chunk_matches?(descriptor, bytes),
+          do: {:ok, bytes},
+          else: {:error, {:sealed_chunk_mismatch, descriptor.chunk_id}}
+
+      {:error, reason} ->
+        {:error, {:sealed_chunk_read_failed, descriptor.chunk_id, reason}}
+    end
+  end
+
+  defp sealed_chunk_matches?(descriptor, bytes) do
+    descriptor.byte_count == byte_size(bytes) and
+      descriptor.checksum == sha256_hex(bytes) and
+      descriptor.sample_count == length(records(bytes, []))
+  end
+
+  defp decode_manifest_artifact(bytes) do
+    {:ok, %{manifest: RaceManifest.decode(bytes), bytes: bytes}}
+  rescue
+    _exception -> {:error, :invalid_manifest_artifact}
+  catch
+    _kind, _reason -> {:error, :invalid_manifest_artifact}
+  end
 
   defp roll_chunk(recording) do
     recording
