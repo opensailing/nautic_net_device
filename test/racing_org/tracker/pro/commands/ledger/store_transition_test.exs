@@ -132,13 +132,18 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
     alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
 
     def read(path), do: FileSystem.read(path)
+    def read(device, count), do: FileSystem.read(device, count)
     def list_dir(path), do: FileSystem.list_dir(path)
+    def lstat(path), do: FileSystem.lstat(path)
+    def file_info(device), do: FileSystem.file_info(device)
     def mkdir_p(path), do: FileSystem.mkdir_p(path)
+    def mkdir(path), do: FileSystem.mkdir(path)
     def chmod(path, mode), do: FileSystem.chmod(path, mode)
     def open(path, modes), do: FileSystem.open(path, modes)
     def write(device, contents), do: FileSystem.write(device, contents)
     def close(device), do: FileSystem.close(device)
     def remove(path), do: FileSystem.remove(path)
+    def rmdir(path), do: FileSystem.rmdir(path)
 
     def rename(source, destination) do
       case FileSystem.rename(source, destination) do
@@ -167,10 +172,14 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
     def detach, do: :persistent_term.erase({__MODULE__, :block})
 
     def read(path), do: FileSystem.read(path)
+    def read(device, count), do: FileSystem.read(device, count)
     def list_dir(path), do: FileSystem.list_dir(path)
-    def lstat(path), do: File.lstat(path)
+    def lstat(path), do: FileSystem.lstat(path)
+    def file_info(device), do: FileSystem.file_info(device)
 
-    def mkdir_p(path) do
+    def mkdir_p(path), do: FileSystem.mkdir_p(path)
+
+    def mkdir(path) do
       case :persistent_term.get({__MODULE__, :block}, nil) do
         {owner, blocked_path} ->
           if Path.basename(path) == Path.basename(blocked_path) do
@@ -185,7 +194,11 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
           :ok
       end
 
-      FileSystem.mkdir_p(path)
+      case FileSystem.lstat(path) do
+        {:ok, %File.Stat{}} -> {:error, :eexist}
+        {:error, :enoent} -> FileSystem.mkdir(path)
+        other -> other
+      end
     end
 
     def chmod(path, mode), do: FileSystem.chmod(path, mode)
@@ -195,6 +208,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
     def close(device), do: FileSystem.close(device)
     def rename(source, destination), do: FileSystem.rename(source, destination)
     def remove(path), do: FileSystem.remove(path)
+    def rmdir(path), do: FileSystem.rmdir(path)
   end
 
   defmodule ToggleReadFailureFileSystem do
@@ -209,9 +223,12 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
         else: FileSystem.read(path)
     end
 
+    def read(device, count), do: FileSystem.read(device, count)
     def list_dir(path), do: FileSystem.list_dir(path)
     def lstat(path), do: FileSystem.lstat(path)
+    def file_info(device), do: FileSystem.file_info(device)
     def mkdir_p(path), do: FileSystem.mkdir_p(path)
+    def mkdir(path), do: FileSystem.mkdir(path)
     def chmod(path, mode), do: FileSystem.chmod(path, mode)
     def open(path, modes), do: FileSystem.open(path, modes)
     def write(device, contents), do: FileSystem.write(device, contents)
@@ -219,6 +236,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
     def close(device), do: FileSystem.close(device)
     def rename(source, destination), do: FileSystem.rename(source, destination)
     def remove(path), do: FileSystem.remove(path)
+    def rmdir(path), do: FileSystem.rmdir(path)
   end
 
   defmodule ReclassifyingAdmissionAuthority do
@@ -1348,7 +1366,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreTransitionTest do
         atomic_opts: Keyword.put(pending.atomic_opts, :file_system, PostRenameCrashFileSystem)
     }
 
-    assert {:error, {:command_ledger_durability_uncertain, {:directory_sync, {:callback_failed, :raise}}}} =
+    assert {:error, {:command_ledger_durability_uncertain, {:destination_file_sync, {:callback_failed, :raise}}}} =
              Store.reject_intent(faulted, plan)
 
     assert {:ok, reopened} = open_store(path)

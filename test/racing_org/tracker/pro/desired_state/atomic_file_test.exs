@@ -14,15 +14,27 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
     def read(path), do: RealFileSystem.read(path)
 
     @impl true
+    def read(device, count), do: RealFileSystem.read(device, count)
+
+    @impl true
     def list_dir(path), do: RealFileSystem.list_dir(path)
 
     @impl true
     def lstat(path), do: File.lstat(path)
 
     @impl true
+    def file_info(device), do: RealFileSystem.file_info(device)
+
+    @impl true
     def mkdir_p(path) do
       report({:mkdir_p, path})
       RealFileSystem.mkdir_p(path)
+    end
+
+    @impl true
+    def mkdir(path) do
+      report({:mkdir, path})
+      RealFileSystem.mkdir(path)
     end
 
     @impl true
@@ -68,6 +80,12 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
     def remove(path) do
       report({:remove, path})
       RealFileSystem.remove(path)
+    end
+
+    @impl true
+    def rmdir(path) do
+      report({:rmdir, path})
+      RealFileSystem.rmdir(path)
     end
 
     defp report(event) do
@@ -129,13 +147,16 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
     def read(path), do: RealFileSystem.read(path)
     def list_dir(path), do: invoke(:list_dir, fn -> RealFileSystem.list_dir(path) end)
     def lstat(path), do: invoke(:lstat, fn -> File.lstat(path) end)
-    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
-    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+    def mkdir_p(path), do: invoke(:mkdir_p, fn -> RealFileSystem.mkdir_p(path) end)
+    def chmod(path, mode), do: invoke(:chmod, fn -> RealFileSystem.chmod(path, mode) end)
     def open(path, modes), do: invoke(:open, fn -> RealFileSystem.open(path, modes) end)
-    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def write(device, contents), do: invoke(:write, fn -> RealFileSystem.write(device, contents) end)
     def sync(device), do: invoke(:sync, fn -> RealFileSystem.sync(device) end)
     def close(device), do: invoke(:close, fn -> RealFileSystem.close(device) end)
-    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+
+    def rename(source, destination),
+      do: invoke(:rename, fn -> RealFileSystem.rename(source, destination) end)
+
     def remove(path), do: invoke(:remove, fn -> RealFileSystem.remove(path) end)
 
     defp invoke(stage, callback) do
@@ -146,6 +167,503 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
         _other -> callback.()
       end
     end
+  end
+
+  defmodule MissingWriteCallbacksFileSystem do
+  end
+
+  defmodule RenameRaisesAfterCommitFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+
+    def rename(source, destination) do
+      case RealFileSystem.rename(source, destination) do
+        :ok -> raise "simulated return-path failure after rename"
+        other -> other
+      end
+    end
+
+    def remove(path), do: RealFileSystem.remove(path)
+  end
+
+  defmodule RemoveRaisesAfterCommitFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def file_info(device), do: RealFileSystem.file_info(device)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+
+    def remove(path) do
+      case RealFileSystem.remove(path) do
+        :ok -> raise "simulated return-path failure after remove"
+        other -> other
+      end
+    end
+  end
+
+  defmodule RenameFailsBeforeCommitFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+    def rename(_source, _destination), do: {:error, :eacces}
+    def remove(path), do: RealFileSystem.remove(path)
+  end
+
+  defmodule RenameFailsWithoutLstatFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+    def rename(_source, _destination), do: {:error, :eacces}
+    def remove(path), do: RealFileSystem.remove(path)
+  end
+
+  defmodule RenameFailsAfterCommitAndRecreatesTempFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+
+    def rename(source, destination) do
+      case RealFileSystem.rename(source, destination) do
+        :ok ->
+          File.write!(source, "other-writer")
+          raise "simulated return-path failure after rename"
+
+        other ->
+          other
+      end
+    end
+
+    def remove(path), do: RealFileSystem.remove(path)
+  end
+
+  defmodule OpenRaisesAfterCreateFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+
+    def open(path, modes) do
+      case RealFileSystem.open(path, modes) do
+        {:ok, device} = result ->
+          if :exclusive in modes do
+            :ok = RealFileSystem.close(device)
+            raise "simulated return-path failure after open"
+          else
+            result
+          end
+
+        other ->
+          other
+      end
+    end
+
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+    def remove(path), do: RealFileSystem.remove(path)
+  end
+
+  defmodule OpenRaisesBeforeAcquireFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+
+    def open(path, modes) do
+      if :exclusive in modes do
+        raise "simulated callback failure before exclusive open"
+      else
+        RealFileSystem.open(path, modes)
+      end
+    end
+
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+    def remove(path), do: RealFileSystem.remove(path)
+  end
+
+  defmodule ChmodNoopFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def read(device, count), do: RealFileSystem.read(device, count)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def file_info(device), do: RealFileSystem.file_info(device)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def mkdir(path), do: RealFileSystem.mkdir(path)
+    def chmod(_path, _mode), do: :ok
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+    def remove(path), do: RealFileSystem.remove(path)
+    def rmdir(path), do: RealFileSystem.rmdir(path)
+  end
+
+  defmodule ParentSwapAfterRenameFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def read(device, count), do: RealFileSystem.read(device, count)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def file_info(device), do: RealFileSystem.file_info(device)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def mkdir(path), do: RealFileSystem.mkdir(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+
+    def rename(source, destination) do
+      with :ok <- RealFileSystem.rename(source, destination),
+           parent = Path.dirname(destination),
+           :ok <- File.rename(parent, parent <> ".moved"),
+           :ok <- File.mkdir(parent) do
+        :ok
+      end
+    end
+
+    def remove(path), do: RealFileSystem.remove(path)
+    def rmdir(path), do: RealFileSystem.rmdir(path)
+  end
+
+  defmodule ParentSwapAfterRemoveFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def read(device, count), do: RealFileSystem.read(device, count)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def file_info(device), do: RealFileSystem.file_info(device)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def mkdir(path), do: RealFileSystem.mkdir(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+
+    def remove(path) do
+      with :ok <- RealFileSystem.remove(path),
+           parent = Path.dirname(path),
+           :ok <- File.rename(parent, parent <> ".moved"),
+           :ok <- File.mkdir(parent) do
+        :ok
+      end
+    end
+
+    def rmdir(path), do: RealFileSystem.rmdir(path)
+  end
+
+  defmodule TempContentMutationFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def read(device, count), do: RealFileSystem.read(device, count)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def file_info(device), do: RealFileSystem.file_info(device)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def mkdir(path), do: RealFileSystem.mkdir(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+
+    def open(path, modes) do
+      case RealFileSystem.open(path, modes) do
+        {:ok, device} = result ->
+          if :exclusive in modes, do: Process.put({__MODULE__, :temp_path, device}, path)
+          result
+
+        other ->
+          other
+      end
+    end
+
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+
+    def close(device) do
+      temp_path = Process.delete({__MODULE__, :temp_path, device})
+      result = RealFileSystem.close(device)
+
+      if result == :ok and is_binary(temp_path) do
+        :ok = File.write(temp_path, "substitute")
+      end
+
+      result
+    end
+
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+    def remove(path), do: RealFileSystem.remove(path)
+    def rmdir(path), do: RealFileSystem.rmdir(path)
+  end
+
+  defmodule RenameContentMutationFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def read(device, count), do: RealFileSystem.read(device, count)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def file_info(device), do: RealFileSystem.file_info(device)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def mkdir(path), do: RealFileSystem.mkdir(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+
+    def rename(source, destination) do
+      with :ok <- File.write(source, "substitute"),
+           :ok <- RealFileSystem.rename(source, destination) do
+        :ok
+      end
+    end
+
+    def remove(path), do: RealFileSystem.remove(path)
+    def rmdir(path), do: RealFileSystem.rmdir(path)
+  end
+
+  defmodule TempPathSwapFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def read(device, count), do: RealFileSystem.read(device, count)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def file_info(device), do: RealFileSystem.file_info(device)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def mkdir(path), do: RealFileSystem.mkdir(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+
+    def open(path, modes) do
+      case RealFileSystem.open(path, modes) do
+        {:ok, device} = result ->
+          if :exclusive in modes, do: Process.put({__MODULE__, :temp_path, device}, path)
+          result
+
+        other ->
+          other
+      end
+    end
+
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+
+    def close(device) do
+      temp_path = Process.delete({__MODULE__, :temp_path, device})
+      result = RealFileSystem.close(device)
+
+      if result == :ok and is_binary(temp_path) do
+        :ok = File.rename(temp_path, temp_path <> ".staged")
+        :ok = File.write(temp_path, "substituted")
+      end
+
+      result
+    end
+
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+    def remove(path), do: RealFileSystem.remove(path)
+    def rmdir(path), do: RealFileSystem.rmdir(path)
+  end
+
+  defmodule OrphanRemoveRaisesAfterCommitFileSystem do
+    @behaviour RealFileSystem
+
+    def attach(owner), do: :persistent_term.put({__MODULE__, :owner}, owner)
+    def detach, do: :persistent_term.erase({__MODULE__, :owner})
+
+    def read(path), do: RealFileSystem.read(path)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+
+    def open(path, modes) do
+      case RealFileSystem.open(path, modes) do
+        {:ok, device} = result ->
+          Process.put({__MODULE__, :path, device}, path)
+          result
+
+        other ->
+          other
+      end
+    end
+
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+
+    def sync(device) do
+      if owner = :persistent_term.get({__MODULE__, :owner}, nil) do
+        send(owner, {:orphan_cleanup_synced, Process.get({__MODULE__, :path, device})})
+      end
+
+      RealFileSystem.sync(device)
+    end
+
+    def close(device) do
+      result = RealFileSystem.close(device)
+      Process.delete({__MODULE__, :path, device})
+      result
+    end
+
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+
+    def remove(path) do
+      case RealFileSystem.remove(path) do
+        :ok -> raise "simulated return-path failure after orphan unlink"
+        other -> other
+      end
+    end
+  end
+
+  defmodule ConcurrentDirectoryCreateFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def read(device, count), do: RealFileSystem.read(device, count)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def file_info(device), do: RealFileSystem.file_info(device)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+
+    def mkdir(path) do
+      :ok = RealFileSystem.mkdir(path)
+      {:error, :eexist}
+    end
+
+    def chmod(_path, _mode), do: raise("simulated chmod failure on concurrently created directory")
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+    def remove(path), do: RealFileSystem.remove(path)
+    def rmdir(path), do: RealFileSystem.rmdir(path)
+  end
+
+  defmodule ChmodRaisesAfterMkdirFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def read(device, count), do: RealFileSystem.read(device, count)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def file_info(device), do: RealFileSystem.file_info(device)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def mkdir(path), do: RealFileSystem.mkdir(path)
+    def chmod(_path, _mode), do: raise("simulated chmod failure after mkdir")
+
+    def open(path, modes) do
+      case RealFileSystem.open(path, modes) do
+        {:ok, device} = result ->
+          Process.put({__MODULE__, :path, device}, path)
+          result
+
+        other ->
+          other
+      end
+    end
+
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+
+    def sync(device) do
+      send(self(), {:chmod_cleanup_synced, Process.get({__MODULE__, :path, device})})
+      RealFileSystem.sync(device)
+    end
+
+    def close(device) do
+      result = RealFileSystem.close(device)
+      Process.delete({__MODULE__, :path, device})
+      result
+    end
+
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+    def remove(path), do: RealFileSystem.remove(path)
+
+    def rmdir(path) do
+      result = RealFileSystem.rmdir(path)
+      send(self(), {:chmod_cleanup_rmdir, path, result})
+      result
+    end
+  end
+
+  defmodule MissingChmodFileSystem do
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(device, contents), do: RealFileSystem.write(device, contents)
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+    def remove(path), do: RealFileSystem.remove(path)
+  end
+
+  defmodule TempWriteAndCleanupFailureFileSystem do
+    @behaviour RealFileSystem
+
+    def read(path), do: RealFileSystem.read(path)
+    def list_dir(path), do: RealFileSystem.list_dir(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
+    def open(path, modes), do: RealFileSystem.open(path, modes)
+    def write(_device, _contents), do: raise("simulated temp write failure")
+    def sync(device), do: RealFileSystem.sync(device)
+    def close(device), do: RealFileSystem.close(device)
+    def rename(source, destination), do: RealFileSystem.rename(source, destination)
+    def remove(_path), do: raise("simulated temp cleanup failure")
   end
 
   defmodule PostRenameCallbackFailureFileSystem do
@@ -269,22 +787,143 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
       assert_mode(directory, 0o700)
     end
 
-    synced_paths = collect_synced_paths([])
+    events = collect_file_system_events([])
+
+    synced_paths =
+      for {:sync, path} <- events,
+          do: path
 
     assert Path.dirname(ctx.base) in synced_paths
     assert ctx.base in synced_paths
     assert Path.join(ctx.base, "generations") in synced_paths
     assert Path.join([ctx.base, "generations", "candidate"]) in synced_paths
     assert Path.join([ctx.base, "generations", "candidate", "chunks"]) in synced_paths
+
+    for directory <- [
+          ctx.base,
+          Path.join(ctx.base, "generations"),
+          Path.join([ctx.base, "generations", "candidate"]),
+          Path.join([ctx.base, "generations", "candidate", "chunks"]),
+          Path.join([ctx.base, "generations", "candidate", "chunks", "calibration"])
+        ] do
+      chmod = Enum.find_index(events, &(&1 == {:chmod, directory, 0o700}))
+      assert is_integer(chmod)
+
+      directory_sync =
+        events
+        |> Enum.with_index()
+        |> Enum.find_value(fn
+          {{:sync, ^directory}, index} when index > chmod -> index
+          _event -> nil
+        end)
+
+      assert is_integer(directory_sync)
+      parent = Path.dirname(directory)
+
+      parent_sync =
+        events
+        |> Enum.with_index()
+        |> Enum.find_value(fn
+          {{:sync, ^parent}, index} when index > directory_sync -> index
+          _event -> nil
+        end)
+
+      assert is_integer(parent_sync)
+      assert chmod < directory_sync
+      assert directory_sync < parent_sync
+    end
+  end
+
+  test "hardens missing ancestors above the directory root one component at a time", ctx do
+    root = Path.join([ctx.base, "nested", "root"])
+    destination = Path.join([root, "child", "record"])
+
+    assert :ok = AtomicFile.write(destination, "non-sensitive-state", directory_root: root)
+
+    for directory <- [ctx.base, Path.join(ctx.base, "nested"), root, Path.join(root, "child")] do
+      assert_mode(directory, 0o700)
+    end
+  end
+
+  test "rejects a symlink descendant that escapes the directory root", ctx do
+    outside =
+      Path.join(System.tmp_dir!(), "desired_atomic_outside_#{System.unique_integer([:positive])}")
+
+    on_exit(fn -> File.rm_rf(outside) end)
+
+    File.mkdir_p!(ctx.base)
+    File.mkdir_p!(outside)
+    escape = Path.join(ctx.base, "escape")
+    File.ln_s!(outside, escape)
+    destination = Path.join(escape, "record")
+
+    assert {:error, {:pre_rename, {:invalid_directory_type, ^escape, :symlink}}} =
+             AtomicFile.write(destination, "non-sensitive-state", directory_root: ctx.base)
+
+    refute File.exists?(Path.join(outside, "record"))
+    assert {:ok, %File.Stat{type: :symlink}} = File.lstat(escape)
+  end
+
+  test "rejects a missing directory root beneath a symlink parent" do
+    nonce = Base.url_encode64(:crypto.strong_rand_bytes(18), padding: false)
+    container = Path.join(System.tmp_dir!(), "desired_atomic_root_parent_#{nonce}")
+    outside = Path.join(System.tmp_dir!(), "desired_atomic_root_outside_#{nonce}")
+    alias_parent = Path.join(container, "alias")
+    root = Path.join(alias_parent, "missing-root")
+    destination = Path.join(root, "record")
+
+    on_exit(fn ->
+      File.rm_rf(container)
+      File.rm_rf(outside)
+    end)
+
+    File.mkdir_p!(container)
+    File.mkdir_p!(outside)
+    File.ln_s!(outside, alias_parent)
+
+    assert {:error, {:pre_rename, {:invalid_directory_type, ^alias_parent, :symlink}}} =
+             AtomicFile.write(destination, "non-sensitive-state", directory_root: root)
+
+    refute File.exists?(Path.join([outside, "missing-root", "record"]))
+  end
+
+  test "removes and syncs a newly created directory when chmod fails", ctx do
+    destination = Path.join(ctx.base, "record")
+
+    assert {:error, {:pre_rename, {:chmod_directory, {:callback_failed, :raise}}}} =
+             AtomicFile.write(destination, "non-sensitive-state",
+               file_system: ChmodRaisesAfterMkdirFileSystem,
+               directory_root: ctx.base
+             )
+
+    refute File.exists?(ctx.base)
+    assert_receive {:chmod_cleanup_rmdir, base, :ok}
+    assert base == ctx.base
+    assert_receive {:chmod_cleanup_synced, parent}
+    assert parent == Path.dirname(ctx.base)
+  end
+
+  test "never removes a directory created concurrently before chmod", ctx do
+    destination = Path.join(ctx.base, "record")
+
+    assert {:error, {:pre_rename, {:chmod_directory, {:callback_failed, :raise}}}} =
+             AtomicFile.write(destination, "non-sensitive-state",
+               file_system: ConcurrentDirectoryCreateFileSystem,
+               directory_root: ctx.base
+             )
+
+    assert File.dir?(ctx.base)
+    refute File.exists?(destination)
   end
 
   test "a temporary-name collision retries without removing another writer's file", ctx do
     File.mkdir_p!(ctx.base)
     destination = Path.join(ctx.base, "record")
-    collision = destination <> ".tmp.same"
+    suffix = "SAMEsameSAMEsame"
+    collision = destination <> ".tmp." <> suffix
     File.write!(collision, "other-writer")
 
-    assert :ok = AtomicFile.write(destination, "ours", temp_suffix: fn -> "same" end)
+    assert :ok = AtomicFile.write(destination, "ours", temp_suffix: fn -> suffix end)
 
     assert File.read!(collision) == "other-writer"
     assert File.read!(destination) == "ours"
@@ -439,6 +1078,234 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
     assert File.dir?(matching_directory)
   end
 
+  test "cleanup syncs earlier removals before reporting a later invalid artifact", ctx do
+    File.mkdir_p!(ctx.base)
+    TracingFileSystem.attach(self())
+    destination = Path.join(ctx.base, "record")
+    removed = destination <> ".tmp.AAAAAAAAAAAAAAAA"
+    rejected = destination <> ".tmp.BBBBBBBBBBBBBBBB"
+    File.write!(removed, "non-sensitive-state")
+    File.mkdir_p!(rejected)
+
+    assert {:error, {:orphan_temp_cleanup, :invalid_temp_type}} =
+             AtomicFile.cleanup_orphan_temps(destination,
+               file_system: TracingFileSystem
+             )
+
+    refute File.exists?(removed)
+    assert File.dir?(rejected)
+
+    events = collect_file_system_events([])
+    removal = Enum.find_index(events, &(&1 == {:remove, removed}))
+    directory_sync = Enum.find_index(events, &(&1 == {:sync, ctx.base}))
+    assert is_integer(removal)
+    assert is_integer(directory_sync)
+    assert removal < directory_sync
+  end
+
+  test "cleanup syncs a first orphan unlink whose callback return is ambiguous", ctx do
+    File.mkdir_p!(ctx.base)
+    OrphanRemoveRaisesAfterCommitFileSystem.attach(self())
+
+    on_exit(fn ->
+      OrphanRemoveRaisesAfterCommitFileSystem.detach()
+    end)
+
+    destination = Path.join(ctx.base, "record")
+    orphan = destination <> ".tmp.AAAAAAAAAAAAAAAA"
+    File.write!(orphan, "non-sensitive-state")
+
+    assert {:error, {:orphan_temp_cleanup, {:remove_temp, {:callback_failed, :raise}}}} =
+             AtomicFile.cleanup_orphan_temps(destination,
+               file_system: OrphanRemoveRaisesAfterCommitFileSystem
+             )
+
+    refute File.exists?(orphan)
+    assert_receive {:orphan_cleanup_synced, base}
+    assert base == ctx.base
+  end
+
+  test "rejects custom temporary suffixes that orphan cleanup cannot recognize", ctx do
+    destination = Path.join(ctx.base, "invalid-suffix")
+
+    assert {:error, {:pre_rename, :invalid_temp_suffix}} =
+             AtomicFile.write(destination, "non-sensitive-state", temp_suffix: fn -> "same" end)
+
+    refute File.exists?(destination)
+    assert [] == Path.wildcard(destination <> ".tmp.*")
+  end
+
+  test "missing and raising write callbacks remain typed before rename", ctx do
+    missing_destination = Path.join(ctx.base, "missing-mkdir")
+
+    assert {:error, {:pre_rename, {:callback_unavailable, :mkdir_p}}} =
+             AtomicFile.write(missing_destination, "non-sensitive-state", file_system: MissingWriteCallbacksFileSystem)
+
+    raised_destination = Path.join(ctx.base, "raising-mkdir")
+    CallbackFailureFileSystem.fail(:mkdir_p, :raise)
+
+    assert {:error, {:pre_rename, {:mkdir, {:callback_failed, :raise}}}} =
+             AtomicFile.write(raised_destination, "non-sensitive-state", file_system: CallbackFailureFileSystem)
+
+    CallbackFailureFileSystem.reset()
+    refute File.exists?(missing_destination)
+    refute File.exists?(raised_destination)
+  end
+
+  test "a rename callback failure after installation is durability uncertain", ctx do
+    destination = Path.join(ctx.base, "rename-return-failure")
+
+    assert {:error, {:durability_uncertain, {:rename, {:callback_failed, :raise}}}} =
+             AtomicFile.write(destination, "non-sensitive-state", file_system: RenameRaisesAfterCommitFileSystem)
+
+    assert File.read!(destination) == "non-sensitive-state"
+    assert [] == Path.wildcard(destination <> ".tmp.*")
+  end
+
+  test "ambiguous rename failure never deletes a reused temporary name", ctx do
+    destination = Path.join(ctx.base, "rename-reused-temp")
+    suffix = "REUSEDTEMP123456"
+    temp_path = destination <> ".tmp." <> suffix
+
+    assert {:error, {:durability_uncertain, {:rename, {:callback_failed, :raise}}}} =
+             AtomicFile.write(destination, "ours",
+               file_system: RenameFailsAfterCommitAndRecreatesTempFileSystem,
+               temp_suffix: fn -> suffix end
+             )
+
+    assert File.read!(destination) == "ours"
+    assert File.read!(temp_path) == "other-writer"
+  end
+
+  test "a definite rename error remains pre-rename without optional lstat", ctx do
+    destination = Path.join(ctx.base, "rename-definite-failure")
+
+    assert {:error, {:pre_rename, {:rename, :eacces}}} =
+             AtomicFile.write(destination, "non-sensitive-state",
+               file_system: RenameFailsWithoutLstatFileSystem,
+               temp_suffix: fn -> "DEFINITERENAME01" end
+             )
+
+    refute File.exists?(destination)
+    assert [] == Path.wildcard(destination <> ".tmp.*")
+  end
+
+  test "an ambiguous open callback failure never deletes another writer's temporary path", ctx do
+    destination = Path.join(ctx.base, "open-return-failure")
+    suffix = "OPENFAILAFTER001"
+    temp_path = destination <> ".tmp." <> suffix
+    File.mkdir_p!(ctx.base)
+    File.write!(temp_path, "other-writer")
+
+    assert {:error, {:pre_rename, {:open, {:callback_failed, :raise}}}} =
+             AtomicFile.write(destination, "non-sensitive-state",
+               file_system: OpenRaisesBeforeAcquireFileSystem,
+               temp_suffix: fn -> suffix end
+             )
+
+    refute File.exists?(destination)
+    assert File.read!(temp_path) == "other-writer"
+  end
+
+  test "verifies restrictive directory mode before publishing its link", ctx do
+    destination = Path.join(ctx.base, "directory-mode")
+
+    assert {:error, {:pre_rename, {:invalid_directory_mode, base}}} =
+             AtomicFile.write(destination, "ours",
+               file_system: ChmodNoopFileSystem,
+               directory_root: ctx.base
+             )
+
+    assert base == ctx.base
+    refute File.exists?(ctx.base)
+    refute File.exists?(destination)
+  end
+
+  test "verifies restrictive temporary-file mode before rename", ctx do
+    File.mkdir_p!(ctx.base)
+    File.chmod!(ctx.base, 0o700)
+    destination = Path.join(ctx.base, "temp-mode")
+    suffix = "TEMPMODECHECK001"
+    temp_path = destination <> ".tmp." <> suffix
+
+    assert {:error, {:pre_rename, {:invalid_temporary_file_mode, ^temp_path}}} =
+             AtomicFile.write(destination, "ours",
+               file_system: ChmodNoopFileSystem,
+               directory_root: ctx.base,
+               temp_suffix: fn -> suffix end
+             )
+
+    refute File.exists?(destination)
+    refute File.exists?(temp_path)
+  end
+
+  test "rejects same-inode temporary content mutation before rename", ctx do
+    destination = Path.join(ctx.base, "temp-content-mutation")
+    suffix = "TEMPCONTENTMUT01"
+    temp_path = destination <> ".tmp." <> suffix
+
+    assert {:error, {:pre_rename, {:temporary_file_content_mismatch, ^temp_path}}} =
+             AtomicFile.write(destination, "authorized",
+               file_system: TempContentMutationFileSystem,
+               directory_root: ctx.base,
+               temp_suffix: fn -> suffix end
+             )
+
+    refute File.exists?(destination)
+    refute File.exists?(temp_path)
+  end
+
+  test "does not report success when rename mutates the staged inode", ctx do
+    destination = Path.join(ctx.base, "rename-content-mutation")
+
+    assert {:error, {:durability_uncertain, {:temporary_file_content_mismatch, ^destination}}} =
+             AtomicFile.write(destination, "authorized",
+               file_system: RenameContentMutationFileSystem,
+               directory_root: ctx.base
+             )
+
+    assert File.read!(destination) == "substitute"
+  end
+
+  test "rejects temporary pathname substitution before rename", ctx do
+    destination = Path.join(ctx.base, "temp-path-substitution")
+    suffix = "TEMPPATHSWAP0001"
+    temp_path = destination <> ".tmp." <> suffix
+
+    assert {:error, {:pre_rename, {:temporary_file_identity_mismatch, ^temp_path}}} =
+             AtomicFile.write(destination, "ours",
+               file_system: TempPathSwapFileSystem,
+               directory_root: ctx.base,
+               temp_suffix: fn -> suffix end
+             )
+
+    refute File.exists?(destination)
+    assert File.read!(temp_path) == "substituted"
+    assert File.read!(temp_path <> ".staged") == "ours"
+  end
+
+  test "preflights required callbacks before creating directories", ctx do
+    destination = Path.join([ctx.base, "missing-chmod", "record"])
+
+    assert {:error, {:pre_rename, {:callback_unavailable, :chmod}}} =
+             AtomicFile.write(destination, "non-sensitive-state", file_system: MissingChmodFileSystem)
+
+    refute File.exists?(Path.dirname(destination))
+  end
+
+  test "temp operation and cleanup callback failures remain typed", ctx do
+    destination = Path.join(ctx.base, "temp-cleanup-failure")
+
+    assert {:error,
+            {:pre_rename, {{:write, {:callback_failed, :raise}}, {:temp_cleanup, {:error, {:callback_failed, :raise}}}}}} =
+             AtomicFile.write(destination, "non-sensitive-state",
+               file_system: TempWriteAndCleanupFailureFileSystem,
+               temp_suffix: fn -> "TEMPCLEANUPFAIL1" end
+             )
+
+    refute File.exists?(destination)
+  end
+
   test "filesystem callback failures before rename retain pre-rename typing", ctx do
     for {callback, kind, operation} <- [
           {:open, :raise, :directory_open},
@@ -454,6 +1321,23 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
       CallbackFailureFileSystem.reset()
       refute File.exists?(destination)
     end
+  end
+
+  test "does not report success after the destination parent is replaced", ctx do
+    destination = Path.join(ctx.base, "parent-replaced")
+    moved_base = ctx.base <> ".moved"
+    moved_destination = Path.join(moved_base, "parent-replaced")
+    on_exit(fn -> File.rm_rf(moved_base) end)
+
+    assert {:error, {:durability_uncertain, {:parent_directory_identity_mismatch, parent}}} =
+             AtomicFile.write(destination, "durable-state",
+               file_system: ParentSwapAfterRenameFileSystem,
+               directory_root: ctx.base
+             )
+
+    assert parent == ctx.base
+    refute File.exists?(destination)
+    assert File.read!(moved_destination) == "durable-state"
   end
 
   test "post-rename parent-sync callback failures are durability uncertain", ctx do
@@ -477,12 +1361,41 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
     end
   end
 
+  test "durably removes a temporary file after a pre-rename failure", ctx do
+    TracingFileSystem.attach(self())
+    destination = Path.join(ctx.base, "durable-temp-cleanup")
+
+    assert {:error, {:pre_rename, {:fault_injected, :before_rename, :power_loss}}} =
+             AtomicFile.write(destination, "non-sensitive-state",
+               file_system: TracingFileSystem,
+               temp_suffix: fn -> "TEMPCLEANUPSYNC1" end,
+               fault_injector: fail_at(:before_rename)
+             )
+
+    temp_path = destination <> ".tmp.TEMPCLEANUPSYNC1"
+    events = collect_file_system_events([])
+    removal = Enum.find_index(events, &(&1 == {:remove, temp_path}))
+
+    cleanup_sync =
+      events
+      |> Enum.with_index()
+      |> Enum.find_value(fn
+        {{:sync, path}, index} when path == ctx.base and index > removal -> index
+        _event -> nil
+      end)
+
+    assert is_integer(removal)
+    assert is_integer(cleanup_sync)
+    assert removal < cleanup_sync
+    refute File.exists?(temp_path)
+  end
+
   test "distinguishes pre-rename failure, durability uncertainty, and durable success", ctx do
     pre_path = Path.join(ctx.base, "pre")
 
     assert {:error, {:pre_rename, {:fault_injected, :before_rename, :power_loss}}} =
              AtomicFile.write(pre_path, "pre",
-               temp_suffix: fn -> "pre" end,
+               temp_suffix: fn -> "PREPREPREPREPRE1" end,
                fault_injector: fail_at(:before_rename)
              )
 
@@ -493,7 +1406,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
 
     assert {:error, {:durability_uncertain, {:fault_injected, :renamed, :power_loss}}} =
              AtomicFile.write(uncertain_path, "visible",
-               temp_suffix: fn -> "uncertain" end,
+               temp_suffix: fn -> "UNCERTAIN1234567" end,
                fault_injector: fail_at(:renamed)
              )
 
@@ -505,6 +1418,43 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.AtomicFileTest do
              AtomicFile.write(durable_path, "durable", fault_injector: fail_at(:parent_synced))
 
     assert File.read!(durable_path) == "durable"
+  end
+
+  test "remove callback failure after unlink re-establishes durable absence", ctx do
+    File.mkdir_p!(ctx.base)
+    destination = Path.join(ctx.base, "remove-return-failure")
+    File.write!(destination, "non-sensitive-state")
+    owner = self()
+
+    assert :ok =
+             AtomicFile.remove(destination,
+               file_system: RemoveRaisesAfterCommitFileSystem,
+               fault_injector: fn
+                 :parent_synced -> send(owner, :remove_parent_synced)
+                 _stage -> :ok
+               end
+             )
+
+    refute File.exists?(destination)
+    assert_receive :remove_parent_synced
+  end
+
+  test "does not report durable removal after the parent is replaced", ctx do
+    File.mkdir_p!(ctx.base)
+    destination = Path.join(ctx.base, "parent-replaced-remove")
+    moved_base = ctx.base <> ".moved"
+    File.write!(destination, "non-sensitive-state")
+    on_exit(fn -> File.rm_rf(moved_base) end)
+
+    assert {:error, {:durability_uncertain, {:parent_directory_identity_mismatch, parent}}} =
+             AtomicFile.remove(destination,
+               file_system: ParentSwapAfterRemoveFileSystem,
+               directory_root: ctx.base
+             )
+
+    assert parent == ctx.base
+    refute File.exists?(destination)
+    refute File.exists?(Path.join(moved_base, "parent-replaced-remove"))
   end
 
   test "idempotent remove syncs durable absence and reports post-remove uncertainty", ctx do

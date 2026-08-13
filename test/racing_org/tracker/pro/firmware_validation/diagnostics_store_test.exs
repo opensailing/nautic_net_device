@@ -91,7 +91,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.DiagnosticsStoreTest do
     for stage <- @fault_stages do
       File.rm_rf!(dir)
 
-      opts = [fault_injector: fail_at(stage), temp_suffix: fn -> Atom.to_string(stage) end]
+      opts = [fault_injector: fail_at(stage), temp_suffix: fn -> "DiagFaultStage01" end]
       result = DiagnosticsStore.save(dir, pending_record(), opts)
 
       case stage do
@@ -149,7 +149,14 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.DiagnosticsStoreTest do
   defmodule UnreadableFileSystem do
     @behaviour RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
 
+    alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
+
     def read(_path), do: {:error, :eacces}
+    defdelegate read(device, count), to: FileSystem
+    defdelegate lstat(path), to: FileSystem
+    defdelegate file_info(device), to: FileSystem
+    defdelegate mkdir(path), to: FileSystem
+    defdelegate rmdir(path), to: FileSystem
     def mkdir_p(path), do: File.mkdir_p(path)
     def chmod(path, mode), do: File.chmod(path, mode)
     def open(path, modes), do: File.open(path, modes)

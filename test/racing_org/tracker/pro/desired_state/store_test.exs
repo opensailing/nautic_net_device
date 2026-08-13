@@ -18,7 +18,11 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
       end
     end
 
+    defdelegate read(device, count), to: FileSystem
+    defdelegate file_info(device), to: FileSystem
+    defdelegate lstat(path), to: FileSystem
     defdelegate mkdir_p(path), to: FileSystem
+    defdelegate mkdir(path), to: FileSystem
     defdelegate chmod(path, mode), to: FileSystem
     defdelegate open(path, modes), to: FileSystem
     defdelegate write(device, contents), to: FileSystem
@@ -26,6 +30,7 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
     defdelegate close(device), to: FileSystem
     defdelegate rename(source, destination), to: FileSystem
     defdelegate remove(path), to: FileSystem
+    defdelegate rmdir(path), to: FileSystem
   end
 
   setup do
@@ -759,17 +764,18 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
     assert {:ok, %{generation: 1}} = Store.active(ctx.store)
   end
 
-  test "active pointer transitions never claim success before directory durability", ctx do
-    for stage <- [
-          :temp_opened,
-          :temp_chmodded,
-          :temp_written,
-          :temp_synced,
-          :temp_closed,
-          :before_rename,
-          :renamed,
-          :parent_synced
-        ] do
+  for stage <- [
+        :temp_opened,
+        :temp_chmodded,
+        :temp_written,
+        :temp_synced,
+        :temp_closed,
+        :before_rename,
+        :renamed,
+        :parent_synced
+      ] do
+    test "active pointer transition at #{stage} never claims success before directory durability", ctx do
+      stage = unquote(stage)
       base = Path.join(ctx.base, Atom.to_string(stage))
       clean = Store.new(base_dir: base, storage_epoch: DS.storage_epoch())
       first = fully_stage(clean, DS.generation_fixture(generation: 1))
@@ -789,22 +795,13 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
       result = Store.activate(faulted, 2, second.manifest_hash)
       assert {:ok, pointer} = Store.active(clean)
 
-      case stage do
-        :renamed ->
-          assert {:error, {:durability_uncertain, {:fault_injected, :renamed, :power_loss}}} = result
-          assert pointer.generation == 1
-          assert pointer.manifest_hash == first.manifest_hash
-
-        :parent_synced ->
-          assert {:ok, %{generation: 1}} = result
-          assert pointer.generation == 2
-          assert pointer.manifest_hash == second.manifest_hash
-
-        pre_rename_stage ->
-          assert {:error, {:pre_rename, {:fault_injected, ^pre_rename_stage, :power_loss}}} = result
-          assert pointer.generation == 1
-          assert pointer.manifest_hash == first.manifest_hash
-      end
+      assert_active_pointer_fault(
+        stage,
+        result,
+        pointer,
+        first.manifest_hash,
+        second.manifest_hash
+      )
     end
   end
 
@@ -1057,6 +1054,42 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.StoreTest do
     Enum.each(DS.chunks(fixture), &assert({:ok, _} = Store.put_chunk(store, &1)))
     assert {:ok, %{status: :staged}} = Store.verify_and_stage(store, fixture.binding.generation, fixture.manifest_hash)
     fixture
+  end
+
+  defp assert_active_pointer_fault(
+         :renamed,
+         result,
+         pointer,
+         first_manifest_hash,
+         _second_manifest_hash
+       ) do
+    assert {:error, {:durability_uncertain, {:fault_injected, :renamed, :power_loss}}} = result
+    assert pointer.generation == 1
+    assert pointer.manifest_hash == first_manifest_hash
+  end
+
+  defp assert_active_pointer_fault(
+         :parent_synced,
+         result,
+         pointer,
+         _first_manifest_hash,
+         second_manifest_hash
+       ) do
+    assert {:ok, %{generation: 1}} = result
+    assert pointer.generation == 2
+    assert pointer.manifest_hash == second_manifest_hash
+  end
+
+  defp assert_active_pointer_fault(
+         pre_rename_stage,
+         result,
+         pointer,
+         first_manifest_hash,
+         _second_manifest_hash
+       ) do
+    assert {:error, {:pre_rename, {:fault_injected, ^pre_rename_stage, :power_loss}}} = result
+    assert pointer.generation == 1
+    assert pointer.manifest_hash == first_manifest_hash
   end
 
   defp assert_modes(path, expected) do

@@ -887,8 +887,20 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
   end
 
   defp prepare_and_open_locked(store) do
-    with :ok <- prepare_parent_directory(store),
-         {:ok, canonical_path} <- canonical_ledger_path(store.path),
+    case prepare_parent_directory(store) do
+      :ok ->
+        open_prepared_path(store)
+
+      {:error, {:prepare_command_ledger_directory, {:invalid_directory_type, _path, :symlink}}} = error ->
+        retry_retargeted_path(store, error)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp open_prepared_path(store) do
+    with {:ok, canonical_path} <- canonical_ledger_path(store.path),
          :ok <- available_destination_path(canonical_path) do
       if canonical_path == store.path do
         case read_snapshot(store) do
@@ -899,6 +911,19 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Store do
       else
         {:retry_command_ledger_path, canonical_path}
       end
+    end
+  end
+
+  defp retry_retargeted_path(store, original_error) do
+    case canonical_ledger_path(store.path) do
+      {:ok, canonical_path} when canonical_path != store.path ->
+        {:retry_command_ledger_path, canonical_path}
+
+      {:ok, _same_path} ->
+        original_error
+
+      {:error, _reason} = error ->
+        error
     end
   end
 

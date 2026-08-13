@@ -17,6 +17,27 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.RuntimeIdentityTest do
     end
 
     @impl true
+    defdelegate read(device, count), to: RealFileSystem
+
+    @impl true
+    defdelegate lstat(path), to: RealFileSystem
+
+    @impl true
+    defdelegate file_info(device), to: RealFileSystem
+
+    @impl true
+    def mkdir(path) do
+      report({:mkdir, path})
+      RealFileSystem.mkdir(path)
+    end
+
+    @impl true
+    def rmdir(path) do
+      report({:rmdir, path})
+      RealFileSystem.rmdir(path)
+    end
+
+    @impl true
     def mkdir_p(path) do
       report({:mkdir_p, path})
       RealFileSystem.mkdir_p(path)
@@ -257,9 +278,13 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.RuntimeIdentityTest do
 
     assert RuntimeIdentity.storage_epoch(pid) == <<0x82::128>>
     assert_receive {:file_system, {:read, ^path}}
-    assert_receive {:file_system, {:mkdir_p, base}}
+    assert_receive {:file_system, {:mkdir, base}}
     assert base == ctx.base
     assert_receive {:file_system, {:chmod, ^base, 0o700}}
+    assert_receive {:file_system, {:open, ^base, root_modes}}
+    assert :directory in root_modes
+    assert_receive {:file_system, {:sync, ^base}}
+    assert_receive {:file_system, {:close, ^base}}
     parent = Path.dirname(base)
     assert_receive {:file_system, {:open, ^parent, parent_modes}}
     assert :directory in parent_modes

@@ -8,9 +8,12 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreSnapshotTest do
     @behaviour RealFileSystem
 
     def read(path), do: RealFileSystem.read(path)
+    def read(device, count), do: RealFileSystem.read(device, count)
     def list_dir(path), do: File.ls(path)
-    def lstat(path), do: File.lstat(path)
+    def lstat(path), do: RealFileSystem.lstat(path)
+    def file_info(device), do: RealFileSystem.file_info(device)
     def mkdir_p(path), do: RealFileSystem.mkdir_p(path)
+    def mkdir(path), do: RealFileSystem.mkdir(path)
     def chmod(path, mode), do: RealFileSystem.chmod(path, mode)
     def open(path, modes), do: RealFileSystem.open(path, modes)
     def write(device, contents), do: RealFileSystem.write(device, contents)
@@ -18,6 +21,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.StoreSnapshotTest do
     def close(device), do: RealFileSystem.close(device)
     def rename(source, destination), do: RealFileSystem.rename(source, destination)
     def remove(_path), do: {:error, :simulated_remove_failure}
+    def rmdir(path), do: RealFileSystem.rmdir(path)
   end
 
   @device_id Base.decode16!("00112233445566778899aabbccddeeff", case: :lower)

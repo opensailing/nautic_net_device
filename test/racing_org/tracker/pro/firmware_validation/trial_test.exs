@@ -188,14 +188,17 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
 
     Agent.update(clock, fn _ -> 1 end)
     assert :ok = Trial.check_now(pid)
-    assert_receive {:scheduled, {:validation_effect, first_retry}, 5}
+    assert_receive {:scheduled, {:validation_effect, first_retry}, 5}, 1_000
     assert {:ok, %{timing: %{remaining_deadline_ms: 14}}} = DiagnosticsStore.load(dir)
 
     last_retry =
       Enum.reduce([{6, 5}, {11, 5}, {16, 4}], first_retry, fn {now_ms, expected_delay_ms}, retry ->
         Agent.update(clock, fn _ -> now_ms end)
         send(pid, {:validation_effect, retry})
-        assert_receive {:scheduled, {:validation_effect, next_retry}, ^expected_delay_ms}
+
+        assert_receive {:scheduled, {:validation_effect, next_retry}, ^expected_delay_ms},
+                       1_000
+
         next_retry
       end)
 
@@ -207,14 +210,16 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
                      %{
                        phase: :rollback_decided,
                        result: {:rollback_required, [%{criterion: :input, diagnostic_code: :invalid_snapshot}]}
-                     }}}
+                     }}},
+                   1_000
 
     assert_receive {:uncertain_expiry_reboot,
                     {:ok,
                      %{
                        phase: :reboot_pending,
                        result: {:rollback_required, [%{criterion: :input, diagnostic_code: :invalid_snapshot}]}
-                     }}}
+                     }}},
+                   1_000
 
     assert %{phase: :reboot_pending, effect_status: :reboot_requested, remaining_deadline_ms: 0} =
              Trial.status(pid)
@@ -459,8 +464,8 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     refute_receive :restart_reboot
 
     send(restarted, :allow_decision_reestablishment)
-    assert_receive :restart_revert
-    assert_receive :restart_reboot
+    assert_receive :restart_revert, 1_000
+    assert_receive :restart_reboot, 1_000
   end
 
   test "supervisor restart re-establishes visible reboot-pending state before reboot", %{dir: dir} do
@@ -525,7 +530,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
             :ok
           end
         end,
-        temp_suffix: fn -> Integer.to_string(System.unique_integer([:positive])) end
+        temp_suffix: fn -> "TrialFaultStage1" end
       ]
 
       opts = [
@@ -630,7 +635,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
         target: target(deadline_at_ms: 1, soak_period_ms: 1)
       )
 
-    assert_receive {:validation_attempt, {:ok, :not_exact}}
+    assert_receive {:validation_attempt, {:ok, :not_exact}}, 1_000
     assert %{phase: :validation_decided, effect_status: :validation_failed} = Trial.status(pid)
 
     assert {:ok, %{phase: :validation_decided, timing: %{remaining_deadline_ms: 5}}} =
@@ -638,7 +643,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
 
     Agent.update(validation_result, fn _ -> :ok end)
     assert :ok = Trial.check_now(pid)
-    assert_receive {:validation_attempt, :ok}
+    assert_receive {:validation_attempt, :ok}, 1_000
     assert %{phase: :validated} = Trial.status(pid)
     assert {:ok, %{phase: :validated}} = DiagnosticsStore.load(dir)
     refute_receive :unexpected_revert
@@ -680,9 +685,9 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
         target: target(deadline_at_ms: 1, soak_period_ms: 1)
       )
 
-    assert_receive :regression_validation_attempt
-    assert_receive :regression_validation_revert
-    assert_receive :regression_validation_reboot
+    assert_receive :regression_validation_attempt, 1_000
+    assert_receive :regression_validation_revert, 1_000
+    assert_receive :regression_validation_reboot, 1_000
     assert %{phase: :reboot_pending} = Trial.status(pid)
   end
 
@@ -773,7 +778,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
         target: target(deadline_at_ms: 1, soak_period_ms: 1)
       )
 
-    assert_receive :resumed_reboot
+    assert_receive :resumed_reboot, 1_000
     refute_receive :unexpected_revert
   end
 
