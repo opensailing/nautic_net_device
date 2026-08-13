@@ -2,10 +2,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Submission.Planner do
   @moduledoc """
   Pure planning from one pending durable outbox entry to frozen submission frames.
 
-  Generic delivery submissions intentionally carry only durable identity and the
-  payload hash. Their payload bytes remain separate work for the stream-specific
-  transport. Checkpoint submissions carry their canonical content directly when
-  it fits one frozen control payload and otherwise become exact checkpoint chunks.
+  Generic delivery entries plan the frozen delivery identity first, then their
+  payload bytes: one `delivery_payload` frame when the payload fits a single
+  frozen control payload, ordered `delivery_payload_chunk` frames otherwise.
+  Checkpoint submissions carry their canonical content directly when it fits one
+  frozen control payload and otherwise become exact checkpoint chunks.
   """
 
   alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Payload
@@ -38,13 +39,16 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Submission.Planner do
 
   def plan(%Entry{} = entry, opts) when is_list(opts) do
     with {:ok, encoder} <- message_encoder(opts),
+         {:ok, payload_hash_fun} <- payload_chunk_hash_fun(opts),
+         :ok <- exact_payload_hash(entry),
          attrs = delivery_submission_attrs(entry),
-         {:ok, _encoded} <- encoder.(:delivery_submission, attrs) do
+         {:ok, _encoded} <- encoder.(:delivery_submission, attrs),
+         {:ok, payload_frames} <- payload_frames(attrs, entry.payload, encoder, payload_hash_fun) do
       {:ok,
        %{
          entry: entry,
-         payload: entry.payload,
-         frames: [%{type: :delivery_submission, attrs: attrs}]
+         payload: nil,
+         frames: [%{type: :delivery_submission, attrs: attrs} | payload_frames]
        }}
     end
   end
@@ -62,6 +66,102 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Submission.Planner do
       payload_hash: entry.payload_hash
     }
   end
+
+  defp exact_payload_hash(%Entry{payload: payload, payload_hash: payload_hash})
+       when is_binary(payload) and is_binary(payload_hash) do
+    expected = :crypto.hash(:sha256, payload)
+
+    if byte_size(payload_hash) == byte_size(expected) and
+         :crypto.hash_equals(expected, payload_hash) do
+      :ok
+    else
+      {:error, :delivery_payload_hash_mismatch}
+    end
+  end
+
+  defp exact_payload_hash(_entry), do: {:error, :delivery_payload_hash_mismatch}
+
+  defp payload_frames(common, payload, encoder, hash_fun) do
+    total_payload_length = byte_size(payload)
+
+    cond do
+      total_payload_length <= Contract.max_delivery_payload_size() ->
+        attrs = Map.put(common, :payload, payload)
+
+        with {:ok, _encoded} <- encoder.(:delivery_payload, attrs) do
+          {:ok, [%{type: :delivery_payload, attrs: attrs}]}
+        end
+
+      total_payload_length > Contract.max_delivery_payload_content_size() ->
+        {:error, :payload_too_large}
+
+      true ->
+        build_payload_chunk_frames(
+          common,
+          payload,
+          total_payload_length,
+          delivery_chunk_count(total_payload_length),
+          encoder,
+          hash_fun,
+          0,
+          []
+        )
+    end
+  end
+
+  defp build_payload_chunk_frames(
+         _common,
+         _payload,
+         _total_payload_length,
+         chunk_count,
+         _encoder,
+         _hash_fun,
+         chunk_count,
+         frames
+       ),
+       do: {:ok, Enum.reverse(frames)}
+
+  defp build_payload_chunk_frames(
+         common,
+         payload,
+         total_payload_length,
+         chunk_count,
+         encoder,
+         hash_fun,
+         chunk_index,
+         frames
+       ) do
+    chunk_offset = chunk_index * Contract.chunk_size()
+    chunk_length = min(Contract.chunk_size(), total_payload_length - chunk_offset)
+    chunk = binary_part(payload, chunk_offset, chunk_length)
+
+    hash_attrs = %{
+      payload_hash: common.payload_hash,
+      total_payload_length: total_payload_length,
+      chunk_index: chunk_index,
+      chunk_count: chunk_count,
+      chunk_offset: chunk_offset,
+      chunk: chunk
+    }
+
+    with {:ok, chunk_hash} <- hash_fun.(hash_attrs),
+         attrs <- Map.merge(common, Map.put(hash_attrs, :chunk_hash, chunk_hash)),
+         {:ok, _encoded} <- encoder.(:delivery_payload_chunk, attrs) do
+      build_payload_chunk_frames(
+        common,
+        payload,
+        total_payload_length,
+        chunk_count,
+        encoder,
+        hash_fun,
+        chunk_index + 1,
+        [%{type: :delivery_payload_chunk, attrs: attrs} | frames]
+      )
+    end
+  end
+
+  defp delivery_chunk_count(total_payload_length),
+    do: div(total_payload_length + Contract.chunk_size() - 1, Contract.chunk_size())
 
   defp checkpoint_entry_matches(entry, submission) when is_map(submission) do
     if submission.device_id == entry.device_id and
@@ -179,6 +279,9 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Submission.Planner do
 
   defp message_encoder(opts), do: option_fun(opts, :message_encoder, 2, &Messages.encode/2)
   defp chunk_hash_fun(opts), do: option_fun(opts, :chunk_hash, 1, &Checkpoint.chunk_hash/1)
+
+  defp payload_chunk_hash_fun(opts),
+    do: option_fun(opts, :payload_chunk_hash, 1, &Messages.delivery_payload_chunk_hash/1)
 
   defp option_fun(opts, key, arity, default) do
     case Keyword.fetch(opts, key) do

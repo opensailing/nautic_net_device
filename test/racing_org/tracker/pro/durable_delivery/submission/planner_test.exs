@@ -19,22 +19,18 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Submission.PlannerTest do
   @chunk_size 61_440
 
   describe "generic delivery entries" do
-    test "plans only the frozen delivery identity while retaining payload as separate transport work" do
+    test "plans the frozen delivery identity followed by one single-frame payload" do
       entry = generic_entry(:telemetry, <<0x00, 0xFF, 0x42>>)
 
       assert {:ok,
               %{
                 entry: ^entry,
-                payload: payload,
+                payload: nil,
                 frames: [
-                  %{
-                    type: :delivery_submission,
-                    attrs: attrs
-                  }
+                  %{type: :delivery_submission, attrs: attrs},
+                  %{type: :delivery_payload, attrs: payload_attrs}
                 ]
               }} = Planner.plan(entry)
-
-      assert payload == entry.payload
 
       assert attrs == %{
                device_id: @device_id,
@@ -49,6 +45,109 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Submission.PlannerTest do
       refute Map.has_key?(attrs, :payload_checksum)
       assert {:ok, encoded} = Messages.encode(:delivery_submission, attrs)
       assert {:ok, ^attrs} = Messages.decode(:delivery_submission, encoded)
+
+      assert payload_attrs == Map.put(attrs, :payload, entry.payload)
+      assert {:ok, encoded_payload} = Messages.encode(:delivery_payload, payload_attrs)
+      assert {:ok, ^payload_attrs} = Messages.decode(:delivery_payload, encoded_payload)
+    end
+
+    test "uses the single payload frame exactly up to the frozen single-frame cap" do
+      payload = :binary.copy(<<0xAB>>, Contract.max_delivery_payload_size())
+      entry = generic_entry(:race_recording_chunk, payload)
+
+      assert {:ok, %{frames: [%{type: :delivery_submission}, %{type: :delivery_payload, attrs: attrs}]}} =
+               Planner.plan(entry)
+
+      assert attrs.payload == payload
+      assert {:ok, _encoded} = Messages.encode(:delivery_payload, attrs)
+    end
+
+    test "chunks payloads immediately above the frozen single-frame cap" do
+      total = Contract.max_delivery_payload_size() + 1
+      payload = :binary.copy(<<0xCD>>, total)
+      entry = generic_entry(:race_recording_chunk, payload)
+
+      assert {:ok, %{payload: nil, frames: [%{type: :delivery_submission} | chunk_frames]}} =
+               Planner.plan(entry)
+
+      assert [
+               %{type: :delivery_payload_chunk, attrs: first},
+               %{type: :delivery_payload_chunk, attrs: final}
+             ] = chunk_frames
+
+      assert first.total_payload_length == total
+      assert first.chunk_count == 2
+      assert first.chunk_index == 0
+      assert first.chunk_offset == 0
+      assert byte_size(first.chunk) == @chunk_size
+      assert final.chunk_index == 1
+      assert final.chunk_offset == @chunk_size
+      assert byte_size(final.chunk) == total - @chunk_size
+    end
+
+    test "chunked payload frames carry frozen geometry, hashes, and the exact payload bytes" do
+      total = 2 * @chunk_size + 17
+      payload = :crypto.hash(:sha256, "seed") |> then(&:binary.copy(&1, div(total, 32) + 1)) |> binary_part(0, total)
+      entry = generic_entry(:desired_state_ack, payload)
+
+      chunk_hash = fn attrs ->
+        send(self(), {:payload_chunk_hash, attrs.chunk_index})
+        Messages.delivery_payload_chunk_hash(attrs)
+      end
+
+      assert {:ok, %{frames: [%{type: :delivery_submission, attrs: common} | chunk_frames]}} =
+               Planner.plan(entry, payload_chunk_hash: chunk_hash)
+
+      assert_received {:payload_chunk_hash, 0}
+      assert_received {:payload_chunk_hash, 1}
+      assert_received {:payload_chunk_hash, 2}
+
+      assert Enum.map(chunk_frames, & &1.type) == List.duplicate(:delivery_payload_chunk, 3)
+      assert Enum.map(chunk_frames, & &1.attrs.chunk_index) == [0, 1, 2]
+      assert Enum.map(chunk_frames, & &1.attrs.chunk_count) == [3, 3, 3]
+      assert Enum.map(chunk_frames, & &1.attrs.chunk_offset) == [0, @chunk_size, 2 * @chunk_size]
+      assert Enum.map(chunk_frames, & &1.attrs.total_payload_length) == List.duplicate(total, 3)
+      assert Enum.map(chunk_frames, &byte_size(&1.attrs.chunk)) == [@chunk_size, @chunk_size, 17]
+      assert IO.iodata_to_binary(Enum.map(chunk_frames, & &1.attrs.chunk)) == payload
+
+      for frame <- chunk_frames do
+        attrs = frame.attrs
+
+        assert Map.drop(attrs, [
+                 :total_payload_length,
+                 :chunk_index,
+                 :chunk_count,
+                 :chunk_offset,
+                 :chunk_hash,
+                 :chunk
+               ]) == common
+
+        assert {:ok, attrs.chunk_hash} ==
+                 Messages.delivery_payload_chunk_hash(
+                   Map.take(attrs, [
+                     :payload_hash,
+                     :total_payload_length,
+                     :chunk_index,
+                     :chunk_count,
+                     :chunk_offset,
+                     :chunk
+                   ])
+                 )
+
+        assert {:ok, encoded} = Messages.encode(:delivery_payload_chunk, attrs)
+        assert {:ok, ^attrs} = Messages.decode(:delivery_payload_chunk, encoded)
+      end
+    end
+
+    test "rejects a generic entry whose durable payload hash does not match its payload bytes" do
+      entry = %{generic_entry(:health, "health") | payload_hash: <<0xA5::256>>}
+      assert {:error, :delivery_payload_hash_mismatch} = Planner.plan(entry)
+    end
+
+    test "rejects payloads above the frozen generic content capacity" do
+      total = Contract.max_delivery_payload_content_size() + 1
+      entry = generic_entry(:race_recording_chunk, :binary.copy(<<0>>, total))
+      assert {:error, :payload_too_large} = Planner.plan(entry)
     end
 
     test "uses an injected message encoder and propagates a frozen-contract rejection" do
