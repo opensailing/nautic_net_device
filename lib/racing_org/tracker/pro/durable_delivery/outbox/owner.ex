@@ -18,9 +18,10 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   matches an authenticated receipt against the exact durable identity, or by an
   explicit `authorize_loss/4`. A successful transport send is never sufficient.
 
-  Any `{:durability_uncertain, _}` result, and any identity drift, latches the
-  Owner into a quarantined state: it stops accepting work and fails closed on
-  every subsequent call until it is restarted and durable state is replayed.
+  When verified authority is not yet available at startup, the permanent Owner
+  stays alive and identity-unbound, failing mutations closed until a later
+  refresh can open the Store. Any `{:durability_uncertain, _}` result, and any
+  identity drift after binding, latches the Owner into quarantine until restart.
 
   `status/1` is deliberately sanitized. It reports only counters, limits, and
   booleans — never payload bytes, hashes, identifiers, credentials, Wi-Fi data,
@@ -45,6 +46,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   @default_max_entries 10_000
   @default_max_bytes 32 * 1_024 * 1_024
   @default_segment_max_bytes 1_024 * 1_024
+  @default_identity_refresh_ms 250
   @root_lock_retry_attempts 50
   @root_lock_retry_ms 10
   @identity_keys [:device_id, :credential_epoch, :storage_epoch]
@@ -65,7 +67,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
           storage_epoch_bound: boolean(),
           pending_entries: non_neg_integer(),
           pending_bytes: non_neg_integer(),
-          disk_bytes: non_neg_integer(),
+          disk_bytes: non_neg_integer() | :unavailable,
           max_entries: pos_integer(),
           max_bytes: pos_integer(),
           max_disk_bytes: pos_integer(),
@@ -178,25 +180,28 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   def init(opts) do
     with {:ok, root} <- option_root(opts),
          {:ok, identity_source} <- option_identity_source(opts),
-         {:ok, identity} <- read_identity(identity_source),
          :ok <- claim_root(root),
          {:ok, root_lock} <- claim_root_across_vms(root, opts) do
-      case open_store(root, identity, opts) do
-        {:ok, store} ->
-          Process.flag(:trap_exit, true)
+      Process.flag(:trap_exit, true)
 
-          {:ok,
-           %{
-             store: store,
-             root_lock: root_lock,
-             identity: identity,
-             identity_source: identity_source,
-             quarantined: false
-           }}
+      state = %{
+        root: root,
+        root_lock: root_lock,
+        store: nil,
+        store_opts: opts,
+        identity: nil,
+        identity_source: identity_source,
+        identity_refresh_ms: identity_refresh_ms(opts),
+        identity_refresh_ref: nil,
+        identity_refresh_token: nil,
+        binding_error: :identity_unbound,
+        quarantined: false
+      }
 
-        {:error, reason} ->
-          _ = close_root_lock(root_lock)
-          {:stop, reason}
+      case read_identity(identity_source) do
+        {:ok, identity} -> start_bound(state, identity)
+        {:error, :no_verified_authority} -> {:ok, schedule_identity_refresh(state)}
+        {:error, reason} -> stop_unbound(state, reason)
       end
     else
       {:error, reason} -> {:stop, reason}
@@ -208,6 +213,10 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
 
   def handle_call(_message, _from, %{quarantined: true} = state) do
     {:reply, {:error, :quarantined}, state}
+  end
+
+  def handle_call(_message, _from, %{store: nil} = state) do
+    {:reply, {:error, state.binding_error}, state}
   end
 
   def handle_call({:pending, opts}, _from, state) do
@@ -281,6 +290,19 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   end
 
   @impl true
+  def handle_info(
+        {:refresh_identity, token},
+        %{identity_refresh_token: token, store: nil} = state
+      ) do
+    state = %{state | identity_refresh_ref: nil, identity_refresh_token: nil}
+
+    case refresh_identity(state) do
+      {:ok, state} -> {:noreply, state}
+      {:error, reason, state} -> {:stop, reason, release_root_lock(state)}
+    end
+  end
+
+  def handle_info({:refresh_identity, _token}, state), do: {:noreply, state}
   def handle_info(_message, state), do: {:noreply, state}
 
   # Latch only on faults that make durability or single-writer ownership
@@ -300,6 +322,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
   defp verify_identity(state) do
     case read_identity(state.identity_source) do
       {:ok, current} -> compare_identity(state.identity, current)
+      {:error, :no_verified_authority} -> {:error, :identity_unbound}
       {:error, _reason} -> {:error, :identity_unavailable}
     end
   end
@@ -310,6 +333,78 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
       bound.credential_epoch != current.credential_epoch -> {:error, :credential_epoch_mismatch}
       bound.storage_epoch != current.storage_epoch -> {:error, :storage_epoch_mismatch}
       true -> :ok
+    end
+  end
+
+  defp refresh_identity(state) do
+    case read_identity(state.identity_source) do
+      {:ok, identity} ->
+        case open_store(state.root, identity, state.store_opts) do
+          {:ok, store} ->
+            {:ok,
+             %{
+               state
+               | store: store,
+                 identity: identity,
+                 binding_error: nil
+             }}
+
+          {:error, reason}
+          when reason in [:device_id_mismatch, :credential_epoch_mismatch, :storage_epoch_mismatch] ->
+            {:ok,
+             %{
+               state
+               | binding_error: reason,
+                 quarantined: true
+             }}
+
+          {:error, reason} ->
+            {:error, reason, state}
+        end
+
+      {:error, :no_verified_authority} ->
+        {:ok,
+         state
+         |> Map.put(:binding_error, :identity_unbound)
+         |> schedule_identity_refresh()}
+
+      {:error, reason} ->
+        {:error, reason, state}
+    end
+  end
+
+  defp schedule_identity_refresh(state) do
+    if is_reference(state.identity_refresh_ref), do: Process.cancel_timer(state.identity_refresh_ref)
+
+    token = make_ref()
+    timer_ref = Process.send_after(self(), {:refresh_identity, token}, state.identity_refresh_ms)
+    %{state | identity_refresh_ref: timer_ref, identity_refresh_token: token}
+  end
+
+  defp start_bound(state, identity) do
+    case open_store(state.root, identity, state.store_opts) do
+      {:ok, store} ->
+        {:ok, %{state | store: store, identity: identity, binding_error: nil}}
+
+      {:error, reason} ->
+        stop_unbound(state, reason)
+    end
+  end
+
+  defp release_root_lock(state) do
+    _ = close_root_lock(state.root_lock)
+    %{state | root_lock: nil}
+  end
+
+  defp stop_unbound(state, reason) do
+    _state = release_root_lock(state)
+    {:stop, reason}
+  end
+
+  defp identity_refresh_ms(opts) do
+    case Keyword.get(opts, :identity_refresh_ms, @default_identity_refresh_ms) do
+      milliseconds when is_integer(milliseconds) and milliseconds > 0 -> milliseconds
+      _invalid -> @default_identity_refresh_ms
     end
   end
 
@@ -324,6 +419,26 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner do
       sequence: entry.sequence,
       payload_hash: entry.payload_hash,
       cumulative_sequence: 0
+    }
+  end
+
+  defp sanitized_status(%{store: nil} = state) do
+    max_entries = Keyword.get(state.store_opts, :max_entries, @default_max_entries)
+    max_bytes = Keyword.get(state.store_opts, :max_bytes, @default_max_bytes)
+    segment_max_bytes = Keyword.get(state.store_opts, :segment_max_bytes, @default_segment_max_bytes)
+
+    %{
+      accepting: false,
+      quarantined: state.quarantined,
+      storage_epoch_bound: false,
+      pending_entries: 0,
+      pending_bytes: 0,
+      disk_bytes: :unavailable,
+      max_entries: max_entries,
+      max_bytes: max_bytes,
+      max_disk_bytes: Keyword.get(state.store_opts, :max_disk_bytes, max_bytes + segment_max_bytes),
+      loss_authorizations: 0,
+      streams: state.store_opts |> Keyword.get(:streams, @default_streams) |> length()
     }
   end
 

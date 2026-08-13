@@ -131,7 +131,112 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.OwnerTest do
       assert {:ok, %{storage_epoch: @storage_epoch}} = Owner.enqueue(owner, :telemetry, "payload")
     end
 
-    test "refuses to start when the identity source cannot supply an identity", %{root: root} do
+    test "a permanent owner stays alive while authority is unavailable and binds later", %{root: root} do
+      {:ok, identity_source} = Agent.start_link(fn -> {:error, :no_verified_authority} end)
+      on_exit(fn -> if Process.alive?(identity_source), do: Agent.stop(identity_source) end)
+
+      children = [
+        Owner.child_spec(
+          owner_opts(root,
+            identity: fn -> Agent.get(identity_source, & &1) end,
+            identity_refresh_ms: 10
+          )
+        )
+      ]
+
+      assert {:ok, supervisor} =
+               Supervisor.start_link(children,
+                 strategy: :one_for_one,
+                 max_restarts: 1,
+                 max_seconds: 60
+               )
+
+      on_exit(fn ->
+        if Process.alive?(supervisor) do
+          try do
+            Supervisor.stop(supervisor)
+          catch
+            :exit, _reason -> :ok
+          end
+        end
+      end)
+
+      assert [{Owner, owner, :worker, [Owner]}] = Supervisor.which_children(supervisor)
+      assert Process.alive?(owner)
+      assert {:error, :identity_unbound} = Owner.enqueue(owner, :telemetry, "unbound")
+      assert {:error, :identity_unbound} = Owner.acknowledge(owner, fake_receipt())
+
+      assert %{
+               accepting: false,
+               quarantined: false,
+               storage_epoch_bound: false,
+               pending_entries: 0
+             } = Owner.status(owner)
+
+      assert Process.alive?(owner)
+      Agent.update(identity_source, fn _unavailable -> {:ok, identity()} end)
+
+      assert eventually(fn -> match?(%{storage_epoch_bound: true}, Owner.status(owner)) end, 100)
+      assert [{Owner, ^owner, :worker, [Owner]}] = Supervisor.which_children(supervisor)
+      assert {:ok, receipt} = Owner.enqueue(owner, :telemetry, "bound")
+      assert receipt.storage_epoch == @storage_epoch
+    end
+
+    test "stops and releases ownership if an unbound refresh becomes malformed", %{root: root} do
+      {:ok, identity_source} = Agent.start_link(fn -> {:error, :no_verified_authority} end)
+      on_exit(fn -> if Process.alive?(identity_source), do: Agent.stop(identity_source) end)
+
+      assert {:ok, owner} =
+               start_owner(root,
+                 identity: fn -> Agent.get(identity_source, & &1) end,
+                 identity_refresh_ms: 10
+               )
+
+      reference = Process.monitor(owner)
+      Process.unlink(owner)
+      Agent.update(identity_source, fn _unavailable -> {:error, :identity_provider_failed} end)
+
+      assert_receive {:DOWN, ^reference, :process, ^owner, :identity_provider_failed}, 1_000
+      assert {:ok, _replacement} = start_owner(root)
+    end
+
+    test "deferred bind preserves a foreign-origin root in stable quarantine", %{root: root} do
+      assert {:ok, original} = start_owner(root)
+      assert {:ok, _receipt} = Owner.enqueue(original, :telemetry, "historical")
+      assert :ok = stop_owner(original)
+
+      {:ok, identity_source} = Agent.start_link(fn -> {:error, :no_verified_authority} end)
+      on_exit(fn -> if Process.alive?(identity_source), do: Agent.stop(identity_source) end)
+
+      assert {:ok, owner} =
+               start_owner(root,
+                 identity: fn -> Agent.get(identity_source, & &1) end,
+                 identity_refresh_ms: 10
+               )
+
+      Agent.update(identity_source, fn _unavailable ->
+        {:ok, identity(storage_epoch: @other_storage_epoch)}
+      end)
+
+      assert eventually(
+               fn ->
+                 match?(
+                   %{quarantined: true, storage_epoch_bound: false, disk_bytes: :unavailable},
+                   Owner.status(owner)
+                 )
+               end,
+               100
+             )
+
+      assert Process.alive?(owner)
+      assert {:error, :quarantined} = Owner.enqueue(owner, :telemetry, "new-origin")
+
+      assert :ok = stop_owner(owner)
+      assert {:ok, reopened} = start_owner(root)
+      assert Enum.map(Owner.pending(reopened), & &1.payload) == ["historical"]
+    end
+
+    test "still refuses malformed identities at startup", %{root: root} do
       assert {:error, :identity_unavailable} =
                start_owner(root, identity: fn -> {:error, :identity_unavailable} end)
 
