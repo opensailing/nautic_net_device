@@ -27,7 +27,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem do
   @callback unlink_empty(segment()) :: :ok | {:error, term()}
   @callback file_info(segment()) :: {:ok, file_info()} | {:error, term()}
   @callback close(segment()) :: :ok | {:error, term()}
-  @callback bind_entry(Path.t(), :regular | :directory, identity(), identity()) ::
+  @callback bind_entry(Path.t(), Path.t(), :regular | :directory, identity(), identity(), identity()) ::
               {:ok, bound_entry()} | {:error, term()}
   @callback bound_info(bound_entry()) :: {:ok, file_info()} | {:error, term()}
   @callback read_bound(bound_entry(), non_neg_integer()) :: {:ok, binary()} | :eof | {:error, term()}
@@ -87,7 +87,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.SegmentFileSystem do
   def close(_segment), do: :erlang.nif_error(:not_loaded)
 
   @doc false
-  def bind_entry(_path, _type, _identity, _parent_identity), do: :erlang.nif_error(:not_loaded)
+  def bind_entry(_root, _path, _type, _identity, _parent_identity, _root_identity),
+    do: :erlang.nif_error(:not_loaded)
 
   @doc false
   def bound_info(_entry), do: :erlang.nif_error(:not_loaded)

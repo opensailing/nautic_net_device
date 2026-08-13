@@ -639,6 +639,68 @@ static int open_or_create_directory_chain_nofollow(const ErlNifBinary *path,
   return traverse_directory_chain(path, 1, mode);
 }
 
+static int open_relative_directory_chain_nofollow(int root_fd,
+                                                  const char *path) {
+  char *copy;
+  char *component;
+  char *save = NULL;
+  int fd;
+  int child_fd;
+  int error;
+
+  if (path == NULL || path[0] == '/') {
+    errno = EINVAL;
+    return -1;
+  }
+  if (path[0] == '\0' || strcmp(path, ".") == 0) {
+    return duplicate_descriptor(root_fd);
+  }
+  copy = enif_alloc(strlen(path) + 1);
+  if (copy == NULL) {
+    errno = ENOMEM;
+    return -1;
+  }
+  strcpy(copy, path);
+
+  fd = duplicate_descriptor(root_fd);
+  if (fd == -1) {
+    error = errno;
+    enif_free(copy);
+    errno = error;
+    return -1;
+  }
+
+  component = strtok_r(copy, "/", &save);
+  while (component != NULL) {
+    if (strcmp(component, ".") == 0 || strcmp(component, "..") == 0) {
+      error = EINVAL;
+      goto fail;
+    }
+
+    do {
+      child_fd = openat(fd, component,
+                        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    } while (child_fd == -1 && errno == EINTR);
+    if (child_fd == -1) {
+      error = errno;
+      goto fail;
+    }
+
+    close_owned_fd(fd);
+    fd = child_fd;
+    component = strtok_r(NULL, "/", &save);
+  }
+
+  enif_free(copy);
+  return fd;
+
+fail:
+  close_owned_fd(fd);
+  enif_free(copy);
+  errno = error;
+  return -1;
+}
+
 static int open_or_create_relative_directory_chain_nofollow(
     int root_fd, const char *path, mode_t mode) {
   char *copy;
@@ -1608,6 +1670,7 @@ static ERL_NIF_TERM unlink_empty_nif(ErlNifEnv *env, int argc,
 static ERL_NIF_TERM bind_entry_nif(ErlNifEnv *env, int argc,
                                    const ERL_NIF_TERM argv[]) {
   nif_state *state = enif_priv_data(env);
+  ErlNifBinary root_path;
   ErlNifBinary path;
   ErlNifUInt64 expected_device;
   ErlNifUInt64 expected_special_device;
@@ -1619,13 +1682,16 @@ static ERL_NIF_TERM bind_entry_nif(ErlNifEnv *env, int argc,
   struct stat stat;
   struct stat path_stat;
   struct stat parent_stat;
+  struct stat root_stat;
   char *parent;
   char *name;
+  char *relative_parent;
   char *parent_copy;
   char *name_copy;
   size_t parent_size;
   size_t name_size;
   mode_t expected_type;
+  int root_fd;
   int parent_fd;
   int entry_fd;
   int flags;
@@ -1635,16 +1701,22 @@ static ERL_NIF_TERM bind_entry_nif(ErlNifEnv *env, int argc,
   ErlNifUInt64 expected_parent_device;
   ErlNifUInt64 expected_parent_special_device;
   ErlNifUInt64 expected_parent_inode;
+  ErlNifUInt64 expected_root_device;
+  ErlNifUInt64 expected_root_special_device;
+  ErlNifUInt64 expected_root_inode;
   const ERL_NIF_TERM *parent_identity_elements;
+  const ERL_NIF_TERM *root_identity_elements;
   int parent_identity_arity;
+  int root_identity_arity;
 
-  if (argc != 4 || !enif_inspect_binary(env, argv[0], &path) ||
-      !enif_get_tuple(env, argv[2], &identity_arity, &identity_elements) ||
+  if (argc != 6 || !enif_inspect_binary(env, argv[0], &root_path) ||
+      !enif_inspect_binary(env, argv[1], &path) ||
+      !enif_get_tuple(env, argv[3], &identity_arity, &identity_elements) ||
       identity_arity != 3 ||
       !enif_get_uint64(env, identity_elements[0], &expected_device) ||
       !enif_get_uint64(env, identity_elements[1], &expected_special_device) ||
       !enif_get_uint64(env, identity_elements[2], &expected_inode) ||
-      !enif_get_tuple(env, argv[3], &parent_identity_arity,
+      !enif_get_tuple(env, argv[4], &parent_identity_arity,
                       &parent_identity_elements) ||
       parent_identity_arity != 3 ||
       !enif_get_uint64(env, parent_identity_elements[0],
@@ -1652,21 +1724,29 @@ static ERL_NIF_TERM bind_entry_nif(ErlNifEnv *env, int argc,
       !enif_get_uint64(env, parent_identity_elements[1],
                        &expected_parent_special_device) ||
       !enif_get_uint64(env, parent_identity_elements[2],
-                       &expected_parent_inode)) {
+                       &expected_parent_inode) ||
+      !enif_get_tuple(env, argv[5], &root_identity_arity,
+                      &root_identity_elements) ||
+      root_identity_arity != 3 ||
+      !enif_get_uint64(env, root_identity_elements[0], &expected_root_device) ||
+      !enif_get_uint64(env, root_identity_elements[1],
+                       &expected_root_special_device) ||
+      !enif_get_uint64(env, root_identity_elements[2], &expected_root_inode)) {
     return enif_make_badarg(env);
   }
 
-  if (enif_is_identical(argv[1], atom_regular)) {
+  if (enif_is_identical(argv[2], atom_regular)) {
     expected_type = S_IFREG;
     flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC;
-  } else if (enif_is_identical(argv[1], atom_directory)) {
+  } else if (enif_is_identical(argv[2], atom_directory)) {
     expected_type = S_IFDIR;
     flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
   } else {
     return enif_make_badarg(env);
   }
 
-  if (!absolute_path(&path) ||
+  if (!absolute_path(&root_path) || !absolute_path(&path) ||
+      !path_within_root(&path, &root_path) ||
       !path_parent_and_name(&path, &parent, &parent_size, &name, &name_size)) {
     return enif_make_badarg(env);
   }
@@ -1685,8 +1765,59 @@ static ERL_NIF_TERM bind_entry_nif(ErlNifEnv *env, int argc,
   memcpy(name_copy, name, name_size);
   name_copy[name_size] = '\0';
 
-  parent_fd = open(parent_copy, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+  char *root_copy = enif_alloc(root_path.size + 1);
+  if (root_copy == NULL) {
+    enif_free(parent_copy);
+    enif_free(name_copy);
+    enif_free(cleanup);
+    return make_errno_error(env, ENOMEM);
+  }
+  memcpy(root_copy, root_path.data, root_path.size);
+  root_copy[root_path.size] = '\0';
+  root_fd = open(root_copy, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
   error = errno;
+  enif_free(root_copy);
+  if (root_fd == -1) {
+    enif_free(parent_copy);
+    enif_free(name_copy);
+    enif_free(cleanup);
+    return make_errno_error(env, error);
+  }
+  if (fstat(root_fd, &root_stat) == -1) {
+    error = errno;
+    close_owned_fd(root_fd);
+    enif_free(parent_copy);
+    enif_free(name_copy);
+    enif_free(cleanup);
+    return make_errno_error(env, error);
+  }
+  if (!S_ISDIR(root_stat.st_mode) ||
+      (ErlNifUInt64)root_stat.st_dev != expected_root_device ||
+      (ErlNifUInt64)root_stat.st_rdev != expected_root_special_device ||
+      (ErlNifUInt64)root_stat.st_ino != expected_root_inode) {
+    close_owned_fd(root_fd);
+    enif_free(parent_copy);
+    enif_free(name_copy);
+    enif_free(cleanup);
+    return make_error(env, atom_stale_entry);
+  }
+
+  if (parent_size < root_path.size ||
+      memcmp(parent_copy, root_path.data, root_path.size) != 0 ||
+      (parent_size > root_path.size && root_path.size > 1 &&
+       parent_copy[root_path.size] != '/')) {
+    close_owned_fd(root_fd);
+    enif_free(parent_copy);
+    enif_free(name_copy);
+    enif_free(cleanup);
+    return enif_make_badarg(env);
+  }
+
+  relative_parent = parent_copy + root_path.size;
+  while (*relative_parent == '/') relative_parent++;
+  parent_fd = open_relative_directory_chain_nofollow(root_fd, relative_parent);
+  error = errno;
+  close_owned_fd(root_fd);
   enif_free(parent_copy);
   if (parent_fd == -1) {
     enif_free(name_copy);
@@ -2056,7 +2187,7 @@ static ErlNifFunc nif_functions[] = {
     {"unlink_empty", 1, unlink_empty_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"file_info", 1, file_info_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"close", 1, close_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
-    {"bind_entry", 4, bind_entry_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
+    {"bind_entry", 6, bind_entry_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"bound_info", 1, bound_info_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"read_bound", 2, read_bound_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
     {"sync_bound", 1, sync_bound_nif, ERL_NIF_DIRTY_JOB_IO_BOUND},
