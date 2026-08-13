@@ -3,10 +3,34 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.RuntimeTest do
 
   alias RacingOrg.Tracker.Pro
   alias RacingOrg.Tracker.Pro.DesiredState.{Applier, Manager, OperationalGate, Runtime, RuntimeIdentity}
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner
   alias RacingOrg.Tracker.Pro.DesiredState.OperationalGate.AuthorityRequest
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapState
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages
+
+  defmodule FakeAckProducer do
+    def admit(ack, opts) do
+      send(self(), {:admit_ack, ack, opts})
+
+      case opts[:outbox] do
+        %{result: result} -> result
+        _outbox -> {:error, :invalid_outbox_response}
+      end
+    end
+  end
+
+  defmodule RaisingAckProducer do
+    def admit(_ack, _opts), do: raise("simulated producer failure")
+  end
+
+  defmodule ThrowingAckProducer do
+    def admit(_ack, _opts), do: throw(:simulated_producer_failure)
+  end
+
+  defmodule ExitingAckProducer do
+    def admit(_ack, _opts), do: exit(:simulated_producer_failure)
+  end
 
   defmodule ResetApplier do
     use GenServer
@@ -92,15 +116,65 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.RuntimeTest do
              })
   end
 
-  test "production ACK sink enqueues asynchronously to ChannelClient" do
+  test "production ACK sink accepts only after durable Outbox admission" do
     ack = %{status: :effective}
-    sink = Runtime.ack_sink(self())
+
+    receipt = %{
+      stream: :desired_state_ack,
+      device_id: <<1::128>>,
+      credential_epoch: 7,
+      storage_epoch: <<2::128>>,
+      sequence: 11,
+      payload_hash: <<3::256>>,
+      cumulative_sequence: 0
+    }
+
+    outbox = %{test_pid: self(), result: {:ok, receipt}}
+    sink = Runtime.ack_sink(outbox: outbox, producer: FakeAckProducer)
 
     assert :ok = sink.(ack)
-    assert_receive {:send_desired_state_ack, ^ack}
+    assert_receive {:admit_ack, ^ack, [outbox: ^outbox]}
+  end
 
-    unavailable = Runtime.ack_sink(:missing_channel_client)
-    assert {:error, :control_plane_unavailable} = unavailable.(ack)
+  test "production ACK sink fails closed with the exact durable admission error" do
+    ack = %{status: :effective}
+
+    for error <- [
+          {:error, :duplicate_entry_id},
+          {:error, :identity_unbound},
+          {:error, {:backpressure, :entry_capacity}},
+          {:error, {:durability_uncertain, {:file_sync, :eio}}}
+        ] do
+      outbox = %{test_pid: self(), result: error}
+      sink = Runtime.ack_sink(outbox: outbox, producer: FakeAckProducer)
+
+      assert ^error = sink.(ack)
+      assert_receive {:admit_ack, ^ack, [outbox: ^outbox]}
+    end
+  end
+
+  test "production ACK sink defaults to the supervised Outbox Owner" do
+    ack = %{status: :effective}
+    sink = Runtime.ack_sink(producer: FakeAckProducer)
+
+    assert {:error, :invalid_outbox_response} = sink.(ack)
+    assert_receive {:admit_ack, ^ack, [outbox: Owner]}
+  end
+
+  test "production ACK sink rejects invalid options and producer seams" do
+    ack = %{status: :effective}
+
+    assert {:error, :invalid_ack_sink_options} = Runtime.ack_sink(:not_options).(ack)
+    assert {:error, :invalid_ack_sink_options} = Runtime.ack_sink([:not_a_keyword]).(ack)
+    assert {:error, :invalid_ack_producer} = Runtime.ack_sink(producer: String).(ack)
+  end
+
+  test "production ACK sink traps producer failures" do
+    ack = %{status: :effective}
+
+    for producer <- [RaisingAckProducer, ThrowingAckProducer, ExitingAckProducer] do
+      assert {:error, :ack_admission_failed} = Runtime.ack_sink(producer: producer).(ack)
+    end
   end
 
   test "runtime child specs retain the authoritative process IDs" do

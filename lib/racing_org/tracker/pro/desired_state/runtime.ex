@@ -9,9 +9,10 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Runtime do
 
   alias RacingOrg.Tracker.Pro
   alias RacingOrg.Tracker.Pro.DesiredState.{Applier, Manager, OperationalGate, RuntimeIdentity, Store}
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner, as: OutboxOwner
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Producer.DesiredStateAck
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapState
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
-  alias RacingOrg.Tracker.Pro.SecureTransport.ChannelClient
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
   alias RacingOrg.Tracker.Pro.SecureTransport.SessionHolder
 
@@ -82,7 +83,10 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Runtime do
         end),
       ack_sink:
         Keyword.get_lazy(opts, :ack_sink, fn ->
-          ack_sink(Keyword.get(opts, :channel_client, ChannelClient))
+          ack_sink(
+            outbox: Keyword.get(opts, :outbox, OutboxOwner),
+            producer: Keyword.get(opts, :ack_producer, DesiredStateAck)
+          )
         end)
     )
   end
@@ -184,8 +188,41 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Runtime do
   end
 
   @doc false
-  @spec ack_sink(GenServer.server()) :: (map() -> :ok | {:error, :control_plane_unavailable})
-  def ack_sink(channel_client \\ ChannelClient) do
-    fn ack -> ChannelClient.send_desired_state_ack(channel_client, ack) end
+  @spec ack_sink(keyword()) :: (map() -> :ok | {:error, term()})
+  def ack_sink(opts \\ [])
+
+  def ack_sink(opts) when is_list(opts) do
+    if Keyword.keyword?(opts) do
+      outbox = Keyword.get(opts, :outbox, OutboxOwner)
+      producer = Keyword.get(opts, :producer, DesiredStateAck)
+
+      if valid_ack_producer?(producer) do
+        fn ack -> admit_ack(producer, outbox, ack) end
+      else
+        fn _ack -> {:error, :invalid_ack_producer} end
+      end
+    else
+      fn _ack -> {:error, :invalid_ack_sink_options} end
+    end
+  end
+
+  def ack_sink(_opts), do: fn _ack -> {:error, :invalid_ack_sink_options} end
+
+  defp valid_ack_producer?(producer) when is_atom(producer) do
+    Code.ensure_loaded?(producer) and function_exported?(producer, :admit, 2)
+  end
+
+  defp valid_ack_producer?(_producer), do: false
+
+  defp admit_ack(producer, outbox, ack) do
+    case producer.admit(ack, outbox: outbox) do
+      {:ok, _receipt} -> :ok
+      {:error, _reason} = error -> error
+      _other -> {:error, :invalid_outbox_response}
+    end
+  rescue
+    _exception -> {:error, :ack_admission_failed}
+  catch
+    kind, _reason when kind in [:throw, :exit] -> {:error, :ack_admission_failed}
   end
 end
