@@ -193,7 +193,10 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
       timer_ref: nil,
       timer_token: nil,
       effect_status: nil,
-      recovery_record: nil
+      recovery_record: nil,
+      health_event_sink: Keyword.get(opts, :health_event_sink),
+      health_event_context: Keyword.get(opts, :health_event_context, %{}),
+      last_health_event: nil
     }
 
     case DiagnosticsStore.load(store_dir, store_opts) do
@@ -293,9 +296,16 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
     }
 
     case result do
-      {:pending, _unmet} -> persist_monitoring_and_schedule(state)
-      {:rollback_required, _unmet} -> decide_rollback(state, result)
-      :ready -> attempt_validation(state)
+      {:pending, unmet} ->
+        state
+        |> emit_health_event(:validation_pending, pending_reason(unmet))
+        |> persist_monitoring_and_schedule()
+
+      {:rollback_required, _unmet} ->
+        decide_rollback(state, result)
+
+      :ready ->
+        attempt_validation(state)
     end
   end
 
@@ -345,8 +355,12 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
 
   defp persist_validated(state) do
     case persist_record(state, :validated, :ready, state.remaining_deadline_ms) do
-      :ok -> {:ok, %{cancel_timer(state) | phase: :validated, result: :ready, effect_status: nil}}
-      {:error, reason} -> {:stop, {:diagnostics_persist_failed, reason}, state}
+      :ok ->
+        state = emit_health_event(state, :validation_succeeded, nil)
+        {:ok, %{cancel_timer(state) | phase: :validated, result: :ready, effect_status: nil}}
+
+      {:error, reason} ->
+        {:stop, {:diagnostics_persist_failed, reason}, state}
     end
   end
 
@@ -381,6 +395,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
     state =
       state
       |> Map.put(:effect_status, :validation_failed)
+      |> emit_health_event(:validation_failed, :firmware_validation_failed)
       |> anchor_validation_retry_clock()
 
     if state.remaining_deadline_ms > 0 do
@@ -400,6 +415,7 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
     state =
       state
       |> Map.put(:effect_status, :validation_uncertain)
+      |> emit_health_event(:validation_failed, :firmware_validation_uncertain)
       |> anchor_validation_retry_clock()
 
     if state.remaining_deadline_ms > 0 do
@@ -440,6 +456,8 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
         remaining_deadline_ms: 0,
         effect_status: nil
     }
+
+    state = emit_health_event(state, :rollback_deadline_expired, :rollback_deadline_expired)
 
     case persist_record(state, :rollback_decided, result, 0) do
       :ok -> enforce_rollback(state)
@@ -671,6 +689,96 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.Trial do
   catch
     _kind, _reason -> {:error, :invalid_target}
   end
+
+  # Durable health evidence is best-effort observation: an event is emitted only
+  # on a (type, reason) transition, and neither sink nor context faults may ever
+  # disturb the trial's validation or rollback decisions.
+  defp emit_health_event(%{health_event_sink: nil} = state, _event_type, _reason_code), do: state
+
+  defp emit_health_event(state, event_type, reason_code) do
+    key = {event_type, reason_code}
+
+    if state.last_health_event == key do
+      state
+    else
+      case build_health_event(state, event_type, reason_code) do
+        {:ok, event} ->
+          deliver_health_event(state.health_event_sink, event)
+          %{state | last_health_event: key}
+
+        :error ->
+          state
+      end
+    end
+  end
+
+  defp build_health_event(state, event_type, reason_code) do
+    with %{firmware: %{version: version, git_sha: git_sha}} <- state.target_identity,
+         {:ok, manifest_hash} <- read_manifest_hash(state.health_event_context) do
+      common = %{
+        event_type: event_type,
+        occurred_at_ms: state.last_now_ms,
+        firmware_version: version,
+        firmware_git_sha: git_sha,
+        target: %{
+          credential_epoch: state.target_identity.credential_epoch,
+          desired_generation: state.target_identity.desired_generation,
+          manifest_hash: manifest_hash
+        }
+      }
+
+      if reason_code == nil,
+        do: {:ok, common},
+        else: {:ok, Map.put(common, :reason_code, reason_code)}
+    else
+      _unavailable -> :error
+    end
+  rescue
+    _exception -> :error
+  catch
+    _kind, _reason -> :error
+  end
+
+  defp read_manifest_hash(%{manifest_hash_reader: reader}) when is_function(reader, 0) do
+    case reader.() do
+      %{active: %{manifest_hash: <<_::256>> = manifest_hash}} -> {:ok, manifest_hash}
+      _other -> :error
+    end
+  rescue
+    _exception -> :error
+  catch
+    _kind, _reason -> :error
+  end
+
+  defp read_manifest_hash(_context), do: :error
+
+  defp deliver_health_event(sink, event) when is_function(sink, 1) do
+    _ = sink.(event)
+    :ok
+  rescue
+    _exception -> :ok
+  catch
+    _kind, _reason -> :ok
+  end
+
+  defp deliver_health_event(_sink, _event), do: :ok
+
+  defp pending_reason(unmet) when is_list(unmet) do
+    diagnostic_codes =
+      RacingOrg.Tracker.Pro.DurableDelivery.HealthEvent.V1.reason_codes()
+
+    unmet
+    |> Enum.find_value(fn
+      %{diagnostic_code: code} when is_atom(code) ->
+        if code in diagnostic_codes, do: code
+
+      _entry ->
+        nil
+    end)
+    |> Kernel.||(:invalid_snapshot)
+  end
+
+  defp pending_reason(_unmet), do: :invalid_snapshot
 
   defp read_clock(clock) when is_function(clock, 0) do
     case clock.() do

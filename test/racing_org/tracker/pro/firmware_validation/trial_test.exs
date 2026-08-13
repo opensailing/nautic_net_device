@@ -1,6 +1,7 @@
 defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
   use ExUnit.Case, async: false
 
+  alias RacingOrg.Tracker.Pro.DurableDelivery.HealthEvent.V1, as: HealthEventV1
   alias RacingOrg.Tracker.Pro.FirmwareValidation.DiagnosticsStore
   alias RacingOrg.Tracker.Pro.FirmwareValidation.Trial
 
@@ -21,6 +22,123 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.TrialTest do
     File.mkdir_p!(dir)
     on_exit(fn -> File.rm_rf(dir) end)
     %{dir: dir}
+  end
+
+  describe "durable health evidence" do
+    test "emits one pending transition and one success without duplicates", %{dir: dir} do
+      clock = agent(0)
+      events = agent([])
+
+      pid =
+        start_trial(dir,
+          clock: fn -> Agent.get(clock, & &1) end,
+          snapshot_opts: healthy_snapshot_opts(),
+          status_fun: fn -> false end,
+          validate_fun: fn -> :ok end,
+          health_event_sink: fn event ->
+            Agent.update(events, &(&1 ++ [event]))
+            {:ok, :receipt}
+          end,
+          health_event_context: %{
+            target_source: :firmware_validation_target,
+            manifest_hash_reader: fn -> %{active: %{manifest_hash: <<3::256>>}} end
+          },
+          target: target(deadline_at_ms: 500, soak_period_ms: 100)
+        )
+
+      assert :ok = Trial.check_now(pid)
+      Agent.update(clock, fn _now -> 50 end)
+      assert :ok = Trial.check_now(pid)
+      Agent.update(clock, fn _now -> 250 end)
+      assert :ok = Trial.check_now(pid)
+      assert %{phase: :validated} = Trial.status(pid)
+
+      assert [pending, succeeded] = Agent.get(events, & &1)
+
+      assert pending.event_type == :validation_pending
+      assert pending.reason_code == :soak_period_incomplete
+      assert pending.firmware_version == "0.7.0"
+      assert pending.firmware_git_sha == @git_sha
+
+      assert pending.target == %{
+               credential_epoch: 4,
+               desired_generation: 12,
+               manifest_hash: <<3::256>>
+             }
+
+      assert {:ok, _payload} = HealthEventV1.encode(pending)
+
+      assert succeeded.event_type == :validation_succeeded
+      assert succeeded.occurred_at_ms == 250
+      refute Map.has_key?(succeeded, :reason_code)
+      assert {:ok, _payload} = HealthEventV1.encode(succeeded)
+    end
+
+    test "emits validation failure once and terminal rollback deadline evidence", %{dir: dir} do
+      clock = agent(0)
+      events = agent([])
+
+      pid =
+        start_trial(dir,
+          clock: fn -> Agent.get(clock, & &1) end,
+          snapshot_opts: healthy_snapshot_opts(),
+          status_fun: fn -> false end,
+          validate_fun: fn -> {:ok, :not_exact} end,
+          revert_fun: fn -> :ok end,
+          reboot_fun: fn -> :ok end,
+          health_event_sink: fn event ->
+            Agent.update(events, &(&1 ++ [event]))
+            {:ok, :receipt}
+          end,
+          health_event_context: %{
+            manifest_hash_reader: fn -> %{active: %{manifest_hash: <<3::256>>}} end
+          },
+          target: target(deadline_at_ms: 100, soak_period_ms: 10)
+        )
+
+      Agent.update(clock, fn _now -> 10 end)
+      assert :ok = Trial.check_now(pid)
+      assert %{phase: :validation_decided, effect_status: :validation_failed} = Trial.status(pid)
+
+      Agent.update(clock, fn _now -> 100 end)
+      assert :ok = Trial.check_now(pid)
+      assert %{phase: :reboot_pending} = Trial.status(pid)
+
+      event_kinds =
+        events
+        |> Agent.get(& &1)
+        |> Enum.map(&{&1.event_type, Map.get(&1, :reason_code)})
+
+      assert {:validation_failed, :firmware_validation_failed} in event_kinds
+      assert {:rollback_deadline_expired, :rollback_deadline_expired} in event_kinds
+
+      assert Enum.count(event_kinds, &match?({:validation_failed, _reason}, &1)) == 1
+
+      for event <- Agent.get(events, & &1) do
+        assert {:ok, _payload} = HealthEventV1.encode(event)
+      end
+    end
+
+    test "a crashing or absent evidence sink never disturbs the trial", %{dir: dir} do
+      clock = agent(0)
+
+      crashing =
+        start_trial(dir,
+          clock: fn -> Agent.get(clock, & &1) end,
+          snapshot_opts: healthy_snapshot_opts(),
+          status_fun: fn -> false end,
+          validate_fun: fn -> :ok end,
+          health_event_sink: fn _event -> raise "sink crashed" end,
+          health_event_context: %{
+            manifest_hash_reader: fn -> raise "manifest unavailable" end
+          },
+          target: target(deadline_at_ms: 500, soak_period_ms: 10)
+        )
+
+      Agent.update(clock, fn _now -> 250 end)
+      assert :ok = Trial.check_now(crashing)
+      assert %{phase: :validated, result: :ready} = Trial.status(crashing)
+    end
   end
 
   test "requires one continuous healthy soak before exact firmware validation succeeds", %{dir: dir} do
