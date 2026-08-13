@@ -8,6 +8,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Submission.Planner do
   it fits one frozen control payload and otherwise become exact checkpoint chunks.
   """
 
+  alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Payload
   alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Entry
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{Checkpoint, Messages}
@@ -174,11 +175,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Submission.Planner do
   defp chunk_count(total_content_length),
     do: div(total_content_length + Contract.chunk_size() - 1, Contract.chunk_size())
 
-  defp checkpoint_decoder(opts) do
-    option_fun(opts, :checkpoint_decoder, 1, fn payload ->
-      Messages.decode(:checkpoint_submission, payload)
-    end)
-  end
+  defp checkpoint_decoder(opts), do: option_fun(opts, :checkpoint_decoder, 1, &Payload.decode/1)
 
   defp message_encoder(opts), do: option_fun(opts, :message_encoder, 2, &Messages.encode/2)
   defp chunk_hash_fun(opts), do: option_fun(opts, :chunk_hash, 1, &Checkpoint.chunk_hash/1)

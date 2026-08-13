@@ -10,6 +10,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Builder do
   """
 
   alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record
+  alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Payload
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages
@@ -78,14 +79,20 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Builder do
              content_hash
            ),
          {:ok, checkpoint_hash} <- dependencies.checkpoint_hash.(attrs),
-         {:ok, payload} <-
-           dependencies.message_encoder.(
-             :checkpoint_submission,
-             attrs
-             |> Map.put(:checkpoint_hash, checkpoint_hash)
-             |> Map.put(:content, canonical_content)
-           ) do
+         submission =
+           attrs
+           |> Map.put(:checkpoint_hash, checkpoint_hash)
+           |> Map.put(:content, canonical_content),
+         {:ok, payload} <- encode_payload(submission, dependencies) do
       {:ok, %{payload: payload, payload_hash: checkpoint_hash}}
+    end
+  end
+
+  defp encode_payload(%{content: content} = submission, dependencies) do
+    if byte_size(content) <= Contract.max_checkpoint_size() do
+      dependencies.message_encoder.(:checkpoint_submission, submission)
+    else
+      Payload.encode(submission)
     end
   end
 

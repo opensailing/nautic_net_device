@@ -3,7 +3,11 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.BuilderTest
 
   alias RacingOrg.Tracker.Pro.Calibration.Observer
   alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointHead.Record
-  alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Builder
+  alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.{Builder, Payload}
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store
+  alias RacingOrg.Tracker.Pro.DurableDelivery.Submission.Planner
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Canonical
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime.Calibration
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages
@@ -98,6 +102,77 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.BuilderTest
     assert {:ok, submission.checkpoint_hash} == Checkpoint.hash(hash_attrs)
     assert submission.checkpoint_hash == built.payload_hash
     assert receipt.payload_hash == built.payload_hash
+  end
+
+  test "durably stores and plans valid exact-runtime content above the single-frame cap" do
+    content = runtime_polar_content(Contract.max_checkpoint_size() + 1)
+    assert byte_size(content) == Contract.max_checkpoint_size() + 1
+    assert {:ok, projected} = Checkpoint.decode_canonical_content(:polar, 3, content)
+
+    root = Path.join(System.tmp_dir!(), "builder-large-checkpoint-#{System.unique_integer([:positive])}")
+    on_exit(fn -> File.rm_rf!(root) end)
+
+    assert {:ok, store} =
+             Store.open(root,
+               device_id: @device_id,
+               credential_epoch: 7,
+               storage_epoch: @storage_epoch,
+               streams: [:checkpoint],
+               max_entries: 10,
+               max_bytes: 1_000_000,
+               segment_max_bytes: 1_000_000
+             )
+
+    enqueue_checkpoint = fn sequence_builder ->
+      wrapped_builder = fn sequence ->
+        with {:ok, built} <- sequence_builder.(sequence) do
+          case Payload.decode(built.payload) do
+            {:ok, submission} ->
+              assert submission.content == content
+              assert submission.checkpoint_hash == built.payload_hash
+              {:ok, built}
+
+            {:error, reason} ->
+              {:error, {:payload_decode_failed, reason}}
+          end
+        end
+      end
+
+      case Store.enqueue_checkpoint(store, wrapped_builder, entry_id: <<1::128>>) do
+        {:ok, entry, _store} -> {:ok, entry}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    assert {:ok, entry} =
+             Builder.submit(:polar,
+               observer_snapshot: fn -> {:ok, :large_runtime_snapshot} end,
+               runtime_adapter: fn :large_runtime_snapshot -> {:ok, projected} end,
+               durable_identity: fn -> {:ok, durable_identity()} end,
+               accepted_parent: fn :polar -> :empty end,
+               enqueue_checkpoint: enqueue_checkpoint
+             )
+
+    assert entry.payload_hash != entry.payload_checksum
+    assert {:error, _reason} = Messages.decode(:checkpoint_submission, entry.payload)
+
+    assert {:ok, reopened} =
+             Store.open(root,
+               device_id: @device_id,
+               credential_epoch: 7,
+               storage_epoch: @storage_epoch,
+               streams: [:checkpoint],
+               max_entries: 10,
+               max_bytes: 1_000_000,
+               segment_max_bytes: 1_000_000
+             )
+
+    assert [replayed] = Store.pending(reopened)
+    assert replayed == entry
+    assert {:ok, %{entry: ^replayed, payload: nil, frames: frames}} = Planner.plan(replayed)
+    assert Enum.map(frames, & &1.type) == List.duplicate(:checkpoint_submission_chunk, 2)
+    assert IO.iodata_to_binary(Enum.map(frames, & &1.attrs.chunk)) == content
+    assert Enum.all?(frames, &(&1.attrs.checkpoint_hash == entry.payload_hash))
   end
 
   test "uses the checkpoint genesis parent when no accepted checkpoint exists" do
@@ -306,6 +381,130 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.BuilderTest
       :parent_hash,
       :content_hash
     ]
+  end
+
+  defp runtime_polar_content(target_size) do
+    Enum.find_value([polar_checkpoint(), %{polar_checkpoint() | "cells" => []}], fn learner ->
+      content = runtime_polar_checkpoint(learner)
+      assert {:ok, base} = Canonical.encode(content)
+      padding_size = target_size - byte_size(base)
+
+      if padding_size >= 0 and rem(padding_size, 2) == 0 do
+        current_authority = content["authority"]["boat_identifier"]
+        authority = :binary.copy("x", byte_size(current_authority) + div(padding_size, 2))
+
+        padded =
+          content
+          |> put_in(["authority", "boat_identifier"], authority)
+          |> put_in(["learner", "content", "authority"], authority)
+
+        case Checkpoint.canonical_content(:polar, 3, padded) do
+          {:ok, bytes} when byte_size(bytes) == target_size -> bytes
+          _other -> nil
+        end
+      end
+    end) || flunk("could not build exact #{target_size}-byte runtime polar checkpoint")
+  end
+
+  defp runtime_polar_checkpoint(learner) do
+    authority = "boat-runtime"
+    policy = runtime_polar_policy()
+    assert {:ok, learner_bytes} = Checkpoint.canonical_content(:polar, 2, learner)
+    assert {:ok, learner_hash} = Checkpoint.content_hash(:polar, 2, learner_bytes)
+
+    %{
+      "runtime_schema_version" => 3,
+      "runtime_snapshot_version" => 1,
+      "captured_at_utc_ms" => 1_786_536_000_000,
+      "authority" => %{"boat_identifier" => authority},
+      "policy" => policy,
+      "learner" => %{
+        "source_generation" => 42,
+        "content" => %{
+          "authority" => authority,
+          "policy_hash" => policy["admission_hash"],
+          "kind" => "polar",
+          "schema_version" => 2,
+          "source_generation" => 42,
+          "content_hash" => Canonical.bytes(learner_hash),
+          "content" => Canonical.bytes(learner_bytes)
+        }
+      },
+      "upstream_seq" => 0,
+      "window" => %{"count" => 0, "chunks" => []},
+      "sync" => %{
+        "dirty_keys" => %{"count" => 0, "chunks" => []},
+        "last_sync_age_ms" => 0
+      },
+      "persistence_phase" => %{
+        "dirty_keys" => %{"count" => 0, "chunks" => []},
+        "force" => false,
+        "last_persist_age_ms" => 0
+      },
+      "tick" => %{"remaining_ms" => nil}
+    }
+  end
+
+  defp runtime_polar_policy do
+    gate = %{
+      "angle_band_deg" => [25.0, 165.0],
+      "heel_band_deg" => [-45.0, 45.0],
+      "max_tws_sd_mps" => 0.2572,
+      "max_turn_rate_dps" => 3.0,
+      "max_accel_mps2" => 0.05,
+      "min_dwell" => 1,
+      "engine_rpm_idle" => 50.0,
+      "angle_key" => "twa_deg"
+    }
+
+    hash_content = %{
+      "gate" => gate,
+      "min_stw_mps" => 0.3,
+      "p" => 0.9,
+      "window_size" => 1
+    }
+
+    assert {:ok, hash_bytes} = Canonical.encode(hash_content)
+    admission_hash = :crypto.hash(:sha256, "RacingOrg-PolarObserverPolicy-v1" <> hash_bytes)
+
+    %{
+      "admission_hash" => Canonical.bytes(admission_hash),
+      "gate" => gate,
+      "min_stw_mps" => 0.3,
+      "window_size" => 1,
+      "p" => 0.9,
+      "sample_ms" => 0,
+      "sync_ms" => 60_000,
+      "persist_ms" => 60_000,
+      "persistence_enabled" => true,
+      "bins" => %{
+        "twa_width_deg" => 5.0,
+        "tws_width_mps" => 0.514444,
+        "max_tws_mps" => 51.4444
+      }
+    }
+  end
+
+  defp polar_checkpoint do
+    %{
+      "cells" => [
+        %{
+          "count" => 5,
+          "quantile" => %{
+            "buffer" => [],
+            "n" => [2, 3, 4],
+            "np" => [1.0, 2.8, 4.6, 4.8, 5.0],
+            "q" => [1.0, 2.0, 3.0, 4.0, 5.0]
+          },
+          "twa_bin" => 35,
+          "tws_bin" => 3
+        }
+      ],
+      "max_tws_mps" => 51.4444,
+      "p" => 0.9,
+      "twa_width_deg" => 5.0,
+      "tws_width_mps" => 0.514444
+    }
   end
 
   defp internal_snapshot do

@@ -31,7 +31,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     Snapshot
   }
 
-  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages
+  alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Payload, as: CheckpointPayload
 
   @dir_mode 0o700
   @file_mode 0o600
@@ -2400,7 +2400,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
     do: {:ok, record.payload_hash}
 
   defp recovered_payload_hash(store, :checkpoint, record) do
-    case Messages.decode(:checkpoint_submission, record.payload) do
+    case CheckpointPayload.decode(record.payload) do
       {:ok, submission} ->
         with :ok <-
                validate_decoded_checkpoint_submission_identity(
@@ -2435,7 +2435,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
          payload_hash,
          payload_checksum
        ) do
-    case Messages.decode(:checkpoint_submission, payload) do
+    case CheckpointPayload.decode(payload) do
       {:ok, submission} ->
         with :ok <- validate_decoded_checkpoint_submission_identity(store, sequence, submission),
              true <- submission.checkpoint_hash == payload_hash do
@@ -2452,7 +2452,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Store do
   end
 
   defp validate_checkpoint_submission_identity(store, sequence, payload, payload_hash) do
-    with {:ok, submission} <- Messages.decode(:checkpoint_submission, payload),
+    with {:ok, submission} <- CheckpointPayload.decode(payload),
          :ok <- validate_decoded_checkpoint_submission_identity(store, sequence, submission),
          true <- submission.checkpoint_hash == payload_hash do
       :ok

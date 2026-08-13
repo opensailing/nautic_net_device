@@ -1,6 +1,7 @@
 defmodule RacingOrg.Tracker.Pro.DurableDelivery.Submission.PlannerTest do
   use ExUnit.Case, async: true
 
+  alias RacingOrg.Tracker.Pro.DurableDelivery.CheckpointSubmission.Payload, as: CheckpointPayload
   alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Entry
   alias RacingOrg.Tracker.Pro.DurableDelivery.Submission.Planner
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
@@ -94,8 +95,8 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Submission.PlannerTest do
 
     test "uses chunk carriage immediately above the frozen single-frame cap" do
       submission = checkpoint_submission(Contract.max_checkpoint_size() + 1)
-      entry = checkpoint_entry(submission, submission.content)
-      decoder = fn payload when payload == entry.payload -> {:ok, submission} end
+      assert {:ok, payload} = CheckpointPayload.encode(submission)
+      entry = checkpoint_entry(submission, payload)
 
       assert {:ok,
               %{
@@ -103,7 +104,7 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Submission.PlannerTest do
                   %{type: :checkpoint_submission_chunk, attrs: first},
                   %{type: :checkpoint_submission_chunk, attrs: final}
                 ]
-              }} = Planner.plan(entry, checkpoint_decoder: decoder)
+              }} = Planner.plan(entry)
 
       assert first.total_content_length == Contract.max_checkpoint_size() + 1
       assert first.chunk_count == 2
@@ -113,6 +114,26 @@ defmodule RacingOrg.Tracker.Pro.DurableDelivery.Submission.PlannerTest do
       assert final.chunk_index == 1
       assert final.chunk_offset == @chunk_size
       assert byte_size(final.chunk) == Contract.max_checkpoint_size() + 1 - @chunk_size
+    end
+
+    test "keeps the exact legacy wire payload for single-frame durable checkpoints" do
+      submission = checkpoint_submission(Contract.max_checkpoint_size())
+      assert {:ok, legacy} = Messages.encode(:checkpoint_submission, submission)
+      assert CheckpointPayload.encode(submission) == {:ok, legacy}
+      assert CheckpointPayload.decode(legacy) == {:ok, submission}
+    end
+
+    test "rejects corruption of the durable large-checkpoint representation" do
+      submission = checkpoint_submission(Contract.max_checkpoint_size() + 1)
+      assert {:ok, payload} = CheckpointPayload.encode(submission)
+      last = byte_size(payload) - 1
+      <<prefix::binary-size(last), byte>> = payload
+      corrupt = prefix <> <<Bitwise.bxor(byte, 1)>>
+
+      assert {:error, :checkpoint_payload_checksum_mismatch} = CheckpointPayload.decode(corrupt)
+
+      entry = checkpoint_entry(submission, corrupt)
+      assert {:error, :checkpoint_payload_checksum_mismatch} = Planner.plan(entry)
     end
 
     test "chunks larger checkpoint content at exactly 61,440 bytes with frozen geometry and hashes" do
