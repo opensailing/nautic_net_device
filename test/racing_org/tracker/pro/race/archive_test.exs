@@ -160,6 +160,126 @@ defmodule RacingOrg.Tracker.Pro.Race.ArchiveTest do
     refute_receive {:enqueued, _legacy_manifest}
   end
 
+  test "retry accepts an exact pending duplicate chunk and continues to manifest", %{base: base} do
+    test_pid = self()
+    {:ok, durable} = Agent.start_link(fn -> %{attempt: 0, pending: []} end)
+
+    durable_enqueue = fn stream, payload, entry_id: entry_id ->
+      result =
+        Agent.get_and_update(durable, fn state ->
+          entry = %{stream: stream, entry_id: entry_id, payload: payload}
+
+          {result, pending} =
+            case state.attempt do
+              0 -> {{:ok, %{stream: stream}}, [entry]}
+              1 -> {{:error, {:backpressure, :disk_capacity}}, state.pending}
+              2 -> {{:error, :duplicate_entry_id}, state.pending}
+              _later -> {{:ok, %{stream: stream}}, [entry | state.pending]}
+            end
+
+          {result, %{state | attempt: state.attempt + 1, pending: pending}}
+        end)
+
+      send(test_pid, {:durable_attempt, stream, payload, entry_id, result})
+      result
+    end
+
+    durable_pending = fn -> Agent.get(durable, & &1.pending) end
+
+    %{commands: c, archive: a} =
+      start_archive(base,
+        durable_enqueue_fn: durable_enqueue,
+        durable_pending_fn: durable_pending
+      )
+
+    race(a, c, "2026-06-03-7", [1])
+    send(a, {:sampling_phase, :finish, :complete})
+    assert Archive.current_recording_id(a) == "2026-06-03-7"
+
+    assert_receive {:durable_attempt, :race_recording_chunk, chunk_bytes, chunk_entry_id, {:ok, _receipt}}
+
+    assert_receive {:durable_attempt, :race_recording_manifest, _manifest_bytes, _manifest_entry_id,
+                    {:error, {:backpressure, :disk_capacity}}}
+
+    send(a, {:sampling_phase, :finish, :complete})
+    assert Archive.current_recording_id(a) == nil
+
+    assert_receive {:durable_attempt, :race_recording_chunk, ^chunk_bytes, ^chunk_entry_id,
+                    {:error, :duplicate_entry_id}}
+
+    assert_receive {:durable_attempt, :race_recording_manifest, _manifest_bytes, _manifest_entry_id, {:ok, _receipt}}
+
+    assert_receive {:enqueued, _legacy_manifest}
+  end
+
+  test "restart accepts exact pending duplicates for both chunks and manifest", %{base: base} do
+    test_pid = self()
+
+    {recording, manifest} =
+      base
+      |> Recording.open(%{recording_id: "2026-06-03-3", device_id: "dev"})
+      |> Recording.append(ds(1))
+      |> Recording.finalize(device_status: "recovered")
+
+    assert {:ok, [%{descriptor: descriptor, bytes: chunk_bytes}]} =
+             Recording.sealed_chunk_artifacts(recording)
+
+    assert {:ok, %{bytes: manifest_bytes}} = Recording.manifest_artifact(recording)
+
+    pending = [
+      %{
+        stream: :race_recording_chunk,
+        entry_id: RaceRecordingProducer.chunk_entry_id(recording.recording_id, descriptor.chunk_id),
+        payload: chunk_bytes
+      },
+      %{
+        stream: :race_recording_manifest,
+        entry_id: RaceRecordingProducer.manifest_entry_id(recording.recording_id),
+        payload: manifest_bytes
+      }
+    ]
+
+    start_archive(base,
+      durable_enqueue_fn: fn stream, payload, opts ->
+        send(test_pid, {:durable_duplicate, stream, payload, opts})
+        {:error, :duplicate_entry_id}
+      end,
+      durable_pending_fn: fn -> pending end
+    )
+
+    assert_receive {:durable_duplicate, :race_recording_chunk, ^chunk_bytes, _opts}
+    assert_receive {:durable_duplicate, :race_recording_manifest, ^manifest_bytes, _opts}
+    assert_receive {:enqueued, legacy_bytes}
+    assert DataSet.decode(legacy_bytes).manifest == manifest
+  end
+
+  test "retry rejects a duplicate whose pending payload does not match", %{base: base} do
+    test_pid = self()
+
+    durable_enqueue = fn stream, payload, entry_id: entry_id ->
+      send(test_pid, {:durable_attempt, stream, payload, entry_id})
+      {:error, :duplicate_entry_id}
+    end
+
+    durable_pending = fn ->
+      [%{stream: :race_recording_chunk, entry_id: <<0::256>>, payload: "unrelated"}]
+    end
+
+    %{commands: c, archive: a} =
+      start_archive(base,
+        durable_enqueue_fn: durable_enqueue,
+        durable_pending_fn: durable_pending
+      )
+
+    race(a, c, "2026-06-03-7", [1])
+    send(a, {:sampling_phase, :finish, :complete})
+
+    assert Archive.current_recording_id(a) == "2026-06-03-7"
+    assert_receive {:durable_attempt, :race_recording_chunk, _payload, _entry_id}
+    refute_receive {:durable_attempt, :race_recording_manifest, _payload, _entry_id}
+    refute_receive {:enqueued, _legacy_manifest}
+  end
+
   test "legacy completion is not an authoritative durable receipt", %{base: base} do
     test_pid = self()
     %{commands: c, archive: a} = start_archive(base, durable_opts(test_pid))

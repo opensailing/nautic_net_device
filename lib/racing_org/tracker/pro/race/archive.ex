@@ -278,25 +278,64 @@ defmodule RacingOrg.Tracker.Pro.Race.Archive do
 
   # --- helpers ---
 
-  defp admit_recording(%{durable_enqueue_fn: enqueue}, recording) when is_function(enqueue, 3) do
+  defp admit_recording(
+         %{durable_enqueue_fn: enqueue, durable_pending_fn: pending},
+         recording
+       )
+       when is_function(enqueue, 3) and is_function(pending, 0) do
     with {:ok, chunks} <- Recording.sealed_chunk_artifacts(recording),
-         :ok <- admit_chunks(enqueue, recording.recording_id, chunks),
-         {:ok, %{manifest: manifest}} <- Recording.manifest_artifact(recording),
-         {:ok, _receipt} <-
-           RaceRecordingProducer.admit_manifest(enqueue, recording.recording_id, manifest) do
+         :ok <- admit_chunks(enqueue, pending, recording.recording_id, chunks),
+         {:ok, %{manifest: manifest, bytes: manifest_bytes}} <- Recording.manifest_artifact(recording),
+         entry_id = RaceRecordingProducer.manifest_entry_id(recording.recording_id),
+         result <- RaceRecordingProducer.admit_manifest(enqueue, recording.recording_id, manifest),
+         :ok <- admitted_or_exact_pending(result, pending, :race_recording_manifest, entry_id, manifest_bytes) do
       :ok
     end
   end
 
   defp admit_recording(_state, _recording), do: {:error, :durable_admission_unconfigured}
 
-  defp admit_chunks(enqueue, recording_id, chunks) do
+  defp admit_chunks(enqueue, pending, recording_id, chunks) do
     Enum.reduce_while(chunks, :ok, fn %{descriptor: descriptor, bytes: bytes}, :ok ->
-      case RaceRecordingProducer.admit_chunk(enqueue, recording_id, descriptor.chunk_id, bytes) do
-        {:ok, _receipt} -> {:cont, :ok}
+      entry_id = RaceRecordingProducer.chunk_entry_id(recording_id, descriptor.chunk_id)
+      result = RaceRecordingProducer.admit_chunk(enqueue, recording_id, descriptor.chunk_id, bytes)
+
+      case admitted_or_exact_pending(result, pending, :race_recording_chunk, entry_id, bytes) do
+        :ok -> {:cont, :ok}
         {:error, _reason} = error -> {:halt, error}
       end
     end)
+  end
+
+  defp admitted_or_exact_pending({:ok, _receipt}, _pending, _stream, _entry_id, _payload), do: :ok
+
+  defp admitted_or_exact_pending({:error, :duplicate_entry_id}, pending, stream, entry_id, payload) do
+    case pending.() do
+      entries when is_list(entries) ->
+        if Enum.any?(entries, &exact_pending_entry?(&1, stream, entry_id, payload)),
+          do: :ok,
+          else: {:error, :duplicate_entry_id}
+
+      {:error, _reason} = error ->
+        error
+
+      _other ->
+        {:error, :invalid_pending_result}
+    end
+  rescue
+    _exception -> {:error, :pending_failed}
+  catch
+    _kind, _reason -> {:error, :pending_failed}
+  end
+
+  defp admitted_or_exact_pending({:error, _reason} = error, _pending, _stream, _entry_id, _payload),
+    do: error
+
+  defp exact_pending_entry?(entry, stream, entry_id, payload) do
+    match?(
+      %{stream: ^stream, entry_id: ^entry_id, payload: ^payload},
+      entry
+    )
   end
 
   defp prune_recordings(%{durable_pending_fn: pending} = state) when is_function(pending, 0) do
