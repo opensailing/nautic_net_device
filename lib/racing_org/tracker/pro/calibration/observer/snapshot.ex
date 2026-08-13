@@ -132,22 +132,23 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.Snapshot do
          {:ok, sync} <- project_sync(state, current_entries, captured_at_ms),
          {:ok, tick} <- project_tick(state, captured_at_ms),
          :ok <- validate_stats(state.stats),
-         snapshot = %{
-           version: RuntimeSnapshot.version(),
-           captured_at_utc_ms: captured_at_utc_ms,
-           authority: authority,
-           policy: policy,
-           learner: learner,
-           learner_time_basis: learner_time_basis,
-           latest: latest,
-           legs: legs,
-           tack: tack,
-           window_binding: window_binding,
-           window_sources: window_sources,
-           sync: sync,
-           tick: tick,
-           stats: state.stats
-         },
+         snapshot =
+           canonical_zeros(%{
+             version: RuntimeSnapshot.version(),
+             captured_at_utc_ms: captured_at_utc_ms,
+             authority: authority,
+             policy: policy,
+             learner: learner,
+             learner_time_basis: learner_time_basis,
+             latest: latest,
+             legs: legs,
+             tack: tack,
+             window_binding: window_binding,
+             window_sources: window_sources,
+             sync: sync,
+             tick: tick,
+             stats: state.stats
+           }),
          :ok <- preflight(snapshot) do
       {:ok, snapshot}
     else
@@ -319,7 +320,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.Snapshot do
     }
 
     case Checkpoint.project(learner) do
-      {:ok, content} -> {:ok, content}
+      {:ok, content} -> {:ok, canonical_zeros(content)}
       _ -> @error
     end
   rescue
@@ -327,6 +328,22 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.Snapshot do
   end
 
   def learner(_state, _captured_at_ms), do: @error
+
+  # Live estimator arithmetic can legitimately produce IEEE negative zero, but
+  # the closed numeric tree rejects it so canonical bytes and digests stay
+  # deterministic. Projection therefore canonicalizes every -0.0 to +0.0; the
+  # restore side stays strict.
+  defp canonical_zeros(value) when is_float(value), do: value + 0.0
+
+  defp canonical_zeros(value) when is_map(value) and not is_struct(value),
+    do: Map.new(value, fn {key, nested} -> {canonical_zeros(key), canonical_zeros(nested)} end)
+
+  defp canonical_zeros(value) when is_list(value), do: Enum.map(value, &canonical_zeros/1)
+
+  defp canonical_zeros(value) when is_tuple(value),
+    do: value |> Tuple.to_list() |> Enum.map(&canonical_zeros/1) |> List.to_tuple()
+
+  defp canonical_zeros(value), do: value
 
   @doc false
   def learner_identity(state) when is_map(state) do
@@ -732,7 +749,7 @@ defmodule RacingOrg.Tracker.Pro.Calibration.Observer.Snapshot do
       end
     end)
     |> case do
-      {:ok, rows} -> {:ok, Enum.reverse(rows)}
+      {:ok, rows} -> {:ok, canonical_zeros(Enum.reverse(rows))}
       _ -> @error
     end
   rescue
