@@ -830,7 +830,12 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
         :reconcile_pending
 
       {:error, {:apply_failed, :wifi, reason}}
-      when reason in [:confirmation_timeout, :wifi_trial_failed] ->
+      when reason in [
+             :confirmation_timeout,
+             :confirmation_unavailable,
+             :wifi_reconnect_unconfirmed,
+             :wifi_trial_failed
+           ] ->
         finalize_rejected_action(
           state,
           pointer,
@@ -842,7 +847,13 @@ defmodule RacingOrg.Tracker.Pro.DesiredState.Manager do
           transition
         )
 
-      {:error, reason} when reason in [:confirmation_timeout, :wifi_trial_failed] ->
+      {:error, reason}
+      when reason in [
+             :confirmation_timeout,
+             :confirmation_unavailable,
+             :wifi_reconnect_unconfirmed,
+             :wifi_trial_failed
+           ] ->
         finalize_rejected_action(
           state,
           pointer,

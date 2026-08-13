@@ -345,6 +345,48 @@ defmodule RacingOrg.Tracker.Pro.FirmwareValidation.ApplicationIntegrationTest do
     assert %{corrupt: true, critical_pressure: true} = snapshot_opts[:outbox_reader].()
   end
 
+  test "production receipt readers report live round-trip evidence", ctx do
+    _ = ctx
+    Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+
+    Application.put_env(:racing_org_tracker_pro, Coordinator,
+      rollback_after_ms: 50,
+      soak_period_ms: 10,
+      retry_ms: 60_000,
+      store_dir: "/tmp/firmware-validation-test"
+    )
+
+    RacingOrg.Tracker.Pro.FirmwareValidation.ReceiptEvidence.reset()
+    on_exit(fn -> RacingOrg.Tracker.Pro.FirmwareValidation.ReceiptEvidence.reset() end)
+
+    coordinator_spec =
+      :logger
+      |> child_specs(:racing_org_rpi3)
+      |> Enum.find(&(&1.id == Coordinator))
+
+    assert {Coordinator, :start_link, [opts]} = coordinator_spec.start
+    snapshot_opts = opts[:trial_opts][:snapshot_opts]
+
+    assert %{control: :pending, telemetry: :pending} = snapshot_opts[:receipt_health_reader].()
+
+    assert :ok = RacingOrg.Tracker.Pro.FirmwareValidation.ReceiptEvidence.record(:control)
+    assert %{control: :succeeded, telemetry: :pending} = snapshot_opts[:receipt_health_reader].()
+
+    assert :ok = RacingOrg.Tracker.Pro.FirmwareValidation.ReceiptEvidence.record(:telemetry)
+    assert %{control: :succeeded, telemetry: :succeeded} = snapshot_opts[:receipt_health_reader].()
+  end
+
+  test "the real target Wi-Fi manager is wired with the reconnect confirmation" do
+    specs = child_specs(:logger, :racing_org_rpi3)
+
+    wifi_spec = Enum.find(specs, &(&1.id == RacingOrg.Tracker.Pro.WiFiManager))
+    assert wifi_spec, "WiFiManager child spec missing from the real-target logger tree"
+    assert {RacingOrg.Tracker.Pro.WiFiManager, :start_link, [wifi_opts]} = wifi_spec.start
+
+    assert wifi_opts[:confirm_fun] ==
+             (&RacingOrg.Tracker.Pro.WiFiManager.ReconnectConfirmation.confirm/0)
+  end
+
   test "Snapshot consumes aggregate production adapter results and fails closed on unavailable adapters" do
     healthy =
       Snapshot.build(

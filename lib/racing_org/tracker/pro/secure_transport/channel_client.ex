@@ -76,6 +76,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
   alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Entry
   alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner, as: OutboxOwner
   alias RacingOrg.Tracker.Pro.DurableDelivery.Submission.Planner
+  alias RacingOrg.Tracker.Pro.FirmwareValidation
   alias RacingOrg.Tracker.Pro.SecureTransport.Backoff
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
   alias RacingOrg.Tracker.Pro.SecureTransport.BootstrapState
@@ -362,6 +363,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
           OutboxOwner.pending(outbox, pending_opts)
         end),
       delivery_planner: Keyword.get(opts, :delivery_planner, &Planner.plan/1),
+      receipt_evidence: Keyword.get(opts, :receipt_evidence, &FirmwareValidation.ReceiptEvidence.record/1),
       checkpoint_hydration_coordinator: Keyword.get(opts, :checkpoint_hydration_coordinator, Coordinator),
       checkpoint_hydration_coordinator_module: Keyword.get(opts, :checkpoint_hydration_coordinator_module, Coordinator),
       checkpoint_hydration_staging_module: Keyword.get(opts, :checkpoint_hydration_staging_module, Staging),
@@ -876,7 +878,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
          %{assigns: %{control_ready?: true}} = socket
        ) do
     case acknowledge_delivery(socket, Map.delete(attrs, :receipt_hash)) do
-      {:ok, _removed} -> :ok
+      {:ok, _removed} -> record_receipt_evidence(socket, attrs.stream)
       {:error, reason} -> Logger.warning("[ChannelClient] durable receipt refused: #{inspect(reason)}")
     end
 
@@ -1450,6 +1452,24 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClient do
     _exception -> {:error, :outbox_owner_unavailable}
   catch
     :exit, _reason -> {:error, :outbox_owner_unavailable}
+  end
+
+  # Every authenticated receipt proves the control plane round trip; telemetry
+  # receipts additionally prove the telemetry stream. Evidence faults never
+  # disturb receipt handling.
+  defp record_receipt_evidence(socket, stream) do
+    _ = safe_record_evidence(socket, :control)
+    if stream == :telemetry, do: safe_record_evidence(socket, :telemetry)
+    :ok
+  end
+
+  defp safe_record_evidence(socket, class) do
+    _ = socket.assigns.receipt_evidence.(class)
+    :ok
+  rescue
+    _exception -> :ok
+  catch
+    _kind, _reason -> :ok
   end
 
   defp deliver_desired_state(socket, type, generation, attrs) do

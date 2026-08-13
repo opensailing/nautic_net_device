@@ -396,6 +396,52 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
       assert Process.alive?(client)
     end
 
+    test "authenticated receipts record control and telemetry round-trip evidence", ctx do
+      owner = self()
+
+      {client, topic, server_control, _executor} =
+        start_command_client(ctx,
+          outbox: self(),
+          outbox_module: FakeOutbox,
+          receipt_evidence: fn class -> send(owner, {:receipt_evidence, class}) end
+        )
+
+      telemetry_receipt = %{
+        device_id: @logical_device_id,
+        credential_epoch: @control_epoch,
+        storage_epoch: @storage_epoch,
+        stream: :telemetry,
+        sequence: 1,
+        payload_hash: :binary.copy(<<0x23>>, 32),
+        cumulative_sequence: 1
+      }
+
+      assert {:ok, telemetry_hash} = Receipt.hash(telemetry_receipt)
+
+      assert {:ok, telemetry_bytes} =
+               Messages.encode(:delivery_receipt, Map.put(telemetry_receipt, :receipt_hash, telemetry_hash))
+
+      assert {:ok, telemetry_frame, server_control} = Control.seal(server_control, :delivery_receipt, telemetry_bytes)
+      push(client, topic, "control_v1", Control.encode_carrier(telemetry_frame))
+
+      assert_receive {:acknowledge, _telemetry, _opts}
+      assert_receive {:receipt_evidence, :control}
+      assert_receive {:receipt_evidence, :telemetry}
+
+      health_receipt = %{telemetry_receipt | stream: :health, sequence: 2, payload_hash: :binary.copy(<<0x24>>, 32)}
+      assert {:ok, health_hash} = Receipt.hash(health_receipt)
+
+      assert {:ok, health_bytes} =
+               Messages.encode(:delivery_receipt, Map.put(health_receipt, :receipt_hash, health_hash))
+
+      assert {:ok, health_frame, _server_control} = Control.seal(server_control, :delivery_receipt, health_bytes)
+      push(client, topic, "control_v1", Control.encode_carrier(health_frame))
+
+      assert_receive {:acknowledge, _health, _opts}
+      assert_receive {:receipt_evidence, :control}
+      refute_receive {:receipt_evidence, :telemetry}, 50
+    end
+
     test "refuses a receipt before control readiness without mutating the outbox", ctx do
       {client, topic, server_control, _executor} =
         start_command_client(ctx,
@@ -454,6 +500,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCommandTest do
          outbox_module: Keyword.get(opts, :outbox_module, FakeOutbox),
          checkpoint_pending: fn _outbox, _opts -> [] end,
          delivery_pending: fn _outbox, _opts -> [] end,
+         receipt_evidence: Keyword.get(opts, :receipt_evidence, fn _class -> :ok end),
          desired_state_manager: Keyword.get(opts, :desired_state_manager, :unused_desired_state_manager),
          desired_state_manager_module: Keyword.get(opts, :desired_state_manager_module, FakeDesiredStateManager),
          desired_state_identity: fn -> {:ok, control_identity()} end,

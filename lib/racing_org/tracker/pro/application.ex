@@ -162,7 +162,11 @@ defmodule RacingOrg.Tracker.Pro.Application do
   # link-down helpers. Never started on host/test (`real_target?` gate).
   defp wifi_manager_children(target) do
     if real_target?(target) do
-      [{RacingOrg.Tracker.Pro.WiFiManager, compile_default: wifi_enabled?()}]
+      [
+        {RacingOrg.Tracker.Pro.WiFiManager,
+         compile_default: wifi_enabled?(),
+         confirm_fun: &RacingOrg.Tracker.Pro.WiFiManager.ReconnectConfirmation.confirm/0}
+      ]
     else
       []
     end
@@ -382,9 +386,20 @@ defmodule RacingOrg.Tracker.Pro.Application do
       FirmwareValidation.Target.read(soak_period_ms: soak_period_ms)
     end
 
+    receipt_freshness_ms = Keyword.get(config, :receipt_evidence_freshness_ms, 900_000)
+
     default_snapshot_opts = [
       process_health_reader: &FirmwareValidation.RequiredProcesses.status/0,
-      receipt_health_reader: &FirmwareValidation.ReceiptHealth.read/0,
+      receipt_health_reader: fn ->
+        FirmwareValidation.ReceiptHealth.read(
+          control_reader: fn ->
+            FirmwareValidation.ReceiptEvidence.status(:control, freshness_ms: receipt_freshness_ms)
+          end,
+          telemetry_reader: fn ->
+            FirmwareValidation.ReceiptEvidence.status(:telemetry, freshness_ms: receipt_freshness_ms)
+          end
+        )
+      end,
       outbox_reader: &FirmwareValidation.OutboxHealth.read/0
     ]
 
