@@ -269,7 +269,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientTest do
       push(client, origin_topic, "control_v1", Control.encode_carrier(accept_frame))
       assert_push(^origin_topic, "control_v1", readiness_carrier)
       assert {:ok, readiness_frame} = Control.decode_carrier(readiness_carrier)
-      assert {:ok, :readiness, readiness_bytes, server_control} = Control.open(server_control, readiness_frame)
+      assert {:ok, :readiness, readiness_bytes, _server_control} = Control.open(server_control, readiness_frame)
       assert {:ok, readiness} = Messages.decode(:readiness, readiness_bytes)
 
       assert readiness.device_id == @logical_device_id
