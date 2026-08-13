@@ -1,13 +1,20 @@
 defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
   use ExUnit.Case, async: true
 
+  alias RacingOrg.Tracker.Pro.Calibration.Observer, as: CalibrationObserver
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
+  alias RacingOrg.Tracker.Pro.WindShift.Observer, as: WindShiftObserver
 
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.{
     Canonical,
     Checkpoint,
     Messages,
     Receipt
+  }
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime.{
+    Calibration,
+    WindShift
   }
 
   @device_id Base.decode16!("00112233445566778899aabbccddeeff", case: :lower)
@@ -72,6 +79,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
                "RacingOrg-CheckpointRecordHash-v1"
 
       assert Contract.max_checkpoint_size() == 65_327
+      assert Contract.max_checkpoint_content_size() == 8_388_608
 
       assert Contract.delivery_streams() == [
                {:telemetry, 0x01},
@@ -97,13 +105,38 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
                {:wind_shift, 0x03, 0x0001}
              ]
 
+      assert Contract.checkpoint_schemas() == [
+               {:calibration, 0x01, [0x0001, 0x0002]},
+               {:polar, 0x02, [0x0002, 0x0003]},
+               {:wind_shift, 0x03, [0x0001, 0x0002]}
+             ]
+
+      assert Contract.checkpoint_runtime_schemas() == [
+               {:calibration, 0x01, 0x0002},
+               {:polar, 0x02, 0x0003},
+               {:wind_shift, 0x03, 0x0002}
+             ]
+
       for {kind, code, schema_version} <- Contract.checkpoint_kinds() do
         assert Contract.checkpoint_kind(kind) == {:ok, code, schema_version}
         assert Contract.checkpoint_kind(code) == {:ok, kind, schema_version}
       end
 
+      for {kind, code, schema_versions} <- Contract.checkpoint_schemas(),
+          schema_version <- schema_versions do
+        assert Contract.checkpoint_schema(kind, schema_version) == {:ok, code}
+        assert Contract.checkpoint_schema(code, schema_version) == {:ok, kind}
+      end
+
+      assert {:error, :unsupported_checkpoint_schema} =
+               Contract.checkpoint_schema(:calibration, 0x0003)
+
+      assert {:error, :unsupported_checkpoint_schema} =
+               Contract.checkpoint_schema(0x02, 0x0001)
+
       assert {:error, :unknown_delivery_stream} = Contract.delivery_stream(:arbitrary)
       assert {:error, :unknown_checkpoint_kind} = Contract.checkpoint_kind(:arbitrary)
+      assert {:error, :unknown_checkpoint_kind} = Contract.checkpoint_schema(:arbitrary, 1)
     end
   end
 
@@ -363,6 +396,44 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
   end
 
   describe "checkpoint payloads" do
+    test "record hashes admit registered legacy and exact-runtime schema versions" do
+      for {kind, _kind_code, schema_versions} <- Contract.checkpoint_schemas(),
+          schema_version <- schema_versions do
+        attrs =
+          checkpoint_record_attrs(kind)
+          |> Map.take([
+            :device_id,
+            :credential_epoch,
+            :storage_epoch,
+            :sequence,
+            :kind,
+            :source_generation,
+            :parent_hash,
+            :content_hash
+          ])
+          |> Map.put(:schema_version, schema_version)
+
+        assert {:ok, hash} = Checkpoint.hash(attrs)
+        assert byte_size(hash) == 32
+      end
+
+      attrs =
+        checkpoint_record_attrs(:calibration)
+        |> Map.take([
+          :device_id,
+          :credential_epoch,
+          :storage_epoch,
+          :sequence,
+          :kind,
+          :source_generation,
+          :parent_hash,
+          :content_hash
+        ])
+        |> Map.put(:schema_version, 3)
+
+      assert {:error, :unsupported_checkpoint_schema} = Checkpoint.hash(attrs)
+    end
+
     test "round-trips every closed checkpoint content schema" do
       for {kind, content} <- [
             calibration: empty_calibration_checkpoint(),
@@ -384,9 +455,144 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
                      <<Contract.version(), kind_code, schema_version::16, byte_size(bytes)::64, bytes::binary>>
                  )
 
-        # The retired schema is refused rather than silently reinterpreted.
+        # Only explicitly registered schemas are accepted; the next unregistered
+        # version is refused rather than silently reinterpreted.
+        newest_schema =
+          Contract.checkpoint_schemas()
+          |> Enum.find_value(fn
+            {^kind, _code, schemas} -> Enum.max(schemas)
+            _other -> nil
+          end)
+
         assert {:error, :unsupported_checkpoint_schema} =
-                 Checkpoint.encode_content(kind, schema_version + 1, content)
+                 Checkpoint.encode_content(kind, newest_schema + 1, content)
+      end
+    end
+
+    test "registered exact-runtime schemas reject legacy learner-only content" do
+      for {kind, legacy_schema, runtime_schema, legacy_content} <- [
+            {:calibration, 1, 2, empty_calibration_checkpoint()},
+            {:polar, 2, 3, polar_checkpoint()},
+            {:wind_shift, 1, 2, empty_wind_shift_checkpoint()}
+          ] do
+        assert {:ok, _bytes} = Checkpoint.canonical_content(kind, legacy_schema, legacy_content)
+
+        assert {:error, :invalid_checkpoint_content} =
+                 Checkpoint.canonical_content(kind, runtime_schema, legacy_content)
+      end
+    end
+
+    test "hashes valid checkpoint content beyond the single-frame cap" do
+      content = large_polar_checkpoint()
+
+      assert {:ok, bytes} = Checkpoint.canonical_content(:polar, 2, content)
+      assert byte_size(bytes) > Contract.max_checkpoint_size()
+      assert byte_size(bytes) <= Contract.max_checkpoint_content_size()
+
+      assert {:error, :checkpoint_too_large} = Checkpoint.decode_content(:polar, 2, bytes)
+      assert {:ok, ^content} = Checkpoint.decode_canonical_content(:polar, 2, bytes)
+      assert {:ok, content_hash} = Checkpoint.content_hash(:polar, 2, bytes)
+
+      assert content_hash ==
+               :crypto.hash(
+                 :sha256,
+                 Contract.checkpoint_content_hash_domain() <>
+                   <<Contract.version(), 0x02, 2::16, byte_size(bytes)::64, bytes::binary>>
+               )
+    end
+
+    test "rejects valid canonical content beyond the exact-runtime capacity" do
+      content = oversized_polar_checkpoint()
+
+      assert {:ok, bytes} = Canonical.encode(content)
+      assert byte_size(bytes) > Contract.max_checkpoint_content_size()
+
+      assert {:error, :checkpoint_too_large} =
+               Checkpoint.canonical_content(:polar, 2, content)
+    end
+
+    test "keeps checkpoint submission and hydration on the one-frame content boundary" do
+      at_boundary = checkpoint_message_attrs_with_content_size(Contract.max_checkpoint_size())
+      over_boundary = checkpoint_message_attrs_with_content_size(Contract.max_checkpoint_size() + 1)
+
+      assert {:ok, submission_bytes} = Messages.encode(:checkpoint_submission, at_boundary)
+      assert {:ok, ^at_boundary} = Messages.decode(:checkpoint_submission, submission_bytes)
+
+      assert {:error, :checkpoint_too_large} =
+               Messages.encode(:checkpoint_submission, over_boundary)
+
+      assert {:error, :checkpoint_too_large} =
+               Messages.decode(
+                 :checkpoint_submission,
+                 one_byte_oversized_checkpoint_wire(submission_bytes, at_boundary.content)
+               )
+
+      at_boundary_hydration = checkpoint_hydration_attrs(at_boundary)
+      over_boundary_hydration = checkpoint_hydration_attrs(over_boundary)
+
+      assert {:ok, hydration_bytes} =
+               Messages.encode(:checkpoint_hydration, at_boundary_hydration)
+
+      assert {:ok, ^at_boundary_hydration} =
+               Messages.decode(:checkpoint_hydration, hydration_bytes)
+
+      assert {:error, :checkpoint_too_large} =
+               Messages.encode(:checkpoint_hydration, over_boundary_hydration)
+
+      assert {:error, :checkpoint_too_large} =
+               Messages.decode(
+                 :checkpoint_hydration,
+                 one_byte_oversized_checkpoint_wire(hydration_bytes, at_boundary_hydration.content)
+               )
+    end
+
+    test "round-trips exact-runtime submissions and hydrations with canonical typed hashes" do
+      for {kind, schema_version, content} <- runtime_checkpoint_fixtures() do
+        assert {:ok, canonical} = Checkpoint.encode_content(kind, schema_version, content)
+        assert {:ok, ^content} = Checkpoint.decode_content(kind, schema_version, canonical)
+
+        assert {:ok, content_hash} = Checkpoint.content_hash(kind, schema_version, canonical)
+
+        submission =
+          checkpoint_message_attrs(kind, schema_version, runtime_source_generation(kind, content), canonical)
+
+        assert submission.content_hash == content_hash
+        assert {:ok, submission_bytes} = Messages.encode(:checkpoint_submission, submission)
+        assert {:ok, ^submission} = Messages.decode(:checkpoint_submission, submission_bytes)
+
+        hydration = checkpoint_hydration_attrs(submission)
+        assert {:ok, hydration_bytes} = Messages.encode(:checkpoint_hydration, hydration)
+        assert {:ok, ^hydration} = Messages.decode(:checkpoint_hydration, hydration_bytes)
+      end
+    end
+
+    test "binds Wind runtime authority to submission and hydration origin identity" do
+      content = runtime_wind_shift_checkpoint()
+      assert {:ok, canonical} = Checkpoint.encode_content(:wind_shift, 2, content)
+      submission = checkpoint_message_attrs(:wind_shift, 2, 42, canonical)
+
+      for invalid <- [
+            rebuild_checkpoint_submission(submission, device_id: <<0xAA::128>>),
+            rebuild_checkpoint_submission(submission, credential_epoch: 8),
+            rebuild_checkpoint_submission(submission, storage_epoch: @replacement_storage_epoch)
+          ] do
+        assert {:error, :checkpoint_authority_mismatch} =
+                 Messages.encode(:checkpoint_submission, invalid)
+      end
+
+      hydration = checkpoint_hydration_attrs(submission)
+      assert {:ok, bytes} = Messages.encode(:checkpoint_hydration, hydration)
+      assert {:ok, ^hydration} = Messages.decode(:checkpoint_hydration, bytes)
+
+      for invalid <- [
+            rebuild_checkpoint_hydration(hydration, origin_credential_epoch: 8),
+            rebuild_checkpoint_hydration(hydration,
+              origin_storage_epoch: @replacement_storage_epoch
+            ),
+            rebuild_checkpoint_hydration(hydration, device_id: <<0xAA::128>>)
+          ] do
+        assert {:error, :checkpoint_authority_mismatch} =
+                 Messages.encode(:checkpoint_hydration, invalid)
       end
     end
 
@@ -578,8 +784,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
       assert {:error, :unsupported_checkpoint_schema} =
                Messages.encode(:checkpoint_submission, %{submission | schema_version: 1})
 
-      assert {:error, :unsupported_checkpoint_schema} =
+      assert {:error, :invalid_checkpoint_content} =
                Messages.encode(:checkpoint_submission, %{submission | schema_version: @polar_schema + 1})
+
+      assert {:error, :unsupported_checkpoint_schema} =
+               Messages.encode(:checkpoint_submission, %{submission | schema_version: @polar_schema + 2})
 
       assert {:error, :unknown_checkpoint_kind} =
                Messages.encode(:checkpoint_submission, %{submission | kind: :arbitrary})
@@ -684,16 +893,42 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
     Map.put(attrs, :receipt_hash, receipt_hash)
   end
 
+  defp checkpoint_record_attrs(kind) do
+    durable_identity(%{
+      sequence: 11,
+      kind: kind,
+      source_generation: 42,
+      parent_hash: @parent_hash,
+      content_hash: @payload_hash
+    })
+  end
+
   defp checkpoint_submission_attrs do
     assert {:ok, content} = Checkpoint.encode_content(:polar, @polar_schema, polar_checkpoint())
-    assert {:ok, content_hash} = Checkpoint.content_hash(:polar, @polar_schema, content)
+    checkpoint_submission_attrs(content)
+  end
+
+  defp checkpoint_message_attrs_with_content_size(size) do
+    content = exact_size_runtime_polar_content(size)
+    assert byte_size(content) == size
+    checkpoint_submission_attrs(content, 3)
+  end
+
+  defp checkpoint_submission_attrs(content), do: checkpoint_submission_attrs(content, @polar_schema)
+
+  defp checkpoint_submission_attrs(content, schema_version) do
+    checkpoint_message_attrs(:polar, schema_version, 42, content)
+  end
+
+  defp checkpoint_message_attrs(kind, schema_version, source_generation, content) do
+    assert {:ok, content_hash} = Checkpoint.content_hash(kind, schema_version, content)
 
     attrs =
       durable_identity(%{
         sequence: 11,
-        kind: :polar,
-        schema_version: @polar_schema,
-        source_generation: 42,
+        kind: kind,
+        schema_version: schema_version,
+        source_generation: source_generation,
         parent_hash: @parent_hash,
         content_hash: content_hash
       })
@@ -705,6 +940,69 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
     |> Map.put(:content, content)
   end
 
+  defp checkpoint_hydration_attrs(submission) do
+    submission
+    |> Map.put(:credential_epoch, 8)
+    |> Map.put(:storage_epoch, @replacement_storage_epoch)
+    |> Map.put(:origin_credential_epoch, submission.credential_epoch)
+    |> Map.put(:origin_storage_epoch, submission.storage_epoch)
+  end
+
+  defp rebuild_checkpoint_submission(submission, overrides) do
+    attrs = Map.merge(submission, Map.new(overrides))
+    assert {:ok, checkpoint_hash} = Checkpoint.hash(Map.drop(attrs, [:checkpoint_hash, :content]))
+    %{attrs | checkpoint_hash: checkpoint_hash}
+  end
+
+  defp rebuild_checkpoint_hydration(hydration, overrides) do
+    attrs = Map.merge(hydration, Map.new(overrides))
+
+    assert {:ok, checkpoint_hash} =
+             Checkpoint.hash(%{
+               device_id: attrs.device_id,
+               credential_epoch: attrs.origin_credential_epoch,
+               storage_epoch: attrs.origin_storage_epoch,
+               sequence: attrs.sequence,
+               kind: attrs.kind,
+               schema_version: attrs.schema_version,
+               source_generation: attrs.source_generation,
+               parent_hash: attrs.parent_hash,
+               content_hash: attrs.content_hash
+             })
+
+    %{attrs | checkpoint_hash: checkpoint_hash}
+  end
+
+  defp one_byte_oversized_checkpoint_wire(wire, content) do
+    content_size = byte_size(content)
+    prefix_size = byte_size(wire) - content_size - 4
+    <<prefix::binary-size(prefix_size), ^content_size::32, ^content::binary>> = wire
+
+    prefix <> <<content_size + 1::32, content::binary, 0>>
+  end
+
+  defp exact_size_runtime_polar_content(size) do
+    Enum.find_value([polar_checkpoint(), %{polar_checkpoint() | "cells" => []}], fn learner ->
+      content = runtime_polar_checkpoint(learner)
+      assert {:ok, base} = Canonical.encode(content)
+      padding_size = size - byte_size(base)
+
+      if padding_size >= 0 and rem(padding_size, 2) == 0 do
+        current_authority = content["authority"]["boat_identifier"]
+        authority = :binary.copy("x", byte_size(current_authority) + div(padding_size, 2))
+
+        padded =
+          content
+          |> put_in(["authority", "boat_identifier"], authority)
+          |> put_in(["learner", "content", "authority"], authority)
+
+        assert {:ok, bytes} = Checkpoint.canonical_content(:polar, 3, padded)
+        assert byte_size(bytes) == size
+        bytes
+      end
+    end) || flunk("could not construct schema-valid runtime polar content of #{size} bytes")
+  end
+
   defp durable_identity(extra) do
     Map.merge(
       %{
@@ -714,6 +1012,154 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
       },
       extra
     )
+  end
+
+  defp runtime_checkpoint_fixtures do
+    [
+      {:calibration, 2, runtime_calibration_checkpoint()},
+      {:polar, 3, runtime_polar_checkpoint()},
+      {:wind_shift, 2, runtime_wind_shift_checkpoint()}
+    ]
+  end
+
+  defp runtime_calibration_checkpoint do
+    {:ok, observer} =
+      CalibrationObserver.start_link(
+        name: nil,
+        sample_ms: 0,
+        dir: nil,
+        calibration: nil,
+        boat_identifier: "boat-runtime",
+        sender: fn _channel, _update -> :ok end,
+        now_fn: fn -> 10_000 end,
+        utc_now_fn: fn -> ~U[2026-08-10 12:00:00Z] end,
+        sync_ms: 60_000,
+        persist_ms: 60_000,
+        legs: [min_duration_s: 30.0]
+      )
+
+    assert {:ok, snapshot} = CalibrationObserver.snapshot(observer)
+    assert {:ok, content} = Calibration.project(snapshot)
+    content
+  end
+
+  defp runtime_polar_checkpoint do
+    runtime_polar_checkpoint(polar_checkpoint())
+  end
+
+  defp runtime_polar_checkpoint(learner) do
+    authority = "boat-runtime"
+    policy = runtime_polar_policy()
+    assert {:ok, learner_bytes} = Checkpoint.canonical_content(:polar, 2, learner)
+    assert {:ok, learner_hash} = Checkpoint.content_hash(:polar, 2, learner_bytes)
+
+    %{
+      "runtime_schema_version" => 3,
+      "runtime_snapshot_version" => 1,
+      "captured_at_utc_ms" => 1_786_536_000_000,
+      "authority" => %{"boat_identifier" => authority},
+      "policy" => policy,
+      "learner" => %{
+        "source_generation" => 42,
+        "content" => %{
+          "authority" => authority,
+          "policy_hash" => policy["admission_hash"],
+          "kind" => "polar",
+          "schema_version" => 2,
+          "source_generation" => 42,
+          "content_hash" => Canonical.bytes(learner_hash),
+          "content" => Canonical.bytes(learner_bytes)
+        }
+      },
+      "upstream_seq" => 0,
+      "window" => %{"count" => 0, "chunks" => []},
+      "sync" => %{
+        "dirty_keys" => %{"count" => 0, "chunks" => []},
+        "last_sync_age_ms" => 0
+      },
+      "persistence_phase" => %{
+        "dirty_keys" => %{"count" => 0, "chunks" => []},
+        "force" => false,
+        "last_persist_age_ms" => 0
+      },
+      "tick" => %{"remaining_ms" => nil}
+    }
+  end
+
+  defp runtime_wind_shift_checkpoint do
+    {:ok, clock} =
+      Agent.start_link(fn ->
+        %{monotonic_ms: 10_000, utc: ~U[2026-08-12 12:00:00Z]}
+      end)
+
+    {:ok, observer} =
+      WindShiftObserver.start_link(
+        name: nil,
+        sample_ms: 0,
+        dir: nil,
+        config: nil,
+        commands: nil,
+        boat_identifier: "boat-runtime",
+        broadcast_enabled: false,
+        authority_fn: fn ->
+          {:ok, %{device_id: @device_id, credential_epoch: 7, storage_epoch: @storage_epoch}}
+        end,
+        signals_fn: fn -> %{"true_wind_direction" => {200.0, 10_000}} end,
+        now_fn: fn -> Agent.get(clock, & &1.monotonic_ms) end,
+        utc_now_fn: fn -> Agent.get(clock, & &1.utc) end,
+        put_signals_fn: fn _updates, _monotonic_ms -> :ok end,
+        sender: fn _channel, _update -> :ok end,
+        transmit_fn: fn _priority, _pgn, _payload -> :ok end
+      )
+
+    :ok = WindShiftObserver.tick(observer)
+    assert {:ok, snapshot} = WindShiftObserver.snapshot(observer)
+    assert {:ok, content} = WindShift.project(snapshot)
+    content
+  end
+
+  defp runtime_source_generation(:calibration, _content), do: 0
+  defp runtime_source_generation(:polar, content), do: content["learner"]["source_generation"]
+  defp runtime_source_generation(:wind_shift, content), do: content["source_generation"]
+
+  defp runtime_polar_policy do
+    gate = %{
+      "angle_band_deg" => [25.0, 165.0],
+      "heel_band_deg" => [-45.0, 45.0],
+      "max_tws_sd_mps" => 0.2572,
+      "max_turn_rate_dps" => 3.0,
+      "max_accel_mps2" => 0.05,
+      "min_dwell" => 1,
+      "engine_rpm_idle" => 50.0,
+      "angle_key" => "twa_deg"
+    }
+
+    hash_content = %{
+      "gate" => gate,
+      "min_stw_mps" => 0.3,
+      "p" => 0.9,
+      "window_size" => 1
+    }
+
+    assert {:ok, hash_bytes} = Canonical.encode(hash_content)
+    admission_hash = :crypto.hash(:sha256, "RacingOrg-PolarObserverPolicy-v1" <> hash_bytes)
+
+    %{
+      "admission_hash" => Canonical.bytes(admission_hash),
+      "gate" => gate,
+      "min_stw_mps" => 0.3,
+      "window_size" => 1,
+      "p" => 0.9,
+      "sample_ms" => 0,
+      "sync_ms" => 60_000,
+      "persist_ms" => 60_000,
+      "persistence_enabled" => true,
+      "bins" => %{
+        "twa_width_deg" => 5.0,
+        "tws_width_mps" => 0.514444,
+        "max_tws_mps" => 51.4444
+      }
+    }
   end
 
   defp empty_calibration_checkpoint do
@@ -759,6 +1205,50 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DurableDeliveryV1ContractTest do
       "pending_timeline" => [],
       "seq" => 0,
       "session" => nil
+    }
+  end
+
+  defp large_polar_checkpoint do
+    %{
+      "cells" =>
+        for tws_bin <- 0..599 do
+          %{
+            "count" => 5,
+            "quantile" => %{
+              "buffer" => [],
+              "n" => [2, 3, 4],
+              "np" => [1.0, 2.8, 4.6, 4.8, 5.0],
+              "q" => [1.0, 2.0, 3.0, 4.0, 5.0]
+            },
+            "twa_bin" => rem(tws_bin, 72),
+            "tws_bin" => tws_bin
+          }
+        end,
+      "max_tws_mps" => 51.4444,
+      "p" => 0.9,
+      "twa_width_deg" => 2.5,
+      "tws_width_mps" => 0.05
+    }
+  end
+
+  defp oversized_polar_checkpoint do
+    %{
+      large_polar_checkpoint()
+      | "cells" =>
+          for tws_bin <- 0..49_999 do
+            %{
+              "count" => 5,
+              "quantile" => %{
+                "buffer" => [],
+                "n" => [2, 3, 4],
+                "np" => [1.0, 2.8, 4.6, 4.8, 5.0],
+                "q" => [1.0, 2.0, 3.0, 4.0, 5.0]
+              },
+              "twa_bin" => rem(tws_bin, 72),
+              "tws_bin" => tws_bin
+            }
+          end,
+        "tws_width_mps" => 0.0005
     }
   end
 

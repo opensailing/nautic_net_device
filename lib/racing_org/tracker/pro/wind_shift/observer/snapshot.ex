@@ -47,9 +47,11 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Snapshot do
   @reject_reasons [:no_twd, :stale_twd]
   @wally_modes ~w(off shadow on)
   @u32_max 0xFFFF_FFFF
+  @u64_max 0xFFFF_FFFF_FFFF_FFFF
   @database_int_max 9_223_372_036_854_775_807
-  @max_snapshot_bytes 8_388_608
+  @max_finite 1.7976931348623157e308
   @max_pending 65_535
+  @xing_hysteresis_deg 2.0
   @error {:error, :invalid_wind_shift_runtime_snapshot}
 
   @type t :: %{
@@ -114,7 +116,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Snapshot do
          :ok <- validate_stats(snapshot.stats),
          :ok <- validate_tick(snapshot.tick, snapshot.policy.sample_ms),
          :ok <- preflight_runtime_collections(snapshot.runtime),
-         true <- safe_term_size(snapshot) <= @max_snapshot_bytes do
+         :ok <- validate_projectable_tree(snapshot) do
       :ok
     else
       _ -> @error
@@ -125,7 +127,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Snapshot do
     _, _ -> @error
   end
 
-  @doc "Return the bounded deterministic SHA-256 identity of an exact envelope."
+  @doc "Return the deterministic SHA-256 identity of an exact envelope."
   @spec digest(term()) :: {:ok, <<_::256>>} | {:error, :invalid_wind_shift_runtime_snapshot}
   def digest(snapshot) do
     with :ok <- preflight(snapshot) do
@@ -242,7 +244,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Snapshot do
          true <- nonnegative_integer?(policy.staleness_ms),
          true <- positive_integer?(policy.residual_window),
          true <- positive_integer?(policy.period_every_ms),
-         true <- RuntimeSnapshot.finite_positive?(policy.xing_hysteresis_deg),
+         true <- policy.xing_hysteresis_deg === @xing_hysteresis_deg,
          true <- positive_integer?(policy.absorb_dwell_ticks),
          true <- positive_integer?(policy.broadcast_rate_ms) do
       :ok
@@ -355,7 +357,81 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Snapshot do
 
   defp unique_terms?(_values), do: false
 
-  defp safe_term_size(value), do: value |> :erlang.term_to_binary([:deterministic]) |> byte_size()
+  defp validate_projectable_tree(value) when is_map(value) and not is_struct(value) do
+    with :ok <- reject_alias_keys(value) do
+      Enum.reduce_while(value, :ok, fn {_key, nested}, :ok ->
+        case validate_projectable_tree(nested) do
+          :ok -> {:cont, :ok}
+          _ -> {:halt, @error}
+        end
+      end)
+    end
+  end
+
+  defp validate_projectable_tree(value) when is_list(value) do
+    Enum.reduce_while(value, :ok, fn nested, :ok ->
+      case validate_projectable_tree(nested) do
+        :ok -> {:cont, :ok}
+        _ -> {:halt, @error}
+      end
+    end)
+  end
+
+  defp validate_projectable_tree(value) when is_integer(value) and value >= 0 and value <= @u64_max,
+    do: :ok
+
+  defp validate_projectable_tree(value) when is_integer(value), do: @error
+
+  defp validate_projectable_tree(value) when is_float(value) do
+    <<bits::unsigned-big-integer-size(64)>> = <<value::float-big-size(64)>>
+
+    if value == value and value >= -@max_finite and value <= @max_finite and
+         bits != 0x8000_0000_0000_0000,
+       do: :ok,
+       else: @error
+  end
+
+  defp validate_projectable_tree(value)
+       when is_binary(value) or is_boolean(value) or is_nil(value),
+       do: :ok
+
+  defp validate_projectable_tree(value)
+       when value in [
+              :none,
+              :high,
+              :low,
+              :candidate,
+              :confirmed,
+              :up,
+              :down,
+              :pos,
+              :neg,
+              :insufficient_history,
+              :calm,
+              :oscillating,
+              :persistent_ramp,
+              :persistent_step,
+              :mixed,
+              :no_twd,
+              :stale_twd
+            ],
+       do: :ok
+
+  defp validate_projectable_tree(_value), do: @error
+
+  defp reject_alias_keys(value) do
+    normalized =
+      Enum.map(Map.keys(value), fn
+        key when is_atom(key) -> Atom.to_string(key)
+        key when is_binary(key) -> key
+        _key -> :invalid
+      end)
+
+    if :invalid not in normalized and length(normalized) == MapSet.size(MapSet.new(normalized)),
+      do: :ok,
+      else: @error
+  end
+
   defp nonnegative_integer?(value), do: is_integer(value) and value >= 0 and value <= @database_int_max
   defp positive_integer?(value), do: nonnegative_integer?(value) and value > 0
 end

@@ -102,7 +102,8 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.RuntimeSnapshot do
           {:ok, t()} | {:error, :invalid_runtime_snapshot}
   def project(state, captured_at_ms, captured_at_utc)
       when is_map(state) and is_integer(captured_at_ms) do
-    with {:ok, captured_at_utc_ms} <- Shared.utc_ms(captured_at_utc),
+    with :ok <- validate_authoritative_state(state),
+         {:ok, captured_at_utc_ms} <- Shared.utc_ms(captured_at_utc),
          {:ok, authority} <- project_authority(state),
          {:ok, policy} <- project_policy(state),
          {:ok, checkpoint} <-
@@ -267,6 +268,34 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.RuntimeSnapshot do
   end
 
   defp project_authority(_state), do: @error
+
+  defp validate_authoritative_state(state) do
+    with :ok <- exact_atom_keys(state),
+         true <- match?(%Gate{}, state.gate),
+         :ok <- exact_struct_keys(state.gate),
+         true <- match?(%Bins{}, state.bins),
+         :ok <- exact_struct_keys(state.bins) do
+      :ok
+    else
+      _ -> @error
+    end
+  rescue
+    _ -> @error
+  end
+
+  defp exact_atom_keys(map) when is_map(map) and not is_struct(map) do
+    if Enum.all?(Map.keys(map), &is_atom/1), do: :ok, else: @error
+  end
+
+  defp exact_atom_keys(_value), do: @error
+
+  defp exact_struct_keys(struct) when is_struct(struct) do
+    struct
+    |> Map.from_struct()
+    |> exact_atom_keys()
+  end
+
+  defp exact_struct_keys(_value), do: @error
 
   defp project_policy(state) do
     gate = Map.take(state.gate, @gate_fields)
@@ -587,10 +616,13 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.RuntimeSnapshot do
   defp database_int?(value),
     do: is_integer(value) and value >= 0 and value <= @database_int_max
 
-  defp finite_non_negative?(value), do: Shared.finite_non_negative?(value)
+  defp finite_non_negative?(value),
+    do: Shared.finite_non_negative?(value) and not negative_zero?(value)
 
   defp finite_between?(value, minimum, maximum),
-    do: Shared.finite_number?(value) and value >= minimum and value <= maximum and abs_number?(value)
+    do:
+      Shared.finite_number?(value) and value >= minimum and value <= maximum and abs_number?(value) and
+        not negative_zero?(value)
 
   defp finite_or_nil_between?(nil, _minimum, _maximum), do: true
   defp finite_or_nil_between?(value, minimum, maximum), do: finite_between?(value, minimum, maximum)
@@ -598,4 +630,11 @@ defmodule RacingOrg.Tracker.Pro.Polar.Observer.RuntimeSnapshot do
   defp abs_number?(value) when is_integer(value), do: value >= -@max_finite and value <= @max_finite
   defp abs_number?(value) when is_float(value), do: true
   defp abs_number?(_value), do: false
+
+  defp negative_zero?(value) when is_float(value) do
+    <<bits::unsigned-big-64>> = <<value::float-big-64>>
+    bits == 0x8000_0000_0000_0000
+  end
+
+  defp negative_zero?(_value), do: false
 end

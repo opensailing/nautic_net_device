@@ -18,6 +18,8 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Checkpoint do
   @kind :wind_shift
   @schema_version 1
   @invalid_runtime {:error, :invalid_wind_shift_runtime_snapshot}
+  @u64_max 0xFFFF_FFFF_FFFF_FFFF
+  @negative_zero_bits 0x8000_0000_0000_0000
   @max_finite 1.7976931348623157e308
   @max_residuals 1_800
   @max_envelope_entries 100_000
@@ -872,7 +874,11 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Checkpoint do
   defp project_age(_t_ms, _now_ms), do: @invalid_runtime
 
   defp restore_age(nil, _now_ms), do: {:ok, nil}
-  defp restore_age(age_ms, now_ms) when is_integer(age_ms) and age_ms >= 0, do: {:ok, now_ms - age_ms}
+
+  defp restore_age(age_ms, now_ms)
+       when is_integer(age_ms) and age_ms >= 0 and age_ms <= @u64_max,
+       do: {:ok, now_ms - age_ms}
+
   defp restore_age(_age_ms, _now_ms), do: @invalid_runtime
 
   defp project_residuals({queue, count}) when is_integer(count) do
@@ -1312,14 +1318,18 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Checkpoint do
     end)
   end
 
-  defp positive_integer(value), do: ensure(is_integer(value) and value > 0)
-  defp nonnegative_integer(value), do: ensure(is_integer(value) and value >= 0)
+  defp positive_integer(value), do: ensure(is_integer(value) and value > 0 and value <= @u64_max)
+  defp nonnegative_integer(value), do: ensure(is_integer(value) and value >= 0 and value <= @u64_max)
   defp nullable_nonnegative_integer(nil), do: :ok
   defp nullable_nonnegative_integer(value), do: nonnegative_integer(value)
 
-  defp finite_float(value) do
-    ensure(is_float(value) and value == value and value >= -@max_finite and value <= @max_finite)
+  defp finite_float(value)
+       when is_float(value) and value == value and value >= -@max_finite and value <= @max_finite do
+    <<bits::unsigned-big-integer-size(64)>> = <<value::float-big-size(64)>>
+    ensure(bits != @negative_zero_bits)
   end
+
+  defp finite_float(_value), do: @invalid_runtime
 
   defp positive_float(value) do
     with :ok <- finite_float(value), do: ensure(value > 0.0)

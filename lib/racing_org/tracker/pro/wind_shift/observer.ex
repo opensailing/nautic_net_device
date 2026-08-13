@@ -492,7 +492,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
       })
 
     tack = tack_sign(twa)
-    lift = if is_number(means_snap.phase_deg) and is_number(tack), do: means_snap.phase_deg * tack
+    lift = if is_number(means_snap.phase_deg) and is_number(tack), do: normalize_zero(means_snap.phase_deg * tack)
 
     state = %{state | last_verdict: verdict, last_lift: lift, last_tack: tack, dirty_persist: true}
 
@@ -1570,6 +1570,8 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer do
 
   defp normalize_optional_direction(nil), do: nil
   defp normalize_optional_direction(value), do: Circular.normalize(value)
+  defp normalize_zero(value) when value == 0.0, do: 0.0
+  defp normalize_zero(value), do: value
 
   # Signed wrap to (-180, 180] — Compute.Library.wrap180 semantics, so the
   # derived TWA resolves dead astern to starboard exactly like resolve_twa.

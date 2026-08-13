@@ -808,6 +808,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
          :ok <- fixed_binary(attrs.parent_hash, @hash_size, :invalid_parent_hash),
          :ok <- fixed_binary(attrs.content_hash, @hash_size, :invalid_checkpoint_content_hash),
          :ok <- fixed_binary(attrs.checkpoint_hash, @hash_size, :invalid_checkpoint_hash),
+         :ok <- single_frame_checkpoint_content(attrs.content),
          {:ok, expected_content_hash} <-
            Checkpoint.content_hash(attrs.kind, attrs.schema_version, attrs.content),
          :ok <-
@@ -815,6 +816,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
              secure_equal(expected_content_hash, attrs.content_hash),
              :checkpoint_content_hash_mismatch
            ),
+         :ok <-
+           Checkpoint.validate_authority(attrs.kind, attrs.schema_version, attrs.content, %{
+             device_id: attrs.device_id,
+             credential_epoch: attrs.credential_epoch,
+             storage_epoch: attrs.storage_epoch
+           }),
          {:ok, expected_checkpoint_hash} <-
            Checkpoint.hash(Map.drop(attrs, [:checkpoint_hash, :content])),
          :ok <-
@@ -837,7 +844,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
            source_generation::64, parent_hash::binary-size(@hash_size), content_hash::binary-size(@hash_size),
            checkpoint_hash::binary-size(@hash_size), content_length::32, rest::binary>>
        ) do
-    with {:ok, kind, _expected_schema} <- Contract.checkpoint_kind(kind_code),
+    with {:ok, kind} <- Contract.checkpoint_schema(kind_code, schema_version),
          true <- byte_size(rest) >= content_length || {:error, :truncated},
          <<content::binary-size(content_length), trailing::binary>> <- rest,
          attrs = %{
@@ -904,6 +911,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
          :ok <- fixed_binary(attrs.parent_hash, @hash_size, :invalid_parent_hash),
          :ok <- fixed_binary(attrs.content_hash, @hash_size, :invalid_checkpoint_content_hash),
          :ok <- fixed_binary(attrs.checkpoint_hash, @hash_size, :invalid_checkpoint_hash),
+         :ok <- single_frame_checkpoint_content(attrs.content),
          {:ok, expected_content_hash} <-
            Checkpoint.content_hash(attrs.kind, attrs.schema_version, attrs.content),
          :ok <-
@@ -911,6 +919,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
              secure_equal(expected_content_hash, attrs.content_hash),
              :checkpoint_content_hash_mismatch
            ),
+         :ok <-
+           Checkpoint.validate_authority(attrs.kind, attrs.schema_version, attrs.content, %{
+             device_id: attrs.device_id,
+             credential_epoch: attrs.origin_credential_epoch,
+             storage_epoch: attrs.origin_storage_epoch
+           }),
          {:ok, expected_checkpoint_hash} <- hydration_checkpoint_hash(attrs),
          :ok <-
            ensure(
@@ -934,7 +948,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
            source_generation::64, parent_hash::binary-size(@hash_size), content_hash::binary-size(@hash_size),
            checkpoint_hash::binary-size(@hash_size), content_length::32, rest::binary>>
        ) do
-    with {:ok, kind, _expected_schema} <- Contract.checkpoint_kind(kind_code),
+    with {:ok, kind} <- Contract.checkpoint_schema(kind_code, schema_version),
          true <- byte_size(rest) >= content_length || {:error, :truncated},
          <<content::binary-size(content_length), trailing::binary>> <- rest,
          attrs = %{
@@ -962,6 +976,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
   end
 
   defp decode_checkpoint_hydration(_), do: {:error, :truncated}
+
+  defp single_frame_checkpoint_content(content) when is_binary(content) do
+    if byte_size(content) in 1..Contract.max_checkpoint_size(),
+      do: :ok,
+      else: {:error, :checkpoint_too_large}
+  end
+
+  defp single_frame_checkpoint_content(_content), do: {:error, :invalid_checkpoint_content}
 
   defp hydration_checkpoint_hash(attrs) do
     Checkpoint.hash(%{
@@ -999,13 +1021,11 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Messages do
     end
   end
 
-  defp checkpoint_identity(kind, schema_version) do
-    case Contract.checkpoint_kind(kind) do
-      {:ok, code, ^schema_version} -> {:ok, code}
-      {:ok, _code, _expected_schema} -> {:error, :unsupported_checkpoint_schema}
-      {:error, _reason} = error -> error
-    end
-  end
+  defp checkpoint_identity(kind, schema_version)
+       when is_atom(kind) and is_integer(schema_version),
+       do: Contract.checkpoint_schema(kind, schema_version)
+
+  defp checkpoint_identity(_kind, _schema_version), do: {:error, :unknown_checkpoint_kind}
 
   defp normalize_command_fence(attrs) do
     with {:ok, device_id} <- Command.normalize_uuid(attrs.device_id, :invalid_device_id),

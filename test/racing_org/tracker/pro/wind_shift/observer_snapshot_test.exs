@@ -2,8 +2,15 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverSnapshotTest do
   use ExUnit.Case, async: true
 
   alias RacingOrg.Tracker.Pro.RuntimeSnapshot
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint, as: ContractCheckpoint
+
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime.WindShift,
+    as: RuntimeAdapter
+
+  alias RacingOrg.Tracker.Pro.WindShift.Checkpoint, as: RuntimeCheckpoint
   alias RacingOrg.Tracker.Pro.WindShift.Config
   alias RacingOrg.Tracker.Pro.WindShift.Observer
+  alias RacingOrg.Tracker.Pro.WindShift.Observer.Snapshot
 
   @capture_utc ~U[2026-08-12 12:00:00Z]
   @device_id <<1::128>>
@@ -247,6 +254,219 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverSnapshotTest do
       assert Observer.snapshot(target) == {:ok, before}
     end
   end
+
+  test "authoritative preflight recursively rejects atom and string key aliases" do
+    clock = start_clock(10_000)
+    observer = start_observer(clock)
+    accept_sample(observer, clock, 10_000, @capture_utc)
+    assert {:ok, snapshot} = Observer.snapshot(observer)
+
+    for duplicate <- [
+          Map.put(snapshot, "runtime", snapshot.runtime),
+          put_in(snapshot, [:policy], Map.put(snapshot.policy, "windows", snapshot.policy.windows)),
+          put_in(
+            snapshot,
+            [:runtime, :pending_timeline],
+            [Map.put(timeline_row(snapshot), "phase_deg", timeline_row(snapshot).phase_deg)]
+          )
+        ] do
+      assert {:error, :invalid_wind_shift_runtime_snapshot} = Snapshot.preflight(duplicate)
+      assert {:error, :invalid_checkpoint_content} = RuntimeAdapter.project(duplicate)
+    end
+  end
+
+  test "authoritative preflight caps every nonnegative integer at canonical u64 or tighter" do
+    clock = start_clock(10_000)
+    observer = start_observer(clock)
+    accept_sample(observer, clock, 10_000, @capture_utc)
+    assert {:ok, snapshot} = Observer.snapshot(observer)
+
+    u64_max = 0xFFFF_FFFF_FFFF_FFFF
+    under_cap = put_in(snapshot, [:captured_at_utc_ms], u64_max)
+
+    assert :ok = Snapshot.preflight(under_cap)
+    assert {:ok, _wire} = RuntimeAdapter.project(under_cap)
+
+    mutations = replace_each_nonnegative_integer(snapshot, u64_max + 1)
+    assert mutations != []
+
+    for over_cap <- mutations do
+      assert {:error, :invalid_wind_shift_runtime_snapshot} = Snapshot.preflight(over_cap)
+      assert {:error, :invalid_checkpoint_content} = RuntimeAdapter.project(over_cap)
+    end
+  end
+
+  test "authoritative preflight and digest reject leaves the runtime adapter cannot project" do
+    clock = start_clock(10_000)
+    observer = start_observer(clock)
+    accept_sample(observer, clock, 10_000, @capture_utc)
+    assert {:ok, snapshot} = Observer.snapshot(observer)
+
+    for unsupported <- [{:unsupported, :tuple}, Date.utc_today(), fn -> :unsupported end, :wind_task_80_unknown] do
+      invalid = put_in(snapshot, [:runtime, :last_lift], unsupported)
+
+      assert {:error, :invalid_wind_shift_runtime_snapshot} = Snapshot.preflight(invalid)
+      assert {:error, :invalid_wind_shift_runtime_snapshot} = Snapshot.digest(invalid)
+      assert {:error, :invalid_checkpoint_content} = RuntimeAdapter.project(invalid)
+    end
+  end
+
+  test "authoritative preflight preserves legal nil, boolean, text, enum, and canonical leaves" do
+    clock = start_clock(10_000)
+    observer = start_observer(clock)
+    accept_sample(observer, clock, 10_000, @capture_utc)
+    assert {:ok, snapshot} = Observer.snapshot(observer)
+
+    assert :ok = Snapshot.preflight(snapshot)
+    assert {:ok, _digest} = Snapshot.digest(snapshot)
+  end
+
+  test "authoritative preflight rejects negative-zero floats recursively" do
+    clock = start_clock(10_000)
+    observer = start_observer(clock)
+    accept_sample(observer, clock, 10_000, @capture_utc)
+    assert {:ok, snapshot} = Observer.snapshot(observer)
+
+    for invalid <- [
+          put_in(snapshot, [:runtime, :last_lift], -0.0),
+          put_in(snapshot, [:runtime, :residuals, :values, Access.at(0)], -0.0)
+        ] do
+      assert {:error, :invalid_wind_shift_runtime_snapshot} = Snapshot.preflight(invalid)
+      assert {:error, :invalid_checkpoint_content} = RuntimeAdapter.project(invalid)
+    end
+  end
+
+  test "runtime restore rejects negative zero independently of authoritative preflight" do
+    clock = start_clock(10_000)
+    observer = start_observer(clock)
+    accept_sample(observer, clock, 10_000, @capture_utc)
+    assert {:ok, snapshot} = Observer.snapshot(observer)
+
+    invalid = put_in(snapshot.runtime, [:last_lift], -0.0)
+
+    assert {:error, :invalid_wind_shift_runtime_snapshot} =
+             RuntimeCheckpoint.restore_runtime(invalid, 10_000, snapshot.captured_at_utc_ms)
+  end
+
+  test "every runtime age restore rejects values above u64" do
+    clock = start_clock(10_000)
+    observer = start_observer(clock)
+    accept_sample(observer, clock, 10_000, @capture_utc)
+    assert {:ok, snapshot} = Observer.snapshot(observer)
+
+    paths = runtime_age_paths(snapshot.runtime)
+    assert paths != []
+
+    for path <- paths do
+      invalid = put_in(snapshot.runtime, path, 0x1_0000_0000_0000_0000)
+
+      assert {:error, :invalid_wind_shift_runtime_snapshot} =
+               RuntimeCheckpoint.restore_runtime(invalid, 10_000, snapshot.captured_at_utc_ms)
+    end
+  end
+
+  test "naturally reachable last_lift negative zero is normalized before authoritative storage" do
+    clock = start_clock(10_000)
+
+    observer =
+      start_observer(clock,
+        signals_fn: fn ->
+          %{
+            "true_wind_direction" => {200.0, 10_000},
+            "true_wind_angle" => {-40.0, 10_000}
+          }
+        end
+      )
+
+    :ok = Observer.tick(observer)
+    assert {:ok, snapshot} = Observer.snapshot(observer)
+    assert snapshot.runtime.last_lift === 0.0
+    refute negative_zero?(snapshot.runtime.last_lift)
+
+    assert {:ok, wire} = RuntimeAdapter.project(snapshot)
+    assert {:ok, canonical} = ContractCheckpoint.canonical_content(:wind_shift, 2, wire)
+    assert {:ok, decoded} = ContractCheckpoint.decode_canonical_content(:wind_shift, 2, canonical)
+    assert {:ok, hydrated} = RuntimeAdapter.hydrate(decoded)
+    assert hydrated.runtime.last_lift === snapshot.runtime.last_lift
+  end
+
+  defp timeline_row(snapshot) do
+    %{
+      t_ms: snapshot.captured_at_utc_ms,
+      mean_twd_deg: 200.0,
+      phase_deg: 0.0,
+      amplitude_deg: nil,
+      period_s: nil,
+      trend_deg_per_hr: nil,
+      tws_mps: nil
+    }
+  end
+
+  defp runtime_age_paths(runtime) do
+    top_level =
+      for field <- [
+            :last_period_age_ms,
+            :last_persist_age_ms,
+            :last_sync_age_ms,
+            :last_timeline_age_ms,
+            :last_tx_age_ms,
+            :t0_age_ms,
+            :last_t_age_ms
+          ],
+          not is_nil(Map.fetch!(runtime, field)),
+          do: [field]
+
+    envelope =
+      for field <- [:first_age_ms, :last_alarm_age_ms],
+          not is_nil(Map.fetch!(runtime.envelope, field)),
+          do: [:envelope, field]
+
+    queues =
+      for queue <- [:minq, :maxq],
+          {entry, index} <- Enum.with_index(Map.fetch!(runtime.envelope, queue)),
+          not is_nil(entry.age_ms),
+          do: [:envelope, queue, Access.at(index), :age_ms]
+
+    means =
+      for point <- [:fast, :mid, :slow, :sin, :cos],
+          not is_nil(Map.fetch!(runtime.means, point)),
+          do: [:means, point, :age_ms]
+
+    step =
+      for field <- [:u_min_age_ms, :d_max_age_ms, :onset_age_ms],
+          not is_nil(Map.fetch!(runtime.step, field)),
+          do: [:step, field]
+
+    top_level ++ envelope ++ queues ++ means ++ step
+  end
+
+  defp negative_zero?(value) when is_float(value) do
+    <<bits::64>> = <<value::float-big-size(64)>>
+    bits == 0x8000_0000_0000_0000
+  end
+
+  defp replace_each_nonnegative_integer(value, replacement) do
+    value
+    |> nonnegative_integer_paths([])
+    |> Enum.map(fn path -> put_in(value, path, replacement) end)
+  end
+
+  defp nonnegative_integer_paths(value, path) when is_integer(value) and value >= 0,
+    do: [Enum.reverse(path)]
+
+  defp nonnegative_integer_paths(value, path) when is_map(value) and not is_struct(value) do
+    Enum.flat_map(value, fn {key, nested} -> nonnegative_integer_paths(nested, [key | path]) end)
+  end
+
+  defp nonnegative_integer_paths(value, path) when is_list(value) do
+    value
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {nested, index} ->
+      nonnegative_integer_paths(nested, [Access.at(index) | path])
+    end)
+  end
+
+  defp nonnegative_integer_paths(_value, _path), do: []
 
   defp forbidden_key?(map) when is_map(map) do
     Enum.any?(map, fn {key, value} ->

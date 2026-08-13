@@ -51,6 +51,14 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1CanonicalTest do
       assert <<0x05, 0::64>> = canonical_element(-0.0)
     end
 
+    test "rejects byte wrappers carrying extra fields" do
+      bytes = Canonical.bytes(<<0x00, 0xFF>>)
+
+      assert {:ok, <<0x06, 2::32, 0x00, 0xFF>>} = Canonical.encode(bytes)
+      assert {:error, :unsupported_value_type} = Canonical.encode(Map.put(bytes, :unknown, true))
+      assert {:error, :unsupported_value_type} = Canonical.encode(Map.put(bytes, "unknown", true))
+    end
+
     test "normalizes text and map keys to NFC before encoding" do
       decomposed = "é"
 

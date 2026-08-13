@@ -20,6 +20,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   @max_command_payload_size 65_326
   @max_command_result_size 65_337
   @max_checkpoint_size 65_327
+  @max_checkpoint_content_size 8_388_608
   @max_capability_versions 8
   @max_capabilities 64
   @max_missing_ranges_per_section 512
@@ -64,12 +65,28 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
     {:polar, 0x02, 0x0002},
     {:wind_shift, 0x03, 0x0001}
   ]
+  @checkpoint_schemas [
+    {:calibration, 0x01, [0x0001, 0x0002]},
+    {:polar, 0x02, [0x0002, 0x0003]},
+    {:wind_shift, 0x03, [0x0001, 0x0002]}
+  ]
+  @checkpoint_runtime_schemas [
+    {:calibration, 0x01, 0x0002},
+    {:polar, 0x02, 0x0003},
+    {:wind_shift, 0x03, 0x0002}
+  ]
   @checkpoint_kind_by_name Map.new(@checkpoint_kinds, fn {name, code, schema_version} ->
                              {name, {code, schema_version}}
                            end)
   @checkpoint_kind_by_code Map.new(@checkpoint_kinds, fn {name, code, schema_version} ->
                              {code, {name, schema_version}}
                            end)
+  @checkpoint_schema_by_name Map.new(@checkpoint_schemas, fn {name, code, schemas} ->
+                               {name, {code, schemas}}
+                             end)
+  @checkpoint_schema_by_code Map.new(@checkpoint_schemas, fn {name, code, schemas} ->
+                               {code, {name, schemas}}
+                             end)
 
   @capabilities [
     {:atomic_generation, 0x0001, 0x0001},
@@ -227,6 +244,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   def max_command_payload_size, do: @max_command_payload_size
   def max_command_result_size, do: @max_command_result_size
   def max_checkpoint_size, do: @max_checkpoint_size
+  def max_checkpoint_content_size, do: @max_checkpoint_content_size
   def max_capability_versions, do: @max_capability_versions
   def max_capabilities, do: @max_capabilities
   def max_missing_ranges_per_section, do: @max_missing_ranges_per_section
@@ -285,6 +303,36 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1 do
   def delivery_stream(_), do: {:error, :unknown_delivery_stream}
 
   def checkpoint_kinds, do: @checkpoint_kinds
+  def checkpoint_schemas, do: @checkpoint_schemas
+  def checkpoint_runtime_schemas, do: @checkpoint_runtime_schemas
+
+  def checkpoint_schema(name, schema_version)
+      when is_atom(name) and is_integer(schema_version) do
+    case Map.fetch(@checkpoint_schema_by_name, name) do
+      {:ok, {code, schemas}} ->
+        if schema_version in schemas,
+          do: {:ok, code},
+          else: {:error, :unsupported_checkpoint_schema}
+
+      :error ->
+        {:error, :unknown_checkpoint_kind}
+    end
+  end
+
+  def checkpoint_schema(code, schema_version)
+      when is_integer(code) and is_integer(schema_version) do
+    case Map.fetch(@checkpoint_schema_by_code, code) do
+      {:ok, {name, schemas}} ->
+        if schema_version in schemas,
+          do: {:ok, name},
+          else: {:error, :unsupported_checkpoint_schema}
+
+      :error ->
+        {:error, :unknown_checkpoint_kind}
+    end
+  end
+
+  def checkpoint_schema(_kind, _schema_version), do: {:error, :unknown_checkpoint_kind}
 
   def checkpoint_kind(name) when is_atom(name) do
     case Map.fetch(@checkpoint_kind_by_name, name) do

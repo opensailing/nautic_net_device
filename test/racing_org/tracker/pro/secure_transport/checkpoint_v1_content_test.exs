@@ -18,6 +18,42 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
                Checkpoint.decode_content(:polar, @polar_schema, oversized)
     end
 
+    test "admits legitimate runtime identity and canonical byte leaves through shared checkpoint validation" do
+      runtime = exact_runtime_wind_shift_fixture()
+
+      assert runtime["authority"]["credential_epoch"] == 7
+      assert %Canonical.Bytes{data: <<_::128>>} = runtime["authority"]["device_id"]
+      assert %Canonical.Bytes{data: <<_::128>>} = runtime["authority"]["storage_epoch"]
+
+      assert {:ok, bytes} = Checkpoint.canonical_content(:wind_shift, 2, runtime)
+      assert {:ok, ^runtime} = Checkpoint.decode_canonical_content(:wind_shift, 2, bytes)
+    end
+
+    test "fails closed on malformed canonical byte wrappers without Enumerable crashes" do
+      runtime = exact_runtime_wind_shift_fixture()
+      malformed = put_in(runtime, ["authority", "device_id"], %Canonical.Bytes{data: :not_binary})
+
+      assert {:error, :invalid_checkpoint_content} =
+               Checkpoint.canonical_content(:wind_shift, 2, malformed)
+    end
+
+    test "keeps credential and secret-capable near-miss keys forbidden" do
+      runtime = exact_runtime_wind_shift_fixture()
+
+      for key <- [
+            "credential_epoch_token",
+            "credential_epochs",
+            "origin_credential_epoch_secret",
+            "api_key_hint",
+            "private_key_id"
+          ] do
+        candidate = put_in(runtime, ["authority"], Map.put(runtime["authority"], key, "synthetic"))
+
+        assert {:error, :checkpoint_secret_forbidden} =
+                 Checkpoint.canonical_content(:wind_shift, 2, candidate)
+      end
+    end
+
     test "reports capacity separately from content validity" do
       # A schema-VALID polar checkpoint whose canonical form overflows one frame
       # is content awaiting chunked carriage, not malformed content. Laundering
@@ -470,6 +506,171 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.CheckpointV1ContentTest do
                  }
                )
     end
+  end
+
+  defp exact_runtime_wind_shift_fixture do
+    %{
+      "version" => 1,
+      "captured_at_utc_ms" => 1_786_536_000_000,
+      "authority" => %{
+        "device_id" => Canonical.bytes(<<1::128>>),
+        "credential_epoch" => 7,
+        "storage_epoch" => Canonical.bytes(<<2::128>>)
+      },
+      "policy" => %{
+        "version" => nil,
+        "windows" => %{
+          "fast_s" => 30.0,
+          "mid_s" => 300.0,
+          "slow_s" => 1500.0,
+          "envelope_s" => 1800.0
+        },
+        "alarms" => %{"new_extreme_margin_deg" => 2.0, "enabled" => true},
+        "wally_mode" => "off",
+        "sample_ms" => 0,
+        "persist_ms" => 60_000,
+        "sync_ms" => 60_000,
+        "timeline_ms" => 60_000,
+        "staleness_ms" => 3_000,
+        "residual_window" => 1_800,
+        "period_every_ms" => 60_000,
+        "xing_hysteresis_deg" => 2.0,
+        "absorb_dwell_ticks" => 60,
+        "broadcast_rate_ms" => 1_000
+      },
+      "source_generation" => 1,
+      "runtime" => exact_runtime_wind_shift_state(),
+      "stats" => %{
+        "samples" => 1,
+        "accepted" => 1,
+        "rejected" => 0,
+        "reject_reasons" => %{}
+      },
+      "tick" => %{"remaining_ms" => nil}
+    }
+  end
+
+  defp exact_runtime_wind_shift_state do
+    point = %{"value" => 3.490658503988659, "age_ms" => 0}
+
+    %{
+      "session" => %{
+        "started_at_ms" => 1_786_536_000_000,
+        "lat_sum" => 0.0,
+        "lon_sum" => 0.0,
+        "pos_n" => 0,
+        "tws_sum" => 0.0,
+        "tws_n" => 0
+      },
+      "seq" => 0,
+      "pending_timeline" => [],
+      "pending_events" => [],
+      "last_summary" => nil,
+      "means" => %{
+        "tau_fast_s" => 30.0,
+        "tau_mid_s" => 300.0,
+        "tau_slow_s" => 1500.0,
+        "fast" => point,
+        "mid" => point,
+        "slow" => point,
+        "sin" => %{"value" => -0.34202014332566866, "age_ms" => 0},
+        "cos" => %{"value" => -0.9396926207859084, "age_ms" => 0}
+      },
+      "envelope" => %{
+        "window_ms" => 1_800_000,
+        "margin_deg" => 2.0,
+        "debounce_ms" => 60_000,
+        "warmup_ms" => 300_000,
+        "minq" => %{"count" => 1, "chunks" => [[[0, 200.0]]]},
+        "maxq" => %{"count" => 1, "chunks" => [[[0, 200.0]]]},
+        "last_input_deg" => 200.0,
+        "last_unwrapped" => 200.0,
+        "first_age_ms" => 0,
+        "last_alarm_age_ms" => nil,
+        "new_extreme" => "none"
+      },
+      "cycle" => %{
+        "omega" => 0.01308996938995747,
+        "rho_per_s" => 0.9995,
+        "obs_var" => 2.25,
+        "q_level_per_s" => 0.0003,
+        "q_slope_per_s" => 3.0e-8,
+        "cycle_var" => 80.0,
+        "innovation_tau_s" => 300.0,
+        "x" => [200.0, 0.0, 0.0, 0.0],
+        "p" => [
+          [400.0, 0.0, 0.0, 0.0],
+          [0.0, 1.0, 0.0, 0.0],
+          [0.0, 0.0, 100.0, 0.0],
+          [0.0, 0.0, 0.0, 100.0]
+        ],
+        "innovation_var" => 2.25
+      },
+      "step" => %{
+        "delta_deg" => 0.5,
+        "threshold_deg" => 8.0,
+        "band_deg" => 2.0,
+        "settle_s" => 30.0,
+        "min_magnitude_deg" => 8.0,
+        "fast_confirm_deg" => 25.0,
+        "fast_confirm_s" => 90.0,
+        "max_confirm_s" => 480.0,
+        "period_hint_s" => nil,
+        "status" => "none",
+        "u" => -0.5,
+        "u_min" => -0.5,
+        "u_min_age_ms" => 0,
+        "u_min_t_ms" => 1_786_536_000_000,
+        "u_sum" => 0.0,
+        "u_n" => 0,
+        "d" => 0.5,
+        "d_max" => 0.5,
+        "d_max_age_ms" => 0,
+        "d_max_t_ms" => 1_786_536_000_000,
+        "d_sum" => 0.0,
+        "d_n" => 0,
+        "dir" => nil,
+        "onset_age_ms" => nil,
+        "onset_t_ms" => nil,
+        "cand_sum" => 0.0,
+        "cand_n" => 0,
+        "magnitude" => nil
+      },
+      "unwrap" => %{"last_input_deg" => 200.0, "last_unwrapped" => 200.0},
+      "residuals" => %{"count" => 1, "values" => [0.0]},
+      "period" => "none",
+      "last_period_age_ms" => 0,
+      "last_persist_age_ms" => 0,
+      "last_sync_age_ms" => 0,
+      "last_timeline_age_ms" => 0,
+      "last_tx_age_ms" => nil,
+      "t0_age_ms" => 0,
+      "last_t_age_ms" => 0,
+      "prev_step_status" => "none",
+      "prev_regime" => "insufficient_history",
+      "absorb_count" => 0,
+      "last_tack" => nil,
+      "xing" => %{
+        "side" => nil,
+        "extreme" => %{
+          "phase_deg" => 0.0,
+          "twd_deg" => 200.0,
+          "t_ms" => 1_786_536_000_000
+        }
+      },
+      "last_verdict" => %{
+        "regime" => "insufficient_history",
+        "confidence" => 0.0,
+        "oscillation" => nil,
+        "trend_deg_per_hr" => nil,
+        "time_to_next_shift_s" => nil,
+        "ci_s" => nil,
+        "treat_as_persistent" => false,
+        "regime_alarm" => false,
+        "phase_deg" => 0.0
+      },
+      "last_lift" => nil
+    }
   end
 
   defp calibration_checkpoint do

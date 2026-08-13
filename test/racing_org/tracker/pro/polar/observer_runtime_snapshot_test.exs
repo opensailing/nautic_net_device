@@ -3,8 +3,10 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverRuntimeSnapshotTest do
 
   alias RacingOrg.Tracker.Pro.Polar.Observer
   alias RacingOrg.Tracker.Pro.Polar.Observer.Bins
+  alias RacingOrg.Tracker.Pro.Polar.Observer.Gate
   alias RacingOrg.Tracker.Pro.Polar.Observer.PSquare
   alias RacingOrg.Tracker.Pro.Polar.Observer.RuntimeSnapshot
+  alias RacingOrg.Tracker.Pro.Polar.Observer.Snapshot
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint, as: ContractCheckpoint
 
   @capture_utc ~U[2026-08-12 12:00:00Z]
@@ -312,6 +314,115 @@ defmodule RacingOrg.Tracker.Pro.Polar.ObserverRuntimeSnapshotTest do
     assert {:ok, snapshot} = Observer.runtime_snapshot(observer)
     assert snapshot.sync.last_sync_age_ms == 20_000
     assert snapshot.persistence_phase.last_persist_age_ms == 30_000
+  end
+
+  test "projection rejects authoritative alias keys before they can collapse" do
+    {:ok, clock} = start_clock(100_000)
+    {:ok, utc_clock} = start_utc_clock()
+    observer = start_observer(clock, utc_clock, window_size: 1, gate: [min_dwell: 1])
+    state = :sys.get_state(observer)
+
+    alias_cases = [
+      Map.put(state, "boat_identifier", "shadow-authority"),
+      Map.put(state, "seq", state.seq + 1),
+      Map.put(state, "source_generation", state.source_generation + 1),
+      Map.put(state, "window", [sample(100_000)]),
+      Map.put(state, :gate, Map.put(Map.from_struct(state.gate), "min_dwell", state.gate.min_dwell + 1)),
+      Map.put(
+        state,
+        :bins,
+        Map.put(Map.from_struct(state.bins), "twa_width_deg", state.bins.twa_width_deg / 2)
+      )
+    ]
+
+    for aliased <- alias_cases do
+      assert {:error, :invalid_runtime_snapshot} =
+               RuntimeSnapshot.project(aliased, 100_000, @capture_utc)
+    end
+  end
+
+  test "projection preserves database-bounded authoritative integers and rejects u64 overflow" do
+    {:ok, clock} = start_clock(100_000)
+    {:ok, utc_clock} = start_utc_clock()
+    observer = start_observer(clock, utc_clock, window_size: 1, gate: [min_dwell: 1])
+    state = :sys.get_state(observer)
+
+    assert {:ok, maximum} =
+             state
+             |> Map.put(:source_generation, 9_223_372_036_854_775_807)
+             |> Map.put(:seq, 9_223_372_036_854_775_807)
+             |> RuntimeSnapshot.project(100_000, @capture_utc)
+
+    assert maximum.learner.source_generation == 9_223_372_036_854_775_807
+    assert maximum.upstream_seq == 9_223_372_036_854_775_807
+
+    for oversized <- [0x1_0000_0000_0000_0000, 9_223_372_036_854_775_808] do
+      assert {:error, :invalid_runtime_snapshot} =
+               state
+               |> Map.put(:source_generation, oversized)
+               |> RuntimeSnapshot.project(100_000, @capture_utc)
+
+      assert {:error, :invalid_runtime_snapshot} =
+               state
+               |> Map.put(:seq, oversized)
+               |> RuntimeSnapshot.project(100_000, @capture_utc)
+    end
+  end
+
+  test "preflight rejects negative zero before canonical encode can change authoritative bits" do
+    {:ok, clock} = start_clock(100_000)
+    {:ok, utc_clock} = start_utc_clock()
+    observer = start_observer(clock, utc_clock, window_size: 1, gate: [min_dwell: 1])
+    assert {:ok, snapshot} = Observer.runtime_snapshot(observer)
+
+    negative_zero =
+      <<0x8000_0000_0000_0000::64>>
+      |> then(fn bits ->
+        <<value::float-64>> = bits
+        value
+      end)
+
+    for candidate <- [
+          put_in(snapshot, [:policy, :min_stw_mps], negative_zero),
+          put_in(snapshot, [:policy, :gate, :max_accel_mps2], negative_zero),
+          put_in(snapshot, [:window], [
+            sample(100_000, %{tws_mps: negative_zero}) |> Map.delete(:t_ms) |> Map.put(:age_ms, 0)
+          ])
+        ] do
+      assert {:error, :invalid_runtime_snapshot} = RuntimeSnapshot.preflight(candidate)
+    end
+  end
+
+  test "preflight rejects rebound gate negative zero rather than relying on policy hash mismatch" do
+    {:ok, clock} = start_clock(100_000)
+    {:ok, utc_clock} = start_utc_clock()
+    observer = start_observer(clock, utc_clock, window_size: 1, gate: [min_dwell: 1])
+    assert {:ok, snapshot} = Observer.runtime_snapshot(observer)
+
+    negative_zero =
+      <<0x8000_0000_0000_0000::64>>
+      |> then(fn bits ->
+        <<value::float-64>> = bits
+        value
+      end)
+
+    gate = Map.put(snapshot.policy.gate, :max_accel_mps2, negative_zero)
+
+    assert {:ok, policy_hash} =
+             Snapshot.policy_hash(
+               struct!(Gate, gate),
+               snapshot.policy.min_stw_mps,
+               snapshot.policy.window_size,
+               snapshot.policy.p
+             )
+
+    rebound =
+      snapshot
+      |> put_in([:policy, :gate], gate)
+      |> put_in([:policy, :admission_hash], policy_hash)
+      |> put_in([:learner, :content, :policy_hash], policy_hash)
+
+    assert {:error, :invalid_runtime_snapshot} = RuntimeSnapshot.preflight(rebound)
   end
 
   test "strict validation rejects open, noncanonical, duplicate, and causally inconsistent state before mutation" do

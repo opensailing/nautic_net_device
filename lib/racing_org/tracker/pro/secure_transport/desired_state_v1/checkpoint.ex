@@ -1,15 +1,17 @@
 defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
   @moduledoc """
-  Canonical hashing and closed typed content validation for learned-state checkpoints.
+  Canonical hashing and closed typed content validation for versioned checkpoints.
 
-  Checkpoint bytes are not an opaque upload format. Version 1 admits only the exact
-  normalized calibration, polar, and wind-shift shapes validated here. Every map has a
-  closed field set, every collection has typed elements and bounded cardinality, and
-  estimator state is checked for structural invariants before it may be hashed or stored.
+  Checkpoint bytes are not an opaque upload format. Each registered schema has one exact
+  closed meaning: legacy learner-only schemas remain frozen, while additive runtime schemas
+  carry the complete observer state needed for exact recovery. Every map has a closed field
+  set, every collection has typed elements and bounded cardinality, and runtime invariants
+  are checked before content may be hashed or stored.
   """
 
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1, as: Contract
   alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Canonical
+  alias RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.CheckpointRuntime
 
   @device_id_size 16
   @storage_epoch_size 16
@@ -53,8 +55,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
   def canonical_content(kind, schema_version, content) do
     with {:ok, _kind_code} <- checkpoint_identity(kind, schema_version),
          :ok <- reject_secret_capable(content),
-         :ok <- validate_content(kind, content),
-         {:ok, bytes} <- Canonical.encode(content) do
+         :ok <- validate_content(kind, schema_version, content),
+         {:ok, bytes} <- Canonical.encode(content),
+         :ok <- checkpoint_content_size(bytes) do
       {:ok, bytes}
     end
   end
@@ -69,14 +72,8 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
 
   @doc "Decode canonical checkpoint bytes and revalidate the exact closed content schema."
   def decode_content(kind, schema_version, bytes) when is_binary(bytes) do
-    with {:ok, _kind_code} <- checkpoint_identity(kind, schema_version),
-         :ok <- checkpoint_size(bytes),
-         {:ok, content} <- Canonical.decode(bytes),
-         :ok <- reject_secret_capable(content),
-         :ok <- validate_content(kind, content),
-         {:ok, canonical} <- Canonical.encode(content),
-         :ok <- ensure(canonical == bytes, :noncanonical_checkpoint_content) do
-      {:ok, content}
+    with :ok <- checkpoint_size(bytes) do
+      decode_canonical_content(kind, schema_version, bytes)
     end
   end
 
@@ -86,10 +83,43 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
     end
   end
 
+  @doc "Decode canonical checkpoint content up to the exact-runtime capacity."
+  def decode_canonical_content(kind, schema_version, bytes) when is_binary(bytes) do
+    with {:ok, _kind_code} <- checkpoint_identity(kind, schema_version),
+         :ok <- checkpoint_content_size(bytes),
+         {:ok, content} <- Canonical.decode(bytes),
+         :ok <- reject_secret_capable(content),
+         :ok <- validate_content(kind, schema_version, content),
+         {:ok, canonical} <- Canonical.encode(content),
+         :ok <- ensure(canonical == bytes, :noncanonical_checkpoint_content) do
+      {:ok, content}
+    end
+  end
+
+  def decode_canonical_content(kind, schema_version, _bytes) do
+    with {:ok, _kind_code} <- checkpoint_identity(kind, schema_version) do
+      {:error, :invalid_checkpoint_content}
+    end
+  end
+
+  @doc "Validate durable authority embedded by exact-runtime checkpoint schemas."
+  def validate_authority(kind, schema_version, bytes, expected) when is_binary(bytes) and is_map(expected) do
+    with {:ok, content} <- decode_canonical_content(kind, schema_version, bytes),
+         :ok <- validate_authority_content(kind, schema_version, content, expected) do
+      :ok
+    end
+  end
+
+  def validate_authority(kind, schema_version, _bytes, _expected) do
+    with {:ok, _kind_code} <- checkpoint_identity(kind, schema_version) do
+      {:error, :invalid_checkpoint_content}
+    end
+  end
+
   @doc "Hash exact, typed canonical content under the checkpoint-content domain."
   def content_hash(kind, schema_version, bytes) when is_binary(bytes) do
     with {:ok, kind_code} <- checkpoint_identity(kind, schema_version),
-         {:ok, _content} <- decode_content(kind, schema_version, bytes) do
+         {:ok, _content} <- decode_canonical_content(kind, schema_version, bytes) do
       preimage =
         Contract.checkpoint_content_hash_domain() <>
           <<Contract.version(), kind_code, schema_version::16, byte_size(bytes)::64, bytes::binary>>
@@ -155,8 +185,7 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
       ) do
     with :ok <- ensure(domain == Contract.checkpoint_hash_domain(), :checkpoint_hash_domain_mismatch),
          :ok <- ensure(version == Contract.version(), :unsupported_checkpoint_hash_version),
-         {:ok, kind, expected_schema} <- Contract.checkpoint_kind(kind_code),
-         :ok <- ensure(schema_version == expected_schema, :unsupported_checkpoint_schema),
+         {:ok, kind} <- Contract.checkpoint_schema(kind_code, schema_version),
          attrs = %{
            device_id: device_id,
            credential_epoch: credential_epoch,
@@ -183,20 +212,46 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
     end
   end
 
-  defp checkpoint_identity(kind, schema_version) when is_atom(kind) do
-    case Contract.checkpoint_kind(kind) do
-      {:ok, code, ^schema_version} -> {:ok, code}
-      {:ok, _code, _expected_schema} -> {:error, :unsupported_checkpoint_schema}
-      {:error, _reason} = error -> error
-    end
-  end
+  defp checkpoint_identity(kind, schema_version) when is_atom(kind),
+    do: Contract.checkpoint_schema(kind, schema_version)
 
   defp checkpoint_identity(_kind, _schema_version), do: {:error, :unknown_checkpoint_kind}
 
-  defp validate_content(:calibration, content), do: validate_calibration(content)
-  defp validate_content(:polar, content), do: validate_polar(content)
-  defp validate_content(:wind_shift, content), do: validate_wind_shift(content)
-  defp validate_content(_kind, _content), do: {:error, :unknown_checkpoint_kind}
+  defp validate_content(:calibration, 1, content), do: validate_calibration(content)
+  defp validate_content(:calibration, 2, content), do: CheckpointRuntime.Calibration.validate(content)
+  defp validate_content(:polar, 2, content), do: validate_polar(content)
+  defp validate_content(:polar, 3, content), do: CheckpointRuntime.Polar.validate(content)
+  defp validate_content(:wind_shift, 1, content), do: validate_wind_shift(content)
+  defp validate_content(:wind_shift, 2, content), do: CheckpointRuntime.WindShift.validate(content)
+
+  defp validate_content(kind, schema_version, _content)
+       when kind in [:calibration, :polar, :wind_shift] and is_integer(schema_version),
+       do: {:error, :invalid_checkpoint_content}
+
+  defp validate_content(_kind, _schema_version, _content), do: {:error, :unknown_checkpoint_kind}
+
+  defp validate_authority_content(:wind_shift, 2, content, expected) do
+    with {:ok, authority} <- CheckpointRuntime.WindShift.durable_authority(content),
+         :ok <- exact_atom_keys(expected, [:device_id, :credential_epoch, :storage_epoch], :invalid_checkpoint),
+         :ok <- fixed_binary(expected.device_id, @device_id_size, :invalid_device_id),
+         :ok <- u32(expected.credential_epoch, :invalid_credential_epoch),
+         :ok <- nonzero_binary(expected.storage_epoch, @storage_epoch_size, :invalid_storage_epoch),
+         :ok <- ensure(secure_equal(authority.device_id, expected.device_id), :checkpoint_authority_mismatch),
+         :ok <- ensure(authority.credential_epoch === expected.credential_epoch, :checkpoint_authority_mismatch),
+         :ok <-
+           ensure(
+             secure_equal(authority.storage_epoch, expected.storage_epoch),
+             :checkpoint_authority_mismatch
+           ) do
+      :ok
+    end
+  end
+
+  defp validate_authority_content(kind, schema_version, _content, _expected) do
+    with {:ok, _kind_code} <- checkpoint_identity(kind, schema_version) do
+      :ok
+    end
+  end
 
   # Calibration checkpoint v1
 
@@ -897,6 +952,13 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
 
   # Secret boundary and primitive validators
 
+  defp reject_secret_capable(%Canonical.Bytes{data: data} = value)
+       when is_binary(data) and map_size(value) == 2,
+       do: :ok
+
+  defp reject_secret_capable(%Canonical.Bytes{}),
+    do: {:error, :invalid_checkpoint_content}
+
   defp reject_secret_capable(value) when is_map(value) do
     Enum.reduce_while(value, :ok, fn {key, nested}, :ok ->
       cond do
@@ -933,11 +995,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
     if String.valid?(key) do
       normalized = key |> String.normalize(:nfc) |> String.downcase()
 
-      normalized in ~w(metadata payload raw_payload blob data bytes auth authorization) or
-        Enum.any?(
-          ~w(psk password passphrase secret credential private_key api_key token),
-          &String.contains?(normalized, &1)
-        )
+      normalized not in ~w(credential_epoch origin_credential_epoch) and
+        (normalized in ~w(metadata payload raw_payload blob data bytes auth authorization) or
+           Enum.any?(
+             ~w(psk password passphrase secret credential private_key api_key token),
+             &String.contains?(normalized, &1)
+           ))
     else
       false
     end
@@ -947,6 +1010,12 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
 
   defp checkpoint_size(bytes) when is_binary(bytes) do
     if byte_size(bytes) in 1..Contract.max_checkpoint_size(),
+      do: :ok,
+      else: {:error, :checkpoint_too_large}
+  end
+
+  defp checkpoint_content_size(bytes) when is_binary(bytes) do
+    if byte_size(bytes) in 1..Contract.max_checkpoint_content_size(),
       do: :ok,
       else: {:error, :checkpoint_too_large}
   end
@@ -1139,4 +1208,10 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Checkpoint do
   defp ensure(false), do: {:error, :invalid_checkpoint_content}
   defp ensure(true, _reason), do: :ok
   defp ensure(false, reason), do: {:error, reason}
+
+  defp secure_equal(left, right) when is_binary(left) and is_binary(right) do
+    byte_size(left) == byte_size(right) and :crypto.hash_equals(left, right)
+  end
+
+  defp secure_equal(_left, _right), do: false
 end

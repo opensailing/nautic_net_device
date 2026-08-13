@@ -129,13 +129,16 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.DesiredStateV1.Canonical do
     end
   end
 
-  defp encode_value(%Bytes{data: data}, _depth) when is_binary(data) do
+  defp encode_value(%Bytes{data: data} = value, _depth)
+       when is_binary(data) and map_size(value) == 2 do
     if byte_size(data) + 5 <= Contract.max_section_size() do
       {:ok, [<<0x06, byte_size(data)::32>>, data]}
     else
       {:error, :value_too_large}
     end
   end
+
+  defp encode_value(%Bytes{}, _depth), do: {:error, :unsupported_value_type}
 
   defp encode_value(value, depth) when is_binary(value), do: encode_text(value, depth)
 
