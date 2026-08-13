@@ -93,12 +93,12 @@ defmodule RacingOrg.Tracker.Pro.Application do
       # the live session from the holder, and the ChannelClient publishes into it.
       RacingOrg.Tracker.Pro.SecureTransport.SessionHolder,
       {RacingOrg.Tracker.Pro.WebClients.UDPClient, udp_config()},
-      {RacingOrg.Tracker.Pro.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
-      {RacingOrg.Tracker.Pro.DataSetUploader, via: :udp}
+      {RacingOrg.Tracker.Pro.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size}
     ] ++
       wifi_manager_children(target) ++
       desired_state_children(target, controller_capability) ++
-      secure_transport_children(:logger, target, controller_capability)
+      secure_transport_children(:logger, target, controller_capability) ++
+      data_set_uploader_children(:logger)
   end
 
   # Product: Base station receiver node for racing_org_tracker_mini
@@ -106,11 +106,11 @@ defmodule RacingOrg.Tracker.Pro.Application do
     [
       commands_child(),
       RacingOrg.Tracker.Pro.SecureTransport.SessionHolder,
-      {RacingOrg.Tracker.Pro.WebClients.UDPClient, udp_config()},
-      {RacingOrg.Tracker.Pro.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
-      {RacingOrg.Tracker.Pro.DataSetUploader, via: :udp},
-      RacingOrg.Tracker.Pro.BaseStation
-    ] ++ wifi_manager_children(target) ++ secure_transport_children(:uplink, target, nil)
+      {RacingOrg.Tracker.Pro.WebClients.UDPClient, udp_config()}
+    ] ++
+      data_set_children(:uplink) ++
+      [RacingOrg.Tracker.Pro.BaseStation] ++
+      wifi_manager_children(target) ++ secure_transport_children(:uplink, target, nil)
   end
 
   # Wi-Fi: on a real device target, `RacingOrg.Tracker.Pro.WiFiManager` OWNS wlan0 at runtime.
@@ -216,6 +216,24 @@ defmodule RacingOrg.Tracker.Pro.Application do
   end
 
   defp outbox_owner_children(:uplink), do: []
+
+  # Logger legacy spool migration starts only after the durable Outbox owner is
+  # open and identity-bound. The Recorder is started earlier so newly persisted
+  # files can always notify a live admission worker once it boots. Uplink has no
+  # Outbox owner and therefore retains the existing UDP uploader strategy.
+  defp data_set_uploader_children(:logger) do
+    [
+      {RacingOrg.Tracker.Pro.DataSetUploader,
+       delivery: :durable, outbox: RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner}
+    ]
+  end
+
+  defp data_set_children(:uplink) do
+    [
+      {RacingOrg.Tracker.Pro.DataSetRecorder, chunk_every: @max_unfragmented_udp_payload_size},
+      {RacingOrg.Tracker.Pro.DataSetUploader, delivery: :legacy, via: :udp}
+    ]
+  end
 
   defp outbox_root do
     Application.get_env(:racing_org_tracker_pro, :durable_outbox_root) ||

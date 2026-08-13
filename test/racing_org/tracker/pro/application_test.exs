@@ -28,6 +28,8 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
   }
 
   alias RacingOrg.Tracker.Pro.Commands.Ledger.Executor, as: CommandExecutor
+  alias RacingOrg.Tracker.Pro.DataSetRecorder
+  alias RacingOrg.Tracker.Pro.DataSetUploader
   alias RacingOrg.Tracker.Pro.DurableDelivery.Outbox.Owner, as: OutboxOwner
   alias RacingOrg.Tracker.Pro.Race.BulkUploader
   alias RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner
@@ -301,6 +303,40 @@ defmodule RacingOrg.Tracker.Pro.ApplicationTest do
 
       assert Enum.find_index(ids, &(&1 == CommandExecutor)) <
                Enum.find_index(ids, &(&1 == ChannelClient))
+    end
+
+    test "logger starts the durable legacy spool migration after the Outbox" do
+      Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+
+      specs =
+        :logger
+        |> RacingOrg.Tracker.Pro.Application.child_specs(:racing_org_rpi3)
+        |> Enum.map(&Supervisor.child_spec(&1, []))
+
+      ids = spec_ids(specs)
+      assert Enum.find_index(ids, &(&1 == DataSetRecorder)) < Enum.find_index(ids, &(&1 == DataSetUploader))
+      assert Enum.find_index(ids, &(&1 == OutboxOwner)) < Enum.find_index(ids, &(&1 == DataSetUploader))
+
+      uploader_spec = Enum.find(specs, &(&1.id == DataSetUploader))
+      assert {DataSetUploader, :start_link, [uploader_opts]} = uploader_spec.start
+      assert Keyword.fetch!(uploader_opts, :delivery) == :durable
+      assert Keyword.fetch!(uploader_opts, :outbox) == OutboxOwner
+      refute Keyword.has_key?(uploader_opts, :via)
+    end
+
+    test "uplink retains legacy UDP DataSet delivery because it has no Outbox owner" do
+      Application.put_env(:racing_org_tracker_pro, ServerIdentity, public_key: :crypto.strong_rand_bytes(32))
+
+      specs =
+        :uplink
+        |> RacingOrg.Tracker.Pro.Application.child_specs(:racing_org_rpi3)
+        |> Enum.map(&Supervisor.child_spec(&1, []))
+
+      uploader_spec = Enum.find(specs, &(&1.id == DataSetUploader))
+      assert {DataSetUploader, :start_link, [uploader_opts]} = uploader_spec.start
+      assert Keyword.fetch!(uploader_opts, :delivery) == :legacy
+      assert Keyword.fetch!(uploader_opts, :via) == :udp
+      refute Keyword.has_key?(uploader_opts, :outbox)
     end
 
     test "uplink does not start the logger-only desired-state runtime" do
