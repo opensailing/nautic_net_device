@@ -51,6 +51,14 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Snapshot do
   @database_int_max 9_223_372_036_854_775_807
   @max_finite 1.7976931348623157e308
   @max_pending 65_535
+  @max_envelope_entries 100_000
+  @max_residuals 1_800
+  @max_projected_nodes 2_000_000
+  @max_projected_canonical_size 8_388_608
+  @max_canonical_depth 16
+  @max_canonical_key_size 128
+  @max_canonical_collection_count 65_535
+  @canonical_chunk_size 65_535
   @xing_hysteresis_deg 2.0
   @error {:error, :invalid_wind_shift_runtime_snapshot}
 
@@ -115,6 +123,7 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Snapshot do
          :ok <- validate_generation(snapshot.source_generation),
          :ok <- validate_stats(snapshot.stats),
          :ok <- validate_tick(snapshot.tick, snapshot.policy.sample_ms),
+         :ok <- validate_projected_budget(snapshot),
          :ok <- preflight_runtime_collections(snapshot.runtime),
          :ok <- validate_projectable_tree(snapshot) do
       :ok
@@ -323,6 +332,9 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Snapshot do
   defp preflight_runtime_collections(runtime) when is_map(runtime) do
     with :ok <- RuntimeSnapshot.bounded_list(Map.get(runtime, :pending_timeline), @max_pending),
          :ok <- RuntimeSnapshot.bounded_list(Map.get(runtime, :pending_events), @max_pending),
+         :ok <- RuntimeSnapshot.bounded_list(get_in(runtime, [:envelope, :minq]), @max_envelope_entries),
+         :ok <- RuntimeSnapshot.bounded_list(get_in(runtime, [:envelope, :maxq]), @max_envelope_entries),
+         :ok <- RuntimeSnapshot.bounded_list(get_in(runtime, [:residuals, :values]), @max_residuals),
          true <- strictly_increasing_timestamps?(runtime.pending_timeline),
          true <- unique_terms?(runtime.pending_events) do
       :ok
@@ -356,6 +368,182 @@ defmodule RacingOrg.Tracker.Pro.WindShift.Observer.Snapshot do
   end
 
   defp unique_terms?(_values), do: false
+
+  defp validate_projected_budget(snapshot) do
+    case projected_size(snapshot, [], 0, @max_projected_nodes) do
+      {:ok, size, _remaining_nodes} when size <= @max_projected_canonical_size -> :ok
+      _ -> @error
+    end
+  end
+
+  defp projected_size(_value, _path, _depth, node_budget) when node_budget <= 0, do: :error
+
+  defp projected_size(value, [queue, :envelope, :runtime], depth, node_budget)
+       when queue in [:minq, :maxq] and is_list(value) do
+    with true <- depth + 3 < @max_canonical_depth,
+         {:ok, rows_size, count, remaining_nodes} <-
+           projected_queue_rows(value, depth + 3, node_budget - 4, 0, 0),
+         chunks = div(count + @canonical_chunk_size - 1, @canonical_chunk_size),
+         true <- chunks <= @max_canonical_collection_count do
+      wrapper_size =
+        5 +
+          (2 + byte_size("count")) + 9 +
+          (2 + byte_size("chunks")) + 5 + chunks * 5
+
+      {:ok, wrapper_size + rows_size, remaining_nodes}
+    else
+      _ -> :error
+    end
+  end
+
+  defp projected_size(value, [field, :authority], _depth, node_budget)
+       when field in [:device_id, :storage_epoch] and is_binary(value) do
+    if byte_size(value) + 5 <= @max_projected_canonical_size,
+      do: {:ok, byte_size(value) + 5, node_budget - 1},
+      else: :error
+  end
+
+  defp projected_size(value, path, depth, node_budget)
+       when is_map(value) and not is_struct(value) do
+    with true <- depth < @max_canonical_depth,
+         true <- map_size(value) <= @max_canonical_collection_count,
+         {:ok, entries} <- projected_map_entries(value),
+         {:ok, entries_size, remaining_nodes} <-
+           projected_map_size(entries, path, depth + 1, node_budget - 1, 0) do
+      {:ok, 5 + entries_size, remaining_nodes}
+    else
+      _ -> :error
+    end
+  end
+
+  defp projected_size(value, path, depth, node_budget) when is_list(value) do
+    with true <- depth < @max_canonical_depth,
+         {:ok, entries_size, _count, remaining_nodes} <-
+           projected_list_size(value, path, depth + 1, node_budget - 1, 0, 0) do
+      {:ok, 5 + entries_size, remaining_nodes}
+    else
+      _ -> :error
+    end
+  end
+
+  defp projected_size(value, _path, _depth, node_budget)
+       when is_integer(value) or is_float(value),
+       do: {:ok, 9, node_budget - 1}
+
+  defp projected_size(value, _path, _depth, node_budget) when is_boolean(value) or is_nil(value),
+    do: {:ok, 1, node_budget - 1}
+
+  defp projected_size(value, _path, _depth, node_budget) when is_atom(value),
+    do: projected_text_size(Atom.to_string(value), node_budget)
+
+  defp projected_size(value, _path, _depth, node_budget) when is_binary(value),
+    do: projected_text_size(value, node_budget)
+
+  defp projected_size(_value, _path, _depth, _node_budget), do: :error
+
+  defp projected_queue_rows([], _depth, node_budget, size, count),
+    do: {:ok, size, count, node_budget}
+
+  defp projected_queue_rows([entry | rest], depth, node_budget, size, count)
+       when count < @max_envelope_entries and node_budget > 2 do
+    with :ok <- RuntimeSnapshot.exact_keys(entry, [:age_ms, :value]),
+         {:ok, age_size, after_age} <- projected_size(entry.age_ms, [], depth, node_budget - 1),
+         {:ok, value_size, after_value} <- projected_size(entry.value, [], depth, after_age) do
+      projected_queue_rows(rest, depth, after_value, size + 5 + age_size + value_size, count + 1)
+    else
+      _ -> :error
+    end
+  end
+
+  defp projected_queue_rows(_value, _depth, _node_budget, _size, _count), do: :error
+
+  defp projected_map_entries(value) do
+    value
+    |> Enum.reduce_while({:ok, [], MapSet.new()}, fn {key, nested}, {:ok, entries, keys} ->
+      case projected_key(key) do
+        {:ok, normalized} ->
+          if MapSet.member?(keys, normalized) do
+            {:halt, :error}
+          else
+            {:cont, {:ok, [{normalized, key, nested} | entries], MapSet.put(keys, normalized)}}
+          end
+
+        :error ->
+          {:halt, :error}
+      end
+    end)
+    |> case do
+      {:ok, entries, _keys} -> {:ok, entries}
+      _ -> :error
+    end
+  end
+
+  defp projected_map_size([], _path, _depth, node_budget, size),
+    do: {:ok, size, node_budget}
+
+  defp projected_map_size(
+         [{normalized, key, nested} | rest],
+         path,
+         depth,
+         node_budget,
+         size
+       ) do
+    with {:ok, nested_size, remaining_nodes} <-
+           projected_size(nested, [key | path], depth, node_budget) do
+      projected_map_size(
+        rest,
+        path,
+        depth,
+        remaining_nodes,
+        size + 2 + byte_size(normalized) + nested_size
+      )
+    else
+      _ -> :error
+    end
+  end
+
+  defp projected_list_size([], _path, _depth, node_budget, size, count),
+    do: {:ok, size, count, node_budget}
+
+  defp projected_list_size([entry | rest], path, depth, node_budget, size, count)
+       when count < @max_canonical_collection_count do
+    with {:ok, entry_size, remaining_nodes} <- projected_size(entry, path, depth, node_budget) do
+      projected_list_size(rest, path, depth, remaining_nodes, size + entry_size, count + 1)
+    else
+      _ -> :error
+    end
+  end
+
+  defp projected_list_size(_value, _path, _depth, _node_budget, _size, _count), do: :error
+
+  defp projected_key(key) when is_atom(key), do: key |> Atom.to_string() |> projected_key()
+
+  defp projected_key(key) when is_binary(key) and byte_size(key) <= @max_canonical_key_size do
+    if String.valid?(key) do
+      normalized = String.normalize(key, :nfc)
+
+      if byte_size(normalized) <= @max_canonical_key_size,
+        do: {:ok, normalized},
+        else: :error
+    else
+      :error
+    end
+  end
+
+  defp projected_key(_key), do: :error
+
+  defp projected_text_size(value, node_budget) do
+    if byte_size(value) + 5 <= @max_projected_canonical_size and String.valid?(value) do
+      normalized = String.normalize(value, :nfc)
+      size = byte_size(normalized) + 5
+
+      if size <= @max_projected_canonical_size,
+        do: {:ok, size, node_budget - 1},
+        else: :error
+    else
+      :error
+    end
+  end
 
   defp validate_projectable_tree(value) when is_map(value) and not is_struct(value) do
     with :ok <- reject_alias_keys(value) do

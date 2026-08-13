@@ -275,6 +275,29 @@ defmodule RacingOrg.Tracker.Pro.WindShift.ObserverSnapshotTest do
     end
   end
 
+  test "authoritative preflight bounds aggregate runtime bytes and collection work" do
+    clock = start_clock(10_000)
+    observer = start_observer(clock)
+    accept_sample(observer, clock, 10_000, @capture_utc)
+    assert {:ok, snapshot} = Observer.snapshot(observer)
+
+    oversized_queue =
+      put_in(
+        snapshot,
+        [:runtime, :envelope, :minq],
+        Enum.map(1..100_001, &%{age_ms: &1, value: 1.0})
+      )
+
+    oversized_binary =
+      put_in(snapshot, [:runtime, :last_lift], :binary.copy(<<0>>, 8_388_609))
+
+    for oversized <- [oversized_queue, oversized_binary] do
+      assert {:error, :invalid_wind_shift_runtime_snapshot} = Snapshot.preflight(oversized)
+      assert {:error, :invalid_wind_shift_runtime_snapshot} = Snapshot.digest(oversized)
+      assert {:error, :invalid_checkpoint_content} = RuntimeAdapter.project(oversized)
+    end
+  end
+
   test "authoritative preflight caps every nonnegative integer at canonical u64 or tighter" do
     clock = start_clock(10_000)
     observer = start_observer(clock)
