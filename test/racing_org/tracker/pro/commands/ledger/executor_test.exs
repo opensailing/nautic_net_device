@@ -178,6 +178,59 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.ExecutorTest do
       assert [{:execute, _id}] = ScriptedProvider.observed(ctx.script)
     end
 
+    test "first binding rejects a path redirected after unbound startup", ctx do
+      File.mkdir_p!(ctx.root)
+      target = Path.join(ctx.root, "redirected")
+      File.mkdir_p!(target)
+      alias_dir = Path.join(ctx.root, "late_alias")
+      configured_path = Path.join(alias_dir, "commands.ledger")
+      target_path = Path.join(target, "commands.ledger")
+      {:ok, authority} = Agent.start_link(fn -> {:error, :no_verified_authority} end)
+
+      executor =
+        start_dynamic_executor(ctx, authority,
+          path: configured_path,
+          identity_refresh_ms: 10_000
+        )
+
+      original_path = Executor.path(executor)
+      File.ln_s!(target, alias_dir)
+      Agent.update(authority, fn _unavailable -> {:ok, durable_identity()} end)
+
+      assert {:defer, :command_executor_rebind_required} =
+               Executor.deliver(executor, delivery(command_id: command_id(1), payload: payload(:noop)))
+
+      assert Executor.identity(executor) == nil
+      assert Executor.path(executor) == original_path
+      assert Process.alive?(executor)
+      refute File.exists?(target_path)
+      assert ScriptedProvider.observed(ctx.script) == []
+    end
+
+    test "unbound startup cannot bypass the reserved atomic temporary namespace through an alias", ctx do
+      File.mkdir_p!(ctx.root)
+      reserved = Path.join(ctx.root, "commands.ledger.tmp.ABCD-EFGH_IJKLMN")
+      alias_path = Path.join(ctx.root, "command-ledger-alias")
+      File.ln_s!(reserved, alias_path)
+      {:ok, authority} = Agent.start_link(fn -> {:error, :no_verified_authority} end)
+
+      opts =
+        ctx
+        |> executor_opts(
+          identity: fn -> Agent.get(authority, & &1) end,
+          device_id: nil,
+          credential_epoch: nil,
+          storage_epoch: nil,
+          path: alias_path,
+          identity_refresh_ms: 10_000
+        )
+        |> Keyword.put(:name, nil)
+
+      Process.flag(:trap_exit, true)
+      assert {:error, {:invalid_command_ledger_path, :reserved_atomic_temp_name}} = Executor.start_link(opts)
+      refute File.exists?(reserved)
+    end
+
     test "first late bind recovers a pending intent immediately under the live identity fence", ctx do
       pending = seed_pending_intent(ctx)
       ScriptedProvider.script(ctx.script, :recover, {:applied, %{outcome: :applied}})

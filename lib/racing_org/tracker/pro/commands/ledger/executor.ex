@@ -36,7 +36,7 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
   alias RacingOrg.Tracker.Pro.Commands.Ledger
   alias RacingOrg.Tracker.Pro.Commands.Ledger.{Registry, Store}
-  alias RacingOrg.Tracker.Pro.DesiredState.{Manager, OperationalGate, Runtime, RuntimeIdentity}
+  alias RacingOrg.Tracker.Pro.DesiredState.{AtomicFile, Manager, OperationalGate, Runtime, RuntimeIdentity}
 
   @default_max_outcomes 64
   @default_max_result_bytes 262_144
@@ -594,9 +594,18 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
   defp bind_identity(state) do
     case read_identity(state.identity_source) do
       {:ok, identity} ->
-        case open_store(Keyword.put(state.opts, :canonical_path, state.path), identity, state.providers) do
-          {:ok, store} -> finish_bind(state, identity, store)
-          {:error, reason} -> {:error, reason}
+        case verify_configured_path(state) do
+          :ok ->
+            case open_store(Keyword.put(state.opts, :canonical_path, state.path), identity, state.providers) do
+              {:ok, store} -> finish_bind(state, identity, store)
+              {:error, reason} -> {:error, reason}
+            end
+
+          {:error, :command_executor_path_retargeted} ->
+            {:rebind_required, latch_rebind_required(state, :command_executor_path_retargeted)}
+
+          {:error, reason} ->
+            {:error, reason}
         end
 
       {:error, :no_verified_authority} ->
@@ -604,6 +613,14 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
 
       {:error, reason} ->
         {:error, reason}
+    end
+  end
+
+  defp verify_configured_path(state) do
+    case canonical_ledger_path(configured_path(state.opts)) do
+      {:ok, path} when path == state.path -> :ok
+      {:ok, _retargeted_path} -> {:error, :command_executor_path_retargeted}
+      {:error, _reason} = error -> error
     end
   end
 
@@ -732,12 +749,27 @@ defmodule RacingOrg.Tracker.Pro.Commands.Ledger.Executor do
   defp configured_path(opts), do: Keyword.get_lazy(opts, :path, &default_path/0)
 
   defp canonical_ledger_path(path) when is_binary(path) and path != "" do
-    path
-    |> Path.expand()
-    |> resolve_path_symlinks(32)
+    if AtomicFile.reserved_temporary_path?(path) do
+      {:error, {:invalid_command_ledger_path, :reserved_atomic_temp_name}}
+    else
+      path
+      |> Path.expand()
+      |> resolve_path_symlinks(32)
+      |> reject_reserved_canonical_path()
+    end
   end
 
   defp canonical_ledger_path(_path), do: {:error, :invalid_command_ledger_path}
+
+  defp reject_reserved_canonical_path({:ok, path}) do
+    if AtomicFile.reserved_temporary_path?(path) do
+      {:error, {:invalid_command_ledger_path, :reserved_atomic_temp_name}}
+    else
+      {:ok, path}
+    end
+  end
+
+  defp reject_reserved_canonical_path({:error, _reason} = error), do: error
 
   defp resolve_path_symlinks(_path, 0), do: {:error, :command_ledger_symlink_limit}
 
