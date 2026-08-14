@@ -115,6 +115,36 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootProvisionerTest do
     assert {:ok, %BootstrapState{phase: :registered}} = BootstrapStateStore.load(base_path: base)
   end
 
+  test "status/1 reports the sanitized provisioning projection, never authority material" do
+    authority = %{
+      kind: :registration,
+      public_key: :binary.copy(<<0xA1>>, 32),
+      client_nonce: :binary.copy(<<0xA2>>, 32),
+      receipt: "signed-receipt-secret",
+      logical_device_id: :binary.copy(<<0xA3>>, 16),
+      credential_epoch: 5
+    }
+
+    reconcile_fun = fn _opts ->
+      {:ready,
+       %BootstrapState{
+         phase: :registered,
+         authority: authority,
+         verified_credential_epoch: 5,
+         retry_count: 1
+       }}
+    end
+
+    {:ok, pid} = BootProvisioner.start_link(name: nil, reconcile_fun: reconcile_fun)
+
+    status = BootProvisioner.status(pid)
+
+    assert status.phase == :registered
+    assert status.credential_epoch == 5
+    assert status.retry_count == 1
+    refute inspect(status, limit: :infinity) =~ "signed-receipt-secret"
+  end
+
   test "the supervised state machine stays alive once identity authority is ready" do
     reconcile_fun = fn _opts -> {:ready, %BootstrapState{phase: :registered}} end
     {:ok, pid} = BootProvisioner.start_link(name: nil, reconcile_fun: reconcile_fun)

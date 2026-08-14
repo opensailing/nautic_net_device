@@ -170,17 +170,43 @@ Relevant durable phases include:
 - `blocked`; and
 - `limbo`.
 
-Use these sanitized tracker calls for diagnosis:
+### Attaching a serial console
+
+Attach with a 3.3 V USB-TTL adapter on the Raspberry Pi UART header (GND,
+TXD→RX, RXD→TX; never connect 5 V), then:
+
+```shell
+picocom -b 115200 /dev/tty.usbserial-*   # macOS; on Linux: /dev/ttyUSB0
+```
+
+Press Enter for the IEx prompt. Detach with `C-a C-x`. The serial console is a
+local trust boundary: anyone holding it holds the device, so treat transcripts
+as sensitive and never paste raw structs from it into tickets.
+
+### Sanitized diagnostics calls
+
+Start with the one-call summary — it is sanitized end to end (closed key set,
+truncated hex identifiers, everything else redacted; a dead collaborator
+reports `:unavailable` instead of breaking the summary), so its output is safe
+to record verbatim:
 
 ```elixir
-RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner.current_state()
+RacingOrg.Tracker.Pro.Diagnostics.summary()
+```
+
+For provisioning detail, use the sanitized status projection and epoch reads:
+
+```elixir
+RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner.status()
 RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner.credential_epoch()
 RacingOrg.Tracker.Pro.SecureTransport.SessionHolder.live?()
 ```
 
-Do not copy the complete returned bootstrap struct outside the console: it can
-contain exact receipt envelopes and transcript bindings. Record only the phase,
-closed blocked reason, retry count, authority kind, and credential epoch.
+`BootProvisioner.current_state()` remains available for on-console debugging,
+but do not copy the complete returned bootstrap struct outside the console: it
+can contain exact receipt envelopes and transcript bindings. Record only the
+phase, closed blocked reason, retry count, authority kind, and credential
+epoch — exactly the fields `status/0` already projects.
 
 On the backend, use the admin device detail page. It exposes a sanitized
 recovery gate, hardware identity, attempts, and append-only audit history. It

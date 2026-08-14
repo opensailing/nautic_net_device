@@ -93,6 +93,15 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner do
   def current_state(server \\ __MODULE__), do: GenServer.call(server, :current_state)
 
   @doc """
+  Operator-facing sanitized provisioning status (see
+  `BootstrapState.sanitized_status/1`) — safe for serial-console diagnostics;
+  never carries authority material, recovery challenges, or registration
+  payloads.
+  """
+  @spec status(server()) :: map()
+  def status(server \\ __MODULE__), do: GenServer.call(server, :status)
+
+  @doc """
   Whether verified durable authority matches the active signer and current hardware.
 
   A plain key-store option list remains supported for v1 callers. Operational callers
@@ -176,6 +185,9 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootProvisioner do
 
   @impl true
   def handle_call(:current_state, _from, state), do: {:reply, state.bootstrap_state, state}
+
+  def handle_call(:status, _from, state),
+    do: {:reply, BootstrapState.sanitized_status(state.bootstrap_state), state}
 
   def handle_call(:credential_epoch, _from, state) do
     {:reply, BootstrapState.credential_epoch(state.bootstrap_state), state}

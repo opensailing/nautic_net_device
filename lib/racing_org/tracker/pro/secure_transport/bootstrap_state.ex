@@ -112,6 +112,55 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.BootstrapState do
 
   def credential_epoch(%__MODULE__{}), do: {:error, :no_verified_authority}
 
+  @doc """
+  Operator-facing sanitized projection of the provisioning state: a closed key
+  set carrying only phases, epochs, counters, a reason category, and a
+  truncated hardware-identity digest. Authority material, recovery challenges,
+  and legacy registration payloads never appear in it.
+  """
+  @spec sanitized_status(t()) :: %{
+          phase: phase(),
+          credential_epoch: non_neg_integer() | nil,
+          retry_count: non_neg_integer(),
+          blocked_reason: atom() | nil,
+          legacy: boolean(),
+          hardware_identity: String.t() | nil,
+          recovery_pending: boolean()
+        }
+  def sanitized_status(%__MODULE__{} = state) do
+    %{
+      phase: state.phase,
+      credential_epoch: status_credential_epoch(state),
+      retry_count: state.retry_count,
+      blocked_reason: status_blocked_reason(state.blocked_reason),
+      legacy: state.legacy_marker,
+      hardware_identity: status_hardware_identity(state.hardware_identity_digest),
+      recovery_pending: not is_nil(state.recovery)
+    }
+  end
+
+  defp status_credential_epoch(state) do
+    case credential_epoch(state) do
+      {:ok, epoch} -> epoch
+      {:error, _no_authority} -> nil
+    end
+  end
+
+  defp status_blocked_reason(nil), do: nil
+  defp status_blocked_reason(reason) when is_atom(reason), do: reason
+
+  defp status_blocked_reason(reason)
+       when is_tuple(reason) and tuple_size(reason) > 0 and is_atom(elem(reason, 0)),
+       do: elem(reason, 0)
+
+  defp status_blocked_reason(_reason), do: :blocked
+
+  defp status_hardware_identity(nil), do: nil
+
+  defp status_hardware_identity(digest) when is_binary(digest) do
+    digest |> Base.encode16(case: :lower) |> String.slice(0, 12)
+  end
+
   @doc "Structural validation used at the storage trust boundary."
   @spec valid?(term()) :: boolean()
   def valid?(%__MODULE__{} = state) do
