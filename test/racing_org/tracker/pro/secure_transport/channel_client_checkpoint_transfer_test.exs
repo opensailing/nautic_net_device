@@ -106,6 +106,35 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCheckpointTransferT
     end
   end
 
+  defmodule CleanupFailingFileSystem do
+    alias RacingOrg.Tracker.Pro.SecureTransport.KeyStore.FileSystem
+
+    def remove(path) do
+      case :persistent_term.get(__MODULE__, nil) do
+        owner when is_pid(owner) ->
+          send(owner, {:staging_cleanup_remove_refused, path})
+          {:error, :simulated_checkpoint_cleanup_failure}
+
+        _other ->
+          FileSystem.remove(path)
+      end
+    end
+
+    defdelegate read(device, count), to: FileSystem
+    defdelegate file_info(device), to: FileSystem
+    defdelegate list_dir(path), to: FileSystem
+    defdelegate lstat(path), to: FileSystem
+    defdelegate mkdir_p(path), to: FileSystem
+    defdelegate mkdir(path), to: FileSystem
+    defdelegate chmod(path, mode), to: FileSystem
+    defdelegate open(path, modes), to: FileSystem
+    defdelegate write(device, contents), to: FileSystem
+    defdelegate sync(device), to: FileSystem
+    defdelegate close(device), to: FileSystem
+    defdelegate rename(source, destination), to: FileSystem
+    defdelegate rmdir(path), to: FileSystem
+  end
+
   describe "durable checkpoint submission dispatch" do
     test "dispatches exact planner frames in priority/FIFO order without retiring entries", ctx do
       low = single_frame_entry(1, priority: 1, ordinal: 1)
@@ -475,6 +504,81 @@ defmodule RacingOrg.Tracker.Pro.SecureTransport.ChannelClientCheckpointTransferT
       assert_receive {:checkpoint_hydrate, ^generation, ^hydration}, 2_000
       refute_push(^topic, "control_v1", _carrier, 75)
       assert File.dir?(Staging.path(staging_root, hydration.checkpoint_hash))
+      assert Process.alive?(client)
+    end
+
+    test "applies a completed hydration exactly once and retains staged bytes when staging cleanup fails", ctx do
+      staging_root = Path.join(ctx.base, "checkpoint_hydration_cleanup_failure")
+      hydration = large_hydration(33)
+      [first, final] = hydration_chunk_frames(hydration)
+
+      {client, _id, topic, server_control, holder} =
+        start_checkpoint_client(ctx,
+          checkpoint_hydration_coordinator: {self(), {:ok, :hydrated}},
+          checkpoint_hydration_staging_root: staging_root,
+          checkpoint_hydration_staging_opts: [file_system: CleanupFailingFileSystem]
+        )
+
+      server_control = push_control(client, topic, server_control, :checkpoint_hydration_chunk, first.attrs)
+      {server_control, resume} = receive_control(topic, server_control)
+      assert resume.type == :checkpoint_hydration_resume
+
+      generation = SessionHolder.generation(holder)
+      on_exit(fn -> :persistent_term.erase(CleanupFailingFileSystem) end)
+      :persistent_term.put(CleanupFailingFileSystem, self())
+
+      _server_control = push_control(client, topic, server_control, :checkpoint_hydration_chunk, final.attrs)
+
+      assert_receive {:checkpoint_hydrate, ^generation, ^hydration}, 2_000
+      assert_receive {:staging_cleanup_remove_refused, _path}, 2_000
+      refute_receive {:checkpoint_hydrate, _, _}, 100
+      refute_push(^topic, "control_v1", _carrier, 75)
+
+      transfer =
+        hydration
+        |> Map.delete(:content)
+        |> Map.merge(%{total_content_length: byte_size(hydration.content), chunk_count: 2})
+
+      assert File.dir?(Staging.path(staging_root, hydration.checkpoint_hash))
+      assert {:ok, %{chunk_count: 2, missing_ranges: []}} = Staging.status(staging_root, transfer)
+      assert Process.alive?(client)
+    end
+
+    test "fences an in-flight chunked hydration at session replacement and retains staged bytes for resume", ctx do
+      staging_root = Path.join(ctx.base, "checkpoint_hydration_replacement")
+      hydration = large_hydration(34)
+      [first, final] = hydration_chunk_frames(hydration)
+
+      {client, _id, topic, server_control, holder} =
+        start_checkpoint_client(ctx,
+          checkpoint_hydration_coordinator: {self(), {:ok, :hydrated}},
+          checkpoint_hydration_staging_root: staging_root
+        )
+
+      server_control = push_control(client, topic, server_control, :checkpoint_hydration_chunk, first.attrs)
+      {server_control, resume} = receive_control(topic, server_control)
+      assert resume.type == :checkpoint_hydration_resume
+
+      assert {:ok, current} = SessionHolder.get_current_session(holder)
+      replacement = %{current | session_id: <<0xF2::128>>, generation: nil}
+      assert {:ok, replacement} = SessionHolder.publish(holder, replacement, current.generation)
+      assert replacement.generation > current.generation
+
+      _server_control = push_control(client, topic, server_control, :checkpoint_hydration_chunk, final.attrs)
+
+      refute_receive {:checkpoint_hydrate, _, _}, 100
+      refute_push(^topic, "control_v1", _carrier, 75)
+
+      transfer =
+        hydration
+        |> Map.delete(:content)
+        |> Map.merge(%{total_content_length: byte_size(hydration.content), chunk_count: 2})
+
+      assert File.dir?(Staging.path(staging_root, hydration.checkpoint_hash))
+
+      assert {:ok, %{chunk_count: 2, missing_ranges: [%{first_chunk_index: 1, chunk_count: 1}]}} =
+               Staging.status(staging_root, transfer)
+
       assert Process.alive?(client)
     end
   end
