@@ -560,7 +560,7 @@ The vector freezes the canonical offer and hash, canonical scalar/map/list bytes
 The vector uses only deterministic synthetic identifiers, keys, and explicitly synthetic noncredential bytes. Its SHA-256 is:
 
 ```text
-7497ba2f1d0f45181aa9ee3235fdf43f372315c4e568e88a4bb70b31fad86882
+3973265021ae78274938883ee9169ecdfd2cb291a4e02f4ec24856f8fa19055a
 ```
 
 ## 11. Deferred behavior
